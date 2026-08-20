@@ -807,9 +807,3 @@ than oversights:
 [`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md) has a plain-language guide to
 which one you need, and what we ask of contributors so that dual licensing
 remains possible.
-
-**Up to 2026-08-20 InlaySQL was published under MIT, and that grant stands.**
-Anyone who obtained it under MIT keeps MIT rights to the versions they
-received, permanently. The history was later rewritten so every commit carries
-the AGPL text, which changes how the history reads but not what was granted at
-the time. See [`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md).

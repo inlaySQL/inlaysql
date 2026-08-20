@@ -44,19 +44,3 @@ If you would rather your contribution stayed AGPL-only, say so in the pull
 request. That is a legitimate position and we will tell you honestly whether we
 can take the change on those terms rather than merging it and sorting it out
 later.
-
-## Versions released before this change
-
-Up to 2026-08-20, InlaySQL was published under the MIT licence. **That grant
-cannot be withdrawn.** Anyone who obtained the software under MIT during that
-period keeps their MIT rights to the versions they received, permanently, and
-may continue to use, modify and redistribute those versions on MIT terms. This
-document does not, and cannot, take that back.
-
-The repository's git history was subsequently rewritten so that every commit
-carries the AGPL text, which is why browsing an old commit today shows the AGPL
-rather than the MIT file it originally contained. That rewrite changed how the
-history reads; it did not change the licence anyone was granted at the time.
-
-Everything from 2026-08-20 onward is offered under the terms at the top of this
-document: the AGPL, or a commercial licence.

@@ -162,7 +162,12 @@ impl Session {
             // this link with a password.
             "have_ssl" | "have_openssl" => "DISABLED",
             "ssl_cipher" => "",
-            "license" => "MIT",
+            // MySQL answers `GPL` for its community build and `Commercial`
+            // for the licensed one, and a client that inspects this is asking
+            // which of those it is talking to. This engine is dual licensed
+            // under the AGPL or a commercial licence, so it says so rather
+            // than borrowing either of MySQL's two answers.
+            "license" => "AGPL",
             "init_connect" => "",
             "sql_auto_is_null" => "0",
             "default_storage_engine" => "InlaySQL",
