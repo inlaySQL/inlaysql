@@ -214,10 +214,18 @@ row pays a socket round trip.
 | MySQL 8 | 1 | 1,554.4 | 24,481.3 |
 | MySQL 8 | 8 | 6,630.4 | 18,028.8 |
 
-At one connection, InlaySQL loses on writes (0.7x) but wins on reads (1.52x).
-At eight connections, MySQL pulls ahead on both (4.76x on writes); InlaySQL's
-thread-per-connection model does not scale as MySQL's worker pool does. This
-is a structural difference in concurrency strategy, not a tuning gap. Both
+At one connection InlaySQL loses on writes (0.70x) and **wins on reads
+(1.52x)**. At eight it still edges reads (19,874 against 18,029, 1.10x) and
+loses writes badly — **4.76x**.
+
+The number that matters most here is not against MySQL, it is against
+ourselves: **our own read throughput nearly halves as connections rise**,
+37,158 to 19,874, where MySQL gives up 26%. Each connection gets its own
+`Database` handle and therefore its own page cache, so eight connections warm
+eight caches over the same pages instead of sharing one. That is a consequence
+of decision D2 (thread-per-connection, `!Send` engine) and it is a structural
+concurrency difference rather than a tuning gap — but the cache duplication
+specifically is the part worth attacking, and nothing has tried yet. Both
 sides use disjoint id ranges per connection to avoid conflicts; retries are
 zero on both. See "Server-to-server" in `bench/README.md` for the detailed
 methodology, the concurrency-model/credential/TLS asymmetries that remain, and
