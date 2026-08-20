@@ -1,0 +1,155 @@
+# Multi-key ORDER BY with NULLS FIRST/LAST, and LIMIT/OFFSET paging.
+#
+# Every query names a total order, so there is exactly one right answer
+# and the LIMIT cases are not measuring tie-breaking luck.
+#
+# Expected values come from SQLite.
+
+statement ok
+CREATE TABLE p(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO p VALUES (1, 2, 'x')
+
+statement ok
+INSERT INTO p VALUES (2, 1, 'y')
+
+statement ok
+INSERT INTO p VALUES (3, 2, 'a')
+
+statement ok
+INSERT INTO p VALUES (4, NULL, 'z')
+
+statement ok
+INSERT INTO p VALUES (5, 1, NULL)
+
+query I nosort
+SELECT id FROM p ORDER BY a, id
+----
+4
+2
+5
+1
+3
+
+query I nosort
+SELECT id FROM p ORDER BY a DESC, id
+----
+1
+3
+2
+5
+4
+
+query I nosort
+SELECT id FROM p ORDER BY a ASC, b DESC, id
+----
+4
+2
+5
+1
+3
+
+query I nosort
+SELECT id FROM p ORDER BY a NULLS LAST, id
+----
+2
+5
+1
+3
+4
+
+query I nosort
+SELECT id FROM p ORDER BY a NULLS FIRST, id
+----
+4
+2
+5
+1
+3
+
+query I nosort
+SELECT id FROM p ORDER BY a DESC NULLS FIRST, id
+----
+4
+1
+3
+2
+5
+
+query I nosort
+SELECT id FROM p ORDER BY a DESC NULLS LAST, id
+----
+1
+3
+2
+5
+4
+
+query I nosort
+SELECT id FROM p ORDER BY b NULLS LAST, id
+----
+3
+1
+2
+4
+5
+
+query II nosort
+SELECT a, id FROM p ORDER BY 1, 2
+----
+NULL 4
+1 2
+1 5
+2 1
+2 3
+
+query II nosort
+SELECT a, id FROM p ORDER BY 2 DESC
+----
+1 5
+NULL 4
+2 3
+1 2
+2 1
+
+query I nosort
+SELECT id FROM p ORDER BY id LIMIT 2
+----
+1
+2
+
+query I nosort
+SELECT id FROM p ORDER BY id LIMIT 2 OFFSET 2
+----
+3
+4
+
+query I nosort
+SELECT id FROM p ORDER BY id LIMIT 100 OFFSET 3
+----
+4
+5
+
+query I nosort
+SELECT id FROM p ORDER BY id LIMIT 2 OFFSET 100
+----
+
+query I nosort
+SELECT id FROM p ORDER BY id LIMIT 0
+----
+
+query I nosort
+SELECT id FROM p ORDER BY id LIMIT -1
+----
+1
+2
+3
+4
+5
+
+query I nosort
+SELECT id FROM p ORDER BY id LIMIT 3, 2
+----
+4
+5

@@ -1,0 +1,174 @@
+name: Trust
+
+# The evidence behind the claims: fuzzing, logic-bug testing and benchmarks,
+# published as artifacts anyone can download.
+#
+# Separate from `ci.yml` because it answers a different question. CI answers
+# "is this change correct enough to merge" and must be fast; this answers "what
+# is true about main right now" and is allowed to take an hour. Keeping them
+# apart is also what lets this workflow fail honestly: a fuzz crash turns this
+# run red without blocking a single pull request.
+#
+# On a red run, read the `fuzz-status` artifact before blaming the runner. The
+# first campaign on a working runner found two real crashes (fixed in #24), so
+# red here has already meant "the code" once.
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    # 03:00 UTC daily: a fuzzing campaign is only worth having if it runs
+    # again on code nobody changed today.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds to run each fuzz target
+        required: false
+        default: "300"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: coverage-guided fuzzing
+    runs-on: ubuntu-latest
+    # An hour of budget for four targets plus the toolchain. The per-target
+    # limit below is what actually bounds it; this is the backstop.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/rust
+        with:
+          toolchain: nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked || cargo install cargo-fuzz
+
+      # Each target gets the same wall-clock budget rather than a run count:
+      # libFuzzer's throughput differs by orders of magnitude between targets,
+      # and a time limit is the only bound that keeps the job predictable.
+      #
+      # A crash is written to fuzz/artifacts/ and uploaded. The step does not
+      # stop at the first failing target — a run that reports one crash and
+      # hides two is worse than one that reports three.
+      #
+      # A crash fails this job on purpose. The usual argument for filing an
+      # issue instead is that a red check blocks merges — that does not apply
+      # here, because this workflow gates nothing. `ci.yml` does the gating.
+      - name: Fuzz every target
+        run: |
+          seconds="${{ github.event.inputs.fuzz_seconds || '300' }}"
+          mkdir -p fuzz/status
+          failed=0
+          for target in sql_parser storage row_codec json_parser; do
+            echo "::group::$target (${seconds}s)"
+            if cargo +nightly fuzz run "$target" -- -max_total_time="$seconds" \
+                 > "fuzz/status/$target.log" 2>&1; then
+              echo "$target: clean" >> fuzz/status/summary.txt
+            else
+              echo "$target: FOUND A CRASH" >> fuzz/status/summary.txt
+              failed=1
+            fi
+            tail -5 "fuzz/status/$target.log" || true
+            echo "::endgroup::"
+          done
+          {
+            echo "### Fuzzing (${seconds}s per target)"
+            echo '```'
+            cat fuzz/status/summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$failed"
+
+      # `always()`: a crash is exactly when the artifacts matter, and a failed
+      # step must not be the reason nobody can see the input that caused it.
+      - name: Publish fuzzing status
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fuzz-status
+          path: |
+            fuzz/status/
+            fuzz/artifacts/
+          if-no-files-found: warn
+          retention-days: 30
+
+  logic-bugs:
+    name: differential vs SQLite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/rust
+        with:
+          cache: trust
+
+      # A far longer campaign than the one in `cargo test`. Seeds are
+      # consecutive, so this is a superset of what every push already ran.
+      - name: 50,000 random predicates against SQLite
+        env:
+          INLAYSQL_DIFFERENTIAL_ROUNDS: "50000"
+        run: cargo test --release -p inlaysql --test differential -- --nocapture
+
+      # The index-save reproduction: five thousand indexed rows, which is what
+      # it took to overflow one write-ahead log record. Ignored in the normal
+      # run because it is half a minute of durable commits.
+      - name: A five-thousand-row index can be checkpointed
+        run: cargo test --release -p inlaysql --test large_index -- --ignored
+
+  benchmarks:
+    name: benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/rust
+        with:
+          cache: bench
+
+      # The same script a reader runs locally. If this job and a laptop
+      # disagree, the script is the thing both of them ran.
+      - name: Run the benchmark suites
+        run: ./bench/run.sh
+
+      # DuckDB and pgvector need containers, so this is best-effort: a runner
+      # without Docker reports that rather than failing the job, because the
+      # numbers above are still worth publishing without it.
+      - name: Compare against DuckDB and pgvector
+        run: |
+          if docker info >/dev/null 2>&1; then
+            ./bench/compare.sh
+          else
+            echo "::warning::docker unavailable on this runner: DuckDB and pgvector were not measured"
+          fi
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Benchmarks"
+            echo "Numbers are wall-clock on this runner. Reproduce with \`./bench/run.sh\`."
+            for file in bench/results/*.txt; do
+              [ -f "$file" ] || continue
+              echo "<details><summary>$(basename "$file")</summary>"
+              echo
+              echo '```'
+              cat "$file"
+              echo '```'
+              echo "</details>"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish benchmark results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: benchmark-results
+          path: bench/results/
+          if-no-files-found: warn
+          retention-days: 90

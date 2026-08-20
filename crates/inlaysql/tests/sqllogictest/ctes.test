@@ -1,0 +1,220 @@
+# Non-recursive `WITH` (AHL-473, PLAN.md Phase 1c item 3).
+#
+# Every expected value in this file came from SQLite 3 running the same
+# statements. A CTE reference becomes a derived table via AHL-463's
+# machinery (`FromItem::derived`, `SubqueryBody`) — plan once, then clone
+# the planned body into a `FromItem` at every reference site. What that
+# means, and what is deliberately different from SQLite here:
+#
+#   * a CTE referenced more than once is planned once but may *run* more
+#     than once, once per clone — SQLite sometimes shares one materialised
+#     run across references and sometimes does not; this engine never
+#     shares, and the "twice" section below pins that with a query whose
+#     answer could only be `1` if two references genuinely ran the CTE's
+#     body independently;
+#   * a CTE may reference one defined earlier in the same `WITH` list, or in
+#     an enclosing one, exactly as SQLite requires. What SQLite *additionally*
+#     allows and this does not — a forward reference between siblings, which
+#     SQLite resolves lazily as long as it is not circular — is refused
+#     loudly instead, pinned in `unsupported.test` along with the always-
+#     illegal self reference;
+#   * a CTE name shadows a real table of the same name for the rest of the
+#     statement it was declared in, checked ahead of the catalog;
+#   * `WITH t(a, b) AS (...)` column alias lists work (AHL-463 refused them
+#     on derived tables; this is where the underlying rename code lands —
+#     see `sql.rs::apply_column_aliases`'s doc for why it is *not* also
+#     wired onto a derived table's own alias list, unlike what the plan
+#     first assumed: that syntax does not exist in SQLite at all).
+#
+# What is deliberately absent: `WITH RECURSIVE` (refused, named in the
+# message), `WITH` before `UPDATE`/`DELETE`/`INSERT` (SQLite has it; this
+# engine does not reach it yet), and the forward/self-reference and
+# real-table-shadowing-during-its-own-definition cases above — all pinned in
+# `unsupported.test` rather than here.
+
+statement ok
+CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'x')
+
+statement ok
+INSERT INTO t VALUES (2, 20, 'y')
+
+statement ok
+INSERT INTO t VALUES (3, NULL, 'z')
+
+statement ok
+INSERT INTO t VALUES (4, 20, NULL)
+
+# ------------------------------------------------------------------- basic
+
+query I nosort
+WITH x AS (SELECT a FROM t WHERE a > 10) SELECT a FROM x ORDER BY a
+----
+20
+20
+
+# A CTE with more than one output column, referenced through a plain alias.
+query IT nosort
+WITH x AS (SELECT id, b FROM t) SELECT id, b FROM x ORDER BY id
+----
+1 x
+2 y
+3 z
+4 NULL
+
+# --------------------------------------------------------- column aliases
+
+query IT nosort
+WITH x(p, q) AS (SELECT id, b FROM t) SELECT p, q FROM x ORDER BY p
+----
+1 x
+2 y
+3 z
+4 NULL
+
+# The rename does not disturb the underlying projection's collation — a
+# `NOCASE` column stays `NOCASE` under its new name, the same rule a plain
+# derived table's synthetic column already follows.
+statement ok
+CREATE TABLE ci(s TEXT COLLATE NOCASE)
+
+statement ok
+INSERT INTO ci VALUES ('BOB')
+
+statement ok
+INSERT INTO ci VALUES ('bob')
+
+query I nosort
+WITH x(n) AS (SELECT s FROM ci) SELECT COUNT(DISTINCT n) FROM x
+----
+1
+
+# A mismatched column count is refused, same as SQLite.
+statement error
+WITH x(p) AS (SELECT id, a FROM t) SELECT p FROM x
+
+# ------------------------------------------------------- CTEs and CTEs
+
+# A later CTE may reference an earlier one in the same `WITH` list.
+query I nosort
+WITH y AS (SELECT a FROM t WHERE a IS NOT NULL), x AS (SELECT a FROM y WHERE a > 15)
+SELECT a FROM x ORDER BY a
+----
+20
+20
+
+# The main query may join two CTEs against each other.
+query IIT nosort
+WITH x AS (SELECT id, a FROM t WHERE a IS NOT NULL), y AS (SELECT id, b FROM t)
+SELECT x.id, x.a, y.b FROM x JOIN y ON x.id = y.id ORDER BY x.id
+----
+1 10 x
+2 20 y
+4 20 NULL
+
+# --------------------------------------------------------------- shadowing
+
+# A CTE name shadows a real table of the same name for the whole statement.
+query I nosort
+WITH t AS (SELECT 99 AS a) SELECT a FROM t
+----
+99
+
+# The original `t` is unreachable inside the `WITH` clause's own scope, but
+# nothing else about the statement changed it, so it is exactly as it was
+# once the `WITH x AS (...)` statement above finished.
+query I nosort
+SELECT COUNT(*) FROM t
+----
+4
+
+# ---------------------------------------------------------- referenced twice
+
+# A CTE referenced twice through a self-join, correlating rows of the same
+# derived table against each other.
+query II nosort
+WITH x AS (SELECT id, a FROM t WHERE a IS NOT NULL)
+SELECT x1.id, x2.id FROM x AS x1, x AS x2 WHERE x1.a = x2.a AND x1.id < x2.id
+----
+2 4
+
+# This engine's choice, stated in `sql.rs::CteEntry`'s doc: a CTE referenced
+# twice is planned once but evaluated once *per reference*, not memoised and
+# shared. Pinned here rather than merely asserted in prose: `random()` draws
+# a fresh value on every call, so two independent evaluations of the same
+# CTE almost certainly disagree, where one shared evaluation could not.
+# Measured against sqlite3: it answers `0` for this exact query (it shares
+# the one run here), which is the "SQLite sometimes does the same" the plan
+# called out — this is the case it does not.
+query I nosort
+WITH r AS (SELECT random() AS v)
+SELECT (SELECT v FROM r) != (SELECT v FROM r) AS differs
+----
+1
+
+# --------------------------------------------------------------- cross-feature
+
+# A CTE whose own body is a compound (AHL-473 item 2).
+query I nosort
+WITH u AS (SELECT a FROM t WHERE a = 10 UNION SELECT a FROM t WHERE a = 20)
+SELECT a FROM u ORDER BY a
+----
+10
+20
+
+# A CTE used as the source of an `IN (SELECT ...)`.
+query T nosort
+WITH ids AS (SELECT id FROM t WHERE a = 20)
+SELECT b FROM t WHERE id IN (SELECT id FROM ids) ORDER BY b
+----
+NULL
+y
+
+# A CTE joined against a stored, indexed table. `Engine::join_probe` decides
+# purely from the inner table (`big`, which has a matching `BTree` index on
+# `k`) and the `ON` clause's shape — nothing about the *outer* side being a
+# CTE (a `FromItem::derived`, exactly the shape a plain `FROM (SELECT ...)`
+# already produced before this phase) changes that rule, so the index probe
+# this join would take for an ordinary derived table still applies here.
+statement ok
+CREATE TABLE big(id INTEGER PRIMARY KEY, k INTEGER)
+
+statement ok
+CREATE INDEX big_k ON big(k)
+
+statement ok
+INSERT INTO big VALUES (1, 100)
+
+statement ok
+INSERT INTO big VALUES (2, 200)
+
+statement ok
+INSERT INTO big VALUES (3, 300)
+
+query II nosort
+WITH keys(k) AS (SELECT 100 UNION SELECT 300)
+SELECT big.id, big.k FROM keys JOIN big ON big.k = keys.k ORDER BY big.id
+----
+1 100
+3 300
+
+# `WITH` on a derived table's own subquery, nested inside another `WITH` —
+# each pushes its own frame, and the inner one shadows the outer's CTE of
+# the same name for its own scope only.
+query I nosort
+WITH x AS (SELECT 1 AS a)
+SELECT a FROM (WITH x AS (SELECT 2 AS a) SELECT a FROM x) AS d
+----
+2
+
+# A CTE is visible to a subquery nested arbitrarily deep in the main query,
+# not only to the immediate `FROM` — it is scoped to the whole statement,
+# unlike a correlated column reference (which a derived table boundary does
+# stop, per AHL-463).
+query I nosort
+WITH x AS (SELECT 1 AS a)
+SELECT * FROM (SELECT * FROM (SELECT a FROM x))
+----
+1

@@ -1,0 +1,16 @@
+[package]
+name = "inlaysql-uring"
+description = "io_uring I/O backend for InlaySQL (Linux only)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+inlaysql-core = { workspace = true }
+
+# Linux-only: on every other platform this crate compiles to nothing but the
+# module documentation, so depending on it unconditionally is harmless.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true }

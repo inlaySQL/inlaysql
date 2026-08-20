@@ -1,0 +1,56 @@
+# Three-valued logic: NOT, IS NULL, IS NOT NULL.
+# These operators were added because the metamorphic tests in
+# crates/inlaysql-core/tests/logic_bugs.rs could not express their property
+# without them.
+
+statement ok
+CREATE TABLE n(id INTEGER PRIMARY KEY, a INTEGER)
+
+statement ok
+INSERT INTO n VALUES (1, 1), (2, 0), (3, NULL)
+
+query I rowsort
+SELECT id FROM n WHERE a = 1
+----
+1
+
+# NOT of an unknown is unknown, so row 3 is in neither result.
+query I rowsort
+SELECT id FROM n WHERE NOT (a = 1)
+----
+2
+
+query I rowsort
+SELECT id FROM n WHERE a IS NULL
+----
+3
+
+query I rowsort
+SELECT id FROM n WHERE a IS NOT NULL
+----
+1
+2
+
+# The three partitions together are the whole table.
+query I rowsort
+SELECT id FROM n WHERE (a = 1) OR (NOT (a = 1)) OR ((a = 1) IS NULL)
+----
+1
+2
+3
+
+# IS NULL is never itself unknown.
+query III nosort
+SELECT (NULL IS NULL), (NULL IS NOT NULL), (1 IS NULL)
+----
+1 0 0
+
+query II nosort
+SELECT NOT 0, NOT 1
+----
+1 0
+
+query I nosort
+SELECT (NOT NULL) IS NULL
+----
+1

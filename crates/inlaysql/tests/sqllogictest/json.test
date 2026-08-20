@@ -1,0 +1,560 @@
+# SQLite's json1 functions and the `->`/`->>` path operators (AHL-490).
+#
+# Every expected value here was produced by a real sqlite3 3.54 binary, not
+# by InlaySQL: a self-blessed expectation would pass whatever the engine
+# happened to do. JSON is stored exactly as SQLite stores it — as ordinary
+# TEXT — so `attributes` below is a plain TEXT column, the same shape a
+# Laravel `casts => ['attributes' => 'array']` model produces.
+
+statement ok
+CREATE TABLE products(id INTEGER PRIMARY KEY, attributes TEXT)
+
+statement ok
+INSERT INTO products VALUES (1, '{"color":"red","size":10,"tags":["a","b","c"],"meta":{"weight":2.5,"active":true},"note":null}')
+
+statement ok
+INSERT INTO products VALUES (2, '{"color":"blue","size":20,"tags":[],"meta":{"weight":1.5,"active":false}}')
+
+statement ok
+INSERT INTO products VALUES (3, NULL)
+
+# ------------------------------------------------------------ json_extract
+#
+# A missing path, a path into an array, a path into a scalar, and a NULL
+# document all answer NULL rather than erroring — an invalid *path
+# expression* is the one thing that errors instead (further down).
+
+query T nosort
+SELECT json_extract(attributes, '$.color') FROM products ORDER BY id
+----
+red
+blue
+NULL
+
+query I nosort
+SELECT json_extract(attributes, '$.size') FROM products ORDER BY id
+----
+10
+20
+NULL
+
+# A path into an object returns that object's own JSON text, not a further
+# distinct value.
+query T nosort
+SELECT json_extract(attributes, '$.meta') FROM products ORDER BY id
+----
+{"weight":2.5,"active":true}
+{"weight":1.5,"active":false}
+NULL
+
+query T nosort
+SELECT json_extract(attributes, '$.tags[0]') FROM products ORDER BY id
+----
+a
+NULL
+NULL
+
+# Out-of-range array index: NULL, not an error.
+query T nosort
+SELECT json_extract(attributes, '$.tags[5]') FROM products ORDER BY id
+----
+NULL
+NULL
+NULL
+
+# Missing object key: NULL.
+query T nosort
+SELECT json_extract(attributes, '$.missing') FROM products ORDER BY id
+----
+NULL
+NULL
+NULL
+
+# A JSON `null` value is a real match — still NULL as a SQL value, same as a
+# missing key, but exercised separately since `json_type` (below) tells them
+# apart.
+query T nosort
+SELECT json_extract(attributes, '$.note') FROM products ORDER BY id
+----
+NULL
+NULL
+NULL
+
+# Two or more paths wrap the results in a JSON array — one path does not.
+query T nosort
+SELECT json_extract(attributes, '$.color', '$.size') FROM products ORDER BY id
+----
+["red",10]
+["blue",20]
+NULL
+
+# An invalid path expression is an error, never NULL.
+statement error
+SELECT json_extract(attributes, 'color') FROM products
+
+statement error
+SELECT json_extract(attributes, '$.[a]') FROM products
+
+statement error
+SELECT json_extract(attributes, '$[-1]') FROM products
+
+# Malformed JSON is an error too, not NULL and not 0.
+statement error
+SELECT json_extract('not json', '$.a')
+
+# -------------------------------------------------------------- -> / ->>
+#
+# `->` is the JSON representation (quoted text for a string, the same text
+# as json_extract for a composite); `->>` is the SQL value (unwrapped for a
+# scalar). Checked against sqlite3 3.54, which added both in 3.38.0.
+
+query T nosort
+SELECT attributes -> '$.color' FROM products WHERE id = 1
+----
+"red"
+
+query T nosort
+SELECT attributes ->> '$.color' FROM products WHERE id = 1
+----
+red
+
+# For a composite, `->` and `->>` answer identically.
+query T nosort
+SELECT attributes -> '$.meta' FROM products WHERE id = 1
+----
+{"weight":2.5,"active":true}
+
+query T nosort
+SELECT attributes ->> '$.meta' FROM products WHERE id = 1
+----
+{"weight":2.5,"active":true}
+
+# `->` on a JSON `null` is the 4-character text "null"; `->>` is SQL NULL.
+query T nosort
+SELECT attributes -> '$.note' FROM products WHERE id = 1
+----
+null
+
+query T nosort
+SELECT attributes ->> '$.note' FROM products WHERE id = 1
+----
+NULL
+
+# A missing path is SQL NULL either way.
+query T nosort
+SELECT attributes -> '$.missing' FROM products WHERE id = 1
+----
+NULL
+
+query T nosort
+SELECT attributes ->> '$.missing' FROM products WHERE id = 1
+----
+NULL
+
+# A JSON boolean unwraps to SQL INTEGER 1/0 through `->>` (and stays the
+# literal `true`/`false` text through `->`).
+query T nosort
+SELECT attributes -> '$.meta.active' FROM products WHERE id = 1
+----
+true
+
+query I nosort
+SELECT attributes ->> '$.meta.active' FROM products WHERE id = 1
+----
+1
+
+# NULL propagates through both operators when the document itself is NULL.
+query T nosort
+SELECT attributes -> '$.color' FROM products WHERE id = 3
+----
+NULL
+
+query T nosort
+SELECT attributes ->> '$.color' FROM products WHERE id = 3
+----
+NULL
+
+# `->`/`->>` on a non-JSON value error, exactly like json_extract.
+statement error
+SELECT 'not json' -> '$.a'
+
+statement error
+SELECT 'not json' ->> '$.a'
+
+# ---------------------------------------------------------------- json_valid
+
+query I nosort
+SELECT json_valid(attributes) FROM products WHERE id = 1
+----
+1
+
+query I nosort
+SELECT json_valid(attributes) FROM products WHERE id = 3
+----
+NULL
+
+# `json_valid` never errors, even on malformed JSON.
+query I nosort
+SELECT json_valid('{"a":1')
+----
+0
+
+# ----------------------------------------------------------------- json_type
+
+query T nosort
+SELECT json_type(attributes) FROM products WHERE id = 1
+----
+object
+
+query T nosort
+SELECT json_type(attributes, '$.tags') FROM products WHERE id = 1
+----
+array
+
+query T nosort
+SELECT json_type(attributes, '$.meta.weight') FROM products WHERE id = 1
+----
+real
+
+query T nosort
+SELECT json_type(attributes, '$.meta.active') FROM products WHERE id = 1
+----
+true
+
+# A JSON `null` is its own type, distinct from "no match".
+query T nosort
+SELECT json_type(attributes, '$.note') FROM products WHERE id = 1
+----
+null
+
+query T nosort
+SELECT json_type(attributes, '$.missing') FROM products WHERE id = 1
+----
+NULL
+
+# --------------------------------------------------------------- json_quote
+
+query T nosort
+SELECT json_quote('hello')
+----
+"hello"
+
+query T nosort
+SELECT json_quote(42)
+----
+42
+
+query T nosort
+SELECT json_quote(NULL)
+----
+null
+
+statement error
+SELECT json_quote(x'0102')
+
+# --------------------------------------------------------- json_array/object
+
+query T nosort
+SELECT json_array(1, 2, 'x', NULL)
+----
+[1,2,"x",null]
+
+query T nosort
+SELECT json_array()
+----
+[]
+
+# A nested `json_extract`/`json_object` call composes raw JSON rather than
+# being stringified.
+query T nosort
+SELECT json_object('color', json_extract(attributes, '$.color'), 'size', json_extract(attributes, '$.size')) FROM products WHERE id = 1
+----
+{"color":"red","size":10}
+
+query T nosort
+SELECT json_object()
+----
+{}
+
+statement error
+SELECT json_object(1, 'a')
+
+statement error
+SELECT json_object(NULL, 'a')
+
+statement error
+SELECT json_object('a', 1, 'b')
+
+statement error
+SELECT json_array(x'0102')
+
+# ------------------------------------------------------------ array_length
+
+query I nosort
+SELECT json_array_length(attributes, '$.tags') FROM products WHERE id = 1
+----
+3
+
+query I nosort
+SELECT json_array_length(attributes, '$.tags') FROM products WHERE id = 2
+----
+0
+
+# Not an array at that path: 0, not an error.
+query I nosort
+SELECT json_array_length(attributes, '$.meta') FROM products WHERE id = 1
+----
+0
+
+# The document itself is an object, not an array, when no path is given.
+query I nosort
+SELECT json_array_length(attributes) FROM products WHERE id = 1
+----
+0
+
+query I nosort
+SELECT json_array_length(attributes) FROM products WHERE id = 3
+----
+NULL
+
+# ------------------------------------------------------ set/insert/replace
+
+query T nosort
+SELECT json_set(attributes, '$.color', 'green') FROM products WHERE id = 1
+----
+{"color":"green","size":10,"tags":["a","b","c"],"meta":{"weight":2.5,"active":true},"note":null}
+
+query T nosort
+SELECT json_set(attributes, '$.brand', 'acme') FROM products WHERE id = 1
+----
+{"color":"red","size":10,"tags":["a","b","c"],"meta":{"weight":2.5,"active":true},"note":null,"brand":"acme"}
+
+# json_insert never overwrites an existing target.
+query T nosort
+SELECT json_insert(attributes, '$.color', 'green') FROM products WHERE id = 1
+----
+{"color":"red","size":10,"tags":["a","b","c"],"meta":{"weight":2.5,"active":true},"note":null}
+
+query T nosort
+SELECT json_insert(attributes, '$.brand', 'acme') FROM products WHERE id = 1
+----
+{"color":"red","size":10,"tags":["a","b","c"],"meta":{"weight":2.5,"active":true},"note":null,"brand":"acme"}
+
+# json_replace never creates a missing target.
+query T nosort
+SELECT json_replace(attributes, '$.color', 'green') FROM products WHERE id = 1
+----
+{"color":"green","size":10,"tags":["a","b","c"],"meta":{"weight":2.5,"active":true},"note":null}
+
+query T nosort
+SELECT json_replace(attributes, '$.brand', 'acme') FROM products WHERE id = 1
+----
+{"color":"red","size":10,"tags":["a","b","c"],"meta":{"weight":2.5,"active":true},"note":null}
+
+# `[#]` appends past the last element.
+query T nosort
+SELECT json_set(attributes, '$.tags[#]', 'd') FROM products WHERE id = 1
+----
+{"color":"red","size":10,"tags":["a","b","c","d"],"meta":{"weight":2.5,"active":true},"note":null}
+
+# A NULL value writes a JSON null; a NULL path skips that pair rather than
+# nulling the whole result — checked against sqlite3.
+query T nosort
+SELECT json_set('{"a":1}', '$.a', NULL)
+----
+{"a":null}
+
+query T nosort
+SELECT json_set(attributes, NULL, 'x') FROM products WHERE id = 1
+----
+{"color":"red","size":10,"tags":["a","b","c"],"meta":{"weight":2.5,"active":true},"note":null}
+
+# Auto-vivification of missing intermediates, and array element mutation.
+query T nosort
+SELECT json_set('{}', '$.a.b.c', 1)
+----
+{"a":{"b":{"c":1}}}
+
+query T nosort
+SELECT json_set('[1,2,3]', '$[1]', 99)
+----
+[1,99,3]
+
+# An out-of-range array index that is not `[#]` is a no-op.
+query T nosort
+SELECT json_set('[1,2,3]', '$[9]', 99)
+----
+[1,2,3]
+
+query T nosort
+SELECT json_insert('[1,2,3]', '$[#]', 99)
+----
+[1,2,3,99]
+
+statement error
+SELECT json_set('{"a":1}', '$.a', x'0102')
+
+statement error
+SELECT json_set('{"a":1}', '$.a')
+
+# ---------------------------------------------------------------- json_remove
+
+query T nosort
+SELECT json_remove(attributes, '$.color') FROM products WHERE id = 1
+----
+{"size":10,"tags":["a","b","c"],"meta":{"weight":2.5,"active":true},"note":null}
+
+# A missing path is a no-op, not an error.
+query T nosort
+SELECT json_remove(attributes, '$.missing') FROM products WHERE id = 1
+----
+{"color":"red","size":10,"tags":["a","b","c"],"meta":{"weight":2.5,"active":true},"note":null}
+
+query T nosort
+SELECT json_remove('{"a":1,"b":2,"c":3}', '$.a', '$.c')
+----
+{"b":2}
+
+query T nosort
+SELECT json_remove('[1,2,3,4]', '$[1]')
+----
+[1,3,4]
+
+# Unlike json_set's pairs, a NULL path here propagates NULL for the whole
+# result — checked against sqlite3, and deliberately the other way round.
+query T nosort
+SELECT json_remove(attributes, NULL) FROM products WHERE id = 1
+----
+NULL
+
+# `$` alone removes the whole document: NULL, since there is no parent to
+# remove it from.
+query T nosort
+SELECT json_remove(attributes, '$') FROM products WHERE id = 1
+----
+NULL
+
+# -------------------------------------------------------------------- json()
+
+query T nosort
+SELECT json(attributes) FROM products WHERE id = 1
+----
+{"color":"red","size":10,"tags":["a","b","c"],"meta":{"weight":2.5,"active":true},"note":null}
+
+statement error
+SELECT json('not json')
+
+# --------------------------------------------------------- a NULL document
+
+query T nosort
+SELECT json_extract(attributes, '$') FROM products WHERE id = 3
+----
+NULL
+
+query I nosort
+SELECT json_valid(attributes) FROM products WHERE id = 3
+----
+NULL
+
+# ------------------------------------------------ Laravel-shaped composites
+#
+# The two shapes the MySQL shim maps onto (`docs/server.md`): whereJsonContainsKey
+# as `json_type(...) IS NOT NULL`, and whereJsonLength as `json_array_length(...)`.
+
+query T nosort
+SELECT json_object('has_color', json_type(attributes, '$.color') IS NOT NULL, 'has_zzz', json_type(attributes, '$.zzz') IS NOT NULL) FROM products WHERE id = 1
+----
+{"has_color":1,"has_zzz":0}
+
+query I nosort
+SELECT (json_array_length(attributes, '$.tags') > 0) FROM products WHERE id = 1
+----
+1
+
+# ------------------------------------------------- number precision (AHL-492)
+#
+# `fuzz/fuzz_targets/json_parser.rs` found this within seconds on CI's first
+# run: `json::write` used to re-render a parsed number through
+# `eval::real_to_text` (fifteen significant digits, correct for
+# `CAST(x AS TEXT)`), which reparses to a *different* `f64` for a number that
+# needs more digits than that to round-trip — the 18-byte reproducer below.
+# SQLite does not normalise a parsed number through a float at all: it keeps
+# the document's exact source text and re-emits it, trailing zeros, capital
+# exponent markers and all. Every expectation here was produced by a real
+# sqlite3 3.54 binary.
+
+query T nosort
+SELECT json('3.7777777777777777')
+----
+3.7777777777777777
+
+query T nosort
+SELECT json('1.50')
+----
+1.50
+
+query T nosort
+SELECT json('1E5')
+----
+1E5
+
+query T nosort
+SELECT json('1e308')
+----
+1e308
+
+query T nosort
+SELECT json('-0.0')
+----
+-0.0
+
+query T nosort
+SELECT json('[1.50,1E5,1e308,-0.0,3.7777777777777777]')
+----
+[1.50,1E5,1e308,-0.0,3.7777777777777777]
+
+# Two paths keep the result wrapped as a JSON array, so this still goes
+# through the serializer rather than unwrapping to a bare SQL value.
+query T nosort
+SELECT json_extract('[3.7777777777777777]','$[0]','$[0]')
+----
+[3.7777777777777777,3.7777777777777777]
+
+# `json(...)` as a value argument is "JSON-producing" (`is_json_producing`),
+# so its already-precise text is reparsed and composed rather than
+# stringified — the source spelling survives being spliced into another
+# document too, not just a bare `json()` call.
+query T nosort
+SELECT json_insert('{}', '$.a', json('1.50'))
+----
+{"a":1.50}
+
+query T nosort
+SELECT json_set('{"a":1}', '$.a', json('1.50'))
+----
+{"a":1.50}
+
+query T nosort
+SELECT json_object('a', json('1.50'))
+----
+{"a":1.50}
+
+query T nosort
+SELECT json_array(json('1.50'), json('1E5'))
+----
+[1.50,1E5]
+
+# The *other* direction — a bare SQL REAL becoming JSON rather than JSON text
+# being parsed — genuinely differs and is deliberately unchanged: sqlite3
+# rounds it to fifteen significant digits here, the same rule
+# `CAST(x AS TEXT)` uses, and does not attempt to preserve anything (there is
+# no source text for a live float to preserve).
+query T nosort
+SELECT json_quote(3.7777777777777777)
+----
+3.77777777777778
+
+query T nosort
+SELECT json_array(3.7777777777777777, 1.0, 0.1)
+----
+[3.77777777777778,1.0,0.1]

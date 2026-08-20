@@ -1,0 +1,31 @@
+/target
+**/*.rs.bk
+*.inlay
+bench/results/
+.DS_Store
+
+# cargo-fuzz build artifacts, corpora, and the per-run status the trust
+# workflow uploads
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
+fuzz/status
+
+# wasm-bindgen output
+crates/inlaysql-wasm/www/pkg
+
+# npm dependencies for the browser and edge smoke tests
+node_modules/
+.claude/worktrees/
+
+# Working notes that are not part of the product.
+#
+# `PLAN.md` is the internal roadmap — phases, ticket numbers, what is being
+# attempted next and why. Its *durable* half, the architecture decisions the
+# source comments cite by number, lives in `docs/architecture.md` and is
+# public. `CLAUDE.md` and `.claude/` are AI-agent instructions and scratch
+# worktrees, which describe how this repository is worked on rather than what
+# it is.
+PLAN.md
+CLAUDE.md
+.claude/

@@ -1,0 +1,272 @@
+# Declared constraints: DEFAULT, NOT NULL, CHECK and UNIQUE.
+#
+# Every record in this file was replayed through the sqlite3 binary, both the
+# results and the refusals. A `statement error` here means SQLite refuses it
+# too, not that InlaySQL happens to.
+#
+# Each constraint is tested in both directions: the violation is rejected, and
+# the rejection leaves the table as it was. The second half is the one that
+# matters — a constraint that raises the right error and writes the row anyway
+# passes a test that only looks at the error.
+
+# ------------------------------------------------------------------- DEFAULT
+
+statement ok
+CREATE TABLE d(id INTEGER PRIMARY KEY, a INTEGER DEFAULT 7, b TEXT DEFAULT 'x', c INTEGER)
+
+statement ok
+INSERT INTO d (id) VALUES (1)
+
+# Named and set to NULL is not the same as omitted: the default does not apply.
+statement ok
+INSERT INTO d (id, a, b) VALUES (2, NULL, NULL)
+
+statement ok
+INSERT INTO d (id, a) VALUES (3, 1)
+
+statement ok
+INSERT INTO d DEFAULT VALUES
+
+query IITI nosort
+SELECT id, a, b, c FROM d ORDER BY id
+----
+1 7 x NULL
+2 NULL NULL NULL
+3 1 x NULL
+4 7 x NULL
+
+statement ok
+CREATE TABLE dx(id INTEGER PRIMARY KEY, a INTEGER DEFAULT (2 * 3 + 1), b TEXT DEFAULT (upper('ab')))
+
+statement ok
+INSERT INTO dx (id) VALUES (1)
+
+query IIT nosort
+SELECT id, a, b FROM dx
+----
+1 7 AB
+
+# ------------------------------------------------------------------ NOT NULL
+
+statement ok
+CREATE TABLE n(id INTEGER PRIMARY KEY, a INTEGER NOT NULL)
+
+statement ok
+INSERT INTO n VALUES (1, 10)
+
+statement error
+INSERT INTO n VALUES (2, NULL)
+
+# An omitted NOT NULL column with no default is the same violation.
+statement error
+INSERT INTO n (id) VALUES (3)
+
+statement error
+UPDATE n SET a = NULL
+
+query II nosort
+SELECT id, a FROM n ORDER BY id
+----
+1 10
+
+# A statement is atomic: the third row violates, so none of them lands.
+statement error
+INSERT INTO n VALUES (4, 4), (5, 5), (6, NULL)
+
+query I nosort
+SELECT id FROM n ORDER BY id
+----
+1
+
+# --------------------------------------------------------------------- CHECK
+
+statement ok
+CREATE TABLE c(id INTEGER PRIMARY KEY, a INTEGER CHECK (a > 0), b TEXT, CHECK (b <> 'no'))
+
+statement ok
+INSERT INTO c VALUES (1, 5, 'yes')
+
+# A CHECK fails only when it is *false*; NULL passes.
+statement ok
+INSERT INTO c VALUES (2, NULL, NULL)
+
+statement error
+INSERT INTO c VALUES (3, -1, 'yes')
+
+statement error
+INSERT INTO c VALUES (4, 1, 'no')
+
+statement error
+UPDATE c SET a = -5 WHERE id = 1
+
+query IIT nosort
+SELECT id, a, b FROM c ORDER BY id
+----
+1 5 yes
+2 NULL NULL
+
+# -------------------------------------------------------------------- UNIQUE
+
+statement ok
+CREATE TABLE u(id INTEGER PRIMARY KEY, e TEXT UNIQUE, n INTEGER)
+
+statement ok
+INSERT INTO u VALUES (1, 'a', 1)
+
+statement error
+INSERT INTO u VALUES (2, 'a', 2)
+
+statement ok
+INSERT INTO u VALUES (2, 'b', 2)
+
+statement error
+UPDATE u SET e = 'a' WHERE id = 2
+
+query IT nosort
+SELECT id, e FROM u ORDER BY id
+----
+1 a
+2 b
+
+# A NULL never collides, with anything, including another NULL.
+statement ok
+CREATE TABLE un(a NUMERIC UNIQUE)
+
+statement ok
+INSERT INTO un VALUES (NULL)
+
+statement ok
+INSERT INTO un VALUES (NULL)
+
+statement ok
+INSERT INTO un VALUES (1)
+
+# Storage classes decide the key: the text '1' is a different key from 1.
+statement ok
+INSERT INTO un VALUES ('x')
+
+statement error
+INSERT INTO un VALUES (1.0)
+
+query I nosort
+SELECT count(*) FROM un
+----
+4
+
+# Composite UNIQUE needs every column to match.
+statement ok
+CREATE TABLE uc(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE (a, b))
+
+statement ok
+INSERT INTO uc VALUES (1, 1, 1)
+
+statement ok
+INSERT INTO uc VALUES (2, 1, 2)
+
+statement error
+INSERT INTO uc VALUES (3, 1, 1)
+
+query I nosort
+SELECT count(*) FROM uc
+----
+2
+
+# A TEXT PRIMARY KEY is a unique index, not the row id.
+statement ok
+CREATE TABLE tk(k TEXT PRIMARY KEY, v INTEGER)
+
+statement ok
+INSERT INTO tk VALUES ('a', 1)
+
+statement error
+INSERT INTO tk VALUES ('a', 2)
+
+statement ok
+INSERT INTO tk VALUES ('b', 2)
+
+query TI nosort
+SELECT k, v FROM tk ORDER BY k
+----
+a 1
+b 2
+
+# `CREATE UNIQUE INDEX` — the spelling a framework's migrations use. Both
+# halves are real now: a constraint that is enforced, and a B-tree index under
+# the same name that enforces it with a probe. See btree_index.test.
+
+statement ok
+CREATE TABLE ux(id INTEGER PRIMARY KEY, email TEXT NOT NULL)
+
+statement ok
+CREATE UNIQUE INDEX ux_email ON ux (email)
+
+statement ok
+INSERT INTO ux VALUES (1, 'a@example.com')
+
+statement error
+INSERT INTO ux VALUES (2, 'a@example.com')
+
+statement ok
+INSERT INTO ux VALUES (2, 'b@example.com')
+
+statement error
+UPDATE ux SET email = 'a@example.com' WHERE id = 2
+
+query IT nosort
+SELECT id, email FROM ux ORDER BY id
+----
+1 a@example.com
+2 b@example.com
+
+# It is dropped by the name it was given: constraints and indexes share one
+# namespace, as they do in SQLite.
+statement ok
+DROP INDEX ux_email
+
+statement ok
+UPDATE ux SET email = 'a@example.com' WHERE id = 2
+
+query T nosort
+SELECT email FROM ux ORDER BY id
+----
+a@example.com
+a@example.com
+
+# A unique index over data that already violates it is an error, not a
+# constraint that starts out broken.
+statement ok
+CREATE TABLE dup(id INTEGER PRIMARY KEY, e TEXT)
+
+statement ok
+INSERT INTO dup VALUES (1, 'x'), (2, 'x')
+
+statement error
+CREATE UNIQUE INDEX dup_e ON dup (e)
+
+statement ok
+DELETE FROM dup WHERE id = 2
+
+statement ok
+CREATE UNIQUE INDEX dup_e ON dup (e)
+
+statement error
+CREATE UNIQUE INDEX dup_e ON dup (id)
+
+# ---------------------------------------------------------------- FOREIGN KEY
+#
+# Recorded and not enforced, which is SQLite's own default. The row below
+# points at a parent that does not exist, and both engines accept it.
+
+statement ok
+CREATE TABLE parent(id INTEGER PRIMARY KEY)
+
+statement ok
+CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id) ON DELETE CASCADE)
+
+statement ok
+INSERT INTO child VALUES (1, 999)
+
+query II nosort
+SELECT id, parent_id FROM child
+----
+1 999

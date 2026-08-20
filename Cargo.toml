@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+# cargo-fuzz needs nightly and its own dependency tree, so it is built on its
+# own. `tests/fuzz_smoke.rs` runs the same target bodies on stable so they
+# cannot rot between fuzzing runs.
+exclude = ["fuzz"]
+members = [
+    "crates/inlaysql-core",
+    "crates/inlaysql",
+    "crates/inlaysql-uring",
+    "crates/inlaysql-mcp",
+    "crates/inlaysql-server",
+    "crates/inlaysql-wasm",
+    "crates/inlaysql-bench",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+# Dual licensed: AGPL-3.0-only, or a commercial licence from Solution Forest
+# Limited (`LICENSE-COMMERCIAL.md`). This field carries only the AGPL because
+# "commercial" is not an SPDX identifier and crates.io validates against SPDX —
+# stating the open-source half here and the alternative in the repository is the
+# convention other dual-licensed crates follow.
+#
+# `-only`, not `-or-later`: dual licensing depends on knowing exactly which
+# terms the free half grants, and `-or-later` would hand that choice to whatever
+# a future AGPL says. Changing this is a deliberate decision, not a bump.
+license = "AGPL-3.0-only"
+repository = "https://github.com/inlaySQL/inlaysql"
+rust-version = "1.89"
+
+[workspace.dependencies]
+inlaysql-core = { path = "crates/inlaysql-core", version = "0.0.1" }
+inlaysql = { path = "crates/inlaysql", version = "0.0.1" }
+inlaysql-uring = { path = "crates/inlaysql-uring", version = "0.0.1" }
+inlaysql-mcp = { path = "crates/inlaysql-mcp", version = "0.0.1" }
+inlaysql-server = { path = "crates/inlaysql-server", version = "0.0.1" }
+
+# Core (no_std) dependencies.
+sqlparser = { version = "0.62", default-features = false }
+libm = "0.2"
+
+# Engine (std) dependencies. None of these may be pulled into inlaysql-core.
+redb = "4.1"
+io-uring = "0.7"
+serde_json = "1"
+
+# WASM build. Never a dependency of a native crate.
+wasm-bindgen = "0.2"
+wasm-bindgen-test = "0.3"
+
+# Benchmark-only. Never a dependency of a shipped crate.
+rusqlite = { version = "0.40", features = ["bundled"] }
+sqlite-vec = "0.1.6"
+
+# The WASM build is shipped over the network, so it is optimised for size
+# rather than speed. Kept separate from `release` so the benchmarks, which are
+# optimised for speed, are not quietly measured under different flags.
+[profile.release-wasm]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

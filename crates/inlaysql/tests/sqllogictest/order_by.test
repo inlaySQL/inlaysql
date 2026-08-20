@@ -1,0 +1,106 @@
+# ORDER BY on a scalar expression and on a projection alias.
+
+statement ok
+CREATE TABLE t(a INTEGER, b INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1, 30), (2, 10), (3, 20)
+
+query II nosort
+SELECT a, b FROM t ORDER BY b DESC
+----
+1 30
+3 20
+2 10
+
+query I nosort
+SELECT a FROM t ORDER BY a + b
+----
+2
+3
+1
+
+query I nosort
+SELECT a FROM t ORDER BY b - a DESC
+----
+1
+3
+2
+
+query I nosort
+SELECT a + b AS total FROM t ORDER BY total DESC
+----
+31
+23
+12
+
+# ------------------------------------------------- mixed storage classes (AHL-477)
+
+# A plain `ORDER BY` — no `UNION`, no `DISTINCT` — over a `NUMERIC`-affinity
+# column holding every storage class SQLite has: NULL, INTEGER, REAL, TEXT,
+# BLOB. This is `engine.rs::compare_values`'s general sort-key comparator
+# directly, the one that used to fall back to "equal" for a pair that was
+# neither NULL-involving nor same-class, corrupting the whole `sort_by` call
+# rather than misplacing one row. Every expected value and row order below
+# came from running this exact schema and query through a real sqlite3 3.54
+# binary. `NUMERIC` is declared explicitly because it is the one affinity
+# that keeps every class unconverted (`TESTING.md`'s "columns are typed, not
+# merely affine" divergence — the other four would reject the TEXT/BLOB rows).
+statement ok
+CREATE TABLE mixed_order(v NUMERIC)
+
+statement ok
+INSERT INTO mixed_order VALUES (NULL), (2), (1), ('xyz'), (X'0304'), (1.5), (2)
+
+# One row per query, split by `LIMIT`/`OFFSET`, because the sqllogictest type
+# string is one character for the whole query and this column's runtime type
+# changes every row — the same technique `set_operations.test`'s mixed-type
+# section uses. NULL < numbers (INTEGER/REAL interleaved by value) < TEXT <
+# BLOB, confirmed against sqlite3.
+query T nosort
+SELECT v FROM mixed_order ORDER BY v LIMIT 1 OFFSET 0
+----
+NULL
+
+query I nosort
+SELECT v FROM mixed_order ORDER BY v LIMIT 1 OFFSET 1
+----
+1
+
+query R nosort
+SELECT v FROM mixed_order ORDER BY v LIMIT 1 OFFSET 2
+----
+1.5
+
+query I nosort
+SELECT v FROM mixed_order ORDER BY v LIMIT 1 OFFSET 3
+----
+2
+
+query I nosort
+SELECT v FROM mixed_order ORDER BY v LIMIT 1 OFFSET 4
+----
+2
+
+query T nosort
+SELECT v FROM mixed_order ORDER BY v LIMIT 1 OFFSET 5
+----
+xyz
+
+query T nosort
+SELECT v FROM mixed_order ORDER BY v LIMIT 1 OFFSET 6
+----
+<blob>
+
+# `DESC` reverses the identical order — BLOB highest, NULL lowest either way,
+# which is only true if the comparator is a genuine total order in both
+# directions.
+query T nosort
+SELECT v FROM mixed_order ORDER BY v DESC LIMIT 1 OFFSET 0
+----
+<blob>
+
+query T nosort
+SELECT v FROM mixed_order ORDER BY v DESC LIMIT 1 OFFSET 6
+----
+NULL

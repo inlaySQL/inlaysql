@@ -1,0 +1,172 @@
+# Index nested-loop join (AHL-464): a join whose `ON` is an equality on the
+# inner table's INTEGER PRIMARY KEY or on an indexed column is answered by a
+# probe rather than by materialising the inner table. Nothing here is about the
+# access path — every answer below is the one the materialising path gives, and
+# the one SQLite gives, which is the whole point.
+
+statement ok
+CREATE TABLE dept(id INTEGER PRIMARY KEY, name TEXT)
+
+statement ok
+CREATE TABLE emp(id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER, grade INTEGER)
+
+statement ok
+CREATE INDEX emp_dept ON emp (dept_id)
+
+statement ok
+INSERT INTO dept VALUES (1, 'eng'), (2, 'sales'), (3, 'ops')
+
+statement ok
+INSERT INTO emp VALUES (1, 'alice', 1, 5), (2, 'bob', 1, 7), (3, 'carol', 2, 5), (4, 'dave', NULL, 9), (5, 'erin', 9, 5)
+
+# The inner side is probed by INTEGER PRIMARY KEY: one descent per outer row.
+# Erin's department does not exist, and Dave has none at all.
+query TT nosort
+SELECT emp.name, dept.name FROM emp JOIN dept ON emp.dept_id = dept.id ORDER BY emp.id
+----
+alice eng
+bob eng
+carol sales
+
+query TT nosort
+SELECT emp.name, dept.name FROM emp LEFT JOIN dept ON emp.dept_id = dept.id ORDER BY emp.id
+----
+alice eng
+bob eng
+carol sales
+dave NULL
+erin NULL
+
+# The same equality written the other way round.
+query TT nosort
+SELECT emp.name, dept.name FROM emp JOIN dept ON dept.id = emp.dept_id ORDER BY emp.id
+----
+alice eng
+bob eng
+carol sales
+
+# The inner side is probed by secondary index, with duplicate keys: department
+# 1 matches two employees and department 3 matches none.
+query TT nosort
+SELECT dept.name, emp.name FROM dept JOIN emp ON dept.id = emp.dept_id ORDER BY dept.id, emp.id
+----
+eng alice
+eng bob
+sales carol
+
+query TT nosort
+SELECT dept.name, emp.name FROM dept LEFT JOIN emp ON dept.id = emp.dept_id ORDER BY dept.id, emp.id
+----
+eng alice
+eng bob
+sales carol
+ops NULL
+
+# A NULL join key matches nothing, including another NULL. Dave's dept_id is
+# NULL and no department has a NULL id, so neither direction pairs him.
+query T nosort
+SELECT emp.name FROM emp JOIN dept ON emp.dept_id = dept.id WHERE emp.name = 'dave'
+----
+
+query TT nosort
+SELECT emp.name, dept.name FROM emp LEFT JOIN dept ON emp.dept_id = dept.id WHERE emp.dept_id IS NULL
+----
+dave NULL
+
+# A composite ON: one conjunct is the probe, the rest are a residual filter over
+# the rows it found.
+query TT nosort
+SELECT dept.name, emp.name FROM dept JOIN emp ON dept.id = emp.dept_id AND emp.grade = 5 ORDER BY dept.id, emp.id
+----
+eng alice
+sales carol
+
+query TT nosort
+SELECT dept.name, emp.name FROM dept LEFT JOIN emp ON dept.id = emp.dept_id AND emp.grade = 5 ORDER BY dept.id, emp.id
+----
+eng alice
+sales carol
+ops NULL
+
+query TT nosort
+SELECT dept.name, emp.name FROM dept JOIN emp ON emp.grade > 4 AND dept.id = emp.dept_id AND emp.name <> 'bob' ORDER BY dept.id, emp.id
+----
+eng alice
+sales carol
+
+# A LIMIT over a probed join stops the outer scan; the answer is the unlimited
+# one truncated.
+query TT nosort
+SELECT dept.name, emp.name FROM dept JOIN emp ON dept.id = emp.dept_id ORDER BY dept.id, emp.id LIMIT 2
+----
+eng alice
+eng bob
+
+# An aggregate over a probed join.
+query TI nosort
+SELECT dept.name, COUNT(*) FROM dept JOIN emp ON dept.id = emp.dept_id GROUP BY dept.name ORDER BY dept.name
+----
+eng 2
+sales 1
+
+# An empty inner table is probed to nothing, and a LEFT JOIN still pads.
+statement ok
+CREATE TABLE empty_side(id INTEGER PRIMARY KEY, k INTEGER)
+
+statement ok
+CREATE INDEX empty_k ON empty_side (k)
+
+query I nosort
+SELECT COUNT(*) FROM dept JOIN empty_side ON dept.id = empty_side.k
+----
+0
+
+query TT nosort
+SELECT dept.name, empty_side.k FROM dept LEFT JOIN empty_side ON dept.id = empty_side.k ORDER BY dept.id
+----
+eng NULL
+sales NULL
+ops NULL
+
+# Three tables: the second join's outer side is the first join's output, so its
+# probe reads its key out of a row that is itself joined.
+query TTT nosort
+SELECT dept.name, emp.name, peer.name FROM dept JOIN emp ON dept.id = emp.dept_id JOIN emp AS peer ON dept.id = peer.dept_id ORDER BY dept.id, emp.id, peer.id
+----
+eng alice alice
+eng alice bob
+eng bob alice
+eng bob bob
+sales carol carol
+
+# A self-join through the index, where the same table is both sides.
+query TT nosort
+SELECT x.name, y.name FROM emp AS x JOIN emp AS y ON x.dept_id = y.dept_id ORDER BY x.id, y.id
+----
+alice alice
+alice bob
+bob alice
+bob bob
+carol carol
+erin erin
+
+# The shapes the rule declines still answer the same way: a range, a
+# disjunction, and a cross join.
+query TT nosort
+SELECT dept.name, emp.name FROM dept JOIN emp ON dept.id > emp.dept_id ORDER BY dept.id, emp.id
+----
+sales alice
+sales bob
+ops alice
+ops bob
+ops carol
+
+query I nosort
+SELECT COUNT(*) FROM dept JOIN emp ON dept.id = emp.dept_id OR dept.id = emp.id
+----
+5
+
+query I nosort
+SELECT COUNT(*) FROM dept, emp
+----
+15

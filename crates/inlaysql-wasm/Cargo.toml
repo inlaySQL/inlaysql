@@ -1,0 +1,25 @@
+[package]
+name = "inlaysql-wasm"
+description = "InlaySQL compiled to WebAssembly: the whole engine, client-side."
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+inlaysql-core = { workspace = true }
+serde_json = { workspace = true }
+wasm-bindgen = { workspace = true }
+
+[dev-dependencies]
+wasm-bindgen-test = { workspace = true }
+
+# Native-only, for the portability test: a database built here must open in the
+# native build and vice versa. Dev-dependencies are not part of a wasm32 build.
+inlaysql = { workspace = true }
+inlaysql-core = { workspace = true }

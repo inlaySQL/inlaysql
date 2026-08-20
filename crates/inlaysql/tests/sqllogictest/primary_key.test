@@ -1,0 +1,88 @@
+# INTEGER PRIMARY KEY, which in SQLite (and here) is an alias for the row id.
+# The planner turns an equality on it into a point lookup; these records check
+# the semantics that optimisation has to preserve.
+
+statement ok
+CREATE TABLE pk(id INTEGER PRIMARY KEY, body TEXT)
+
+statement ok
+INSERT INTO pk VALUES (10, 'ten'), (20, 'twenty'), (30, 'thirty')
+
+query T nosort
+SELECT body FROM pk WHERE id = 20
+----
+twenty
+
+# A key that matches nothing is empty, not an error.
+query T nosort
+SELECT body FROM pk WHERE id = 99
+----
+
+# The row id is the sort order, whatever order the rows arrived in.
+statement ok
+INSERT INTO pk VALUES (5, 'five')
+
+query I nosort
+SELECT id FROM pk
+----
+5
+10
+20
+30
+
+# An equality inside a conjunction still applies the rest of the filter.
+query T nosort
+SELECT body FROM pk WHERE id = 30 AND body = 'nope'
+----
+
+query T nosort
+SELECT body FROM pk WHERE id = 30 AND body = 'thirty'
+----
+thirty
+
+# A disjunction can match a second row, so it must not collapse to a lookup.
+query I rowsort
+SELECT id FROM pk WHERE id = 5 OR body = 'twenty'
+----
+20
+5
+
+statement ok
+UPDATE pk SET body = 'TEN' WHERE id = 10
+
+query T nosort
+SELECT body FROM pk WHERE id = 10
+----
+TEN
+
+statement ok
+DELETE FROM pk WHERE id = 5
+
+query I nosort
+SELECT id FROM pk
+----
+10
+20
+30
+
+# A duplicate key is refused.
+statement error
+INSERT INTO pk VALUES (20, 'again')
+
+# A primary key on anything but a lone INTEGER column is a unique index in
+# SQLite rather than the row id. It used to be refused here, because nothing
+# could enforce it; now it is accepted and enforced — but it is still not the
+# storage key, so a lookup on it is a scan.
+statement ok
+CREATE TABLE named(name TEXT PRIMARY KEY, body TEXT)
+
+statement ok
+INSERT INTO named VALUES ('a', 'first')
+
+statement error
+INSERT INTO named VALUES ('a', 'second')
+
+query T nosort
+SELECT body FROM named WHERE name = 'a'
+----
+first

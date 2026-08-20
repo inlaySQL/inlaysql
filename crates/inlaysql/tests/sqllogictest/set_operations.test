@@ -1,0 +1,523 @@
+# `UNION [ALL]` / `INTERSECT` / `EXCEPT` (AHL-473, PLAN.md Phase 1c item 2).
+#
+# Every expected value in this file came from SQLite 3 running the same
+# statements — including the ones that look surprising, because they are the
+# ones an assumption instead of a measurement would have gotten wrong:
+#
+#   * a compound's per-column comparison — for deduplication, and for its own
+#     `ORDER BY` unless a term overrides it — is always the *left* arm's
+#     collation, however many operators deep, and an explicit `COLLATE`
+#     anywhere else has no effect at all;
+#   * `UNION`'s dedup keeps the *last*-occurring row of a colliding group (the
+#     right arm overwrites the left), where `INTERSECT`/`EXCEPT` only ever
+#     emit rows drawn from the left arm, deduplicated first-wins;
+#   * every compound operator shares one precedence and chains
+#     left-associatively — `a UNION b INTERSECT c` is `(a UNION b) INTERSECT
+#     c`, not `a UNION (b INTERSECT c)`, which disagrees with the SQL
+#     standard's rule (and with what sqlparser's generic grammar would build
+#     without `plan_compound`'s explicit re-fold);
+#   * output column names come from the left arm, recursively;
+#   * `ORDER BY`/`LIMIT`/`OFFSET` bind to the whole compound, not the last
+#     arm, and an `ORDER BY` term may only be an output label or a 1-based
+#     ordinal — narrower than an ordinary `SELECT`'s `ORDER BY`.
+#
+# What is deliberately absent: `INTERSECT ALL`, `EXCEPT ALL`, `MINUS`, and a
+# parenthesised arm — none are in SQLite's dialect either, and the refusals
+# are pinned in `unsupported.test` rather than here.
+
+statement ok
+CREATE TABLE t1(id INTEGER PRIMARY KEY, x INTEGER, y TEXT)
+
+statement ok
+INSERT INTO t1 VALUES (1, 1, 'a')
+
+statement ok
+INSERT INTO t1 VALUES (2, 2, 'b')
+
+statement ok
+INSERT INTO t1 VALUES (3, NULL, 'c')
+
+statement ok
+INSERT INTO t1 VALUES (4, 3, NULL)
+
+statement ok
+CREATE TABLE t2(id INTEGER PRIMARY KEY, x INTEGER, y TEXT)
+
+statement ok
+INSERT INTO t2 VALUES (1, 2, 'b')
+
+statement ok
+INSERT INTO t2 VALUES (2, 3, 'd')
+
+statement ok
+INSERT INTO t2 VALUES (3, NULL, 'e')
+
+statement ok
+INSERT INTO t2 VALUES (4, 3, NULL)
+
+# --------------------------------------------------------------- basic forms
+
+query I nosort
+SELECT x FROM t1 UNION SELECT x FROM t2 ORDER BY x
+----
+NULL
+1
+2
+3
+
+query I nosort
+SELECT x FROM t1 UNION ALL SELECT x FROM t2
+----
+1
+2
+NULL
+3
+2
+3
+NULL
+3
+
+query I nosort
+SELECT x FROM t1 INTERSECT SELECT x FROM t2 ORDER BY x
+----
+NULL
+2
+3
+
+query I nosort
+SELECT x FROM t1 EXCEPT SELECT x FROM t2 ORDER BY x
+----
+1
+
+query I nosort
+SELECT x FROM t2 EXCEPT SELECT x FROM t1 ORDER BY x
+----
+
+# ------------------------------------------------------------------- NULLs
+
+# NULL folds into one row under UNION, same as any other equal group, and
+# sorts below every non-NULL value.
+query T nosort
+SELECT y FROM t1 UNION SELECT y FROM t2 ORDER BY y
+----
+NULL
+a
+b
+c
+d
+e
+
+# UNION ALL keeps every NULL, in the arms' own order.
+query T nosort
+SELECT y FROM t1 UNION ALL SELECT y FROM t2
+----
+a
+b
+c
+NULL
+b
+d
+e
+NULL
+
+# --------------------------------------------------------------- mixed types
+
+# `NUMERIC` — declared explicitly, not left to default to `BLOB` affinity —
+# is the one affinity that genuinely accepts every storage class unchanged
+# (`crate::eval::numeric_affinity`): the other four convert what they can and
+# refuse the rest, which an untyped column would otherwise hit for the
+# INTEGER/REAL/TEXT rows below (`TESTING.md`'s "columns are typed, not
+# merely affine" divergence).
+#
+# Deduplication (`duplicate_keep_mask`, via `eval::mem_cmp` — the same
+# cross-type comparison the index and `DISTINCT` machinery already use) folds
+# every one of NULL/INTEGER/REAL/TEXT/BLOB correctly: seven rows in, five
+# distinct values out, confirmed against sqlite3.
+statement ok
+CREATE TABLE mix_all(v NUMERIC)
+
+statement ok
+INSERT INTO mix_all VALUES (NULL)
+
+statement ok
+INSERT INTO mix_all VALUES (1)
+
+statement ok
+INSERT INTO mix_all VALUES (1.5)
+
+statement ok
+INSERT INTO mix_all VALUES ('abc')
+
+statement ok
+INSERT INTO mix_all VALUES (X'0102')
+
+statement ok
+INSERT INTO mix_all VALUES (NULL)
+
+statement ok
+INSERT INTO mix_all VALUES (1)
+
+query I nosort
+SELECT COUNT(*) FROM (SELECT v FROM mix_all UNION SELECT v FROM mix_all)
+----
+5
+
+# `ORDER BY`'s cross-type ordering — NULL below every number — over just
+# NULL/INTEGER/REAL. Originally a *separate*, narrower table than the one
+# above, because `engine.rs::compare_values` had a real bug comparing a value
+# that was neither NULL-involving nor same-class: it fell back to a numeric
+# parse and silently called the pair "equal" when neither side was one, which
+# was not merely a TEXT/BLOB gap — a broken comparator corrupts a whole
+# `sort_by` call, not only the pairs it mishandles, so this table used to
+# avoid asserting `ORDER BY` over `mix_all` at all.
+#
+# **Fixed (AHL-477).** `compare_values` now defers entirely to
+# `eval::mem_cmp` — the same total order `DISTINCT`, `UNION`'s dedup and
+# index keys already used — instead of keeping a second, independently-wrong
+# copy of SQLite's storage-class ordering. This table is kept as a smaller,
+# numbers-only regression alongside the full-class one below rather than
+# deleted now that the bug it was narrowed to work around is gone.
+statement ok
+CREATE TABLE mix_num(v NUMERIC)
+
+statement ok
+INSERT INTO mix_num VALUES (NULL)
+
+statement ok
+INSERT INTO mix_num VALUES (1)
+
+statement ok
+INSERT INTO mix_num VALUES (1.5)
+
+statement ok
+INSERT INTO mix_num VALUES (NULL)
+
+statement ok
+INSERT INTO mix_num VALUES (1)
+
+query T nosort
+SELECT v FROM (SELECT v FROM mix_num UNION SELECT v FROM mix_num ORDER BY v) LIMIT 1
+----
+NULL
+
+query I nosort
+SELECT v FROM (SELECT v FROM mix_num UNION SELECT v FROM mix_num ORDER BY v) LIMIT 1 OFFSET 1
+----
+1
+
+query R nosort
+SELECT v FROM (SELECT v FROM mix_num UNION SELECT v FROM mix_num ORDER BY v) LIMIT 1 OFFSET 2
+----
+1.5
+
+# `ORDER BY` over every storage class at once (`mix_all`: NULL, INTEGER, REAL,
+# TEXT, BLOB — five distinct values after the UNION's dedup), which is exactly
+# what the old `compare_values` bug made unsafe to assert: a comparator that
+# is not a total order can corrupt the whole sort, not just misorder the
+# INTEGER/TEXT pair it has no rule for. Split one row per query — rather than
+# one multi-row block — because the sqllogictest type string is one character
+# for the whole query and this column's runtime type changes every row; each
+# offset below pins both the value *and* its class landing where sqlite3 3.54
+# puts it. `LIMIT`/`OFFSET` over a `nosort` block still reads the compound's
+# own materialised, sorted order, so this is asserting `ORDER BY`'s row order
+# exactly, not merely membership.
+query T nosort
+SELECT v FROM (SELECT v FROM mix_all UNION SELECT v FROM mix_all) ORDER BY v LIMIT 1 OFFSET 0
+----
+NULL
+
+query I nosort
+SELECT v FROM (SELECT v FROM mix_all UNION SELECT v FROM mix_all) ORDER BY v LIMIT 1 OFFSET 1
+----
+1
+
+query R nosort
+SELECT v FROM (SELECT v FROM mix_all UNION SELECT v FROM mix_all) ORDER BY v LIMIT 1 OFFSET 2
+----
+1.5
+
+query T nosort
+SELECT v FROM (SELECT v FROM mix_all UNION SELECT v FROM mix_all) ORDER BY v LIMIT 1 OFFSET 3
+----
+abc
+
+query T nosort
+SELECT v FROM (SELECT v FROM mix_all UNION SELECT v FROM mix_all) ORDER BY v LIMIT 1 OFFSET 4
+----
+<blob>
+
+# `DESC` reverses the same order rather than using a different one — BLOB
+# highest, NULL lowest either way.
+query T nosort
+SELECT v FROM (SELECT v FROM mix_all UNION SELECT v FROM mix_all) ORDER BY v DESC LIMIT 1 OFFSET 0
+----
+<blob>
+
+query T nosort
+SELECT v FROM (SELECT v FROM mix_all UNION SELECT v FROM mix_all) ORDER BY v DESC LIMIT 1 OFFSET 4
+----
+NULL
+
+# `GROUP BY` over the same mixed-class column uses the identical comparator
+# (`compare_group_keys`, via `compare_values`) — confirmed against sqlite3:
+# the two NULLs group together, the two `1`s group together (an INTEGER and
+# nothing else lands there in this table), and TEXT/BLOB each land in their
+# own group in the same class order `ORDER BY` gave above.
+query TI nosort
+SELECT v, COUNT(*) FROM mix_all GROUP BY v ORDER BY v LIMIT 1 OFFSET 0
+----
+NULL 2
+
+query II nosort
+SELECT v, COUNT(*) FROM mix_all GROUP BY v ORDER BY v LIMIT 1 OFFSET 1
+----
+1 2
+
+# `MIN`/`MAX` share this ordering too (`eval::mem_cmp` directly, since
+# AHL-477 also removed the second, independently-wrong copy `value_cmp` used
+# to be): the smallest value in storage-class order is the INTEGER `1`, the
+# largest is the BLOB, and NULL is excluded from both like every aggregate.
+query I nosort
+SELECT MIN(v) FROM mix_all
+----
+1
+
+query T nosort
+SELECT MAX(v) FROM mix_all
+----
+<blob>
+
+# --------------------------------------------------------- NOCASE collation
+
+statement ok
+CREATE TABLE nc(s TEXT COLLATE NOCASE)
+
+statement ok
+INSERT INTO nc VALUES ('bob')
+
+statement ok
+INSERT INTO nc VALUES ('Alice')
+
+statement ok
+CREATE TABLE bin(s TEXT COLLATE BINARY)
+
+statement ok
+INSERT INTO bin VALUES ('alice')
+
+# The left arm's NOCASE collation governs the whole comparison: 'Alice' (left,
+# NOCASE) and 'alice' (right, BINARY) collide and fold into one row, and the
+# survivor is the *right* arm's bytes — confirmed against sqlite3.
+query T nosort
+SELECT s FROM nc UNION SELECT s FROM bin ORDER BY s
+----
+alice
+bob
+
+# Reversed: the left arm is now BINARY, so the same two spellings do not
+# collide at all, whatever the right arm's own collation says.
+query T nosort
+SELECT s FROM bin UNION SELECT s FROM nc ORDER BY s
+----
+Alice
+alice
+bob
+
+# An explicit COLLATE on anything but the left arm has no effect on the
+# compound's comparison — confirmed against sqlite3: this still does not
+# dedup, exactly like the plain-BINARY-left-arm case above.
+query T nosort
+SELECT s FROM bin UNION SELECT s COLLATE NOCASE FROM nc ORDER BY s
+----
+Alice
+alice
+bob
+
+# An explicit COLLATE on the left arm's own projection wins over that arm's
+# column collation, same as it would for an ordinary comparison. By ordinal,
+# not by name: the projection's own display label is "s COLLATE NOCASE" (all
+# of it, confirmed against sqlite3, which reports the same header) and a
+# bare `ORDER BY s` does not match that — sqlite3 resolves it anyway, by a
+# fallback this engine's compound `ORDER BY` deliberately does not have (see
+# the "qualified column" note above; the two are the same narrowing).
+query T nosort
+SELECT s COLLATE NOCASE FROM bin UNION SELECT s FROM nc ORDER BY 1
+----
+Alice
+bob
+
+# INTERSECT/EXCEPT only ever emit the left arm's own bytes, deduplicated
+# first-occurrence-wins (like plain DISTINCT) rather than UNION's last-wins.
+statement ok
+CREATE TABLE nc2(s TEXT COLLATE NOCASE)
+
+statement ok
+INSERT INTO nc2 VALUES ('ADA')
+
+statement ok
+INSERT INTO nc2 VALUES ('ada')
+
+statement ok
+CREATE TABLE bin2(s TEXT COLLATE BINARY)
+
+statement ok
+INSERT INTO bin2 VALUES ('ADA')
+
+query T nosort
+SELECT s FROM nc2 INTERSECT SELECT s FROM bin2
+----
+ADA
+
+# ------------------------------------------------------- precedence / chains
+
+statement ok
+CREATE TABLE a3(x INTEGER)
+
+statement ok
+INSERT INTO a3 VALUES (1)
+
+statement ok
+INSERT INTO a3 VALUES (2)
+
+statement ok
+INSERT INTO a3 VALUES (3)
+
+statement ok
+CREATE TABLE b3(x INTEGER)
+
+statement ok
+INSERT INTO b3 VALUES (2)
+
+statement ok
+INSERT INTO b3 VALUES (3)
+
+statement ok
+INSERT INTO b3 VALUES (4)
+
+statement ok
+CREATE TABLE c3(x INTEGER)
+
+statement ok
+INSERT INTO c3 VALUES (3)
+
+statement ok
+INSERT INTO c3 VALUES (4)
+
+statement ok
+INSERT INTO c3 VALUES (5)
+
+# `UNION` and `INTERSECT` share one precedence in SQLite, left-associative:
+# this is `(a3 UNION b3) INTERSECT c3` = {1,2,3,4} ∩ {3,4,5} = {3,4}, not
+# `a3 UNION (b3 INTERSECT c3)` = {1,2,3} ∪ {3,4} = {1,2,3,4} — confirmed
+# against sqlite3, which disagrees with the SQL-standard rule sqlparser's
+# generic grammar would otherwise apply (INTERSECT binding tighter).
+query I nosort
+SELECT x FROM a3 UNION SELECT x FROM b3 INTERSECT SELECT x FROM c3 ORDER BY x
+----
+3
+4
+
+query I nosort
+SELECT x FROM a3 UNION SELECT x FROM b3 EXCEPT SELECT x FROM c3 ORDER BY x
+----
+1
+2
+
+# A nested (three-arm) compound, output labels and collation still coming
+# from the single leftmost SELECT throughout.
+query I nosort
+SELECT x FROM a3 UNION SELECT x FROM b3 UNION SELECT x FROM c3 ORDER BY x
+----
+1
+2
+3
+4
+5
+
+# ------------------------------------------------------------------ ORDER BY
+
+# By 1-based ordinal, descending — NULLs sort last under DESC by default.
+query I nosort
+SELECT x FROM t1 UNION SELECT x FROM t2 ORDER BY 1 DESC
+----
+3
+2
+1
+NULL
+
+# By an output label — the left arm's, even though the right arm's column has
+# no alias of its own.
+query I nosort
+SELECT x AS n FROM t1 UNION SELECT x FROM t2 ORDER BY n
+----
+NULL
+1
+2
+3
+
+# --------------------------------------------------------------- LIMIT/OFFSET
+
+# Bind to the whole compound, applied after ORDER BY — not to the last arm.
+query I nosort
+SELECT x FROM t1 UNION SELECT x FROM t2 ORDER BY x LIMIT 2 OFFSET 1
+----
+1
+2
+
+# --------------------------------------------------------- column count check
+
+statement error
+SELECT id, x FROM t1 UNION SELECT id FROM t2
+
+# ------------------------------------------------------------- cross-feature
+
+# A compound inside `IN (SELECT ...)`.
+query I nosort
+SELECT id FROM t1 WHERE x IN (SELECT x FROM t1 UNION SELECT x FROM t2) ORDER BY id
+----
+1
+2
+4
+
+# A compound inside a correlated `EXISTS (SELECT ...)` — both arms correlate
+# to the same outer row. (Not `t1` aliased against itself on the inner side:
+# a self-correlated subquery over its own outer table is a pre-existing,
+# unrelated bug — `a.x = t1.x` wrongly answers true for `t1.x IS NULL` where
+# it should not, confirmed against sqlite3 and confirmed present on `main`
+# before this change too. `a3` stands in as an unrelated third table so this
+# test exercises the compound, not that bug.)
+query I nosort
+SELECT id FROM t1 WHERE EXISTS (
+  SELECT x FROM t2 WHERE t2.x = t1.x
+  UNION
+  SELECT x FROM a3 WHERE a3.x = t1.x
+) ORDER BY id
+----
+1
+2
+4
+
+# A compound as a derived table (`FROM (SELECT ... UNION SELECT ...)`).
+query I nosort
+SELECT * FROM (SELECT x FROM t1 UNION SELECT x FROM t2) AS d ORDER BY x
+----
+NULL
+1
+2
+3
+
+# `INSERT ... SELECT` with a compound source.
+statement ok
+CREATE TABLE dest(a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO dest SELECT x, y FROM t1 UNION SELECT x, y FROM t2
+
+query IT rowsort
+SELECT a, b FROM dest
+----
+NULL c
+NULL e
+1 a
+2 b
+3 NULL
+3 d

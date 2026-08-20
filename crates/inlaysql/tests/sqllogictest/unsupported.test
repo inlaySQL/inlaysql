@@ -1,0 +1,497 @@
+# Constructs that parse but are not implemented yet.
+#
+# Every record here used to be accepted and then quietly ignored: the
+# statement reported success and the engine did something else. A refusal is
+# the honest answer until the feature lands, and these records are what stops
+# the silent behaviour from coming back.
+
+statement ok
+CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 'one')
+
+# The conflict clauses, `RETURNING` and the `CREATE TABLE` constraints were all
+# in this file until AHL-412 implemented them. What they do now is asserted in
+# `constraints.test`, `ddl.test`, `write_statements.test` and `affinity.test` —
+# every expectation there produced by the sqlite3 binary. What is left here is
+# what is still not implemented, and what is refused on purpose.
+
+# Conflict resolutions that promise something about *partial* writes. A
+# statement here is already atomic — every write it made is discarded together
+# — so `ROLLBACK` and `FAIL` cannot mean what they say, and `ABORT` is exactly
+# what already happens.
+
+statement error
+INSERT OR ROLLBACK INTO t VALUES (2, 2, 'two')
+
+statement error
+INSERT OR FAIL INTO t VALUES (2, 2, 'two')
+
+statement error
+UPDATE OR REPLACE t SET a = 5
+
+statement error
+UPDATE OR IGNORE t SET a = 5
+
+# An `ON CONFLICT` target that names no uniqueness constraint would make the
+# clause unreachable, which is the failure mode this file exists to prevent.
+
+statement error
+INSERT INTO t VALUES (2, 2, 'two') ON CONFLICT (b) DO NOTHING
+
+# A savepoint is a nested rollback point, and the storage engine buffers a
+# transaction as one set of writes with no way to unwind part of it.
+
+statement error
+SAVEPOINT s1
+
+statement error
+RELEASE SAVEPOINT s1
+
+# Nothing above fired, so the row is untouched.
+
+query IIT nosort
+SELECT id, a, b FROM t ORDER BY id
+----
+1 1 one
+
+# Table shapes and column options that are still not implemented: storage
+# layouts this engine does not build.
+#
+# `COLLATE NOCASE` was here until AHL-469 and is a real clause now; what stays
+# refused is a collation this engine does not have. There is no
+# `CREATE COLLATION`, so a name outside BINARY/NOCASE/RTRIM can never be
+# honoured, and accepting it would silently compare byte-wise under a name that
+# promises otherwise — the exact failure this whole file exists to prevent.
+
+statement error
+CREATE TABLE c5(a TEXT COLLATE utf8mb4_unicode_ci)
+
+statement error
+CREATE TABLE c5(a TEXT COLLATE NOACCENT)
+
+statement error
+SELECT 'a' = 'b' COLLATE unicode
+
+statement error
+SELECT 1 FROM t ORDER BY b COLLATE utf8_general_ci
+
+# Accent-insensitivity is not NOCASE and there is nothing here that provides
+# it, so asking for it by name is refused rather than answered with case
+# folding that would quietly match fewer rows.
+
+statement error
+CREATE TABLE c6(a TEXT COLLATE utf8mb4_0900_ai_ci)
+
+# A `UNIQUE` index may not be keyed under a collation its column did not
+# declare: the probe and the scan that both enforce it would then disagree
+# about what a duplicate is.
+
+statement ok
+CREATE TABLE c7(a TEXT)
+
+statement error
+CREATE UNIQUE INDEX c7_a ON c7(a COLLATE NOCASE)
+
+# The same clause inside a table constraint, for the same reason.
+
+statement error
+CREATE TABLE c8(a TEXT, UNIQUE(a COLLATE NOCASE))
+
+statement error
+CREATE TABLE c9(a TEXT, PRIMARY KEY(a COLLATE NOCASE))
+
+# A retrieval index has no collated key for a `COLLATE` to apply to.
+
+statement error
+CREATE INDEX c7_ft ON c7(a COLLATE NOCASE)
+
+statement error
+CREATE TEMPORARY TABLE c12(a INTEGER)
+
+statement error
+CREATE TABLE c13(a INTEGER) WITHOUT ROWID
+
+statement error
+CREATE TABLE c14(a INTEGER) STRICT
+
+statement error
+CREATE TABLE c15 AS SELECT 1
+
+# `AUTOINCREMENT` is accepted on an INTEGER PRIMARY KEY — the row-id counter is
+# monotonic, so the guarantee already holds — and refused everywhere SQLite
+# refuses it.
+
+statement error
+CREATE TABLE c16(a INTEGER AUTOINCREMENT)
+
+statement error
+CREATE TABLE c17(a TEXT PRIMARY KEY AUTOINCREMENT)
+
+# PRIMARY KEY and an explicit NULL are the two options the engine always
+# honoured, so they are accepted rather than refused.
+
+statement ok
+CREATE TABLE ok1(a INTEGER PRIMARY KEY, b INTEGER NULL)
+
+# ---------------------------------------------------------------- query shape
+#
+# Non-recursive `WITH` and `UNION`/`INTERSECT`/`EXCEPT` were here until
+# AHL-473 (Phase 1c items 2 and 3). What they do now is asserted in
+# `ctes.test` and `set_operations.test`, every expectation there produced by
+# the sqlite3 binary. What is left below is the CTE and compound-query ground
+# that is still refused.
+#
+# `WITH RECURSIVE` stays refused, named in the message.
+
+statement error
+WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM x WHERE n < 3) SELECT n FROM x
+
+# SQLite resolves a non-recursive `WITH` list's names as one namespace: a CTE
+# may reference one defined *later* in the same list, as long as it is not
+# circular (verified against sqlite3 3.54: `WITH x AS (SELECT a FROM y), y AS
+# (SELECT 1 AS a) SELECT a FROM x` succeeds there). This engine plans a
+# `WITH` list strictly in written order instead — a narrower, deliberate rule
+# rather than the lazy, topological resolution SQLite's would need — so a
+# forward reference is refused rather than accepted. `ctes.test` pins the
+# *backward*-reference form that is supported.
+
+statement error
+WITH x AS (SELECT a FROM y), y AS (SELECT 1 AS a) SELECT a FROM x
+
+# A non-recursive CTE may not reference itself either, and the real table of
+# the same name is not a fallback: SQLite's own answer to this is a
+# circular-reference error, not a scan of a same-named stored table, and so
+# is this engine's — the CTE name shadows the real table from the moment its
+# own `WITH` clause starts, even inside its own body.
+
+statement error
+WITH t AS (SELECT a FROM t) SELECT a FROM t
+
+# SQLite's compound grammar has no parenthesised arm at all — `... UNION
+# (SELECT ...)` is a syntax error there too, confirmed against sqlite3 —
+# distinct from a full compound wrapped in parentheses, which is not this.
+
+statement error
+SELECT id FROM t UNION (SELECT id FROM t)
+
+# No `INTERSECT ALL`, no `EXCEPT ALL`, no `MINUS` — none are in SQLite's
+# dialect, confirmed against sqlite3 (all three are syntax errors there).
+
+statement error
+SELECT id FROM t INTERSECT ALL SELECT id FROM t
+
+statement error
+SELECT id FROM t EXCEPT ALL SELECT id FROM t
+
+statement error
+SELECT id FROM t MINUS SELECT id FROM t
+
+# A bare `VALUES` query body, whether at the top level or as a compound's
+# arm — SQLite has one, this planner does not yet.
+
+statement error
+VALUES (1), (2)
+
+statement error
+SELECT id FROM t UNION VALUES (1)
+
+# `ORDER BY` over a compound may only name an output label or a 1-based
+# ordinal here. An arbitrary expression matches sqlite3, confirmed: it
+# refuses `ORDER BY id + 1` too ("does not match any column in the result
+# set"). A qualified column does not: sqlite3 sometimes accepts one
+# (`ORDER BY t.id`, resolved against the *left* arm's own `FROM`) — this
+# engine refuses it always, a deliberate narrower rule rather than carrying
+# an arm's `FROM` scope out to the compound's `ORDER BY` for a shape no ORM
+# writes.
+
+statement error
+SELECT id FROM t UNION SELECT id FROM t ORDER BY t.id
+
+statement error
+SELECT id FROM t UNION SELECT id FROM t ORDER BY id + 1
+
+# SQLite itself accepts `WITH` before `UPDATE`/`DELETE`/`INSERT`, not only
+# before `SELECT` (confirmed against sqlite3 — `WITH x AS (...) UPDATE t SET
+# a = (SELECT v FROM x)` really runs there). This engine does not reach that
+# shape yet: sqlparser hands all three back as a `Query` whose body is
+# `SetExpr::Update`/`Delete`/`Insert`, which `plan_query_body`'s catch-all
+# refuses rather than silently running the write with the `WITH` clause
+# dropped.
+
+statement error
+WITH x AS (SELECT 1 AS a) UPDATE t SET a = (SELECT a FROM x)
+
+statement error
+WITH x AS (SELECT 1 AS a) DELETE FROM t WHERE id IN (SELECT a FROM x)
+
+statement error
+WITH x AS (SELECT 1 AS a) INSERT INTO t (id, a, b) SELECT a, a, 'w' FROM x
+
+statement error
+SELECT DISTINCT ON (id) id FROM t
+
+# ------------------------------------------------------------ subqueries (1c)
+#
+# A subquery in a *write* statement is refused, and refused at prepare time.
+# `UPDATE`, `DELETE` and `INSERT ... VALUES` build their expression environment
+# and then take the engine mutably to write, so that environment cannot hold
+# the shared borrow reading a subquery needs. Discovering that halfway through
+# a statement that had already written rows is exactly the failure this project
+# does not accept, so the planner refuses it up front.
+#
+# The query of an `INSERT ... SELECT` is *not* refused — it runs to completion
+# through the ordinary read path before any row is written. `subqueries.test`
+# covers it.
+
+statement error
+UPDATE t SET a = (SELECT MAX(id) FROM t)
+
+statement error
+UPDATE t SET a = 1 WHERE id IN (SELECT id FROM t)
+
+statement error
+DELETE FROM t WHERE id IN (SELECT id FROM t)
+
+statement error
+DELETE FROM t WHERE EXISTS (SELECT 1 FROM t AS other WHERE other.id = t.id)
+
+statement error
+INSERT INTO t VALUES (9, (SELECT MAX(a) FROM t), 'nine')
+
+statement error
+INSERT INTO t VALUES (9, 9, 'nine') RETURNING (SELECT COUNT(*) FROM t)
+
+statement error
+INSERT INTO t VALUES (1, 1, 'one') ON CONFLICT (id) DO UPDATE SET a = (SELECT 1)
+
+# ------------------------------------------- qualified UPDATE SET target (AHL-475)
+#
+# A qualified column on the left of `SET` — checked directly against a real
+# `sqlite3` binary rather than assumed: it is a syntax error there even when
+# the qualifier names the statement's own target table, wrong qualifier or
+# right, aliased or not, two-part or three. So it stays refused here too, on
+# `UPDATE` and inside `ON CONFLICT DO UPDATE SET` alike. A MySQL client's own
+# `t.col = ?` — real syntax there, and what Eloquent writes on every save of a
+# model with timestamps — is translated by `crates/inlaysql-server`'s shim,
+# which strips a qualifier that names the statement's own table or refuses one
+# that does not, before the statement ever reaches this parser
+# (`crates/inlaysql-server/tests/wire.rs`).
+
+statement error
+UPDATE t SET t.a = 5
+
+statement error
+UPDATE t SET a = 1, t.b = 5 WHERE id = 1
+
+statement error
+INSERT INTO t VALUES (1, 1, 'one') ON CONFLICT (id) DO UPDATE SET t.a = excluded.a
+
+# A subquery used as a value has to return exactly one column. SQLite reports
+# this when the statement is prepared, not when it runs, and so does this.
+
+statement error
+SELECT (SELECT id, a FROM t)
+
+statement error
+SELECT id FROM t WHERE id IN (SELECT id, a FROM t)
+
+# A derived table cannot see the query it sits in: SQLite has no LATERAL, so
+# `t.id` here is a name nothing in scope answers to rather than a capture.
+
+statement error
+SELECT id FROM t WHERE id IN (SELECT n FROM (SELECT t.id AS n) AS d)
+
+statement error
+SELECT n FROM t, LATERAL (SELECT t.id AS n) AS d
+
+# A column alias list on a derived table is not SQLite syntax at all —
+# confirmed against sqlite3 3.54, which refuses it as a parse error, unlike
+# `WITH t(a, b) AS (...)` (AHL-473 built that one; this stays refused
+# because accepting it would add syntax outside SQLite's dialect, not merely
+# finish a feature).
+
+statement error
+SELECT n FROM (SELECT id FROM t) AS d(n)
+
+# A retrieval function ranks one stored table's rows; a subquery's rows have no
+# index to probe.
+
+statement error
+SELECT bm25_score(b, 'one') FROM (SELECT b FROM t) AS d
+
+# A stored DEFAULT or CHECK may not contain a subquery; SQLite does not allow
+# one there either.
+
+statement error
+CREATE TABLE c18(a INTEGER CHECK (a IN (SELECT id FROM t)))
+
+statement error
+CREATE TABLE c19(a INTEGER DEFAULT (SELECT 1))
+
+# `LIMIT` is evaluated once, before the query reads a row, so a correlated
+# subquery there has nothing to correlate against.
+
+statement error
+SELECT (SELECT id FROM t LIMIT t.a) FROM t
+
+# An `ORDER BY` or `LIMIT` written outside a parenthesised query means
+# something the inner plan cannot express, so it is refused rather than
+# flattened onto the inner query.
+
+statement error
+(SELECT id FROM t) ORDER BY id
+
+statement error
+(SELECT id FROM t) LIMIT 1
+
+statement error
+SELECT id FROM t ORDER BY 99
+
+statement error
+SELECT id FROM t LIMIT id
+
+# Window functions (AHL-494) implemented the ranking family, `lag`/`lead`,
+# `first_value`/`last_value`/`nth_value`, the aggregate family `OVER (...)`,
+# `ROWS` frames, named windows and `FILTER (WHERE ...)` — see
+# `window_functions.test`. What is still refused, on purpose, is below.
+
+# SQLite ships `percent_rank()`/`cume_dist()` as window functions too, but
+# neither is implemented here.
+
+statement error
+SELECT percent_rank() OVER (ORDER BY id) FROM t
+
+statement error
+SELECT cume_dist() OVER (ORDER BY id) FROM t
+
+# `ROWS` frames are implemented; `RANGE`/`GROUPS` frames with an explicit
+# value-based bound are not — a value-based `RANGE` answers a different
+# question than a position-based `ROWS` the moment `ORDER BY` has ties, so
+# this is not silently treated as `ROWS`.
+
+statement error
+SELECT SUM(a) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t
+
+statement error
+SELECT SUM(a) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t
+
+# `DISTINCT` inside a window function's argument list — refused by sqlite3
+# itself ("DISTINCT is not supported for window functions"), and here.
+
+statement error
+SELECT SUM(DISTINCT a) OVER (ORDER BY id) FROM t
+
+# `FILTER` only applies to an aggregate; `row_number()` is not one.
+
+statement error
+SELECT ROW_NUMBER() FILTER (WHERE id > 1) OVER (ORDER BY id) FROM t
+
+# A window function may appear only in a query's own projection list or its
+# own `ORDER BY` — never in `WHERE`, `GROUP BY`, `HAVING`, nested inside
+# another window function's clauses, or inside a plain aggregate's argument —
+# confirmed against sqlite3, which refuses every one of these with "misuse of
+# window function".
+
+statement error
+SELECT id FROM t WHERE ROW_NUMBER() OVER (ORDER BY id) = 1
+
+statement error
+SELECT COUNT(*) FROM t GROUP BY ROW_NUMBER() OVER (ORDER BY id)
+
+statement error
+SELECT a, COUNT(*) FROM t GROUP BY a HAVING ROW_NUMBER() OVER (ORDER BY a) = 1
+
+statement error
+SELECT SUM(ROW_NUMBER() OVER (ORDER BY id)) FROM t
+
+statement error
+SELECT ROW_NUMBER() OVER (ORDER BY RANK() OVER (ORDER BY id)) FROM t
+
+# A named window reference to a name nothing declares.
+
+statement error
+SELECT SUM(a) OVER nope FROM t
+
+# `WINDOW` needs a `FROM` clause, the same as `WHERE`/`GROUP BY`/`HAVING`.
+
+statement error
+SELECT 1 WINDOW w AS (ORDER BY 1)
+
+# ----------------------------------------------------------- scalar functions
+#
+# An unknown function is an error, not a NULL. A function that quietly returns
+# NULL because nobody implemented it is the same silent lie as a dropped
+# clause, and it is harder to notice.
+
+statement error
+SELECT nosuchfunction(1)
+
+statement error
+SELECT julianday('2024-01-01')
+
+statement error
+SELECT typeof(1)
+
+statement error
+SELECT randomblob(4)
+
+# Arity is checked when the call is planned, so a wrong count fails before the
+# query runs rather than per row.
+
+statement error
+SELECT length()
+
+statement error
+SELECT length('a', 'b')
+
+statement error
+SELECT substr('abc')
+
+statement error
+SELECT replace('a', 'b')
+
+statement error
+SELECT random(1)
+
+statement error
+SELECT coalesce(1)
+
+statement error
+SELECT COUNT(DISTINCT *) FROM t
+
+statement error
+SELECT GROUP_CONCAT(DISTINCT b, '|') FROM t
+
+# The two date modifiers that need the host's timezone database. inlaysql-core
+# is no_std and cannot read one, so they are refused rather than silently
+# treated as UTC - which would be a wrong answer, not a missing feature.
+
+statement error
+SELECT datetime('2024-01-01', 'localtime')
+
+statement error
+SELECT datetime('2024-01-01', 'utc')
+
+# ---------------------------------------------------------------- JSON (AHL-490)
+#
+# `json_extract`/`json_set`/`json_insert`/`json_replace`/`json_remove`/
+# `json_valid`/`json_type`/`json_quote`/`json_array`/`json_object`/
+# `json_array_length`/`json()` and the `->`/`->>` operators are implemented —
+# see `json.test`, every expectation there produced by sqlite3. What is
+# refused here is what is not: `json_each`/`json_tree` are table-valued
+# (SQLite's own `FROM json_each(x)`), and this engine has no mechanism for a
+# function that returns rows in `FROM` at all — the same refusal any other
+# table-valued function gets. `json_patch` is a real SQLite scalar this
+# engine simply does not implement; it falls through to the ordinary
+# "no such function" refusal every unmapped name gets.
+
+statement error
+SELECT * FROM json_each('[1,2,3]')
+
+statement error
+SELECT * FROM json_tree('{"a":1}')
+
+statement error
+SELECT json_patch('{"a":1}', '{"b":2}')

@@ -1,0 +1,112 @@
+# GROUP BY and HAVING.
+
+statement ok
+CREATE TABLE t(a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 'x'), (2, 'x'), (3, 'y'), (4, 'y'), (5, 'y'), (6, NULL)
+
+query TI rowsort
+SELECT b, COUNT(*) FROM t GROUP BY b
+----
+x 2
+y 3
+NULL 1
+
+query TI rowsort
+SELECT b, SUM(a) FROM t GROUP BY b
+----
+x 3
+y 12
+NULL 6
+
+query TI rowsort
+SELECT b, MIN(a) FROM t GROUP BY b
+----
+x 1
+y 3
+NULL 6
+
+query TI rowsort
+SELECT b, MAX(a) FROM t GROUP BY b
+----
+x 2
+y 5
+NULL 6
+
+query TI rowsort
+SELECT b, MAX(a) FROM t GROUP BY b HAVING COUNT(*) > 1
+----
+x 2
+y 5
+
+query TI rowsort
+SELECT b, SUM(a) FROM t GROUP BY b HAVING SUM(a) > 3
+----
+y 12
+NULL 6
+
+query IT nosort
+SELECT a, b FROM t GROUP BY a, b ORDER BY a
+----
+1 x
+2 x
+3 y
+4 y
+5 y
+6 NULL
+
+# ------------------------------------------------- mixed storage classes (AHL-477)
+
+# `GROUP BY` over a `NUMERIC`-affinity column holding NULL, INTEGER, REAL,
+# TEXT and BLOB together. The key comparator is `engine.rs::compare_group_keys`,
+# which calls the same `compare_values` `ORDER BY` uses — this is the
+# regression that pins the fix composes across both call sites, not only the
+# one `order_by.test` exercises directly. Every value and count below came
+# from sqlite3 3.54.
+statement ok
+CREATE TABLE mixed_group(v NUMERIC)
+
+statement ok
+INSERT INTO mixed_group VALUES (NULL), (2), (1), ('xyz'), (X'0304'), (1.5), (2)
+
+query TI nosort
+SELECT v, COUNT(*) FROM mixed_group GROUP BY v ORDER BY v LIMIT 1 OFFSET 0
+----
+NULL 1
+
+query II nosort
+SELECT v, COUNT(*) FROM mixed_group GROUP BY v ORDER BY v LIMIT 1 OFFSET 1
+----
+1 1
+
+query RI nosort
+SELECT v, COUNT(*) FROM mixed_group GROUP BY v ORDER BY v LIMIT 1 OFFSET 2
+----
+1.5 1
+
+# The two `2`s are one group of two, same as an ordinary integer `GROUP BY`.
+query II nosort
+SELECT v, COUNT(*) FROM mixed_group GROUP BY v ORDER BY v LIMIT 1 OFFSET 3
+----
+2 2
+
+query TI nosort
+SELECT v, COUNT(*) FROM mixed_group GROUP BY v ORDER BY v LIMIT 1 OFFSET 4
+----
+xyz 1
+
+# `MIN`/`MAX` share this ordering too (`eval::mem_cmp`, via `AggFunc::Min`/
+# `Max` in `eval.rs`, since AHL-477 also removed the second, independently
+# wrong copy `value_cmp` used to be): the smallest value in storage-class
+# order is the INTEGER `1`, and the largest is the BLOB. `NULL` is excluded
+# from both, as from every aggregate.
+query I nosort
+SELECT MIN(v) FROM mixed_group
+----
+1
+
+query T nosort
+SELECT MAX(v) FROM mixed_group
+----
+<blob>

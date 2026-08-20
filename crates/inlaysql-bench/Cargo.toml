@@ -1,0 +1,28 @@
+[package]
+name = "inlaysql-bench"
+description = "Reproducible benchmark harness for InlaySQL."
+publish = false
+# This crate has two binaries: `inlaysql-bench`, the published-number harness
+# `bench/run.sh` drives, and `profile`, the query-phase-only harness a perf run
+# attaches a sampler to (AHL-478). Adding the second one made a bare
+# `cargo run -p inlaysql-bench` ambiguous, which broke `bench/run.sh` and with
+# it `trust.yml`'s benchmark job. Naming the default keeps every existing
+# invocation meaning what it used to; `--bin profile` reaches the other.
+default-run = "inlaysql-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+inlaysql = { workspace = true }
+inlaysql-core = { workspace = true }
+
+# The baseline we are measured against. `bundled` compiles SQLite from source
+# so the comparison is against a known version rather than whatever the host
+# happens to ship — a number nobody can reproduce is not a number.
+rusqlite = { workspace = true }
+
+# The vector baseline: SQLite's own vector extension, so the retrieval
+# comparison is against something people actually deploy.
+sqlite-vec = { workspace = true }

@@ -1,0 +1,55 @@
+# Aggregate functions without GROUP BY: COUNT, SUM, MIN, MAX, AVG.
+
+statement ok
+CREATE TABLE t(a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 'x'), (2, 'x'), (3, 'y'), (4, NULL)
+
+query I rowsort
+SELECT COUNT(*) FROM t
+----
+4
+
+query I rowsort
+SELECT COUNT(b) FROM t
+----
+3
+
+query I rowsort
+SELECT COUNT(a) FROM t
+----
+4
+
+query I rowsort
+SELECT SUM(a) FROM t
+----
+10
+
+query I rowsort
+SELECT MIN(a) FROM t
+----
+1
+
+query I rowsort
+SELECT MAX(a) FROM t
+----
+4
+
+query T rowsort
+SELECT MIN(b) FROM t
+----
+x
+
+query R rowsort
+SELECT AVG(a) FROM t
+----
+2.5
+
+query I rowsort
+SELECT COUNT(*) FROM t WHERE a >= 3
+----
+2
+
+statement error
+SELECT a FROM t WHERE COUNT(*) > 1

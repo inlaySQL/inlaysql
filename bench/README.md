@@ -1,0 +1,877 @@
+# Benchmarks
+
+```sh
+./bench/run.sh                      # every suite, pinned parameters
+SUITE=points ./bench/run.sh         # just the SQLite comparison
+SUITE=indexed ./bench/run.sh        # just the secondary-index comparison
+SUITE=joins ./bench/run.sh          # just the join comparison
+SUITE=vectors ./bench/run.sh        # just the ANN comparison
+SUITE=concurrency ./bench/run.sh    # just the concurrent-writer comparison
+SUITE=retrieval ./bench/run.sh      # just the retrieval workload
+
+./bench/compare.sh                  # vs DuckDB, pgvector, MySQL, PostgreSQL (needs Docker)
+
+# The HNSW parameter grid behind the shipped defaults. Not in `all`: it is
+# one graph build per (M, ef_construction) point and takes minutes.
+cargo run --release -p inlaysql-bench -- --suite sweep --docs 20000
+```
+
+Writes a timestamped file to `bench/results/` (git-ignored) containing the
+toolchain, host and commit alongside the numbers, so a result is always
+traceable to what produced it.
+
+Two scripts, because of one line the project rules draw: every published number
+has to regenerate from a checkout. SQLite and `sqlite-vec` link into the
+harness, so `run.sh` needs nothing but `cargo`. DuckDB is a separate runtime,
+and pgvector/PostgreSQL/MySQL are servers, so `compare.sh` puts all four (plus
+InlaySQL's own MySQL-wire server) in containers with pinned versions —
+reproducible, but only on a machine with Docker. `compare.sh` covers three
+workloads: the retrieval comparison (recall + latency, against DuckDB and
+pgvector), the OLTP comparison (point reads and writes, against MySQL and
+plain PostgreSQL, InlaySQL as a library — see "OLTP: MySQL and PostgreSQL,
+matched durability" below), and the server-to-server OLTP comparison
+(InlaySQL's own MySQL wire against MySQL's, same client, a couple of
+concurrency levels — see "Server-to-server" below).
+
+## Suite: points — InlaySQL vs SQLite
+
+The narrowest workload a storage engine has: one row by primary key, read and
+written. Both engines use `id INTEGER PRIMARY KEY`, so both do one tree descent
+per lookup, and **both use prepared statements**: each prepares once outside the
+timed loop and binds the key per iteration — InlaySQL through
+`Database::prepare` + `query_prepared`, SQLite through `Connection::prepare` +
+`Statement::query_row`.
+
+That is a change. This suite used to disable prepared statements on both sides,
+because InlaySQL had none and driving SQLite through `Connection::query_row`
+(which prepares per call) was the only way to keep the comparison level. Since
+AHL-373 it has them, so the caveat is gone and both engines are measured the way
+an application would actually use them.
+
+The switch moved both engines, and it moved SQLite by less, because SQLite was
+never paying as much for parsing. On one developer machine (Apple silicon,
+20,000 rows, 5,000 lookups, seed 42), point-read p50:
+
+| | before, neither prepared | after, both prepared |
+| --- | --- | --- |
+| InlaySQL | 15.04 µs | **10.92 µs** |
+| SQLite (journal, `sync=FULL`, `fullfsync`) | 7.21 µs | 6.25 µs |
+| SQLite (WAL, `sync=NORMAL`) | 1.79 µs | 1.04 µs |
+
+So prepared statements took about a quarter off InlaySQL's point read and left
+it still the slower engine — the remaining gap is the executor and the tree, not
+the parser, and the next person to work on this should start there rather than
+on the front end.
+
+SQLite is measured in two configurations, and the difference between them
+matters more than either number:
+
+| Configuration | What it means |
+| --- | --- |
+| `journal`, `synchronous=FULL`, `fullfsync` | Every commit is durable through the drive's write cache. The like-for-like column: InlaySQL always does this. |
+| WAL, `synchronous=NORMAL` | What most applications actually run. Faster, and a power cut can lose recent commits. |
+
+`fullfsync` is not decoration. On macOS, Rust's `File::sync_all` issues
+`F_FULLFSYNC` while SQLite's default `fsync` returns before the data reaches
+the platter — without the pragma, the comparison is a durable engine against a
+hopeful one. It is a no-op on Linux.
+
+InlaySQL is compiled against a `bundled` SQLite, so the baseline is a known
+version rather than whatever the host happens to ship.
+
+### Batched writes
+
+Since AHL-374 there is a second write row: the same per-row `INSERT` loop,
+wrapped in an explicit `begin`/`commit` transaction. The engine batches rows
+into one commit until the write-ahead log is nearly full, commits, and starts a
+fresh transaction — so thousands of rows pay one `fsync` per batch instead of
+one per row. On one developer machine (Apple silicon, 20,000 rows, seed 42):
+
+| | ops/s |
+| --- | --- |
+| InlaySQL, one commit per row | 153 |
+| InlaySQL, batched | **1,788** (11.7x) |
+
+The batch boundary is the engine's own limit, not a magic number: when a
+transaction is about to overflow the log the engine refuses the next statement
+with a clear `Error::Transaction` *before* running it, the harness commits what
+is buffered and starts a new transaction. The same discipline is what makes the
+retrieval suite's `ingest` number.
+
+## Suite: indexed — InlaySQL vs SQLite
+
+```sh
+SUITE=indexed ROWS=100000 ./bench/run.sh
+```
+
+`WHERE email = ?` and a small `WHERE email >= ? AND email < ?` range (50 rows,
+`RANGE_SIZE` in `indexed.rs`) on a non-key column — the query an ORM emits all
+day, and the one where a secondary index changes the *shape* of the answer,
+not just its constant factor. Four rows per query shape:
+
+- **InlaySQL, B-tree index** — `CREATE INDEX users_email ON users (email)
+  USING BTREE`, built after the rows are loaded (the harder path for the
+  engine, since the index has to describe a table that already exists).
+- **InlaySQL, no index** — the identical engine, rows and query, with no index
+  for the planner to use: a full scan. Measured in the same process, on the
+  same rows, in the same run, so a before/after ratio needs no cross-machine
+  caveat. This is the row that makes the AHL-423 figure (scalar B-tree
+  indexes landed at ~3,800x over a 100k-row scan) regenerate from a checkout
+  instead of standing as an unreproduced assertion — rerun with `ROWS=100000`
+  to reproduce that shape.
+- **SQLite, journal + WAL** — the same index, both of the durability
+  configurations the `points` suite uses.
+
+Both engines use prepared statements, bound per iteration, as `points` does.
+The point-lookup sequence and the range starts are drawn once from the seed,
+so every engine answers the identical questions in the identical order; the
+range bound relies on `email`'s id being zero-padded to a fixed width, so
+lexicographic order on the column equals numeric order on the id and every
+range is exactly `RANGE_SIZE` rows on both engines.
+
+**What this deliberately does not claim:** the unindexed row's cost is a
+property of `--rows`, not a fixed number — it is expected to get worse as
+`--rows` grows, and reading it without `--rows` alongside it is reading it
+wrong. Nothing here measures `ORDER BY` pushdown through the index (open per
+`PERF.md`), a composite index, or an index on more than one column.
+
+## Suite: joins — InlaySQL vs SQLite
+
+```sh
+SUITE=joins ROWS=20000 QUERIES=100 LIMIT=20 ./bench/run.sh
+```
+
+`users` x `posts`, the AHL-464 index nested-loop join shape, in both
+directions the planner rule (`Engine::join_probe`) actually takes:
+
+- **PK inner** — `FROM posts JOIN users ON posts.user_id = users.id`. The
+  inner table's join key is its `INTEGER PRIMARY KEY`, so each outer row costs
+  one tree descent.
+- **Secondary-index inner** — `FROM users JOIN posts ON posts.user_id =
+  users.id`. The inner table's join key is `posts.user_id`, a scalar B-tree
+  index, so each outer row costs an index entry-range read plus one descent
+  per matched post. This is the exact shape `PERF.md` names.
+
+Each direction runs with and without a `LIMIT` (`--limit`, default 10),
+because the probe is a stage of the streaming pipeline and a `LIMIT` on an
+unindexed-order plan stops the outer scan once it has enough rows — whether
+that shows up as a wall-clock win over SQLite, which has no equivalent
+streaming guarantee, is what these two rows are for finding out. Every user
+has exactly the same number of posts (`POSTS_PER_USER = 8`, round-robin
+assignment), so neither direction gets a luckier key distribution, and both
+engines run against the identical schema and the identical
+`CREATE INDEX posts_user_id ON posts (user_id)`. Both engines prepare each
+query once, outside the timed loop; neither query takes a bound parameter, so
+this measures execution, not the parser or a lookup key.
+
+**What this deliberately does not claim:** there is no unindexed/materialising
+row. The fallback the AHL-464 rule declines — an equality that is not on the
+inner table's key or a leading index column — is exercised by
+`crates/inlaysql-core/tests/btree_index.rs` and `tests/streaming.rs`, not by
+this harness, and `PERF.md` already states plainly that a join the rule
+declines is still O(n×m) and would still lose. This suite measures the access
+path the rule was built for, nothing about join reordering or a hash join
+(neither exists), and nothing about a join with an `OR` or a composite `ON`
+whose leading conjunct is not the probe key.
+
+## Suite: vectors — InlaySQL vs sqlite-vec
+
+Recall and latency for approximate nearest-neighbour search, against
+[`sqlite-vec`](https://github.com/asg017/sqlite-vec), which is what an InlaySQL
+user would otherwise reach for.
+
+**Recall is printed before latency, and neither means anything alone.** An
+approximate index can be made arbitrarily fast by being arbitrarily wrong, so
+both engines are scored against the same oracle — exhaustive cosine similarity
+computed in Rust — and the fraction of the true top-k each returned is in the
+table. `sqlite-vec`'s `vec0` tables scan exhaustively, so its recall is 1.0 by
+construction and its latency grows linearly with the corpus.
+
+For the exact/int8 acceptance comparison without the full suite's unrelated
+paged and incremental rebuilds:
+
+```sh
+SUITE=quantization DOCS=100000 QUERIES=50 ./bench/run.sh
+```
+
+### Two corpora, because the data decides the answer
+
+Since AHL-372 this suite runs twice, over two shapes of corpus, and the gap
+between them is the most useful thing it reports.
+
+What an ANN index can achieve is not a property of the index. It is a property
+of the data — specifically its **intrinsic dimensionality**. A graph index
+answers a query by walking downhill towards it, and that only ends near the
+right answer if there is a downhill to walk.
+
+**Uniformly random unit vectors have none.** In 384 dimensions every pair is
+near-orthogonal and every distance concentrates: the 10th nearest neighbour and
+the 1000th are about a percent apart. Nothing can navigate that, and holding
+recall fixed as the corpus grows costs an `ef_search` that grows *with the
+corpus* — a linear scan wearing a graph. This is the worst case any ANN index
+can be handed, and it is what this suite used to measure exclusively.
+
+**Real embeddings are the opposite.** A few hundred nominal dimensions with an
+intrinsic dimensionality in the tens, because meaning clusters. The corpus for
+this shape is the same text-derived generator the `retrieval` suite and
+`compare.sh` already use.
+
+Publishing only the first number describes a workload nobody has. Publishing
+only the second hides the worst case. Both run.
+
+### The numbers
+
+On one developer machine (Apple silicon), dim 384, top-10, 50 queries, seed 42:
+
+| Corpus | Shape | recall@10 | InlaySQL p50 | sqlite-vec p50 | |
+| --- | --- | --- | --- | --- | --- |
+| 5,000 | realistic | 0.998 | 0.70 ms | 2.62 ms | **3.7x faster** |
+| 20,000 | realistic | 1.000 | 1.30 ms | 9.78 ms | **7.5x faster** |
+| 100,000 | realistic | 0.998 | 3.08 ms | 48.57 ms | **15.8x faster** |
+| 5,000 | uniform | 0.720 | 0.77 ms | 2.34 ms | 3.0x faster |
+| 20,000 | uniform | 0.384 | 1.41 ms | 9.72 ms | 6.9x faster |
+| 100,000 | uniform | 0.118 | 3.47 ms | 48.27 ms | 13.9x faster |
+
+Read the realistic rows as the engine's number and the uniform rows as its
+floor. **On realistic data recall is flat across a 20x range of corpus sizes**
+— 0.998, 1.000, 0.998 — which is the property AHL-372 existed to restore, and
+the crossover against exhaustive scan has moved below the smallest size
+measured. On uniform data recall falls, and no tuning changes that.
+
+### Scalar int8 quantisation
+
+`VECTOR(n)` is exact. `VECTOR(n, INT8)` opts one column into symmetric
+per-vector scalar quantisation: one `f32` scale and `n` signed bytes in both row
+storage and the HNSW embedding/node payloads. Query vectors remain `f32`.
+
+The dedicated command above measured 100,000 vectors, dim 384, top-10, 50
+queries, seed 42 on the same Apple-silicon development machine:
+
+| Shape | exact recall | int8 recall | loss | exact / int8 build | exact / int8 p50 | exact / int8 resident vector payload |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| realistic | 0.998 | 0.970 | 0.028 | 252.49 s / 121.31 s | 4.95 ms / 2.77 ms | 293.0 MiB / 74.0 MiB |
+| uniform worst case | 0.118 | 0.104 | 0.014 | 311.61 s / 133.43 s | 5.59 ms / 4.33 ms | 293.0 MiB / 74.0 MiB |
+
+The resident vector payload is **3.96x smaller** on both shapes. The complete
+database file is 5,283,348,480 bytes exact and 3,524,169,728 bytes int8 — only
+**1.50x smaller**, not four. The difference is real and important: this B-tree
+is append-only copy-on-write today, so page history, WAL space, adjacency and
+other non-vector bytes dominate a 100k image. Quantisation delivers the claimed
+constant factor on the bytes it owns; it does not disguise unrelated file
+amplification as vector data.
+
+Recall loss is likewise measured rather than assumed. The realistic corpus
+loses 2.8 percentage points while remaining at 0.970 recall@10. The uniform
+corpus loses 1.4 points, but its exact index was already at 0.118 for the
+intrinsic-dimensionality reason above. Int8 also built 2.08–2.34x faster and
+reduced query p50 in this run because its working set fits caches better.
+
+### What it used to be, and why it is not comparable
+
+| | recall@10 at 5,000 | at 20,000 |
+| --- | --- | --- |
+| before AHL-372 | 0.899 | 0.733 |
+| after, realistic corpus | 0.998 | 1.000 |
+| after, uniform corpus | 0.720 | 0.384 |
+
+The old row is **not** a like-for-like baseline, for three reasons, and the
+third is the awkward one:
+
+1. It was measured at dim 128; these are dim 384.
+2. It was measured before the index was tuned. See the commit for AHL-372: the
+   layer distribution was geometric with ratio 1/2, so half the corpus sat one
+   layer up and the greedy descent could not cross it. That is what made recall
+   *fall* as the corpus grew.
+3. **It was measured on a corpus that was neither of the two above.** The
+   generator's comment said "centred on zero so the vectors spread over the
+   sphere"; the code divided a 24-bit value by `2^23`, putting every component
+   in `[-0.5, 1.5)`. Every vector leaned on the all-ones diagonal at a mean
+   pairwise cosine of 0.43. It was an accident, it was easier than uniform and
+   harder than real embeddings, and the published recall was a number about it.
+
+The divisor is fixed. The old numbers are kept here because deleting a number
+you have published is worse than explaining it.
+
+### Tuning, and the curve behind the defaults
+
+```sh
+cargo run --release -p inlaysql-bench -- --suite sweep --docs 20000
+```
+
+The sweep walks `M` x `ef_construction` x `ef_search` over both corpora against
+the same oracle, and prints recall and latency for every point — the argument
+for a default rather than an assertion of one. It drives the index directly
+rather than through SQL, because the engine's insert path costs milliseconds a
+row and would swamp the graph build.
+
+Shipped: `M = 16`, `ef_construction = 200`, `ef_search = max(64, 2k)`. What the
+grid said, measuring the index directly at dim 384, top-10:
+
+| | realistic corpus | uniform corpus |
+| --- | --- | --- |
+| `M = 16`, `ef = 64`, 5,000 | 0.998 @ 55 µs | 0.682 @ 94 µs |
+| `M = 16`, `ef = 64`, 20,000 | 1.000 @ 165 µs | 0.318 @ 296 µs |
+| `M = 16`, `ef = 64`, 100,000 | 0.998 @ 320 µs | 0.102 @ 648 µs |
+| `M = 16`, `ef = 2048`, 100,000 | — | 0.884 @ 12.2 ms |
+| `M = 32`, `ef = 2048`, 100,000 | — | 0.978 @ 18.5 ms |
+
+Two things decide the default. On the realistic corpus `M = 16` at `ef = 64` is
+already at the ceiling and nothing above it buys anything. On the uniform corpus
+nothing short of `M = 32` and `ef = 2048` gets near 0.95, and that costs 18.5 ms
+a query and 12 minutes of build at 100,000 rows — detuning every real workload
+by 30x to chase a corpus nobody has. `ef_construction` above 200 moved recall by
+less than 0.02 on either corpus while costing 15% more build time.
+
+Anyone who *does* have uniformly random vectors can buy the recall back:
+`HnswIndex::with_params` and `set_params` take all four knobs, and `ef_search`
+is the query-time dial.
+
+`ef_search` scales with `k` because a fixed candidate list is a different amount
+of headroom for `k = 1` than for `k = 100`. The engine also over-fetches
+candidates 4x for fusion, so `k` arrives at the index already multiplied.
+
+pgvector and DuckDB are not in this suite because neither links into the
+harness. They are in `./bench/compare.sh` instead, on a corpus generated once
+and shared by all four engines.
+
+### The filtered case
+
+After the unfiltered comparison, the suite runs the same corpus again with
+`WHERE tenant = id % 100`, so each tenant owns ~1% of the rows, and scores the
+result against each tenant's own exhaustive top-k. This is the workload AHL-379
+existed for: a fixed candidate budget over-fetched for fusion contains
+essentially none of one tenant, so filtering *after* retrieval returns nothing
+at all. The engine now over-fetches adaptively until the filter admits `LIMIT`
+rows, and this case reports what that costs — both the recall it preserves and
+the extra latency of the wider probe.
+
+`sqlite-vec` is absent from this case on purpose. Its `vec0` tables take an
+optional `WHERE` on metadata columns, but wiring that into the harness would
+compare two different questions; the filtered case is about InlaySQL's own
+over-fetch cost, not a third-party comparison.
+
+### Incremental maintenance
+
+Since AHL-381 the graph is not rebuilt from scratch on every commit. An insert
+appends one node through the same greedy search queries use; a delete leaves a
+tombstone that is skipped by search and dropped by a later rebuild; and a full
+rebuild happens only when tombstones outnumber live rows or the graph-shaping
+parameters are retuned. This suite measures that maintenance directly against
+`HnswIndex`, because the SQL path defers index commits to the first read and so
+cannot show a per-row cost.
+
+On one developer machine (Apple silicon), dim 384, 20,000 nodes, seed 42:
+
+| Corpus | full rebuild | one incremental insert | distance computations (rebuild vs one insert) |
+| --- | --- | --- | --- |
+| realistic | 14.1 s | 1.04 ms | 255M vs 14,301 |
+| uniform | 20.2 s | 1.31 ms | 430M vs 22,385 |
+
+The distance computations are the guarantee, not the timing: one insert is
+bounded by `ef_construction * M` and the layer count, independent of the corpus
+size, where a full rebuild re-inserts every node. That count stays ~14,000 at
+100,000 vectors too — the pin is the ignored unit test
+`an_incremental_insert_into_a_large_graph_touches_a_fraction`, which asserts it
+counts, not times.
+
+### A corpus larger than RAM
+
+The table above measures the in-RAM `HnswIndex`, which holds every embedding and
+its normalised copy — the memory ceiling AHL-382 exists to remove. A paged
+backend (`inlaysql_core::hnsw_paged::PagedHnswIndex`) stores each node's vector
+and adjacency in the backing store and reads them through a bounded LRU cache on
+demand, so the resident working set is the cache, not the corpus.
+
+The suite now runs it directly (as it runs `HnswIndex` for incremental
+maintenance, since the SQL path cannot show a per-query working set) and prints:
+
+```
+=== corpus larger than RAM: paged HNSW (direct) ===
+corpus: N vectors x dim D = X MiB of f32
+cache bound: 256 nodes (~Y MiB working set); peak resident: 256 nodes
+resident / corpus: 256 / N nodes (Z% held in memory)
+recall@10 vs exhaustive: R (shape)
+```
+
+Two numbers matter. The **resident/corpus ratio** is the memory claim: at the
+default 2,000 documents the paged index holds 12.8% of the corpus in memory, and
+at 20,000 it holds 1.3%, whatever `dim` is — the cache is fixed and the corpus
+grows. The **recall@10** is the quality claim, reported against the same
+exhaustive oracle both corpus shapes already use, and it is unchanged from the
+in-RAM index's number because the paged graph is the same graph. The unit test
+`a_corpus_larger_than_the_cache_is_searchable_with_bounded_memory` pins the same
+bound as a count, which is the project's convention for a number that has to
+survive a noisy machine.
+
+The caveat: this backend is measured against `MemStorage` today, because the
+copy-on-write `TreeStorage` deliberately does not expose its buffered writes to
+reads within a transaction. Wiring the paged index onto `TreeStorage` — so it
+inherits the write-ahead log and crash recovery — needs the engine to commit the
+index's writes in bounded batches and to give the index a read-your-writes
+overlay for the batch in flight. That is the follow-on step; the memory bound
+and the recall are established here.
+
+## Suite: concurrency — InlaySQL vs SQLite
+
+"MVCC with multiple concurrent writers" is the headline claim against SQLite,
+which permits one writer. This is the suite that has to be able to embarrass us,
+so it runs real OS threads rather than simulating contention in a turn-taking
+loop.
+
+Several writers, one file, one row per transaction. Each thread opens its own
+file handle and gets one of four WAL regions. A short process-local gate orders
+conflict decisions, sequence/page reservations and append positions; record
+writes and the expensive `fsync` happen outside that gate. Writers beyond four
+share a region safely because append placement remains reserved.
+
+The keys are disjoint. A stale transaction compares its touched rows against
+the newer root and rebases when none changed; two writers touching the same row
+still get first-committer-wins and the loser receives `Error::Conflict`.
+
+On one developer machine, 200 transactions per writer:
+
+| Writers | InlaySQL commits/s | Conflict rate | SQLite (journal, `sync=FULL`) |
+| --- | --- | --- | --- |
+| 1 | 173 | 0% | 78 |
+| 2 | 237 | 0% | 79 |
+| 4 | 221 | 0% | 78 |
+
+Two things to read there:
+
+**We are ~2.8x faster at four writers.** One `fsync` per InlaySQL commit,
+overlapped across file handles, against SQLite's serialized journal-mode round
+trip.
+
+**Adding writers raises throughput.** Four writers do 1.28x the work of one on
+this machine, with no false conflicts. Scaling is deliberately reported rather
+than assumed: multiple `fsync` calls on one inode still share a filesystem and
+storage device, so four regions are not expected to mean a perfect 4x.
+
+The suite verifies, on every run, that the file ends up holding exactly the rows
+the writers were told they committed. That check is not decoration: before
+`Error::Conflict` existed, the engine reported a rolled-back transaction as
+committed, and this suite would have printed a throughput number for writes that
+were silently dropped. Two writers, ten inserts, five rows in the file, no error
+anywhere.
+
+**Also not covered:** a handle's snapshot only moves when it commits. An open
+handle that never writes keeps answering from the state it opened on, so a
+reader beside a writer goes stale and stays stale. The suite counts rows through
+a freshly opened handle for that reason.
+
+## Suite: retrieval
+
+- **ingest** — rows per second, batched: the single-row `INSERT` loop runs
+  inside explicit transactions, so it pays one `fsync` per batch rather than one
+  per row (see the points suite's batched-write row). On one developer machine,
+  2,000 docs ingest at ~1,650 docs/s.
+- **index build on first read** — index commits are deferred until something
+  reads, so the first query after a load pays for the whole batch. Reported on
+  its own rather than folded into the query numbers.
+- **query latency** — p50/p95/max for vector-only, BM25-only and hybrid
+  queries.
+
+The corpus and the queries are generated from a seeded PRNG, so `--seed 42`
+asks exactly the same questions on every machine. The external comparison of
+the same workload — against DuckDB and pgvector — is `./bench/compare.sh`.
+
+## ./bench/compare.sh — DuckDB, pgvector, MySQL and PostgreSQL
+
+```sh
+./bench/compare.sh                      # 5,000 docs, dim 128, 100 queries
+DOCS=20000 DIM=384 ./bench/compare.sh   # override any parameter
+ROWS=100 LOOKUPS=50 ./bench/compare.sh  # override the OLTP workload size
+SERVER_CONCURRENCY_LEVELS=1,4,16 ./bench/compare.sh  # override the server-to-server concurrency levels
+```
+
+The whole design of this script is one idea: **generate the experiment once**.
+The corpus, the queries and the correct answers are written to disk by the Rust
+harness (`--export`), and every engine — including InlaySQL — then reads those
+same files. It is far too easy to end up with four engines answering four
+slightly different questions and to publish the difference as a performance
+result. The OLTP workload below (`--export-oltp`) follows the identical idea:
+the rows to load and the exact primary-key lookup sequence are written once,
+and MySQL, PostgreSQL and InlaySQL all replay the same operations in the same
+order. InlaySQL replays them *twice* — once on the host, once inside a
+container — so the OLTP table below carries two InlaySQL rows; see "InlaySQL,
+measured twice" under the OLTP section for why.
+
+| | |
+| --- | --- |
+| `corpus.csv` | id, body, embedding as `[0.1,0.2,…]` — pgvector's own input format and a cast DuckDB accepts, so nothing is converted per engine |
+| `queries.csv` | the query text and its embedding |
+| `truth-vector.csv` | exhaustive cosine similarity: an objective answer |
+| `truth-hybrid.csv` | RRF over exact vector and exact BM25: our reference fusion |
+| `results-*.json` | one retrieval result file per engine, merged by `report.py` |
+| `oltp-manifest.json` | rows, lookups, payload size, seed, write order, schema |
+| `oltp-rows.csv` | the exact rows to load — sequential `id`, same payload every driver inserts |
+| `oltp-lookup-keys.csv` | the exact primary-key lookup sequence, in order — the same seeded draw the `points` suite uses in-process |
+| `results-oltp-*.json` | one OLTP result file per engine, merged by `report.py` — including `results-oltp-inlaysql.json` (host) and `results-oltp-inlaysql-container.json` (containerised), both written by the same binary against the same files |
+
+Embeddings are written to six decimal places and InlaySQL is measured on the
+values read back from that text, not on the full-precision originals —
+otherwise part of any recall difference would just be the export format.
+
+On one developer machine — 5,000 documents, dim 128, 100 queries, top-10:
+
+| Engine | recall@10 | vector p50 | hybrid p50 | agree |
+| --- | --- | --- | --- | --- |
+| InlaySQL (HNSW + BM25) | 0.993 | 0.73 ms | **1.57 ms** | 0.975 |
+| DuckDB (exhaustive + `fts` BM25) | 0.999 | 5.46 ms | 15.2 ms | 0.966 |
+| DuckDB (`vss` HNSW + `fts` BM25) | 0.992 | 4.35 ms | 14.2 ms | 0.954 |
+| pgvector (HNSW + `ts_rank`) | 0.987 | **0.17 ms** | 18.8 ms | 0.456 |
+| pgvector (exhaustive + `ts_rank`) | 0.999 | 0.59 ms | 18.9 ms | 0.465 |
+
+Two results, and one of them is a loss.
+
+**We win hybrid by roughly 10x**, because it is one statement here and two
+queries plus client-side fusion everywhere else.
+
+**pgvector beats us on vector search by 4x — over a network.** It is a server;
+every one of those 0.17 ms includes a client round trip that a library in your
+own process does not pay, and it still wins. That row predates AHL-372, which
+tuned the index and took roughly 3x off query latency at these sizes, so it is
+stale and understates us — but the direction of the result is not something a
+rerun is expected to reverse, and the row stays until someone reruns it with
+Docker to hand.
+
+### Reading the table
+
+**`recall@k` is a quality score.** It is measured against exhaustive cosine
+similarity, which is not any engine's opinion.
+
+**`agree` is not.** It is overlap with our reference fusion, and an engine that
+ranks text with a different function scores lower without being worse.
+PostgreSQL ranks with `ts_rank_cd` rather than BM25 and lands around 0.49 for
+exactly that reason. DuckDB's `fts` extension does implement Okapi BM25, which
+is why it sits much higher. Read the latencies as the result.
+
+**The hybrid latencies are not measuring equal work.** InlaySQL fuses inside one
+SQL statement. Neither baseline has a fusion operator, so their driver runs two
+queries and combines the ranks in Python. That is what hybrid search costs on
+them today, which is the comparison worth making — but it is not one query
+against one query.
+
+Both baselines are asked for their query plan, and what the plan actually said —
+index scan or sequential scan — is printed with the row. An "HNSW" row that was
+really a sequential scan would be the most misleading number in the table, and
+it happens easily: DuckDB only rewrites `ORDER BY array_cosine_distance(…)` into
+an index scan, never the equivalent `array_cosine_similarity(…) DESC`.
+
+### What it costs to reproduce
+
+Docker, and pinned images: `pgvector/pgvector:pg17`, `postgres:17`, `mysql:8`,
+`python:3.12-slim`, `duckdb==1.1.3`, `mysql-connector-python==9.1.0`, plus
+`docker/Dockerfile`'s `rust:1.91-bookworm` — the same pinned Linux build image
+`docker/test.sh` uses, reused rather than a second one, for the containerised
+InlaySQL OLTP row below *and* for `inlaysql-server`, the container that runs
+`inlaysql serve --mysql` for the server-to-server comparison further down.
+The `pgvector` container runs with `fsync=off` on a tmpfs, because *that* row
+measures query latency rather than PostgreSQL's durability — the InlaySQL
+numbers it is compared against there are query latencies too. That is a
+different container from the `postgres` service the OLTP section below talks
+to, which is configured for real durability. The `points` suite is the other
+durability comparison, in-process against SQLite, with real barriers on both
+sides.
+
+## OLTP: MySQL and PostgreSQL, matched durability
+
+```sh
+./bench/compare.sh                       # 20,000 rows, 5,000 lookups by default
+ROWS=2000 LOOKUPS=500 ./bench/compare.sh # override the workload size
+```
+
+> [!NOTE]
+> **This section used to carry a warning that the write column could not be
+> trusted at all, because InlaySQL was measured on the host and MySQL/
+> PostgreSQL inside containers, which on Docker Desktop for macOS or Windows
+> fsync to a virtualised disk that does not generally pass a write barrier
+> through to the hardware.** That is still true of the *host* InlaySQL row
+> below — it is not a criticism of the row, it is what makes it the
+> like-for-like column against the `points` suite's SQLite row. The fix was
+> not to make InlaySQL's host fsync cheaper — that would defeat the point —
+> but to add a second InlaySQL row, measured inside a container on the same
+> class of Docker volume MySQL and PostgreSQL already write to, so the write
+> column compares like fsync semantics against like. See "InlaySQL, measured
+> twice" below for exactly what that does and does not prove.
+
+The `points` suite (above) measures the narrowest OLTP workload — one row by
+primary key, read and written — against SQLite, in-process. MySQL and
+PostgreSQL cannot link into the harness, so the same workload is exported
+once (`--export-oltp`, written alongside the retrieval corpus) and replayed
+by a driver against each server inside `bench/compare.sh`, exactly the way
+DuckDB and pgvector already are for retrieval.
+
+**Scope.** Only the workload that has a durable, one-commit-per-statement
+counterpart on a server: sequential inserts (`id` 1..=rows, in that order)
+and the point-lookup key sequence — the same rows and the same seeded
+lookup draw the `points` suite uses for its non-batched write and read rows.
+The `points` suite's *batched*-write row (many rows folded into one
+transaction) is InlaySQL-specific and stays out of this comparison: there is
+no natural equivalent on MySQL/PostgreSQL without picking an arbitrary batch
+size for them too, which would make the comparison about the chosen batch
+size rather than about the engines.
+
+### Durability — the thing that decides whether this comparison means anything
+
+Comparing our durable commit against a server told not to be durable would be
+the most misleading number in this repo, so every engine here is configured
+for real durability, matched as closely as each engine allows:
+
+| Engine | Setting | Why |
+| --- | --- | --- |
+| InlaySQL (host) | No knob — every commit is synced before `execute_prepared` returns | This is the baseline everything else is matched to. Runs on the host filesystem, before the containers come up. |
+| InlaySQL (containerised) | The same commit path, same binary, same workload — the only difference is that this process and its database file run inside the `inlaysql-oltp` container, on the named Docker volume `inlaysql-oltp-data` | See "InlaySQL, measured twice" below. This row exists to be comparable to the MySQL/PostgreSQL rows, which also pay whatever the virtualised disk charges. |
+| SQLite (reference, from the `points` suite) | `journal`, `synchronous=FULL`, `fullfsync` | The like-for-like column the `points` suite already establishes; repeated here so the OLTP row is read against the same standard. |
+| PostgreSQL | `fsync=on`, `synchronous_commit=on` | PostgreSQL's real durability: every commit is confirmed only after WAL is on disk. This is the opposite configuration from the `pgvector` container above, which explicitly disables both to measure query latency — see the note above. |
+| MySQL | `innodb-flush-log-at-trx-commit=1` | InnoDB's most durable setting: the log buffer is written and fsynced to disk at every transaction commit. This is already MySQL's default; it is set explicitly in `compose.yml` so the comparison does not silently depend on that default never changing. |
+| MySQL binary log | Disabled (`--skip-log-bin`), not `sync_binlog=1` | InlaySQL has no replication log to compare against. Enabling the binlog with `sync_binlog=1` would add a second fsync per commit for a durability feature neither engine in this comparison uses — that would be measuring replication safety, not the plain commit path this row is about. If a future comparison specifically targets replication-safe MySQL, that is a different, explicitly-labelled row, not this one. |
+
+**Not tmpfs.** The `postgres`, `mysql` and `inlaysql-oltp` services in
+`compose.yml` all write to normal named Docker volumes (`postgres-oltp-data`,
+`mysql-oltp-data`, `inlaysql-oltp-data`), not tmpfs — a durable write to a RAM
+disk is not a durable write. This is the opposite choice from the `pgvector`
+container above, which uses tmpfs on purpose because that row is explicitly
+not a durability measurement.
+
+### InlaySQL, measured twice: host and containerised
+
+`oltp_export::run` (the `--export-oltp` step `compare.sh` runs before the
+containers come up) measures InlaySQL on the host filesystem — that row is
+the like-for-like column against the `points` suite's SQLite row, and its
+`fsync` is whatever barrier the host actually honours. `oltp_export::replay`,
+run by the `inlaysql-oltp` service after the corpus exists, measures InlaySQL
+a second time: identical rows, identical lookup-key sequence, identical
+commit path, but this process runs inside a container built from
+`docker/Dockerfile` — the same pinned Linux image `docker/test.sh` uses — and
+its database file lives on the named Docker volume `inlaysql-oltp-data`,
+deliberately not the `/corpus` bind mount the exported workload files are
+read from. `postgres-oltp-data` and `mysql-oltp-data` are the same kind of
+volume, so the containerised InlaySQL row's `fsync` crosses whatever boundary
+theirs does.
+
+**What that buys.** Before this, only two of the three engines in the write
+column paid the virtualised-disk cost the note above describes; the
+comparison was between a barrier and something that might not be one. Now
+every engine in the OLTP table pays the same disk, whatever it turns out to
+cost — the comparison is *internally consistent* in a way it was not before,
+even though nobody here has independently confirmed what that disk promises.
+
+**What it does not buy.** Comparable is not the same as hardware-durable. The
+containerised InlaySQL row is not proven to survive a power cut any more than
+the MySQL/PostgreSQL rows are, on Docker Desktop for macOS or Windows — this
+repo cannot verify that a container's `fsync` reaches the platter, only that
+whatever it does reach, all three engines now reach identically. Nor does the
+container remove the structural asymmetry described below: InlaySQL stays a
+library linked into its own process even inside its own container, so it
+never pays the socket round trip MySQL and PostgreSQL do. Crediting the
+containerised row with beating MySQL/PostgreSQL because it removed the fsync
+gap would be honest; crediting it for removing the transport gap would not
+be — that gap is structural and this change does not touch it.
+
+**The gap between the two InlaySQL rows is itself the measurement that
+justifies trusting the containerised one.** If the host row is close to the
+containerised row, the virtualised disk on this machine is not doing much
+work and the earlier concern was overstated for this Docker configuration. If
+the containerised row is many times faster than the host row — the shape the
+original 188 vs. 1,318/1,222 gap suggested — that is direct, on-this-machine
+evidence of what the virtualised fsync costs, measured with the *same*
+engine on both sides of the boundary rather than inferred by comparing two
+different engines. Report both rows; do not report only the faster one.
+
+**Where the match is not exact, and can't be, without changing the OS.**
+InlaySQL's `File::sync_all` issues `F_FULLFSYNC` on macOS — a real barrier
+through the drive's write cache, per the `points` suite's own note above.
+Whether the PostgreSQL and MySQL server processes inside their containers
+reach an equivalent barrier depends on the container runtime and the host
+filesystem backing the Docker volume, not on anything this repo controls;
+`fsync=on` and `innodb-flush-log-at-trx-commit=1` are the strongest settings
+each engine exposes, and that is what is asked for and documented, but this
+repo cannot verify the host honours `fsync` as a real barrier the way it can
+verify its own `F_FULLFSYNC` call. State this plainly rather than implying a
+guarantee the harness cannot make.
+
+### The structural asymmetry that cannot be removed
+
+InlaySQL is a library in the caller's own process — in both of its rows, host
+and containerised. MySQL and PostgreSQL are servers, reached over the Docker
+compose network — every number the `mysql_driver.py` and
+`postgres_oltp_driver.py` drivers report includes a client/server round trip
+that neither InlaySQL number pays. That biases every MySQL/PostgreSQL row
+toward looking slower than either engine would be reached over a faster
+transport (a Unix socket, or a real network rather than a container bridge)
+— the same caveat the pgvector retrieval row above already carries, and for
+the same reason. It is a genuine difference between the two designs, not a
+measurement artifact, and running InlaySQL inside a container alongside the
+servers does not touch it: it cannot be engineered away without giving
+InlaySQL a server to compare against instead of a library call — that
+server-to-server comparison is future work, once InlaySQL has a wire protocol
+of its own to reach over.
+
+Both drivers prepare their statements once, outside the timed loop, and bind
+per iteration (MySQL via the connector's binary-protocol prepared cursor,
+PostgreSQL via psycopg's server-side `prepare=True`) — the same "prepare
+once" methodology the `points` suite already uses for InlaySQL and SQLite, so
+none of the three engines is paying a parse cost the others are not.
+
+### Numbers
+
+Not included here. Per this repo's rule, a number only belongs in this file
+once it regenerates from `./bench/compare.sh` on a machine that is not
+otherwise under load — the methodology above, including the containerised
+InlaySQL row, was verified end to end (both InlaySQL rows land, MySQL and
+PostgreSQL land, `report.py` merges all four without special-casing) while
+other work was running concurrently on the development machine, which makes
+any timing from that run meaningless to publish. Run `./bench/compare.sh`
+yourself, on a quiet machine, to produce the first real OLTP table — it will
+have four rows: InlaySQL (host), InlaySQL (containerised), MySQL, PostgreSQL.
+
+## Server-to-server: InlaySQL's own MySQL wire against MySQL's (AHL-489)
+
+```sh
+./bench/compare.sh                                    # concurrency 1, 8; 2,000 rows, 1,000 lookups by default
+SERVER_CONCURRENCY_LEVELS=1,4,16 ./bench/compare.sh    # override the concurrency levels
+SERVER_ROWS=500 SERVER_LOOKUPS=200 ./bench/compare.sh  # override the workload size
+```
+
+Every row above this one, including the OLTP section's, measures InlaySQL as
+a library linked into the caller's own process against MySQL's and
+PostgreSQL's socket round trip — the "structural asymmetry" section above
+states that plainly rather than hiding it, and `BENCHMARK.md` calls it the
+missing apples-to-apples number. `inlaysql serve --mysql` exists now
+(`docs/server.md`) and a stock ORM's migrations and CRUD run over it
+(AHL-474/475/476), so this section removes the asymmetry for the one
+comparison it is possible to remove it for: **InlaySQL never appears as a
+library here.** `bench/external/server_driver.py` reaches
+`inlaysql-server:3306` with `mysql.connector` — the identical client library,
+the identical prepared-statement/parameter-binding/result-decoding code path
+`mysql_driver.py` already uses to reach `mysql:3306` — because `inlaysql
+serve --mysql` speaks the real MySQL wire protocol rather than an
+approximation of it, so nothing about the client has to change to point it
+somewhere else.
+
+### What is measured
+
+A sysbench-shaped point read/write mix, not sysbench itself: prepared point
+reads by primary key, and single-row durable writes (`INSERT`, autocommit,
+one commit per row) — the same two operations the OLTP section above already
+measures, over the same exported workload (`oltp-rows.csv`,
+`oltp-lookup-keys.csv`), run at **a couple of connection counts** instead of
+one. Each concurrency level opens that many OS threads, one `mysql.connector`
+connection and one prepared statement per thread; writers get disjoint,
+contiguous id ranges (thread *i* writes a contiguous slice of the row list,
+never a shared queue) and readers get disjoint, contiguous slices of the
+lookup-key sequence, so raising the connection count changes how many
+connections are open, not which rows or keys any one of them touches.
+Throughput is total operations over the wall-clock span of the whole
+concurrent phase, matching how `write_oltp_result`'s ops/s is computed above.
+Default levels are **1 and 8**; override with `SERVER_CONCURRENCY_LEVELS`
+(comma-separated).
+
+**The workload size here is deliberately smaller than the OLTP section's own
+`ROWS`/`LOOKUPS`, and is its own separate knob** (`SERVER_ROWS`/
+`SERVER_LOOKUPS`, defaulting to 2,000 rows and 1,000 lookups against the OLTP
+section's 20,000/5,000). This driver measures **two engines at every
+concurrency level**, where the single-connection drivers above measure one
+engine once — reusing the full workload size unchanged would multiply an
+already-durable, one-fsync-per-row write phase by
+`len(concurrency levels) × 2 engines`, which is minutes at the top-level
+defaults and does not fit inside `trust.yml`'s benchmarks job, which budgets
+one hour for `bench/run.sh` and the whole of `bench/compare.sh` together.
+`server_driver.py` still reads the identical exported `oltp-rows.csv`
+(a bounded prefix of it) and the identical seeded `oltp-lookup-keys.csv`
+sequence (filtered down to the keys that land inside that prefix, in their
+original order, not resliced) — the same "generate the experiment once"
+rows and questions the OLTP section's drivers already use, just not every
+one of them. The written result's own `lookups` field always reports the
+count that actually ran, since filtering can leave it below `SERVER_LOOKUPS`
+when the range shrinks a lot.
+
+### Durability — matched the same way the section above matches it
+
+| Engine | Setting | Why |
+| --- | --- | --- |
+| MySQL | `innodb-flush-log-at-trx-commit=1`, binlog off | Unchanged from the OLTP section above — this is the same `mysql` container, reached a second way. |
+| InlaySQL (server) | No knob — every commit is synced before the statement's `COM_STMT_EXECUTE` reply is sent | The server has no durability option of its own to set (`docs/server.md`): every connection opens the same `Database` the library API opens, and every commit takes the same synced-before-return path the host and containerised OLTP rows already measure. This *is* InlaySQL's most durable setting, because it is InlaySQL's only setting. |
+
+PostgreSQL has no row in this table. InlaySQL speaks the MySQL wire
+protocol, not PostgreSQL's (`docs/server.md`), so there is no InlaySQL server
+to put on the other end of a `psycopg` connection — the PostgreSQL row stays
+in the OLTP section above, in-process against a socket, the only comparison
+that exists to make.
+
+### What still is not comparable, even server-to-server
+
+Removing the library-vs-socket asymmetry does not remove every difference
+between these two servers. Four remain, stated here rather than left for a
+reader to discover in a suspicious ratio:
+
+- **The concurrency model is not the same shape.** `inlaysql-server` is
+  thread-per-connection — one OS thread and one `Database` handle per
+  connection, blocking I/O, no thread pool, capped by `--max-connections`
+  (`docs/server.md`, `crates/inlaysql-server/src/lib.rs`). MySQL schedules
+  many connections onto a bounded worker pool. At low concurrency (the
+  default's first level, 1) that difference is invisible. At high
+  concurrency it is real: an OS thread per connection has scheduling and
+  context-switch costs a pooled server does not pay, and nothing in this
+  harness — or in InlaySQL — currently amortises them. **This is a
+  structural property of the two designs, not a tuning gap**, and a widening
+  gap between concurrency levels in this table should be read that way,
+  not as evidence InlaySQL was misconfigured.
+- **One shared credential, on both sides, but for different reasons.** Both
+  containers here are configured with a single username and password. For
+  MySQL that is this benchmark's own setup — a real multi-user grant system
+  sitting unused. For InlaySQL it is the whole of what exists: there is no
+  user table, no per-table permission, no grants at all
+  (`docs/server.md`). This table cannot measure that gap because neither
+  side is asked to exercise per-user permissions; it is named here so the
+  matched-credentials setup is not mistaken for the two servers having
+  equivalent auth models.
+- **No TLS, on either side, for different reasons again.** MySQL's
+  container has no TLS configured for this comparison. InlaySQL's wire
+  protocol does not implement TLS at all yet and never advertises
+  `CLIENT_SSL`, so a client cannot negotiate it even if asked
+  (`docs/server.md`). Both sides are plaintext here; only one side has the
+  option not to be.
+- **A single shared database file, opened by every connection.** Every
+  `inlaysql-server` connection in this table opens the same file
+  (`/data/bench-oltp-server.inlay`), matching how a real deployment would
+  point every client at one server. Disjoint write ranges keep
+  first-committer-wins conflicts at (or near) zero in this workload — see
+  `write_retries` in the output, which counts them rather than silently
+  retrying them away — but a workload with real key contention would see
+  MySQL's row-lock waiting and InlaySQL's optimistic-retry-on-conflict
+  behave differently under the same concurrency number, and this table does
+  not exercise that shape.
+
+### Numbers
+
+Not included here, for the same reason the OLTP section above withholds its
+own: a number only belongs in this file once it regenerates from
+`./bench/compare.sh` on a machine that is not otherwise under load. The
+harness itself — `inlaysql-server` building and answering the MySQL
+handshake, `server_driver.py` measuring both engines at every configured
+concurrency level, `report.py` printing the merged table — was verified
+end to end while other work was running on the development machine, which is
+exactly the condition that makes a timing from that run unpublishable. Run
+`./bench/compare.sh` yourself, on a quiet machine, for the first real
+server-to-server table.
+
+## What these numbers are not
+
+They are wall-clock measurements on one machine. What they are for is catching
+a regression and knowing where we stand — not for a marketing page.
+
+Two costs still dominate and are both scheduled to change:
+
+- **One durable commit per statement.** There is no batch-insert path, so
+  loading N rows costs N `fsync`s — that is what the multi-second "build"
+  column in the vector suite is measuring, not index construction.
+- **Index commits are deferred to the first read**, so a load-then-query
+  sequence pays for the whole batch at once. Before AHL-381 that batch was a
+  full graph rebuild; now it is a one-time cold-load build and every later read
+  only reconciles the rows that changed. `checkpoint()` writes the indexes
+  into the file so the *next* open does not have to rebuild them.
+
+When we publish a number we lose, we publish it. The `points` suite currently
+loses on reads and wins on durable writes; both are in the output.

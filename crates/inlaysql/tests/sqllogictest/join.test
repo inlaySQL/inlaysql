@@ -1,0 +1,49 @@
+# INNER JOIN and LEFT JOIN on an equality predicate, plus a joined aggregate.
+
+statement ok
+CREATE TABLE dept(id INTEGER, name TEXT)
+
+statement ok
+CREATE TABLE emp(id INTEGER, name TEXT, dept_id INTEGER)
+
+statement ok
+INSERT INTO dept VALUES (1, 'eng'), (2, 'sales'), (3, 'ops')
+
+statement ok
+INSERT INTO emp VALUES (1, 'alice', 1), (2, 'bob', 1), (3, 'carol', 2), (4, 'dave', NULL)
+
+query TT rowsort
+SELECT emp.name, dept.name FROM emp JOIN dept ON emp.dept_id = dept.id
+----
+alice eng
+bob eng
+carol sales
+
+query TT rowsort
+SELECT emp.name, dept.name FROM emp LEFT JOIN dept ON emp.dept_id = dept.id
+----
+alice eng
+bob eng
+carol sales
+dave NULL
+
+query ITT nosort
+SELECT dept.id, emp.name, dept.name FROM dept JOIN emp ON dept.id = emp.dept_id ORDER BY emp.id
+----
+1 alice eng
+1 bob eng
+2 carol sales
+
+query TT rowsort
+SELECT emp.name, dept.name FROM emp JOIN dept ON emp.dept_id = dept.id WHERE dept.name = 'sales'
+----
+carol sales
+
+query TI rowsort
+SELECT dept.name, COUNT(*) FROM emp JOIN dept ON emp.dept_id = dept.id GROUP BY dept.name
+----
+eng 2
+sales 1
+
+statement error
+SELECT * FROM emp JOIN missing ON emp.dept_id = missing.id

@@ -1,0 +1,109 @@
+# The date and time family.
+#
+# `now` is absent on purpose: it reads the injected clock, so a fixed
+# expectation would be asserting what time it is. The clock path is
+# covered in inlaysql-core's own tests, where the reading is injected.
+#
+# Expected values come from SQLite.
+
+statement ok
+CREATE TABLE d(id INTEGER PRIMARY KEY, v TEXT, u INTEGER)
+
+statement ok
+INSERT INTO d VALUES (1, '2024-02-29 13:45:56', 1709214356)
+
+statement ok
+INSERT INTO d VALUES (2, '1970-01-01', 0)
+
+statement ok
+INSERT INTO d VALUES (3, 'not a date', NULL)
+
+query T nosort
+SELECT date(v) FROM d ORDER BY id
+----
+2024-02-29
+1970-01-01
+NULL
+
+query T nosort
+SELECT time(v) FROM d ORDER BY id
+----
+13:45:56
+00:00:00
+NULL
+
+query T nosort
+SELECT strftime('%Y-%m-%dT%H:%M:%S', v) FROM d ORDER BY id
+----
+2024-02-29T13:45:56
+1970-01-01T00:00:00
+NULL
+
+query I nosort
+SELECT unixepoch(v) FROM d ORDER BY id
+----
+1709214356
+0
+NULL
+
+query T nosort
+SELECT date(u, 'unixepoch') FROM d ORDER BY id
+----
+2024-02-29
+1970-01-01
+NULL
+
+query T nosort
+SELECT date(v, '+1 day') FROM d WHERE id = 1
+----
+2024-03-01
+
+query T nosort
+SELECT date(v, '-1 month') FROM d WHERE id = 1
+----
+2024-01-29
+
+query T nosort
+SELECT date(v, 'start of month') FROM d WHERE id = 1
+----
+2024-02-01
+
+query T nosort
+SELECT date(v, 'start of year') FROM d WHERE id = 1
+----
+2024-01-01
+
+query T nosort
+SELECT date(v, 'weekday 0') FROM d WHERE id = 1
+----
+2024-03-03
+
+query T nosort
+SELECT strftime('%j', v) FROM d WHERE id = 1
+----
+060
+
+query T nosort
+SELECT strftime('%w', v) FROM d WHERE id = 1
+----
+4
+
+query T nosort
+SELECT strftime('%s', v) FROM d WHERE id = 1
+----
+1709214356
+
+query T nosort
+SELECT strftime('%Y', v) FROM d WHERE id = 3
+----
+NULL
+
+query T nosort
+SELECT date(v, 'start of week') FROM d WHERE id = 1
+----
+NULL
+
+query T nosort
+SELECT strftime('%Q', v) FROM d WHERE id = 1
+----
+NULL

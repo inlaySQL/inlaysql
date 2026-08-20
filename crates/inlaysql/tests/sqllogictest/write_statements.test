@@ -1,0 +1,326 @@
+# INSERT ... SELECT, the conflict clauses, RETURNING, and BEGIN / COMMIT /
+# ROLLBACK.
+#
+# Replayed through the sqlite3 binary. Every one of these statements was an
+# explicit refusal after AHL-410, so this file is the record of what each one
+# does now — including the two distinctions that are easy to get wrong and that
+# the differential oracle had to find:
+#
+#   * an `ON CONFLICT (x)` target narrows which conflicts the clause answers
+#     for, and a collision on any other constraint is an ordinary violation;
+#   * `INSERT OR IGNORE` covers every constraint, `ON CONFLICT DO NOTHING`
+#     covers uniqueness only.
+
+statement ok
+CREATE TABLE t(id INTEGER PRIMARY KEY, e TEXT UNIQUE, n INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1, 'a', 10), (2, 'b', 20)
+
+# ---------------------------------------------------------- INSERT ... SELECT
+
+statement ok
+CREATE TABLE archive(id INTEGER PRIMARY KEY, e TEXT, note TEXT DEFAULT 'copied')
+
+statement ok
+INSERT INTO archive (id, e) SELECT id, e FROM t ORDER BY id
+
+query ITT nosort
+SELECT id, e, note FROM archive ORDER BY id
+----
+1 a copied
+2 b copied
+
+# The query runs to completion before any row is written, so this terminates
+# rather than feeding itself.
+statement ok
+INSERT INTO t (e, n) SELECT e || '!', n FROM t
+
+query T nosort
+SELECT e FROM t ORDER BY id
+----
+a
+b
+a!
+b!
+
+statement error
+INSERT INTO t (id, e) SELECT id FROM t
+
+statement ok
+CREATE TABLE totals(n INTEGER, c INTEGER)
+
+statement ok
+INSERT INTO totals (n, c) SELECT SUM(n), COUNT(*) FROM t
+
+query II nosort
+SELECT n, c FROM totals
+----
+60 4
+
+# --------------------------------------------------------------- OR IGNORE
+
+statement ok
+CREATE TABLE g(id INTEGER PRIMARY KEY, e TEXT UNIQUE, n INTEGER NOT NULL DEFAULT 0 CHECK (n >= 0))
+
+statement ok
+INSERT INTO g VALUES (1, 'a', 1), (2, 'b', 2)
+
+# The middle row collides; the other two land.
+statement ok
+INSERT OR IGNORE INTO g VALUES (3, 'c', 3), (4, 'a', 4), (5, 'd', 5)
+
+query IT nosort
+SELECT id, e FROM g ORDER BY id
+----
+1 a
+2 b
+3 c
+5 d
+
+# OR IGNORE covers CHECK and NOT NULL as well as uniqueness.
+statement ok
+INSERT OR IGNORE INTO g VALUES (6, 'e', -1)
+
+statement ok
+INSERT OR IGNORE INTO g VALUES (7, 'f', NULL)
+
+# ON CONFLICT DO NOTHING does not: it is the upsert clause, and covers
+# uniqueness only.
+statement error
+INSERT INTO g VALUES (8, 'h', -1) ON CONFLICT DO NOTHING
+
+statement error
+INSERT INTO g VALUES (9, 'i', NULL) ON CONFLICT DO NOTHING
+
+statement ok
+INSERT INTO g VALUES (10, 'a', 1) ON CONFLICT DO NOTHING
+
+query I nosort
+SELECT count(*) FROM g
+----
+4
+
+# -------------------------------------------------------------- OR REPLACE
+
+statement ok
+CREATE TABLE r(id INTEGER PRIMARY KEY, e TEXT UNIQUE, n INTEGER)
+
+statement ok
+INSERT INTO r VALUES (1, 'a', 10), (2, 'b', 20)
+
+# Collides with row 1 on the row id and with row 2 on `e`: both go, one lands.
+statement ok
+REPLACE INTO r VALUES (1, 'b', 99)
+
+query ITI nosort
+SELECT id, e, n FROM r ORDER BY id
+----
+1 b 99
+
+statement ok
+INSERT OR REPLACE INTO r VALUES (1, 'z', 5)
+
+query ITI nosort
+SELECT id, e, n FROM r ORDER BY id
+----
+1 z 5
+
+# REPLACE on a NOT NULL column substitutes the column's default rather than
+# replacing a row, and does not absorb a failed CHECK at all.
+statement ok
+CREATE TABLE rn(id INTEGER PRIMARY KEY, n INTEGER NOT NULL DEFAULT 7 CHECK (n >= 0))
+
+statement ok
+INSERT OR REPLACE INTO rn VALUES (1, NULL)
+
+query II nosort
+SELECT id, n FROM rn
+----
+1 7
+
+statement error
+INSERT OR REPLACE INTO rn VALUES (2, -1)
+
+statement ok
+CREATE TABLE rnd(id INTEGER PRIMARY KEY, n INTEGER NOT NULL)
+
+statement error
+INSERT OR REPLACE INTO rnd VALUES (1, NULL)
+
+# ------------------------------------------------------- ON CONFLICT DO UPDATE
+
+statement ok
+CREATE TABLE up(id INTEGER PRIMARY KEY, e TEXT UNIQUE, n INTEGER)
+
+statement ok
+INSERT INTO up VALUES (1, 'a', 10), (2, 'b', 20)
+
+statement ok
+INSERT INTO up VALUES (1, 'a', 5) ON CONFLICT (id) DO UPDATE SET n = n + excluded.n
+
+query II nosort
+SELECT id, n FROM up ORDER BY id
+----
+1 15
+2 20
+
+# No conflict: it inserts, and the DO UPDATE never fires.
+statement ok
+INSERT INTO up VALUES (3, 'c', 7) ON CONFLICT (id) DO UPDATE SET n = 0
+
+query II nosort
+SELECT id, n FROM up ORDER BY id
+----
+1 15
+2 20
+3 7
+
+# A WHERE that excludes the row leaves it as it was; it does not fall back to
+# inserting.
+statement ok
+INSERT INTO up VALUES (1, 'a', 99) ON CONFLICT (id) DO UPDATE SET n = excluded.n WHERE n > 100
+
+query II nosort
+SELECT id, n FROM up ORDER BY id
+----
+1 15
+2 20
+3 7
+
+# The target narrows what the clause answers for: this collides on `e`, and the
+# target names `id`.
+statement error
+INSERT INTO up VALUES (9, 'a', 0) ON CONFLICT (id) DO UPDATE SET n = 0
+
+# Colliding on both: the clause acts on the one it named, and leaves the other
+# alone.
+statement ok
+INSERT INTO up VALUES (1, 'b', 0) ON CONFLICT (id) DO UPDATE SET n = 77
+
+query ITI nosort
+SELECT id, e, n FROM up ORDER BY id
+----
+1 a 77
+2 b 20
+3 c 7
+
+statement ok
+INSERT INTO up VALUES (1, 'b', 0) ON CONFLICT (e) DO UPDATE SET n = 88
+
+query ITI nosort
+SELECT id, e, n FROM up ORDER BY id
+----
+1 a 77
+2 b 88
+3 c 7
+
+# A DO UPDATE still has to satisfy the other constraints.
+statement ok
+CREATE TABLE uc(id INTEGER PRIMARY KEY, n INTEGER NOT NULL CHECK (n > 0))
+
+statement ok
+INSERT INTO uc VALUES (1, 5)
+
+statement error
+INSERT INTO uc VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = NULL
+
+statement error
+INSERT INTO uc VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET n = -1
+
+query II nosort
+SELECT id, n FROM uc
+----
+1 5
+
+# -------------------------------------------------------------- transactions
+
+statement ok
+CREATE TABLE tx(id INTEGER PRIMARY KEY, a INTEGER)
+
+statement ok
+INSERT INTO tx VALUES (1, 1)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO tx VALUES (2, 2)
+
+query I nosort
+SELECT count(*) FROM tx
+----
+2
+
+statement ok
+ROLLBACK
+
+query I nosort
+SELECT count(*) FROM tx
+----
+1
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+INSERT INTO tx VALUES (2, 2)
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT count(*) FROM tx
+----
+2
+
+# `END` is SQLite's spelling of COMMIT.
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM tx WHERE id = 2
+
+statement ok
+END
+
+query I nosort
+SELECT count(*) FROM tx
+----
+1
+
+statement error
+COMMIT
+
+statement error
+ROLLBACK
+
+# ------------------------------------------------------- moving the row id
+
+statement ok
+CREATE TABLE mv(id INTEGER PRIMARY KEY, e TEXT)
+
+statement ok
+INSERT INTO mv VALUES (1, 'a'), (2, 'b')
+
+statement ok
+UPDATE mv SET id = 7 WHERE id = 1
+
+query IT nosort
+SELECT id, e FROM mv ORDER BY id
+----
+2 b
+7 a
+
+query T nosort
+SELECT e FROM mv WHERE id = 7
+----
+a
+
+query I nosort
+SELECT count(*) FROM mv WHERE id = 1
+----
+0
+
+statement error
+UPDATE mv SET id = 2 WHERE id = 7

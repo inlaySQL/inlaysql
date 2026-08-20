@@ -1,0 +1,15 @@
+{
+  "name": "inlaysql-edge",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "InlaySQL running on a Cloudflare Worker: the engine as WASM, the index as a bundled asset.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "smoke": "node smoke.mjs",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "4.42.0"
+  }
+}

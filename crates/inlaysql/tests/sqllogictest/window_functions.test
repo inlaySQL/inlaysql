@@ -1,0 +1,269 @@
+# Window functions (AHL-494): the ranking family, `lag`/`lead`,
+# `first_value`/`last_value`/`nth_value`, the aggregate family `OVER (...)`,
+# `ROWS` frames (and SQLite's implicit default frame), named windows and
+# `FILTER (WHERE ...)`. Every expectation here was produced by running the
+# query through a real sqlite3 3.54 binary, not hand-written.
+
+statement ok
+CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, v INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1,'a',10), (2,'a',20), (3,'a',20), (4,'b',5), (5,'b',NULL)
+
+# row_number/rank/dense_rank ordered by v, which has a tie (id 2 and 3, both
+# v=20) and a NULL (id 5), so all three functions diverge from row_number:
+# rank leaves a gap after a tie, dense_rank does not, and NULL sorts first by
+# default (ascending, no explicit NULLS placement).
+
+query IIIII nosort
+SELECT id, v, row_number() OVER (ORDER BY v), rank() OVER (ORDER BY v), dense_rank() OVER (ORDER BY v) FROM t ORDER BY id
+----
+1 10 3 3 3
+2 20 4 4 4
+3 20 5 4 4
+4 5 2 2 2
+5 NULL 1 1 1
+
+# `ORDER BY v NULLS LAST` — the same query with an explicit placement that
+# actually changes the answer (ascending defaults to NULLS FIRST, so the
+# unadorned form above already put the NULL row first).
+
+query III nosort
+SELECT id, v, row_number() OVER (ORDER BY v NULLS LAST) FROM t ORDER BY id
+----
+1 10 2
+2 20 3
+3 20 4
+4 5 1
+5 NULL 5
+
+# The aggregate family as window functions, `OVER (ORDER BY id)` with no
+# explicit frame: SQLite's implicit default is `RANGE BETWEEN UNBOUNDED
+# PRECEDING AND CURRENT ROW`, and `id` has no ties, so this is an ordinary
+# running total/count/average/min/max.
+
+query IIRIRRR nosort
+SELECT id, v, sum(v) OVER (ORDER BY id), count(v) OVER (ORDER BY id), avg(v) OVER (ORDER BY id), min(v) OVER (ORDER BY id), max(v) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1 10 10 1 10.0 10 10
+2 20 30 2 15.0 10 20
+3 20 50 3 16.666666666666668 10 20
+4 5 55 4 13.75 5 20
+5 NULL 55 4 13.75 5 20
+
+# `PARTITION BY g` with no `ORDER BY` at all: the default frame is the whole
+# partition, so every row of a partition sees the same sum, and it includes
+# the `NULL` row's partition ('b') summing to 5 (`NULL` ignored, not
+# poisoning the sum).
+
+query ITIR nosort
+SELECT id, g, v, sum(v) OVER (PARTITION BY g) FROM t ORDER BY id
+----
+1 a 10 50
+2 a 20 50
+3 a 20 50
+4 b 5 5
+5 b NULL 5
+
+# An explicit `ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING`, ordered by `id`: a
+# 3-row sliding window, clamped at the partition edges (rows 1 and 5 have
+# only two neighbours instead of three).
+
+query IIR nosort
+SELECT id, v, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id
+----
+1 10 30
+2 20 50
+3 20 45
+4 5 25
+5 NULL 5
+
+# A frame that extends well past both partition edges (`5 PRECEDING AND 5
+# FOLLOWING` over 5 rows) clamps to the whole partition for every row —
+# confirmed against sqlite3, not an error and not a truncated frame.
+
+query IIR nosort
+SELECT id, v, sum(v) OVER (ORDER BY id ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM t ORDER BY id
+----
+1 10 55
+2 20 55
+3 20 55
+4 5 55
+5 NULL 55
+
+# `lag`/`lead`, default offset (1) and default value (NULL), then a custom
+# offset and default. The default value only ever applies when the offset
+# reaches outside the partition — not when the target row's own value is
+# NULL, which is why row 4's `lead(v,1,999)` is NULL (the next row, id 5, is
+# genuinely NULL) while row 5's is 999 (there is no next row at all).
+
+query IIIIII nosort
+SELECT id, v, lag(v) OVER (ORDER BY id), lag(v,2,-1) OVER (ORDER BY id), lead(v) OVER (ORDER BY id), lead(v,1,999) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1 10 NULL -1 20 20
+2 20 10 -1 20 20
+3 20 20 10 5 5
+4 5 20 20 NULL NULL
+5 NULL 5 20 NULL 999
+
+# `first_value`/`last_value`/`nth_value` over an explicit whole-partition
+# frame: constant per row, since the frame never changes.
+
+query IIIII nosort
+SELECT id, v, first_value(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), last_value(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), nth_value(v,2) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY id
+----
+1 10 10 NULL 20
+2 20 10 NULL 20
+3 20 10 NULL 20
+4 5 10 NULL 20
+5 NULL 10 NULL 20
+
+# `last_value` with *no* explicit frame is the case that surprises people:
+# the default frame ends at the current row (no ties on `id`), so this is
+# just "this row's own value" — not the partition's actual last value (which
+# the query above shows is `NULL`, from the whole-partition frame).
+
+query III nosort
+SELECT id, v, last_value(v) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1 10 10
+2 20 20
+3 20 20
+4 5 5
+5 NULL NULL
+
+# `ntile`: 5 rows into 2 buckets is 3 then 2 (not 2 then 3); into 3 buckets is
+# 2, 2, 1.
+
+query III nosort
+SELECT id, ntile(2) OVER (ORDER BY id), ntile(3) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1 1 1
+2 1 1
+3 1 2
+4 2 2
+5 2 3
+
+# `FILTER (WHERE ...)` on an aggregate window function: narrows the frame's
+# rows before folding, independent of `PARTITION BY`/`ORDER BY`. Row 1's
+# frame contains only itself (v=10), which the filter (v > 10) excludes,
+# leaving `NULL`.
+
+query IIR nosort
+SELECT id, v, sum(v) FILTER (WHERE v > 10) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1 10 NULL
+2 20 20
+3 20 40
+4 5 40
+5 NULL 40
+
+# `FILTER (WHERE ...)` on a plain (non-window) aggregate: sqlite3 accepts
+# this outside `OVER` too, and it is implemented the same way here. Group
+# 'b' has no row with v > 10 (5 and NULL both fail), so its filtered sum is
+# NULL rather than the group having zero rows.
+
+query TR nosort
+SELECT g, sum(v) FILTER (WHERE v > 10) FROM t GROUP BY g ORDER BY g
+----
+a 40
+b NULL
+
+# `group_concat` as a window function: the running concatenation.
+
+query IIT nosort
+SELECT id, v, group_concat(v) OVER (ORDER BY id) FROM t ORDER BY id
+----
+1 10 10
+2 20 10,20
+3 20 10,20,20
+4 5 10,20,20,5
+5 NULL 10,20,20,5
+
+# A two-key `ORDER BY` (`g, v DESC`) with no `PARTITION BY`: rows 2 and 3 tie
+# on *both* keys (same g, same v) and are peers, so the default frame gives
+# them the identical cumulative value.
+
+query ITIR nosort
+SELECT id, g, v, sum(v) OVER (ORDER BY g, v DESC) FROM t ORDER BY id
+----
+1 a 10 50
+2 a 20 40
+3 a 20 40
+4 b 5 55
+5 b NULL 55
+
+# A window function over an aggregate query's own aggregate: `rank()`
+# ordering groups by their own `sum(v)`.
+
+query TRI nosort
+SELECT g, sum(v), rank() OVER (ORDER BY sum(v) DESC) FROM t GROUP BY g ORDER BY g
+----
+a 50 1
+b 5 2
+
+# `PARTITION BY` under a `NOCASE` column (AHL-469): 'Bob'/'bob' fold into one
+# partition, 'Alice'/'ALICE' into another, and the running sum/count follow
+# the folded partition, not the literal bytes.
+
+statement ok
+CREATE TABLE nc(id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE, v INTEGER)
+
+statement ok
+INSERT INTO nc VALUES (1,'Bob',1), (2,'bob',2), (3,'Alice',3), (4,'ALICE',4)
+
+query ITIRI nosort
+SELECT id, name, v, sum(v) OVER (PARTITION BY name ORDER BY id), count(*) OVER (PARTITION BY name) FROM nc ORDER BY id
+----
+1 Bob 1 1 2
+2 bob 2 3 2
+3 Alice 3 3 2
+4 ALICE 4 7 2
+
+# A single-row partition per group: the running sum is just that row's own
+# value, and `row_number` is 1 for every row.
+
+statement ok
+CREATE TABLE single_partition(id INTEGER PRIMARY KEY, g TEXT, v INTEGER)
+
+statement ok
+INSERT INTO single_partition VALUES (1,'x',100), (2,'y',200), (3,'z',300)
+
+query ITIRI nosort
+SELECT id, g, v, sum(v) OVER (PARTITION BY g ORDER BY id), row_number() OVER (PARTITION BY g ORDER BY id) FROM single_partition ORDER BY id
+----
+1 x 100 100 1
+2 y 200 200 1
+3 z 300 300 1
+
+# An empty table: the window stage sees zero rows and produces zero rows,
+# not an error and not a crash.
+
+statement ok
+CREATE TABLE empty_t(id INTEGER PRIMARY KEY, v INTEGER)
+
+query II nosort
+SELECT id, row_number() OVER (ORDER BY id) FROM empty_t ORDER BY id
+----
+
+# Named windows: a bare `OVER w` uses the declared window as-is, and an
+# inline `OVER (w ROWS BETWEEN ...)` extends it with a frame the base window
+# did not have — both confirmed against sqlite3.
+
+query II nosort
+SELECT id, row_number() OVER w FROM t WINDOW w AS (ORDER BY id) ORDER BY id
+----
+1 1
+2 2
+3 3
+4 4
+5 5
+
+query IIR nosort
+SELECT id, v, sum(v) OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t WINDOW w AS (ORDER BY id) ORDER BY id
+----
+1 10 10
+2 20 30
+3 20 40
+4 5 25
+5 NULL 5

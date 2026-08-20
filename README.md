@@ -1,0 +1,815 @@
+# InlaySQL
+
+[![CI](https://github.com/inlaySQL/inlaysql/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/inlaySQL/inlaysql/actions/workflows/ci.yml?query=branch%3Amain)
+[![WASM](https://github.com/inlaySQL/inlaysql/actions/workflows/wasm.yml/badge.svg?branch=main)](https://github.com/inlaySQL/inlaysql/actions/workflows/wasm.yml?query=branch%3Amain)
+
+<!-- Both badges are pinned to `main`, because a badge that reports whatever ran
+     most recently on any branch is not reporting anything. `trust.yml` has no
+     badge on purpose: it is allowed to go red when the fuzzer finds something,
+     and its output is the artifacts, not a colour. -->
+
+An embedded, serverless database in Rust: SQLite's single-file simplicity, with
+vector search and BM25 as first-class parts of the SQL dialect rather than an
+extension bolted on the side.
+
+> [!WARNING]
+> **Experimental. Do not put data you care about in this yet.**
+>
+> InlaySQL is version `0.0.1` and has never been run in production by anyone.
+> It is a storage engine written from scratch in a few weeks, and the honest
+> summary is:
+>
+> - **The on-disk format is not stable.** The page format is already at
+>   version 5 and the catalog at version 6, and the project is three weeks old.
+>   A version number and a policy exist ([`docs/recovery.md`](docs/recovery.md));
+>   the policy for pre-1.0 formats is *recreate the database*, not migrate.
+> - **No production burn-in.** The crash-safety story rests on deterministic
+>   simulation — thousands of seeded crash and torn-write schedules — which is
+>   a good way to find bugs and is **not** the same as years of real hardware,
+>   real power cuts and real filesystems. SQLite has those; this does not.
+> - **Known gaps are listed, not hidden.** See
+>   [What this is not](#what-this-is-not). Some of them will bite you: filtered
+>   retrieval over-fetches rather than pre-filters, recall on uniformly random
+>   vectors is poor, and there is no cost-based join planner.
+>
+> Use it for experiments, prototypes, and anything you can rebuild from source
+> data. Keep a backup you can restore from something else. If you find a bug,
+> it is genuinely useful to us — please open an issue.
+
+**Where it began.** This started as a walking skeleton assembled from existing
+crates (`redb`, `sqlparser-rs`, `tantivy`, `instant-distance`) behind our own
+API. The storage engine (copy-on-write B+ tree, WAL, MVCC) and both retrieval
+indexes (BM25 and HNSW ANN) are now in-house.
+
+## Why
+
+- **SQLite's model, not Postgres's.** One file, no server, a schema you
+  already know — but with concurrent writers and native retrieval instead of
+  the single writer and bolted-on extensions SQLite ships today.
+- **Retrieval is SQL, not a second system.** `VECTOR` and BM25 are additions
+  to the dialect the planner understands, not a separate vector store an
+  application has to keep in sync and merge client-side.
+- **Correct before fast.** `inlaysql-core` is deterministic-simulation-tested
+  — thousands of seeded crash/torn-write schedules replay byte-for-byte in
+  CI — before any number in this file gets trusted.
+- **Honest about the trade.** Every benchmark below regenerates from a script
+  in this repo, wins and losses both — see [Performance](#performance). What
+  is not built yet is listed just as plainly in
+  [What this is not](#what-this-is-not) and [Next](#next).
+
+How the pieces fit together: [Using it](#using-it) for the API,
+[The SQL surface](#the-sql-surface) for the dialect, and
+[Layout](#layout) for how the crates and the `no_std` boundary are arranged.
+
+## The demo
+
+```sh
+git clone https://github.com/inlaySQL/inlaysql
+cd inlaysql
+cargo run --example hybrid_search
+```
+
+```
+keywords: "embedded database"
+embedded query: "a storage engine that runs inside your application"
+
+vector search only
+  1. [1] 0.4183  embedded databases keep the whole engine inside your process
+  2. [7] 0.2657  write ahead logging and crash recovery in storage engines
+  3. [2] 0.1026  rust gives you memory safety without a garbage collector
+
+BM25 only
+  1. [3] 2.9030  an embedded database written in rust with vector retrieval
+  2. [1] 1.2102  embedded databases keep the whole engine inside your process
+
+hybrid (rank fusion)
+  1. [1] 0.0325  embedded databases keep the whole engine inside your process
+  2. [3] 0.0320  an embedded database written in rust with vector retrieval
+  3. [7] 0.0161  write ahead logging and crash recovery in storage engines
+```
+
+The third ranking comes out of **one ordinary SQL statement**:
+
+```sql
+SELECT id, body, fuse(vector_score(embedding, ?), bm25_score(body, ?)) AS score
+FROM docs
+ORDER BY score DESC
+LIMIT 3;
+```
+
+No separate vector store, no application-side merge step, no second query
+language. The planner recognises the retrieval functions, turns each into an
+index probe, and fuses the two rankings.
+
+## Using it
+
+```rust
+use inlaysql::{Database, Value};
+
+let mut db = Database::open("app.inlay")?;
+
+db.execute(
+    "CREATE TABLE docs (id INTEGER, body TEXT, embedding VECTOR(384))",
+    &[],
+)?;
+db.execute("CREATE INDEX docs_body ON docs (body)", &[])?;
+db.execute("CREATE INDEX docs_embedding ON docs (embedding)", &[])?;
+
+db.execute(
+    "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
+    &[
+        Value::Integer(1),
+        Value::Text("an embedded database written in rust".into()),
+        Value::Vector(embedding),          // straight from your model
+    ],
+)?;
+
+let results = db.query(
+    "SELECT id, body, fuse(vector_score(embedding, ?), bm25_score(body, ?)) AS score
+     FROM docs ORDER BY score DESC LIMIT 5",
+    &[Value::Vector(query_embedding), Value::Text("rust database".into())],
+)?;
+```
+
+A database is **one file**. There is no server, no sidecar index directory and
+nothing to deploy.
+
+### Prepared statements
+
+`execute` and `query` parse and plan from text on every call. For a statement
+that runs in a loop, prepare it once and bind the parameters per execution:
+
+```rust
+let lookup = db.prepare("SELECT body FROM docs WHERE id = ?")?;
+
+for id in ids {
+    let row = db.query_prepared(&lookup, &[Value::Integer(id)])?;
+}
+```
+
+The same statement works on `AsyncDatabase` (`prepare(...).await`,
+`execute_prepared`, `query_prepared`); the handle is reference-counted, so
+holding one and sharing clones between tasks is free.
+
+A plan holds column *ordinals*, so a statement carries the table definition it
+was planned against and re-checks it on every execution. If that table has
+changed underneath, the statement fails with `Error::Stale` — never with a value
+read out of the wrong column — and re-preparing is the fix.
+
+### Async, without a runtime
+
+The same database behind an async API. Statements run on a dedicated I/O
+thread, so your executor is never blocked on an `fsync`:
+
+```rust
+use inlaysql::{AsyncDatabase, Value};
+
+let db = AsyncDatabase::open("app.inlay").await?;
+db.execute("INSERT INTO docs (body) VALUES (?)", &[Value::Text(body)]).await?;
+let results = db.query("SELECT id, body FROM docs WHERE id = ?", &[Value::Integer(7)]).await?;
+```
+
+These are plain futures — Tokio, async-std and smol all drive them, and
+`inlaysql::block_on` drives one without any runtime at all. Nothing in the
+crate depends on a runtime, so embedding InlaySQL never forces one on you.
+
+### Choosing an I/O backend
+
+A backend is a `Device`: read, write, sync, at byte offsets. `Database::open`
+uses ordinary blocking file I/O; on Linux you can hand it an `io_uring` ring
+instead.
+
+```rust
+use inlaysql::Database;
+use inlaysql_uring::UringDevice;                 // Linux only
+
+let db = Database::open_on(UringDevice::open("app.inlay", 32)?)?;
+```
+
+The engine above the seam is unchanged, and
+`crates/inlaysql/tests/backends.rs` runs the same query suite against every
+backend to keep it that way. The `unsafe` that `io_uring` submission requires
+is confined to `inlaysql-uring`; `inlaysql` and `inlaysql-core` remain
+`#![forbid(unsafe_code)]`.
+
+### Handing the database to an agent
+
+An InlaySQL file is an MCP tool. No glue code, no schema translation, no vector
+store to keep in sync:
+
+```sh
+inlaysql serve --mcp app.inlay          # read-only; add --allow-writes to permit writes
+```
+
+The agent gets `schema`, `query`, `hybrid_search` and `changes`; `execute` is
+not even advertised unless writes are allowed. Read-only is enforced by
+*planning* the statement, results are capped by row count and by bytes, and
+embeddings render as `<vector(384)>` rather than as 384 floats in the model's
+context. See [`docs/mcp.md`](docs/mcp.md).
+
+### Speaking MySQL over the wire
+
+```sh
+inlaysql serve --mysql app.inlay --password-env INLAYSQL_PASSWORD
+```
+
+`inlaysql-server` speaks the MySQL wire protocol over one InlaySQL database
+file, so a client that already knows how to talk to MySQL — `mysql`, PDO,
+mysqli, JDBC, `mysql2` — can talk to this instead. `AUTO_INCREMENT`,
+`ENGINE=`, `CHARSET`/`COLLATE`, `UNSIGNED` and MySQL's own DDL and upsert
+syntax are translated in a shim that never touches the engine's SQLite
+dialect (`inlaysql-core` gains nothing from this crate, which is what the
+`determinism` CI job polices); a dropped clause is never silent — it comes
+back as a MySQL `1618` warning naming it, visible in `SHOW WARNINGS`.
+
+It is real enough to run a stock framework now: a Laravel migration —
+`bigint unsigned auto_increment`, `timestamp`, `engine=InnoDB default
+charset=utf8mb4`, a fluent `->unique()`/`->index()`/`->foreign()`,
+`TRUNCATE`, `RENAME TABLE` — completes over the wire, and so does ordinary
+Eloquent CRUD after it: create, find, a model save with a qualified
+`updated_at`, a paginated `whereIn`/`JOIN`/`whereHas` query, and `upsert()`'s
+own `ON DUPLICATE KEY UPDATE`. Window functions (`ROW_NUMBER() OVER (...)`)
+are the current wall — nothing in the dialect has them yet — and the
+collation mapping only folds ASCII case: `WHERE name = 'ADA'` matches a
+stored `'ada'` under a `*_ci` collation the way MySQL does, but not an accent
+(`'é' = 'e'`). It is plaintext, single-user and binds `127.0.0.1` by default.
+[`docs/server.md`](docs/server.md) has the full security posture, the
+function-by-function mapping and the complete divergence list, each checked
+against a real MySQL 8.4.11.
+
+### In a browser
+
+**<https://inlaysql.github.io/inlaysql/>** — the whole database, running
+in your tab. Nothing is sent anywhere; there is no server behind the page. Or
+run it yourself:
+
+```sh
+./crates/inlaysql-wasm/build.sh --serve
+```
+
+The engine compiles to `wasm32` — the core is `no_std` and trait-based, so this
+was a matter of supplying a backend rather than porting anything. 661 KiB
+gzipped. The database is a `Vec<u8>` in the *same format* the CLI reads, so a
+database built in a browser tab saves to OPFS, downloads, and opens with
+`inlaysql serve --mcp` — and back again.
+
+### On an edge runtime
+
+```sh
+cd crates/inlaysql-wasm/edge && npm ci && npm run smoke
+```
+
+The same module, on Cloudflare Workers: a retrieval index built once natively
+and shipped to the edge as a static asset, queried in the isolate that took the
+request. No database to connect to, no pool, no region to be far from.
+
+```
+GET /search?q=embedded%20database&limit=3
+
+{ "results": [
+  { "id": 3, "body": "an embedded database written in rust with vector retrieval", "score": 0.0328 },
+  { "id": 1, "body": "embedded databases keep the whole engine inside your process", "score": 0.0323 },
+  { "id": 5, "body": "approximate nearest neighbour search over embeddings",        "score": 0.0159 }
+] }
+```
+
+The file that worker opens was written by the *native* build. Both demos, the
+sizes and what CI checks: [`docs/wasm.md`](docs/wasm.md).
+
+### Change data capture
+
+```sh
+inlaysql changes app.inlay --from 41
+```
+
+```
+41	insert	notes	17
+42	update	notes	3
+43	delete	notes	9
+```
+
+A record says *what* changed, not what it became — read the row for its current
+contents. A consumer that has fallen outside the retention window is told so
+(`lost`) rather than handed a silently short list.
+
+## The SQL surface
+
+SQLite's dialect is the baseline. Stage 1 implements a slice of it, plus:
+
+| Addition | Meaning |
+| --- | --- |
+| `VECTOR(n)` | A column of fixed-width `f32` embeddings. |
+| `VECTOR(n, INT8)` | The same SQL value with deterministic per-vector int8 scalar quantisation in rows and ANN storage (about 4x smaller, with measured recall loss). |
+| `INTEGER PRIMARY KEY` | SQLite's row-id alias: the key *is* the row's address, so `WHERE id = 42` is one tree descent, not a scan. |
+| `CREATE [UNIQUE] INDEX` / `DROP INDEX` | Declares an index. On `TEXT` it is a BM25 index by default (`USING BTREE` asks for a scalar one instead); on `VECTOR` it is ANN; on `INTEGER`/`REAL` it is a scalar B-tree, which may span more than one column and may be declared `UNIQUE`. |
+| `vector_score(column, embedding)` | Approximate nearest neighbours over a `VECTOR` column. |
+| `bm25_score(column, 'terms')` | BM25 relevance over a `TEXT` column. |
+| `fuse(a, b, ...)` (alias `rrf`) | Reciprocal rank fusion over the retrieval expressions inside it. |
+
+Retrieval functions are not scalar functions evaluated per row — the planner
+hoists them out and answers each from an index. An index exists only where a
+`CREATE INDEX` declared it (or where a pre-`CREATE INDEX` database was
+grandfathered): a query that scores an unindexed column is an error, not a
+silent scan.
+
+### Scalar indexes and joins that use them
+
+`CREATE INDEX users_email ON users (email)` — or `pairs_ab ON pairs (a, b)`
+for a composite key — builds an ordinary ordered B-tree over one or more
+`INTEGER`/`REAL`/`TEXT` columns (AHL-423), living in the same copy-on-write
+tree as the rows, so it gets WAL, crash recovery and MVCC rebase for free. A
+top-level equality or range predicate on an indexed column becomes a range
+probe instead of a full scan — worth roughly 1,500x over the engine's own
+unindexed scan (`BENCHMARK.md`) — and `CREATE UNIQUE INDEX` enforces a
+uniqueness constraint at insert time. The same index also answers the inner
+side of a join: `FROM posts JOIN users ON posts.user_id = users.id` probes
+`users` by one tree descent per outer row instead of materialising and
+scanning it, when the `ON` is a top-level equality on the inner table's
+`INTEGER PRIMARY KEY` or an indexed column (AHL-464). Index selection stops
+there — there is no cost model, so a join or a predicate the rule does not
+cover still runs nested-loop over a full scan; see
+[What this is not](#what-this-is-not).
+
+### What a retrieval function means in a join
+
+A retrieval index lives over one table's rows, so when a query joins tables the
+retrieval expression may reference **only the driving table** (the first table
+in `FROM`). The ranking is computed over that table's rows, then the join runs,
+then `WHERE` and `LIMIT` apply to the joined result. An inner join can therefore
+drop ranked rows, and a one-to-many join can expand them past `LIMIT`; the score
+still reflects the driving table's rows only. A query that names a
+non-driving table's column in `vector_score`/`bm25_score` is rejected at prepare
+time rather than answered incorrectly. Retrieval and aggregation cannot be
+combined in one query.
+
+### Why fusion works on ranks, not scores
+
+Cosine similarity lives in `[-1, 1]`; BM25 is unbounded and depends on corpus
+statistics. Normalising one against the other needs calibration nobody has at
+query time. Reciprocal rank fusion throws the raw scores away and combines
+*positions*:
+
+```
+score(d) = Σ_retrievers 1 / (60 + rank(d))
+```
+
+That is why, in the demo above, the row both retrievers ranked well beats the
+row that only one of them loved.
+
+Also supported: `SELECT` with projections and `*`, `WHERE` filters over scalar
+expressions (`column <op> value`, `AND`/`OR`, arithmetic and comparisons),
+`DISTINCT`, multi-key `ORDER BY` (with `NULLS FIRST`/`NULLS LAST`) on a
+column, a scalar expression or a projection alias, `LIMIT` and `OFFSET`
+(both literal or a bound `?`), `?` bind parameters, `SELECT` without a `FROM`
+clause over scalar expressions (`SELECT 1 + 2 * 3`, comparisons, `NULL` and
+unary minus), `UPDATE` / `DELETE` with `WHERE` filters and expressions on the
+right-hand side, `INSERT ... SELECT`, `INNER JOIN` and `LEFT JOIN` on an
+equality predicate (nested-loop, with the inner side probed by index where
+the rule above applies), the aggregate functions `COUNT`, `SUM`, `MIN`,
+`MAX` and `AVG` with `GROUP BY`, `HAVING`, `COUNT(DISTINCT x)` and
+`GROUP_CONCAT`, three-valued logic (`NOT`, `IS NULL`, `IS NOT NULL`), the
+expression operators `LIKE` (with `ESCAPE`), `IN` over a literal list or a
+subquery, `BETWEEN`, `CASE` in both its forms, `CAST`, `||`, blob literals
+(`X'..'`) and `COLLATE` (SQLite's three collating sequences — `BINARY`,
+`NOCASE`, `RTRIM` — column-level, expression-level and on an index's column
+list), the scalar function library (`length`, `upper`, `lower`, `substr`,
+`trim`/`ltrim`/`rtrim`, `replace`, `instr`, `abs`, `round`, `coalesce`,
+`ifnull`, `nullif`, scalar `min`/`max`, `random`, `hex`) and the date/time
+family (`date`, `time`, `datetime`, `strftime`, `unixepoch`,
+`CURRENT_TIMESTAMP`), `BEGIN`/`COMMIT`/`ROLLBACK` as SQL,
+`DROP TABLE [IF EXISTS]`, `CREATE TABLE IF NOT EXISTS`, `ALTER TABLE` (`ADD COLUMN`,
+`RENAME TO`, `RENAME COLUMN`, `DROP COLUMN`), `CREATE TABLE` constraints
+(`DEFAULT`, `NOT NULL`, `UNIQUE`, `CHECK`; a foreign key is recorded and left
+unenforced, SQLite's own long-standing default), `INSERT OR IGNORE`/
+`OR REPLACE`, `ON CONFLICT DO NOTHING`/`DO UPDATE` (upsert), and `RETURNING`
+on `INSERT`/`UPDATE`/`DELETE`.
+
+Subqueries too, since AHL-463: a scalar `(SELECT ...)`, `IN (SELECT ...)`,
+`EXISTS (SELECT ...)`, a derived table (`FROM (SELECT ...)`), and the
+correlated form of each. They are not decorrelated — a correlated subquery is
+re-evaluated per outer row — and one in an `UPDATE`, `DELETE` or
+`INSERT ... VALUES` is refused rather than half-run.
+
+`UNION`/`INTERSECT`/`EXCEPT` and non-recursive `WITH`, since AHL-473. Every
+compound operator shares one precedence and chains left-associatively; the
+per-column comparison — for dedup and for the compound's own `ORDER BY` — is
+always the *left* arm's collation, however many operators deep; `UNION`'s
+dedup keeps the last-occurring row of a colliding group where
+`INTERSECT`/`EXCEPT` keep the first, deduplicated. A `WITH` reference becomes
+a derived table planned once, but a CTE referenced twice may *run* once per
+reference rather than being shared — this engine's own choice, not a bug, and
+pinned as such in `ctes.test`. `WITH RECURSIVE` is refused, named in the
+message.
+
+Not yet, and refused explicitly rather than silently ignored: `WITH
+RECURSIVE`, window functions (`ROW_NUMBER() OVER (...)`) and aggregate
+`FILTER`, `SAVEPOINT`, the partial-write conflict resolutions (`INSERT OR
+ROLLBACK`/`OR FAIL`, `UPDATE OR REPLACE`/`OR IGNORE` — a statement here is
+already atomic, so they cannot mean what they say), `CREATE TABLE ... AS
+SELECT`, `TEMPORARY`, `WITHOUT ROWID`, `STRICT`, the `AUTOINCREMENT` keyword,
+`COUNT(DISTINCT *)`, `GROUP_CONCAT(DISTINCT ...)`, and a collation this engine
+does not have (there is no `CREATE COLLATION`, so a name outside
+`BINARY`/`NOCASE`/`RTRIM` is refused rather than silently compared byte-wise
+under a name that promises otherwise).
+
+## SQL Logic Test
+
+Compatibility is measured against SQLite's
+[SQL Logic Test](https://www.sqlite.org/sqllogictest/doc/trunk/about.wiki)
+corpus, in the standard `statement ok` / `query <types>` format. The harness is
+`inlaysql::sqllogictest`; a curated subset lives in
+`crates/inlaysql/tests/sqllogictest/` and runs in CI on every push.
+
+```sh
+cargo test -p inlaysql --test sqllogictest          # fail on any mismatch
+cargo run -p inlaysql --bin sqllogictest -- \
+  crates/inlaysql/tests/sqllogictest/*.test          # print the pass rate
+```
+
+Current pass rate over the subset: **1008/1008 (100%)** — covering `CREATE TABLE`,
+`INSERT`, projection, `WHERE`, `DISTINCT`, `ORDER BY` (column, expression,
+alias, multi-key, `NULLS FIRST`/`LAST`), `LIMIT`/`OFFSET` (literal or bound),
+type coercion and affinity, `SELECT`-without-`FROM` scalar expressions,
+expressions in the projection and `WHERE` of `FROM` queries, `UPDATE`/
+`DELETE`, `INSERT ... SELECT`, `INTEGER PRIMARY KEY`, three-valued logic
+(`NOT`, `IS NULL`, `IS NOT NULL`), `INNER JOIN` and `LEFT JOIN`, including the
+index nested-loop join, the aggregate functions (`COUNT`, `SUM`, `MIN`,
+`MAX`, `AVG`) with `GROUP BY`, `HAVING`, `COUNT(DISTINCT x)` and
+`GROUP_CONCAT`, scalar B-tree `CREATE INDEX` / `DROP INDEX` (including
+`UNIQUE` and composite keys) alongside `CREATE INDEX` for BM25/ANN, `LIKE`,
+`IN`, `BETWEEN`, `CASE`, `CAST`, `||` and blob literals, `COLLATE` with
+SQLite's three collating sequences (`BINARY`, `NOCASE`, `RTRIM`) resolved by
+SQLite's own rules, declared constraints (`DEFAULT`, `NOT NULL`, `UNIQUE`,
+`CHECK`, recorded foreign keys), `DROP TABLE`, `ALTER TABLE`,
+`BEGIN`/`COMMIT`/`ROLLBACK`, every conflict clause (`INSERT OR IGNORE`/
+`REPLACE`, `ON CONFLICT DO NOTHING`/`DO UPDATE`) and `RETURNING`, subqueries
+in every read position (scalar, `IN (SELECT ...)`, `EXISTS`, derived tables,
+correlated and uncorrelated), and `UNION`/`INTERSECT`/`EXCEPT`/non-recursive
+`WITH`. The number is meant to grow (and be reported) as the dialect
+matures — it does not yet include the parts of the corpus that exercise
+`WITH RECURSIVE` or window functions, because the dialect does not have them.
+
+One file in that subset asserts **refusals** rather than results, because the
+alternative was worse than a missing feature: `INSERT ... ON CONFLICT`,
+`INSERT OR REPLACE`, `RETURNING` and every `CREATE TABLE` constraint (`DEFAULT`,
+`NOT NULL`, `UNIQUE`, `CHECK`, `REFERENCES`) used to parse and then be silently
+discarded — the statement reported success while doing something the caller did
+not ask for. They are now refused explicitly until the dialect implements them.
+[`TESTING.md`](TESTING.md) also names the three places the dialect knowingly
+disagrees with SQLite: rendering a `REAL` as text, columns being *typed*
+rather than merely affine (four of five affinities convert or reject where
+SQLite's affinity is a preference that keeps a value it cannot convert), and
+one row-id counter per database rather than per table. Integer overflow used
+to be a fourth; AHL-412 made arithmetic promote to `REAL` on overflow the way
+SQLite does, so that one is gone.
+
+How everything else is tested — deterministic simulation, metamorphic and
+differential logic-bug tests, fuzzing, cross-backend equivalence — and what is
+*not* covered is in [`TESTING.md`](TESTING.md). Benchmarks against SQLite,
+`sqlite-vec`, DuckDB, pgvector, MySQL and PostgreSQL, including the ones we
+lose, are in [`bench/README.md`](bench/README.md) and
+[`BENCHMARK.md`](BENCHMARK.md); every number in either one regenerates from
+`./bench/run.sh` or `./bench/compare.sh`.
+
+## Layout
+
+```
+crates/
+  inlaysql-core/    SQL + planner + executor + storage + retrieval  (no_std)
+  inlaysql/         file-backed Device, Database and AsyncDatabase  (std)
+  inlaysql-uring/   io_uring Device backend  (Linux)
+  inlaysql-mcp/     MCP server mode and the `inlaysql` CLI
+  inlaysql-server/  MySQL wire-protocol server mode, depends on inlaysql alone
+  inlaysql-wasm/    the engine compiled to WebAssembly
+    www/            the browser demo, published to GitHub Pages
+    edge/           a Cloudflare Worker, smoke-tested on workerd in CI
+    browser/        Playwright harness that drives www/ in headless Chromium
+  inlaysql-bench/   benchmark harness, incl. the SQLite comparison
+fuzz/               cargo-fuzz targets
+bench/run.sh        reproducible benchmark run (SQLite, sqlite-vec)
+bench/compare.sh    the same, against DuckDB, pgvector, MySQL and PostgreSQL in containers
+```
+
+`inlaysql-core` is where the database actually lives. It is `no_std`, so it
+**cannot** open a file, read the clock or start a thread even by accident —
+everything it needs arrives through the traits in `inlaysql_core::traits`
+(`Storage`, `FullTextIndex`, `VectorIndex`, `Clock`, `Rng`).
+
+Stage 2 built the storage engine inside `inlaysql-core`: a copy-on-write B+ tree
+(`btree`) with a write-ahead log (`wal`) that survives crashes, torn writes and
+reordered syncs, recovered deterministically under the fault-injecting
+simulation harness (`sim`), plus MVCC: snapshot reads and optimistic concurrent
+writers with first-committer-wins. Native writers reserve commit order briefly,
+append to four WAL regions and perform their durability syncs in parallel;
+stale disjoint-key transactions rebase, while a real overlapping write is
+reported as `Error::Conflict`. Stage 4 moved both retrieval indexes into the
+engine: an in-engine HNSW ANN index (`hnsw`) and an Okapi BM25 full-text index
+(`bm25`) replace the borrowed `instant-distance` and `tantivy` crates, and both
+are written into the database file so opening it does not have to re-read every
+row. See [`docs/recovery.md`](docs/recovery.md) for the crash-recovery protocol
+and [`docs/indexes.md`](docs/indexes.md) for how a saved index stays honest
+about what it describes.
+`redb` remains behind the traits for comparison and benchmarks.
+
+That is not a style preference. It is what makes deterministic simulation
+testing possible: `inlaysql_core::mem` provides a complete in-memory
+environment — `BTreeMap` storage, a reference BM25 implementation, brute-force
+nearest neighbours, a logical clock and a seeded PRNG — so an entire workload
+replays byte for byte on any machine. The multi-writer sweep drives all four
+WAL regions through crash/torn-write schedules and checks that recovery is
+always one committed interleaving.
+
+```rust
+let mut engine = inlaysql_core::mem::engine()?;   // no files, no clock, no threads
+```
+
+CI enforces the boundary: it fails if `#![no_std]` disappears from core or if an
+OS-facing crate turns up in its dependency tree.
+
+## Performance
+
+```sh
+LOOKUPS=50000 ./bench/run.sh      # points, indexed, joins, concurrency, vectors, retrieval
+./bench/compare.sh                # DuckDB, pgvector, MySQL, PostgreSQL (needs Docker)
+```
+
+Every number below is [`BENCHMARK.md`](BENCHMARK.md), regenerated at commit
+`2ce978a` on a quiet machine (load average 2.5–3.8 across the runs). One
+developer machine — reproduce it, do not trust it. See
+[`bench/README.md`](bench/README.md) for how each comparison is kept fair:
+matched schema, prepared statements on both sides, matched durability
+(`fullfsync` on macOS, which is what makes these numbers mean anything at
+all), and each engine's own query plan checked rather than assumed.
+
+Several rounds of work aimed squarely at the losses below have landed on
+`main` since this commit — a clock-based page cache and a retained leaf
+cursor (AHL-472), `ValueRef` on the read path (AHL-478) and a cheaper index
+entry walk (AHL-479) moved the join and range numbers 4–30% each, and a
+double-`fsync` fix (AHL-480) targets the durable-write row — but none of it
+has been measured together on a quiet machine yet, so the table below is
+what stands until that regeneration runs.
+
+### Against SQLite
+
+SQLite is measured two ways, because they are two different promises:
+`journal` + `synchronous=FULL` + `fullfsync` is the durability InlaySQL
+always gives; WAL + `synchronous=NORMAL` is SQLite at its fastest, and the
+harder target.
+
+| Workload | InlaySQL | SQLite, durable | SQLite, fastest |
+| --- | --- | --- | --- |
+| Point read by primary key | **1,662,494 ops/s**, 500 ns p50 | 305,370 ops/s (**5.4x**) | 1,165,810 ops/s (**1.43x**) |
+| Point read, secondary index | **499,740 ops/s**, 1.79 µs p50 | 223,877 ops/s (**2.2x**) | 667,768 ops/s (we lose 1.34x) |
+| Indexed range scan, 50 rows | 48,915 ops/s, 19.25 µs p50 | 112,915 ops/s (we lose 2.3x) | 179,641 ops/s (we lose 3.7x) |
+| Join, PK inner, full scan | 71.5 ms | 9.37 ms (we lose 7.6x) | — |
+| Join, secondary-index inner, full scan | 166.5 ms | 14.8 ms (we lose 11.4x) | — |
+| Durable write, one commit each | **241 ops/s**, 3.99 ms p50 | 93 ops/s (**2.6x**) | — |
+| Concurrent durable writers, 8 threads | **832 commits/s**, 0.0% aborted | 92 commits/s (**9.0x**) | — |
+
+A single indexed point probe wins — the index itself is worth roughly 1,500x
+over the engine's own unindexed scan. **Iterating rows is where we lose**: a
+50-row range scan and both join shapes above are slower than SQLite, and the
+`LIMIT 10` form of the same two joins narrows from 7.6–11.4x down to
+2.3–3.8x, which is what pins the cost as per-row rather than per-query. This
+is the top open performance target — [`PERF.md`](PERF.md) has the profile,
+and index selection stops at the narrow rule in
+[What this is not](#what-this-is-not).
+
+The point-read win is the page cache (AHL-420): caching decoded pages took
+warm p50 from 6.75 µs to 500 ns, past SQLite in *both* configurations above —
+including WAL mode with `synchronous=NORMAL`, the fastest reading
+configuration SQLite has. The cache needs no invalidation protocol because
+the tree is copy-on-write and (until recently) never reused a page id; a free
+list that reuses ids now exists inside the engine (AHL-481), versioning the
+cache the way `crates/inlaysql-core/src/btree/cache.rs` warns it must, but it
+sits behind a handle-level opt-in that nothing in the public API turns on
+yet. The caveat that keeps the point-read row a *warm* number: our *miss*
+path — a `pread` plus a decode — is still dearer than SQLite's, so a cold
+handle warms up more slowly.
+
+Durable writes win because we pay one `fsync` per commit against the
+journal's several; batching the same workload into one commit per many rows
+reaches 32,586 ops/s at 21.8 µs (**135x**) — a bulk-load number, not the
+transaction one above. Concurrent writers now scale where they used to
+flatten: the reservation gate used to hold ~100% of wall clock re-deriving
+committed state on every commit, so no two commits ever overlapped in the
+sync window; with the gate down to ~0.9 ms (AHL-468), group commit (AHL-461)
+batches most fsyncs and 8 writers do 3.4x the work of one instead of 1.45x.
+
+### Against `sqlite-vec`, DuckDB and pgvector
+
+2,000 vectors, dim 384, 100 queries, top-10, recall measured against an
+exhaustive oracle:
+
+| Corpus | recall@10 | InlaySQL p50 | vs `sqlite-vec` |
+| --- | --- | --- | --- |
+| Text-derived embeddings | 1.000 | 71.17 µs | **9.4x faster at 100% of its recall** |
+| Uniform random | 0.922 | 98.50 µs | 6.8x faster at 92.2% of its recall |
+
+Both corpus shapes are published because only one of them flatters us:
+uniformly random vectors in 384 dimensions have no structure for a graph
+index to navigate, so recall falls and no tuning fixes it — text-derived
+embeddings are what an application actually stores. `VECTOR(n, INT8)`
+quantisation costs 0.014 recall on the realistic corpus for a 4x smaller
+resident vector payload.
+
+Hybrid retrieval (vector + BM25, fused in one SQL statement) at 2,000
+documents: ingest 14,119 docs/s, vector p50 80.75 µs, BM25 p50 315.63 µs,
+hybrid p50 377.67 µs.
+
+Against DuckDB and pgvector, one corpus and one exhaustive ground truth
+shared by all three engines — see
+[`bench/README.md`](bench/README.md#benchcomparesh--duckdb-pgvector-mysql-and-postgresql)
+for the full methodology. 5,000 documents, dim 128, 100 queries, top-10:
+
+| Engine | recall@10 | vector p50 | hybrid p50 |
+| --- | --- | --- | --- |
+| InlaySQL (HNSW + BM25) | 1.000 | 0.073 ms | **0.85 ms** |
+| DuckDB (`vss` HNSW + `fts`) | 0.993 | 3.89 ms | 11.69 ms |
+| pgvector (HNSW + `ts_rank`) | 0.989 | **0.17 ms** | 14.68 ms |
+
+**Hybrid is roughly 14–17x** the nearer baseline, because it is one statement
+here and two queries plus client-side rank fusion there — not a comparison of
+equal amounts of work either way, and `bench/README.md` says so.
+Vector-only, pgvector's 0.17 ms **includes a socket round trip** and is
+within touching distance of our 0.073 ms in-process; read that as close, not
+as a rout in either direction.
+
+Recall on uniformly random vectors is a structural, not a tuning, problem: on
+text-derived embeddings recall@10 stays flat across a 20x range of corpus
+sizes (0.998 at 5,000 rows, 1.000 at 20,000, 0.998 at 100,000); on uniformly
+random unit vectors in 384 dimensions it falls to 0.12 at a hundred thousand,
+because every pairwise distance in that corpus concentrates to within about a
+percent of the rest — there is no downhill for a graph to walk. Both numbers
+are in `bench/README.md`, reproduced with `SUITE=vectors ./bench/run.sh`.
+
+### Against MySQL and PostgreSQL
+
+Reads win by a wide margin; sequential writes now beat PostgreSQL and still
+lose to MySQL. InlaySQL is measured twice — on the host with a real
+`F_FULLFSYNC` barrier, and inside a container on the same volume class as the
+servers, so all three pay the same virtualised fsync:
+
+| Engine | write ops/s | read ops/s |
+| --- | --- | --- |
+| InlaySQL, host (real `F_FULLFSYNC`) | 243 | 807,000 |
+| InlaySQL, containerised | **529** | 675,000 |
+| MySQL 8 (`innodb_flush_log_at_trx_commit=1`, binlog off) | **1,434** | 10,800 |
+| PostgreSQL 17 (`fsync=on`, `synchronous_commit=on`) | 475 | 20,600 |
+
+**Reads: ~62x MySQL and ~33x PostgreSQL**, containerised — an in-process
+library against a socket round trip, an asymmetry that is structural and
+stated rather than hidden. **Writes: PostgreSQL is beaten** (529 vs 475);
+**MySQL is still 2.7x faster** — this workload is one commit at a time on one
+connection, so group commit cannot fire by design, and what is left is
+per-commit cost against InnoDB's own redo write.
+
+What none of this proves: Docker Desktop's virtual disk was never
+independently verified to honour `fsync` as a barrier for any of the three
+engines, and there is still no **server-to-server** number —
+[`inlaysql serve --mysql`](#speaking-mysql-over-the-wire) exists, but
+benchmarking it against MySQL/PostgreSQL over the same wire, rather than
+InlaySQL as a library, is still open . Also
+not measured anywhere here: sustained or multi-core saturation, and
+cold-cache reads — the point-read rows throughout this section are warm, and
+an application that opens a handle, reads a handful of rows and exits sees
+something weaker, because our miss path is dearer than SQLite's.
+
+## Next
+
+Roughly in order of value. Every line here is a gap already named in
+[What this is not](#what-this-is-not) or in the benchmarks above — nothing
+below is a surprise to the project, it is the honest state of it:
+
+1. **The join and range miss path** — the last measured read loss to
+   SQLite. AHL-479 found the entry-range walk itself was not the
+   bottleneck — reading admitted entries without cloning their keys moved
+   the indexed-range case +15–18%, but a full join barely moved (~4.5%),
+   because the join workload's table plus index (~18 MiB) exceeds the
+   default 8 MiB page cache: the same "our miss path is dearer than
+   SQLite's" story the point read had, now showing up in a workload big
+   enough to miss. [`PERF.md`](PERF.md) has the profile and the
+   cache-budget arithmetic that settled it.
+2. **The sequential-commit gap to MySQL.** One write shape is still
+   behind — 1,434 vs 529 containerised ops/s, 2.7x. Group commit cannot fire
+   on a single connection, so what is left is per-commit cost against
+   InnoDB's own redo write.
+3. **Wiring the free list into the public API.** The free list and page
+   reuse landed inside the engine (AHL-481), including the versioned page
+   cache and the DST sweep that reuse needs — but nothing reachable through
+   `EngineOptions`, `Database` or the SQL surface can turn it on for a real
+   user yet, and there is still no `VACUUM` for whole-file compaction. See
+   `docs/recovery.md` for what is and is not done.
+4. **A cost-based join planner.** Joins run nested-loop in the order they are
+   written; index selection is the narrow rule in
+   [Scalar indexes and joins that use them](#scalar-indexes-and-joins-that-use-them).
+   This is what the join losses in [Performance](#performance) are waiting
+   on.
+5. **A server-to-server benchmark**, once the items above settle —
+   [`inlaysql serve --mysql`](#speaking-mysql-over-the-wire) against
+   MySQL/PostgreSQL over the same wire, the apples-to-apples this file does
+   not claim yet .
+6. **Multi-column and composite retrieval indexes.** `CREATE INDEX` for
+   BM25/ANN is single-column only — the scalar B-tree index already supports
+   composite keys.
+7. **Filter-aware graph walks and per-value sub-indexes.** A restrictive
+   `WHERE` on a retrieval query over-fetches from the index rather than
+   pre-filtering it.
+8. **Quantised paged index nodes.** `PagedHnswIndex` stores exact `f32` even
+   for an `INT8` column, so the paged path does not yet get the 4x that
+   quantisation buys the in-memory index.
+9. **Deeper SQL Logic Test coverage, real SQLancer runs and continuous
+   fuzzing** beyond what `trust.yml` runs today (see
+   [`docs/sqlancer.md`](docs/sqlancer.md)).
+
+Full Postgres parity is deliberately not on this list — see the last point in
+[What this is not](#what-this-is-not). Neither are window functions and
+`WITH RECURSIVE`: nothing in the Laravel corpus that motivated Phase 1 needs
+them yet.
+
+## What this is not
+
+Explicit non-goals for the current stage, all of them scheduled work rather
+than oversights:
+
+- **Retrieval indexes are explicit and single-column.** A `TEXT` column is
+  only full-text indexed after `CREATE INDEX idx ON t (body)` (or in a
+  database written before `CREATE INDEX` existed, whose columns are
+  grandfathered); the same for a `VECTOR` column and an ANN index. Composite
+  and multi-column *retrieval* indexes are not supported (see
+  [Next](#next)). A scalar index is a different structure: `CREATE INDEX` on
+  `INTEGER`/`REAL`/`TEXT` (`USING BTREE` on the last) is a real ordered
+  B-tree, may be declared `UNIQUE`, and may span more than one column — see
+  [Scalar indexes and joins that use them](#scalar-indexes-and-joins-that-use-them).
+- **No cost-based join planner.** Joins run nested-loop in the order they are
+  written, and are never reordered or hashed. Index selection is the narrow
+  rule that already pays: a retrieval expression is answered by its index, a
+  top-level equality on `INTEGER PRIMARY KEY` or a scalar-indexed column by a
+  tree descent or range probe — including as the inner side of a join
+  (AHL-464) — everything else by a full scan. [Performance](#performance)
+  publishes what that rule still loses to SQLite on an unindexed range or a
+  join it declines.
+- **Recall on uniformly random vectors is poor, and cannot be fixed by
+  tuning.** On text-derived embeddings recall@10 stays flat across a 20x
+  range of corpus sizes tested (0.998 at 5,000 rows, 1.000 at 20,000, 0.998
+  at 100,000); on uniformly random unit vectors in 384 dimensions it is 0.12
+  at a hundred thousand. That is not a defect in the index — distances in
+  that corpus concentrate to within about a percent of each other, so there
+  is no structure for a graph to navigate, and holding recall fixed there
+  costs an `ef_search` that grows with the corpus. `bench/README.md`
+  measures both and explains the difference; the first is what an
+  application sees.
+- **Filtered retrieval over-fetches rather than pre-filters.** A `WHERE` on a
+  retrieval query is applied by widening the index probe until the filter admits
+  `LIMIT` rows or the index is exhausted, so a restrictive filter returns the
+  rows that match it instead of an empty result. When no amount of over-fetching
+  satisfies the filter, the query falls back to scanning every row the index can
+  rank — correct, at the cost of the full scan. Filter-aware graph walks and
+  per-value sub-indexes are later-stage work.
+- **Vector quantisation is explicit per column.** `VECTOR(n)` remains exact;
+  `VECTOR(n, INT8)` reduces row and HNSW vector payloads by about 4x using a
+  symmetric per-vector scale. Queries stay `f32`, and the vectors benchmark
+  publishes recall, file size and resident vector bytes for both corpus shapes.
+- **The in-memory ANN index is still the default, and holds the whole corpus.**
+  `Database::open` uses `HnswIndex`, which keeps every embedding and its
+  normalised copy in RAM — roughly twice the corpus bytes for exact columns or
+  half the original `f32` corpus bytes for int8 columns, before the graph.
+  `Database::open_paged` opens `inlaysql_core::hnsw_paged::PagedHnswIndex`
+  instead: the graph is stored as ordinary rows in the same database file and
+  read through a bounded LRU cache, so the resident working set is the cache
+  rather than the corpus. It writes through the engine's own transaction, so the
+  graph and the rows it describes reach the log together, it carries the write
+  version it describes and is rebuilt rather than trusted if that stamp goes
+  stale, and it goes through the same fault-injection sweep as everything else
+  (`crates/inlaysql/tests/index_recovery_dst.rs`). It is not the default because
+  the trade is real: opening is instant where the in-memory index rebuilds, but
+  every cache miss during a search is a read from the file. The file format is
+  the same either way, so one database can be opened both ways.
+  `bench/README.md` reports the measured memory bound.
+- **A paged index stores exact `f32` vectors even for an int8 column.**
+  `VECTOR(n, INT8)` shrinks the row and the in-memory graph; the paged graph's
+  node records do not quantise yet, so on an int8 column the paged index trades
+  away the 4x the quantisation was for. Results are unaffected — queries are
+  `f32` on both paths.
+- **Full Postgres parity is not a goal**, now or later.
+
+## Licence
+
+**Dual licensed: AGPLv3, or commercial.**
+
+- **[GNU AGPL v3.0](LICENSE)** — free of charge, on the AGPL's terms. Note
+  section 13: if users reach a modified version *over a network*, you owe those
+  users the corresponding source. For an embedded database that is the clause
+  worth reading before you adopt it.
+- **[Commercial licence](LICENSE-COMMERCIAL.md)** — removes those obligations.
+  Contact info@solutionforest.net.
+
+[`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md) has a plain-language guide to
+which one you need, and what we ask of contributors so that dual licensing
+remains possible.
+
+**Up to 2026-08-20 InlaySQL was published under MIT, and that grant stands.**
+Anyone who obtained it under MIT keeps MIT rights to the versions they
+received, permanently. The history was later rewritten so every commit carries
+the AGPL text, which changes how the history reads but not what was granted at
+the time. See [`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md).

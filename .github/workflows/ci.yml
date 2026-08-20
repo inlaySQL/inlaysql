@@ -1,0 +1,183 @@
+name: CI
+
+# The gate: is this change correct enough to merge?
+#
+# This workflow spent its early life red — the self-hosted runner had no
+# `rustup` on its PATH, so every job since the first commit died on its first
+# step — and #19 took it off pull requests rather than leave a check that
+# taught everyone to ignore checks. AHL-369 fixed the runner; the repository
+# then went public, and a public repository must not run untrusted pull-request
+# code on a self-hosted runner, so these jobs moved to GitHub-hosted ones. They
+# are free for public repositories, and the `.github/actions/rust` bootstrap
+# works on both.
+#
+# So pull requests are checked again, which was the point. What runs here is
+# only what a reviewer should wait for — minutes, not an hour. The 5,000-seed
+# DST sweeps below are the exception and say so; the fuzzing campaign, the
+# 50,000-round differential run and the benchmarks live in `trust.yml`, where
+# a slow job can never be the reason a pull request is blocked.
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+# Pushing a fix to a branch should not leave the previous run competing with it
+# for a runner. `main` and tags are exempt: those runs are the
+# record of what a commit did, not a preview.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/rust
+        with:
+          components: rustfmt,clippy
+          cache: cargo
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # `inlaysql-bench` builds `rusqlite` and `sqlite-vec` from bundled C
+      # sources, so a workspace test run needs a C compiler. The runner has
+      # one — the benchmark job in `trust.yml` has built them green — and this
+      # is where that stops being true quietly if the image ever changes.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Demo still runs
+        run: cargo run --example hybrid_search -p inlaysql
+
+      - name: SQL Logic Test
+        run: cargo run -p inlaysql --bin sqllogictest -- crates/inlaysql/tests/sqllogictest/*.test
+
+      # The io_uring backend only exists on Linux, and `tests/backends.rs`
+      # only compiles its case there. Running the suite explicitly makes the
+      # cross-backend claim visible in the log rather than implicit in a
+      # `cargo test` line that would silently pass with the case absent.
+      - name: Every I/O backend passes the same suite
+        run: |
+          cargo test -p inlaysql --test backends -- --nocapture
+          if [ "$(uname -s)" != "Linux" ]; then
+            echo "::warning::io_uring case skipped: this runner is $(uname -s), not Linux"
+          fi
+
+      # The MCP surface is a wire protocol, so it is checked by driving a
+      # client through it rather than by testing the functions underneath.
+      - name: MCP client session
+        run: cargo test -p inlaysql-mcp --test client
+
+      # Logic bugs do not announce themselves, so the metamorphic tests get
+      # their own line in the log rather than disappearing into `cargo test`.
+      - name: Metamorphic logic-bug tests
+        run: cargo test -p inlaysql-core --test logic_bugs -- --nocapture
+
+  # The wasm32 build, its size, the browser demo and the edge runtime live in
+  # `wasm.yml`: they need `wasm-bindgen-cli`, a browser and `workerd`, which is
+  # a different image from the one that builds the workspace. That split is by
+  # capability, not by which runner happens to work.
+
+  fuzz-targets:
+    name: fuzz targets still build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/rust
+        with:
+          toolchain: nightly
+
+      # The fuzzers themselves run in `trust.yml`, not on every pull request.
+      # What must not rot is the targets: a target that stopped compiling is a
+      # fuzzing gap nobody notices until the next campaign.
+      # `tests/fuzz_smoke.rs` covers the properties on stable in the main job.
+      - name: Check the targets compile
+        run: cargo +nightly check --manifest-path fuzz/Cargo.toml --all-targets
+
+  determinism:
+    name: core stays deterministic
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/rust
+
+      # The project rule is that inlaysql-core performs no syscalls and reads
+      # no wall clock. `#![no_std]` is what enforces it — without `std` the
+      # crate cannot reach the filesystem, the network or `SystemTime` at all.
+      # These checks fail loudly if someone removes the attribute or pulls an
+      # OS-facing crate into core's dependency tree.
+      - name: Core is no_std
+        run: grep -q '^#!\[no_std\]' crates/inlaysql-core/src/lib.rs
+
+      - name: Core has no OS-facing dependencies
+        run: |
+          deps="$(cargo tree -p inlaysql-core --edges normal --prefix none | awk '{print $1}' | sort -u)"
+          echo "$deps"
+          for forbidden in libc redb tantivy instant-distance mio tokio socket2 io-uring rusqlite libsqlite3-sys; do
+            if echo "$deps" | grep -qx "$forbidden"; then
+              echo "::error::inlaysql-core must not depend on $forbidden"
+              exit 1
+            fi
+          done
+
+  sweep:
+    name: DST fault-injection sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # Thousands of seeds is tens of minutes, which is not a thing to make a
+    # reviewer wait for on every push. It runs on `main`, on a tag, on demand,
+    # and on a pull request that asks for it with the `full-ci` label — so
+    # anything touching recovery, the write-ahead log or the storage format can
+    # still get the full sweep before it merges.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'full-ci')
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/rust
+        with:
+          cache: sweep
+
+      # Thousands of randomized crash/torn-write schedules, each replayed to
+      # prove the recovered database is always a committed snapshot. Runs in
+      # release because the sweep is CPU-bound.
+      - name: Sweep thousands of fault schedules
+        run: cargo test --release -p inlaysql-core --test dst_sweep -- --ignored
+
+      # The rows recovering is only half the story once indexes live in the
+      # same file: this asserts the recovered indexes agree with the recovered
+      # rows, across thousands of crash schedules.
+      - name: Sweep index recovery
+        run: cargo test --release -p inlaysql --test index_recovery_dst -- --ignored
+
+      # Page reuse (AHL-481) is the one thing in this engine that can break the
+      # assumption everything else rests on — that a page id names one
+      # immutable sequence of bytes for the life of the file. AHL-406 is what
+      # happens when it breaks by accident: a database recovered to a state no
+      # commit ever wrote, with no checksum failing anywhere. The other two
+      # sweeps above never recycle a page id, so neither of them exercises it;
+      # this one does nothing else. It was written with AHL-481 and then ran
+      # only when somebody remembered to (AHL-484 found that), which is not a
+      # gate.
+      - name: Sweep page reuse
+        run: cargo test --release -p inlaysql-core --test free_list_reuse_dst -- --ignored

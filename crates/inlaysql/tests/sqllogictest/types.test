@@ -1,0 +1,27 @@
+# Type handling: INTEGER widened to REAL, REAL formatting, per-column typing.
+
+statement ok
+CREATE TABLE r(x REAL, i INTEGER)
+
+statement ok
+INSERT INTO r VALUES (1, 2), (2.5, 3)
+
+query RI rowsort
+SELECT x, i FROM r
+----
+1.0 2
+2.5 3
+
+statement error
+INSERT INTO r VALUES ('not a number', 4)
+
+statement ok
+CREATE TABLE s(a TEXT, b INTEGER)
+
+statement ok
+INSERT INTO s VALUES ('hello', 7)
+
+query T
+SELECT a FROM s WHERE b = 7
+----
+hello

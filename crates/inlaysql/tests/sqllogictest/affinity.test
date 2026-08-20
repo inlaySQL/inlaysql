@@ -1,0 +1,375 @@
+# SQLite's type affinity rules, and what a column with each affinity stores.
+#
+# Replayed through the sqlite3 binary. Every declared type name here is one a
+# framework's migrations actually emit, and every one of them was a hard error
+# before decision D7 — `resolve_data_type` was a whitelist that refused
+# anything it did not recognise, which is stricter than the dialect this engine
+# claims to implement.
+
+# ------------------------------------------------- the types a migration emits
+
+statement ok
+CREATE TABLE users(id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(255) NOT NULL, price DECIMAL(8,2), active BOOLEAN DEFAULT 0, payload JSON, created_at DATETIME)
+
+statement ok
+INSERT INTO users (name, price, payload, created_at) VALUES ('alice', '10.50', 'json-ish', '2024-01-01')
+
+query ITRIT nosort
+SELECT id, name, price, active, payload FROM users
+----
+1 alice 10.5 0 json-ish
+
+# AUTOINCREMENT asks for keys that are never reused, which this engine's row-id
+# counter already guarantees.
+statement ok
+INSERT INTO users (name) VALUES ('bob')
+
+statement ok
+DELETE FROM users WHERE name = 'bob'
+
+statement ok
+INSERT INTO users (name) VALUES ('carol')
+
+query TI nosort
+SELECT name, id FROM users ORDER BY id
+----
+alice 1
+carol 3
+
+# ------------------------------------------------------------ INTEGER affinity
+
+statement ok
+CREATE TABLE i(a INT, b BIGINT, c TINYINT, d INT2)
+
+statement ok
+INSERT INTO i VALUES (1, 2, 3, 4)
+
+query IIII nosort
+SELECT a, b, c, d FROM i
+----
+1 2 3 4
+
+# --------------------------------------------------------------- TEXT affinity
+
+statement ok
+CREATE TABLE t(a TEXT, b VARCHAR(20), c CHARACTER(5), d CLOB)
+
+statement ok
+INSERT INTO t VALUES ('w', 'x', 'y', 'z')
+
+query TTTT nosort
+SELECT a, b, c, d FROM t
+----
+w x y z
+
+# --------------------------------------------------------------- REAL affinity
+
+statement ok
+CREATE TABLE r(a REAL, b DOUBLE, c FLOAT)
+
+statement ok
+INSERT INTO r VALUES (1, 2.5, 3)
+
+query RRR nosort
+SELECT a, b, c FROM r
+----
+1.0 2.5 3.0
+
+# ------------------------------------------------------------ NUMERIC affinity
+#
+# Not a storage class: a NUMERIC column holds whatever the value turns out to
+# be. Text that *is* a number becomes one, text that merely contains one does
+# not, and a real an integer reproduces exactly is stored as an integer.
+
+statement ok
+CREATE TABLE n(id INTEGER PRIMARY KEY, v NUMERIC)
+
+statement ok
+INSERT INTO n VALUES (1, 4.0), (2, '7'), (3, ' 9 '), (4, '1e3'), (5, '10.')
+
+query II nosort
+SELECT id, v FROM n ORDER BY id
+----
+1 4
+2 7
+3 9
+4 1000
+5 10
+
+statement ok
+CREATE TABLE nr(id INTEGER PRIMARY KEY, v NUMERIC)
+
+statement ok
+INSERT INTO nr VALUES (1, 2.5), (2, '10.50'), (3, '.5')
+
+query IR nosort
+SELECT id, v FROM nr ORDER BY id
+----
+1 2.5
+2 10.5
+3 0.5
+
+statement ok
+CREATE TABLE nt(id INTEGER PRIMARY KEY, v NUMERIC)
+
+statement ok
+INSERT INTO nt VALUES (1, 'abc'), (2, '0x10'), (3, '5abc'), (4, 'inf')
+
+query IT nosort
+SELECT id, v FROM nt ORDER BY id
+----
+1 abc
+2 0x10
+3 5abc
+4 inf
+
+# Every name SQLite does not recognise gets NUMERIC affinity, so all of these
+# store the integer they were given rather than converting it.
+statement ok
+CREATE TABLE misc(a BOOLEAN, b DATE, c DATETIME, d JSON, e STRING, f NUMERIC)
+
+statement ok
+INSERT INTO misc VALUES (1, 2, 3, 4, 5, 6)
+
+query IIIIII nosort
+SELECT a, b, c, d, e, f FROM misc
+----
+1 2 3 4 5 6
+
+# ---------------------------------------------------------- the rule order
+#
+# The order is the whole algorithm, and it is load-bearing rather than tidy:
+# `POINT` is INTEGER because rule 1 sees the `INT` inside it, before rule 5
+# ever gets a chance to call it NUMERIC. SQLite's own worked example is
+# `FLOATING POINT`, which makes the same point more sharply — `sqlparser` does
+# not parse that two-word spelling, so `POINT` stands in for it here and the
+# unit test in `sql.rs` covers the rest of the table.
+#
+# `CAST` is where an affinity shows up as a *value* rather than as a storage
+# decision, and it runs off the same rule table — one implementation, shared,
+# so a cast and a column declaration cannot disagree about what a name means.
+
+query II nosort
+SELECT CAST(2.5 AS POINT), CAST('7' AS POINT)
+----
+2 7
+
+query RI nosort
+SELECT CAST(2.5 AS DOUBLE), CAST('abc' AS NUMERIC)
+----
+2.5 0
+
+statement ok
+CREATE TABLE fp(a POINT, b BLOB)
+
+statement ok
+INSERT INTO fp VALUES (2, X'6279746573')
+
+query I nosort
+SELECT a FROM fp
+----
+2
+
+# ----------------------------------------------- comparison-time affinity (AHL-486)
+#
+# Everything above is affinity as a *storage* decision — what a column keeps
+# on the way in. This is affinity's other job, which this engine never had
+# until AHL-486: converting one side of a *comparison* before ranking the
+# pair by storage class. AHL-477 gave cross-class pairs SQLite's class order
+# (NULL < numbers < TEXT < BLOB) but nothing applied affinity first, so
+# `WHERE id = '1'` against an INTEGER column silently returned zero rows
+# instead of the matching one — a loud `Error::Type` (pre-AHL-477) had become
+# a silent wrong answer, the worst direction that bug could have moved.
+#
+# Every expectation below was produced by running the query through a real
+# `sqlite3` (3.54) binary, not by re-deriving what the rule *should* say.
+
+# The issue's own repro, word for word: sqlite3 returns the one row, a count
+# of 1; before AHL-486 this engine answered 0.
+statement ok
+CREATE TABLE issue_repro(id INTEGER PRIMARY KEY, s TEXT)
+
+statement ok
+INSERT INTO issue_repro VALUES (1,'a'), (2,'b')
+
+query I nosort
+SELECT count(*) FROM issue_repro WHERE id = '1'
+----
+1
+
+# `s` has TEXT affinity here and neither stored value looks like a number, so
+# the literal `1` renders as `"1"` and still matches nothing — 0 both before
+# and after AHL-486, but for the right reason now (a real conversion that
+# still misses) rather than by coincidence (no conversion attempted at all).
+query I nosort
+SELECT count(*) FROM issue_repro WHERE s = 1
+----
+0
+
+# Two bare literals: neither carries an affinity of its own, so nothing
+# converts and this stays a class-order comparison — `1` and `'1'` are
+# different classes and sqlite3 says so too.
+query I nosort
+SELECT (1 = '1')
+----
+0
+
+statement ok
+CREATE TABLE aff(id INTEGER PRIMARY KEY, s TEXT, r REAL, num NUMERIC, bl BLOB)
+
+statement ok
+INSERT INTO aff VALUES (1, '1', 1.5, 3, X'0102')
+
+statement ok
+INSERT INTO aff VALUES (2, '2', 2.5, 4, X'0304')
+
+# The exact repro this issue was filed over: an INTEGER column's own affinity
+# converts the TEXT literal before comparing.
+query I nosort
+SELECT id FROM aff WHERE id = '1'
+----
+1
+
+# Leading/trailing whitespace is still "well-formed" — SQLite trims it before
+# deciding whether the text is a number.
+query I nosort
+SELECT id FROM aff WHERE id = ' 1 '
+----
+1
+
+# `'1.0'`/`'1e0'` are well-formed numbers that happen to equal 1.
+query I nosort
+SELECT id FROM aff WHERE id = '1.0'
+----
+1
+
+query I nosort
+SELECT id FROM aff WHERE id = '1e0'
+----
+1
+
+# A partial number or non-number never converts — it stays TEXT and the pair
+# answers false by class order, exactly as it did before this column had an
+# INTEGER PRIMARY KEY to match against. Not an error either way.
+query I nosort
+SELECT id FROM aff WHERE id = '1x'
+----
+
+query I nosort
+SELECT id FROM aff WHERE id = 'abc'
+----
+
+# Affinity conversion is not limited to `=`.
+query I nosort
+SELECT id FROM aff WHERE id < '2'
+----
+1
+
+# `s` has TEXT affinity: the rule converts the *other* operand to TEXT, not
+# `s` to a number. `s` stores `'1'`/`'2'`, so the INTEGER literal `1` renders
+# as `"1"` and matches the row that literally holds it.
+query I nosort
+SELECT id FROM aff WHERE s = 1
+----
+1
+
+# The INTEGER/REAL distinction in that rendering is load-bearing: `1.0`
+# renders as `"1.0"`, not `"1"`, so it matches neither stored string here...
+query I nosort
+SELECT id FROM aff WHERE s = 1.0
+----
+
+# ...but does match a column that actually stores `'1.0'`, and an INTEGER `1`
+# still only matches the row storing `'1'`, not `'1.0'`.
+statement ok
+CREATE TABLE aff_text(s TEXT)
+
+statement ok
+INSERT INTO aff_text VALUES ('1.0'), ('1'), ('1.5')
+
+query T nosort
+SELECT s FROM aff_text WHERE s = 1.0
+----
+1.0
+
+query T nosort
+SELECT s FROM aff_text WHERE s = 1
+----
+1
+
+# `r` (REAL) and `num` (NUMERIC) convert a well-formed TEXT operand exactly as
+# `id` (INTEGER) does — the rule is one NUMERIC affinity, not three.
+query I nosort
+SELECT id FROM aff WHERE r = '1.5'
+----
+1
+
+query I nosort
+SELECT id FROM aff WHERE num = '3'
+----
+1
+
+# A BLOB is never affinity-converted, in either direction: not into a number,
+# and never rendered from one either.
+query I nosort
+SELECT id FROM aff WHERE bl = ''
+----
+
+query I nosort
+SELECT id FROM aff WHERE bl = X'0102'
+----
+1
+
+# An *expression* carries no affinity, only a bare column reference or a
+# `CAST` does — `id + 0` loses it even though it is still an INTEGER value.
+query I nosort
+SELECT id FROM aff WHERE id + 0 = '1'
+----
+
+# `CAST(... AS type)` carries the cast's own affinity, confirmed by giving it
+# something to convert: `CAST(s AS INTEGER)` is INTEGER-affinity, so the
+# TEXT literal on the other side converts and only the row whose cast result
+# is `1` matches.
+query I nosort
+SELECT id FROM aff WHERE CAST(s AS INTEGER) = '1'
+----
+1
+
+# `IN (...)`: **the left operand alone decides**, the same as its collation.
+# Every candidate is converted under the probe's own affinity, not its own.
+query I nosort
+SELECT id FROM aff WHERE id IN ('1', '2') ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM aff WHERE id IN ('1', 'x') ORDER BY id
+----
+1
+
+# `BETWEEN` resolves each bound against the probed expression, same as `=`.
+query I nosort
+SELECT id FROM aff WHERE id BETWEEN '1' AND '1'
+----
+1
+
+# The simple form of `CASE` compares with `=`, branch by branch.
+query T nosort
+SELECT CASE id WHEN '1' THEN 'one' WHEN '2' THEN 'two' ELSE 'other' END FROM aff ORDER BY id
+----
+one
+two
+
+# A `JOIN`'s `ON` is an ordinary comparison: `aff.id` (INTEGER) against
+# `aff_tags.tag` (TEXT) converts the same way `WHERE id = '1'` does.
+statement ok
+CREATE TABLE aff_tags(tag_id INTEGER PRIMARY KEY, tag TEXT)
+
+statement ok
+INSERT INTO aff_tags VALUES (1, '1'), (2, 'x')
+
+query II nosort
+SELECT aff.id, aff_tags.tag_id FROM aff JOIN aff_tags ON aff.id = aff_tags.tag
+----
+1 1

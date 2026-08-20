@@ -1,0 +1,16 @@
+name = "inlaysql-edge"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# `.inlay` is a database file, not something to parse: this hands the bytes to
+# the worker as an ArrayBuffer. `.wasm` needs no rule — Workers already import
+# it as a compiled `WebAssembly.Module`, which is what lets `initSync` run at
+# isolate startup with no fetch.
+[[rules]]
+type = "Data"
+globs = ["**/*.inlay"]
+fallthrough = true
+
+# Nothing here needs an account. `npm run smoke` runs the worker on `workerd`,
+# the same runtime Cloudflare runs in production, entirely locally — which is
+# what makes this a CI job rather than a deployment someone checks by hand.

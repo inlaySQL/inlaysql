@@ -1,0 +1,171 @@
+# SELECT DISTINCT, COUNT(DISTINCT x), SUM(DISTINCT x) and GROUP_CONCAT.
+#
+# Expected values come from SQLite. The GROUP_CONCAT cases are written so
+# that each group has one possible order, because SQLite does not promise
+# one.
+
+statement ok
+CREATE TABLE g(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, w TEXT)
+
+statement ok
+INSERT INTO g VALUES (1, 1, 10, 'a')
+
+statement ok
+INSERT INTO g VALUES (2, 1, 10, 'b')
+
+statement ok
+INSERT INTO g VALUES (3, 1, 20, 'a')
+
+statement ok
+INSERT INTO g VALUES (4, 2, 30, NULL)
+
+statement ok
+INSERT INTO g VALUES (5, 2, NULL, 'c')
+
+statement ok
+INSERT INTO g VALUES (6, 2, 30, 'c')
+
+query I nosort
+SELECT DISTINCT k FROM g ORDER BY k
+----
+1
+2
+
+query I nosort
+SELECT DISTINCT v FROM g ORDER BY v
+----
+NULL
+10
+20
+30
+
+query II nosort
+SELECT DISTINCT k, v FROM g ORDER BY k, v
+----
+1 10
+1 20
+2 NULL
+2 30
+
+query T nosort
+SELECT DISTINCT w FROM g ORDER BY w
+----
+NULL
+a
+b
+c
+
+query I nosort
+SELECT DISTINCT k FROM g ORDER BY k LIMIT 1
+----
+1
+
+query I nosort
+SELECT DISTINCT k FROM g ORDER BY k LIMIT 1 OFFSET 1
+----
+2
+
+query I nosort
+SELECT COUNT(DISTINCT k) FROM g
+----
+2
+
+query I nosort
+SELECT COUNT(DISTINCT v) FROM g
+----
+3
+
+query I nosort
+SELECT COUNT(DISTINCT w) FROM g
+----
+3
+
+query II nosort
+SELECT k, COUNT(DISTINCT v) FROM g GROUP BY k ORDER BY k
+----
+1 2
+2 1
+
+query I nosort
+SELECT SUM(DISTINCT v) FROM g
+----
+60
+
+query IT nosort
+SELECT k, GROUP_CONCAT(w) FROM g WHERE w IS NOT NULL GROUP BY k ORDER BY k
+----
+1 a,b,a
+2 c,c
+
+query IT nosort
+SELECT k, GROUP_CONCAT(w, '|') FROM g WHERE w IS NOT NULL GROUP BY k ORDER BY k
+----
+1 a|b|a
+2 c|c
+
+query T nosort
+SELECT GROUP_CONCAT(DISTINCT w) FROM g WHERE k = 2 AND w IS NOT NULL
+----
+c
+
+query T nosort
+SELECT GROUP_CONCAT(v) FROM g WHERE v IS NULL
+----
+NULL
+
+query I nosort
+SELECT COUNT(DISTINCT v) FROM g WHERE v IS NULL
+----
+0
+
+# ------------------------------------------------- mixed storage classes (AHL-477)
+
+# `SELECT DISTINCT` over a `NUMERIC`-affinity column holding NULL, INTEGER,
+# REAL, TEXT and BLOB together — the fold itself already went through
+# `eval::mem_cmp` (`duplicate_keep_mask`) and was never the bug; this pins
+# that dedup composes correctly with the *comparator* fix, since `DISTINCT`
+# also has to sort-and-fold rather than just dedup an unordered set here
+# once `ORDER BY v` is layered on top. Verified against sqlite3 3.54.
+statement ok
+CREATE TABLE mixed_distinct(v NUMERIC)
+
+statement ok
+INSERT INTO mixed_distinct VALUES (NULL), (2), (1), ('xyz'), (X'0304'), (1.5), (2)
+
+query T nosort
+SELECT DISTINCT v FROM mixed_distinct ORDER BY v LIMIT 1 OFFSET 0
+----
+NULL
+
+query I nosort
+SELECT DISTINCT v FROM mixed_distinct ORDER BY v LIMIT 1 OFFSET 1
+----
+1
+
+query R nosort
+SELECT DISTINCT v FROM mixed_distinct ORDER BY v LIMIT 1 OFFSET 2
+----
+1.5
+
+query I nosort
+SELECT DISTINCT v FROM mixed_distinct ORDER BY v LIMIT 1 OFFSET 3
+----
+2
+
+query T nosort
+SELECT DISTINCT v FROM mixed_distinct ORDER BY v LIMIT 1 OFFSET 4
+----
+xyz
+
+query T nosort
+SELECT DISTINCT v FROM mixed_distinct ORDER BY v LIMIT 1 OFFSET 5
+----
+<blob>
+
+# The duplicate `2` folds away and `NULL` does not count as a distinct value
+# (`COUNT(DISTINCT x)`'s own rule, not this comparator's): five, from the
+# seven rows.
+query I nosort
+SELECT COUNT(DISTINCT v) FROM mixed_distinct
+----
+5

@@ -1,0 +1,207 @@
+name: WASM
+
+# Does it still run everywhere? Builds `wasm32`, drives the demo page in a real
+# browser, runs the engine on an edge runtime, and publishes the demo from
+# `main`.
+#
+# These jobs run on GitHub-hosted runners, and that is now a decision about
+# capability rather than a workaround: they need `wasm-bindgen-cli`, headless
+# Chromium and `workerd`, which the workspace build image does not carry. The
+# jobs in `ci.yml` need an image that can build the workspace, and
+# that one can. (The original reason was AHL-369 — `ci.yml` had never passed
+# because the runner had no `rustup`. That is fixed; this split stays because
+# it is the right one.)
+#
+# It runs per pull request because the claim being defended is that
+# `inlaysql-core` stays portable — no syscalls, no threads, no wall clock — and
+# a claim like that is only true on the day someone checks it. Checking it on
+# tags would mean finding out at release time.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wasm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: wasm32 build, size and browser demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/rust
+        with:
+          targets: wasm32-unknown-unknown
+          cache: wasm
+
+      # The core is `no_std` and trait-based, so this should just work. It is a
+      # job rather than a hope: anything in core that blocks wasm32 is a bug in
+      # core, and this is what finds it.
+      - name: Build for wasm32
+        run: cargo build -p inlaysql-wasm --target wasm32-unknown-unknown --profile release-wasm
+
+      # The CLI has to match the `wasm-bindgen` crate exactly or the generated
+      # glue does not match the module, so the version is read out of
+      # Cargo.lock rather than written down twice. A prebuilt binary keeps this
+      # to seconds; building it from source is the fallback, not the plan.
+      - name: Install wasm-bindgen-cli
+        run: |
+          version="$(awk '/^name = "wasm-bindgen"$/{getline; gsub(/[",]/,""); print $3; exit}' Cargo.lock)"
+          echo "wasm-bindgen $version"
+          url="https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${version}/wasm-bindgen-${version}-x86_64-unknown-linux-musl.tar.gz"
+          if curl --proto '=https' --tlsv1.2 -sSfL "$url" | tar -xz --strip-components=1 -C /usr/local/bin \
+               "wasm-bindgen-${version}-x86_64-unknown-linux-musl/wasm-bindgen"; then
+            echo "installed the prebuilt binary"
+          else
+            echo "no prebuilt binary for $version; building from source"
+            cargo install wasm-bindgen-cli --version "$version" --locked
+          fi
+          wasm-bindgen --version
+
+      - name: Generate the browser bundle
+        run: ./crates/inlaysql-wasm/build.sh
+
+      # The database the edge worker ships is written by the *native* build, so
+      # generating it here is half of the portability claim; the edge job
+      # opening it from `wasm32` is the other half.
+      - name: Build the edge fixture
+        run: cargo run -p inlaysql-wasm --example edge_fixture
+
+      # A module that ships over the network has a size budget, so the number
+      # is published on every build rather than checked occasionally.
+      - name: Report module size
+        run: |
+          wasm=crates/inlaysql-wasm/www/pkg/inlaysql_wasm_bg.wasm
+          image=crates/inlaysql-wasm/edge/assets/demo.inlay
+          raw=$(wc -c < "$wasm")
+          gz=$(gzip -c "$wasm" | wc -c)
+          image_gz=$(gzip -c "$image" | wc -c)
+          echo "wasm: $raw bytes, gzipped $gz bytes"
+          {
+            echo "### WASM payload"
+            echo
+            echo "| | bytes | KiB | gzipped KiB |"
+            echo "| --- | ---: | ---: | ---: |"
+            echo "| module | $raw | $((raw / 1024)) | $((gz / 1024)) |"
+            echo "| edge database image | $(wc -c < "$image") | $(($(wc -c < "$image") / 1024)) | $((image_gz / 1024)) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # The target is single-digit MB compressed. Fail loudly if that slips.
+          if [ "$gz" -gt 5000000 ]; then
+            echo "::error::gzipped module is over 5 MB"
+            exit 1
+          fi
+
+      - name: The format is portable between native and wasm
+        run: cargo test -p inlaysql-wasm
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      # The demo page is what the README sends people to, so "does it still
+      # load" is not something to learn from a bug report. This also covers
+      # OPFS, which exists only in a browser and so cannot be reached from the
+      # Rust tests at all.
+      - name: The browser demo works in a real browser
+        working-directory: crates/inlaysql-wasm/browser
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npm run smoke
+
+      # `www/` is published verbatim, so it is uploaded as it stands — the
+      # Playwright harness deliberately lives in a sibling directory.
+      - name: Package the demo for Pages
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: crates/inlaysql-wasm/www
+
+      - name: Keep the built module for the edge job
+        uses: actions/upload-artifact@v6
+        with:
+          name: wasm-bundle
+          path: |
+            crates/inlaysql-wasm/www/pkg
+            crates/inlaysql-wasm/edge/assets/demo.inlay
+          retention-days: 1
+
+  edge:
+    name: edge runtime smoke test
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+
+      # No Rust here: the edge job's whole job is to prove the *artifact* runs
+      # somewhere that is not a browser. Rebuilding it would only prove the
+      # build works twice.
+      - uses: actions/download-artifact@v7
+        with:
+          name: wasm-bundle
+          path: crates/inlaysql-wasm
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      # `wrangler dev` runs `workerd` — the runtime Cloudflare runs in
+      # production — locally, with no account and nothing deployed.
+      - name: The engine answers hybrid queries on workerd
+        working-directory: crates/inlaysql-wasm/edge
+        run: |
+          npm ci
+          npm run smoke
+
+  deploy:
+    name: publish the demo
+    runs-on: ubuntu-latest
+    needs: [build, edge]
+    # Only from main: a pull request builds the demo and drives it in a browser,
+    # but publishing someone's branch to the URL in the README is not a thing a
+    # pull request should be able to do.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      # `actions: read` is what lets deploy-pages fetch the artifact by id.
+      actions: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # Pages has never been enabled on this repository, so `deploy-pages` has
+      # only ever 404'd — the one part of AHL-369 that no pull request could
+      # fix. `enablement: true` asks the API to turn it on, which works when
+      # the token is allowed to; if it is not, this reports what a human has to
+      # click instead of leaving a permanently red check behind. Everything
+      # above this point has already proven the demo builds and runs.
+      - name: Enable Pages if it is not on yet
+        id: pages
+        continue-on-error: true
+        uses: actions/configure-pages@v6
+        with:
+          enablement: true
+
+      - name: Deploy
+        id: deployment
+        if: steps.pages.outcome == 'success'
+        uses: actions/deploy-pages@v5
+
+      - name: Pages is still off
+        if: steps.pages.outcome != 'success'
+        run: |
+          echo "::warning::GitHub Pages could not be enabled from Actions. \
+          A repository admin needs Settings → Pages → Source: GitHub Actions. \
+          The demo built and passed its browser smoke test; only publishing was skipped."

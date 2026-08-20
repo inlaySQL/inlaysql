@@ -1,0 +1,122 @@
+// Drive the browser demo in headless Chromium.
+//
+//   npm run smoke            # from crates/inlaysql-wasm/browser
+//
+// The demo is the page a reader lands on from the README, so "it still loads"
+// is not a thing to find out from a bug report. This opens it in a real
+// browser, searches, and round-trips the database through the origin-private
+// file system — the one part of the persistence story that only exists in a
+// browser and therefore cannot be covered by the Rust tests.
+//
+// It deliberately lives outside `www/`: that directory is published to GitHub
+// Pages verbatim, and a `node_modules/` has no business being deployed.
+
+import { createServer } from "node:http";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { extname, join, normalize } from "node:path";
+import { chromium } from "playwright";
+
+const ROOT = join(import.meta.dirname, "..", "www");
+
+// `www/pkg` is build output, not checked in. Say so plainly: without this the
+// failure is a 404 inside the page, reported as "the module did not load".
+if (!existsSync(join(ROOT, "pkg", "inlaysql_wasm.js"))) {
+  console.error("the WASM bundle (www/pkg) is missing — run ../build.sh first");
+  process.exit(1);
+}
+const TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".wasm": "application/wasm",
+};
+
+let failures = 0;
+function check(what, condition, detail) {
+  if (condition) {
+    console.log(`  ok    ${what}`);
+  } else {
+    failures += 1;
+    console.log(`  FAIL  ${what}${detail === undefined ? "" : ` — ${detail}`}`);
+  }
+}
+
+// A static server rather than `file://`: ES modules, `fetch` and OPFS all need
+// a real origin, and `application/wasm` has to be the actual content type.
+const server = createServer(async (request, response) => {
+  const path = new URL(request.url, "http://localhost").pathname;
+  const file = join(ROOT, normalize(path === "/" ? "/index.html" : path));
+  if (!file.startsWith(ROOT)) {
+    response.writeHead(403).end();
+    return;
+  }
+  try {
+    const body = await readFile(file);
+    response.writeHead(200, { "content-type": TYPES[extname(file)] ?? "application/octet-stream" });
+    response.end(body);
+  } catch {
+    response.writeHead(404).end("not found");
+  }
+});
+
+await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+const base = `http://127.0.0.1:${server.address().port}/`;
+
+const browser = await chromium.launch();
+const page = await browser.newPage();
+const problems = [];
+page.on("pageerror", (error) => problems.push(String(error)));
+page.on("console", (message) => {
+  if (message.type() === "error") problems.push(message.text());
+});
+
+try {
+  await page.goto(base, { waitUntil: "networkidle" });
+
+  // The page seeds and searches on load, so waiting for results to stop saying
+  // "loading" is waiting for the whole engine to have run.
+  await page.waitForFunction(
+    () => !document.getElementById("results").textContent.startsWith("loading"),
+    { timeout: 60_000 },
+  );
+
+  const results = await page.locator("#results").textContent();
+  console.log(`\n  search "embedded database":\n${results.replace(/^/gm, "    ")}\n`);
+  check("the module loaded and ranked rows", /\[\d+\]/.test(results), results);
+  check("the ranking is not an error", !/error|Error/.test(results), results);
+
+  // Plain SQL, to prove the demo is a database and not a search box.
+  await page.fill("#sql", "SELECT id, body FROM docs WHERE id = 3");
+  await page.click("#run");
+  await page.waitForFunction(() => document.getElementById("out").textContent.length > 0);
+  const out = await page.locator("#out").textContent();
+  check("arbitrary SQL runs client-side", out.includes("rust"), out);
+
+  // OPFS: the only persistence path that exists solely in a browser.
+  await page.click("#save");
+  await page.waitForFunction(() => /saved|unavailable/.test(document.getElementById("storage").textContent));
+  const saved = await page.locator("#storage").textContent();
+  check("the database saved to OPFS", /saved \d+ bytes/.test(saved), saved);
+
+  await page.click("#load");
+  await page.waitForFunction(() => /loaded|nothing/.test(document.getElementById("storage").textContent));
+  const loaded = await page.locator("#storage").textContent();
+  check("it came back out of OPFS", /loaded \d+ bytes/.test(loaded), loaded);
+
+  // Reopening must not lose the corpus — a database that round-trips its bytes
+  // but forgets its rows would pass every check above.
+  await page.waitForFunction(
+    () => !document.getElementById("results").textContent.startsWith("loading"),
+  );
+  const afterReload = await page.locator("#results").textContent();
+  check("the reopened database still ranks", /\[\d+\]/.test(afterReload), afterReload);
+
+  check("nothing threw along the way", problems.length === 0, problems.join(" | "));
+} finally {
+  await browser.close();
+  server.close();
+}
+
+console.log(failures === 0 ? "\nbrowser smoke test passed" : `\n${failures} check(s) failed`);
+process.exit(failures === 0 ? 0 : 1);

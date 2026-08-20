@@ -1,0 +1,13 @@
+{
+  "name": "inlaysql-browser-smoke",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Drives ../www in headless Chromium, so the browser demo cannot rot unnoticed.",
+  "scripts": {
+    "smoke": "node smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

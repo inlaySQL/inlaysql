@@ -1,0 +1,556 @@
+# Subqueries: scalar, IN (SELECT), EXISTS, derived tables, and correlated
+# forms (AHL-463, PLAN.md Phase 1c item 1).
+#
+# Every expected value in this file came from SQLite 3 running the same
+# statements, including the ones that look surprising:
+#
+#   * a scalar subquery returning more than one row is NOT an error — SQLite
+#     takes the first row and ignores the rest, and so does this engine;
+#   * a scalar subquery returning no row is NULL;
+#   * `IN (SELECT ...)` is three-valued in both directions, and an empty result
+#     is false even for a NULL probe.
+#
+# What is deliberately absent: correlated subqueries in UPDATE/DELETE, and
+# subqueries in any write statement at all. Those are refused, and the refusals
+# are pinned in unsupported.test rather than here.
+
+statement ok
+CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 'x')
+
+statement ok
+INSERT INTO t VALUES (2, 20, 'y')
+
+statement ok
+INSERT INTO t VALUES (3, NULL, 'z')
+
+statement ok
+INSERT INTO t VALUES (4, 20, NULL)
+
+statement ok
+CREATE TABLE u(id INTEGER PRIMARY KEY, a INTEGER, k INTEGER)
+
+statement ok
+INSERT INTO u VALUES (1, 10, 1)
+
+statement ok
+INSERT INTO u VALUES (2, 30, 1)
+
+statement ok
+INSERT INTO u VALUES (3, NULL, 2)
+
+statement ok
+CREATE TABLE empty(id INTEGER PRIMARY KEY, a INTEGER)
+
+# ---------------------------------------------------------------- scalar
+
+query I nosort
+SELECT (SELECT MAX(a) FROM u)
+----
+30
+
+query I nosort
+SELECT (SELECT COUNT(*) FROM u)
+----
+3
+
+# No rows is NULL, not an error, and not zero.
+query I nosort
+SELECT (SELECT a FROM empty)
+----
+NULL
+
+query I nosort
+SELECT (SELECT a FROM u WHERE a > 1000)
+----
+NULL
+
+# More than one row: SQLite takes the first and ignores the rest. Pinned
+# because "error" is the answer most engines give and the one a reader expects.
+query I nosort
+SELECT (SELECT a FROM u)
+----
+10
+
+query I nosort
+SELECT (SELECT a FROM u ORDER BY a DESC)
+----
+30
+
+# Uncorrelated: one value, repeated for every outer row.
+query II nosort
+SELECT id, (SELECT MAX(a) FROM u) FROM t ORDER BY id
+----
+1 30
+2 30
+3 30
+4 30
+
+query I nosort
+SELECT id FROM t WHERE a < (SELECT MAX(a) FROM u) ORDER BY id
+----
+1
+2
+4
+
+# A scalar subquery in every position that takes an expression.
+query I nosort
+SELECT a FROM t WHERE a IS NOT NULL GROUP BY a HAVING COUNT(*) > (SELECT 0) ORDER BY a
+----
+10
+20
+
+query I nosort
+SELECT id FROM t ORDER BY id LIMIT (SELECT 2)
+----
+1
+2
+
+query I nosort
+SELECT id FROM t ORDER BY (SELECT 1), id DESC
+----
+4
+3
+2
+1
+
+query I nosort
+SELECT SUM(a + (SELECT 1)) FROM t
+----
+53
+
+# Nesting: a subquery inside a subquery.
+query I nosort
+SELECT (SELECT (SELECT MAX(a) FROM u))
+----
+30
+
+query I nosort
+SELECT (SELECT MAX(a) FROM u WHERE a < (SELECT MAX(a) FROM t))
+----
+10
+
+# ------------------------------------------------------------ IN (SELECT)
+
+query I nosort
+SELECT id FROM t WHERE a IN (SELECT a FROM u) ORDER BY id
+----
+1
+
+# `NOT IN` over a list that holds a NULL is never true, so nothing comes back.
+query I nosort
+SELECT id FROM t WHERE a NOT IN (SELECT a FROM u) ORDER BY id
+----
+
+# With the NULL filtered out of the subquery, `NOT IN` behaves.
+query I nosort
+SELECT id FROM t WHERE a NOT IN (SELECT a FROM u WHERE a IS NOT NULL) ORDER BY id
+----
+2
+4
+
+# An empty result is false for `IN` and true for `NOT IN` — even when the probe
+# is NULL, which is the one place `IN` is not three-valued.
+query I nosort
+SELECT id FROM t WHERE a IN (SELECT a FROM empty) ORDER BY id
+----
+
+query I nosort
+SELECT id FROM t WHERE a NOT IN (SELECT a FROM empty) ORDER BY id
+----
+1
+2
+3
+4
+
+query I nosort
+SELECT (SELECT 1) IN (SELECT a FROM empty)
+----
+0
+
+query I nosort
+SELECT NULL IN (SELECT a FROM empty)
+----
+0
+
+query I nosort
+SELECT NULL NOT IN (SELECT a FROM empty)
+----
+1
+
+# A NULL probe against a non-empty result is unknown.
+query I nosort
+SELECT NULL IN (SELECT a FROM u)
+----
+NULL
+
+query I nosort
+SELECT NULL NOT IN (SELECT a FROM u)
+----
+NULL
+
+# A miss with a NULL among the candidates is unknown, not false.
+query I nosort
+SELECT 99 IN (SELECT a FROM u)
+----
+NULL
+
+query I nosort
+SELECT 99 NOT IN (SELECT a FROM u)
+----
+NULL
+
+# A hit is a hit even when a NULL is also there.
+query I nosort
+SELECT 10 IN (SELECT a FROM u)
+----
+1
+
+query I nosort
+SELECT 10 NOT IN (SELECT a FROM u)
+----
+0
+
+# No NULLs anywhere: ordinary two-valued logic.
+query I nosort
+SELECT 99 IN (SELECT a FROM u WHERE a IS NOT NULL)
+----
+0
+
+query I nosort
+SELECT id FROM t WHERE id IN (SELECT k FROM u) ORDER BY id
+----
+1
+2
+
+# --------------------------------------------------------------- EXISTS
+
+query I nosort
+SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u) ORDER BY id
+----
+1
+2
+3
+4
+
+query I nosort
+SELECT id FROM t WHERE EXISTS (SELECT 1 FROM empty) ORDER BY id
+----
+
+query I nosort
+SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM empty) ORDER BY id
+----
+1
+2
+3
+4
+
+# EXISTS is never NULL, even when the row it found is entirely NULLs.
+query I nosort
+SELECT EXISTS (SELECT a FROM u WHERE a IS NULL)
+----
+1
+
+query I nosort
+SELECT EXISTS (SELECT NULL FROM u)
+----
+1
+
+query I nosort
+SELECT NOT EXISTS (SELECT 1 FROM empty)
+----
+1
+
+# EXISTS puts no constraint on the subquery's width — SQLite does not either.
+query I nosort
+SELECT EXISTS (SELECT id, a FROM u)
+----
+1
+
+# ------------------------------------------------------------- correlated
+
+query II nosort
+SELECT id, (SELECT COUNT(*) FROM u WHERE u.a = t.a) FROM t ORDER BY id
+----
+1 1
+2 0
+3 0
+4 0
+
+query II nosort
+SELECT id, (SELECT u.id FROM u WHERE u.a = t.a) FROM t ORDER BY id
+----
+1 1
+2 NULL
+3 NULL
+4 NULL
+
+query I nosort
+SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.a = t.a) ORDER BY id
+----
+1
+
+query I nosort
+SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.a = t.a) ORDER BY id
+----
+2
+3
+4
+
+query I nosort
+SELECT id FROM t WHERE a IN (SELECT a FROM u WHERE u.id = t.id) ORDER BY id
+----
+1
+
+query I nosort
+SELECT id FROM t WHERE id IN (SELECT k FROM u WHERE u.a > t.a) ORDER BY id
+----
+1
+
+# The same outer column twice: it is captured once, which the answer cannot
+# see but which is what `Binder::capture` folds.
+query I nosort
+SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.a > t.a AND u.a < t.a + 100) ORDER BY id
+----
+1
+2
+4
+
+# Correlated with an aggregate, which belongs to the inner query and must not
+# turn the outer SELECT into an aggregate one.
+query II nosort
+SELECT id, (SELECT SUM(u.a) FROM u WHERE u.k = t.id) FROM t ORDER BY id
+----
+1 40
+2 NULL
+3 NULL
+4 NULL
+
+# A subquery with no FROM that reads only the outer row.
+query II nosort
+SELECT id, (SELECT t.a + 1) FROM t ORDER BY id
+----
+1 11
+2 21
+3 NULL
+4 21
+
+# Two levels deep, the inner one naming the outermost query's column: every
+# level between them captures it in turn.
+query II nosort
+SELECT id, (SELECT (SELECT COUNT(*) FROM u WHERE u.a = t.a)) FROM t ORDER BY id
+----
+1 1
+2 0
+3 0
+4 0
+
+query I nosort
+SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE EXISTS (SELECT 1 FROM empty WHERE empty.a = t.a)) ORDER BY id
+----
+
+# Correlated inside a join's ON predicate.
+query II nosort
+SELECT t.id, u.id FROM t JOIN u ON u.a = t.a AND EXISTS (SELECT 1 FROM u AS v WHERE v.a = t.a) ORDER BY t.id, u.id
+----
+1 1
+
+# A correlated subquery that reads its own outer table again, under an alias
+# (AHL-477). The outer `FROM t` has no alias, so its default alias is `t`
+# itself; the inner `FROM t AS x` reads the same table under `x`. Once a
+# source has an explicit alias, only that alias answers to a qualifier —
+# `x.a`, never `t.a` — because `t` is the *outer* row's name here, and it has
+# to be captured, not resolved locally. That used to go the other way:
+# `Scope::source` matched a qualifier against a source's real table name even
+# when the source had been given a different alias, so `t.a` inside the
+# subquery wrongly resolved to the subquery's own `x.a` instead of the outer
+# capture — turning the predicate into `x.a = x.a`, true for every row the
+# subquery scanned that had a non-NULL `a`, regardless of what the outer row
+# actually held. Row 3's `a` is `NULL`: `NULL = anything` is unknown, never
+# true, so `EXISTS` must be false for it and true for the other three (each
+# finds itself, `a`'s value being unique enough here to do so) — confirmed
+# against sqlite3 3.54, and confirmed present on `main` before this phase.
+query II nosort
+SELECT id, EXISTS (SELECT 1 FROM t AS x WHERE x.a = t.a) FROM t ORDER BY id
+----
+1 1
+2 1
+3 0
+4 1
+
+# The same bug, the predicate's two sides swapped — the comparator is
+# symmetric, so this must answer identically.
+query II nosort
+SELECT id, EXISTS (SELECT 1 FROM t AS x WHERE t.a = x.a) FROM t ORDER BY id
+----
+1 1
+2 1
+3 0
+4 1
+
+# Once aliased, the real table name genuinely stops resolving *locally* too
+# — not only across the correlation boundary, and not only inside a
+# subquery: confirmed against sqlite3, `SELECT t.a FROM t AS x` is
+# `no such column: t.a` there, not a reference to `x`.
+statement error
+SELECT t.a FROM t AS x
+
+# ---------------------------------------------------------- derived tables
+
+query I nosort
+SELECT n FROM (SELECT id AS n FROM t) ORDER BY n
+----
+1
+2
+3
+4
+
+query I nosort
+SELECT n FROM (SELECT id AS n FROM t) AS d ORDER BY n
+----
+1
+2
+3
+4
+
+query I nosort
+SELECT d.n FROM (SELECT id AS n FROM t) AS d WHERE d.n > 2 ORDER BY d.n
+----
+3
+4
+
+# The paginator's shape: COUNT(*) over a derived table.
+query I nosort
+SELECT COUNT(*) FROM (SELECT id FROM t WHERE a IS NOT NULL)
+----
+3
+
+query I nosort
+SELECT COUNT(*) FROM (SELECT id FROM t ORDER BY id LIMIT 2)
+----
+2
+
+# An inner LIMIT is the subquery's own, not the outer query's.
+query I nosort
+SELECT n FROM (SELECT id AS n FROM t ORDER BY id DESC LIMIT 2) ORDER BY n
+----
+3
+4
+
+query II nosort
+SELECT k, SUM(s) FROM (SELECT k, a AS s FROM u) GROUP BY k ORDER BY k
+----
+1 40
+2 NULL
+
+# A derived table joined to a stored one, in both positions.
+query II nosort
+SELECT d.n, u.a FROM (SELECT id AS n FROM t) AS d JOIN u ON u.id = d.n ORDER BY d.n
+----
+1 10
+2 30
+3 NULL
+
+query II nosort
+SELECT u.id, d.n FROM u JOIN (SELECT id AS n FROM t) AS d ON d.n = u.id ORDER BY u.id
+----
+1 1
+2 2
+3 3
+
+query II nosort
+SELECT d.n, e.m FROM (SELECT id AS n FROM t) AS d LEFT JOIN (SELECT id AS m FROM u) AS e ON e.m = d.n ORDER BY d.n
+----
+1 1
+2 2
+3 3
+4 NULL
+
+# A derived table over a derived table.
+query I nosort
+SELECT m FROM (SELECT n AS m FROM (SELECT id AS n FROM t)) ORDER BY m
+----
+1
+2
+3
+4
+
+# A derived table with no FROM of its own.
+query I nosort
+SELECT v FROM (SELECT 7 AS v)
+----
+7
+
+# A subquery inside a derived table.
+query II nosort
+SELECT n, c FROM (SELECT id AS n, (SELECT COUNT(*) FROM u) AS c FROM t) ORDER BY n
+----
+1 3
+2 3
+3 3
+4 3
+
+# A *correlated* subquery inside a derived table that is itself inside a
+# subquery. The derived table starts a fresh scope chain — it cannot be
+# correlated — while the capture stack is still two levels deep, and getting
+# that wrong put the inner capture in the outer subquery's list.
+query I nosort
+SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT (SELECT COUNT(*) FROM u WHERE u.id = x.id) AS c FROM u AS x) AS d WHERE d.c > 0) ORDER BY id
+----
+1
+2
+3
+4
+
+query II nosort
+SELECT n, c FROM (SELECT x.id AS n, (SELECT COUNT(*) FROM u WHERE u.a = x.a) AS c FROM u AS x) ORDER BY n
+----
+1 1
+2 1
+3 0
+
+# `SELECT *` over a derived table takes its output columns, in order.
+query II nosort
+SELECT * FROM (SELECT id AS n, a AS v FROM t) ORDER BY n
+----
+1 10
+2 20
+3 NULL
+4 20
+
+# --------------------------------------------------- placeholders and params
+
+query I nosort
+SELECT id FROM t WHERE a IN (SELECT a FROM u WHERE a > 5) ORDER BY id
+----
+1
+
+# ------------------------------------------------------- INSERT ... SELECT
+
+statement ok
+CREATE TABLE copy(id INTEGER PRIMARY KEY, a INTEGER)
+
+statement ok
+INSERT INTO copy SELECT id, (SELECT MAX(a) FROM u) FROM t WHERE EXISTS (SELECT 1 FROM u)
+
+query II nosort
+SELECT id, a FROM copy ORDER BY id
+----
+1 30
+2 30
+3 30
+4 30
+
+statement ok
+DELETE FROM copy
+
+statement ok
+INSERT INTO copy SELECT n, n * 2 FROM (SELECT id AS n FROM t WHERE id < 3)
+
+query II nosort
+SELECT id, a FROM copy ORDER BY id
+----
+1 2
+2 4

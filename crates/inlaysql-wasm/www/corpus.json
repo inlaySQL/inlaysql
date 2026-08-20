@@ -1,0 +1,14 @@
+{
+  "_comment": "The demo corpus, shared by every build. The browser demo fetches this and seeds a database client-side; `cargo run -p inlaysql-wasm --example edge_fixture` compiles the same rows into the .inlay file the edge worker ships. One corpus, so the three demos cannot drift apart.",
+  "dim": 384,
+  "docs": [
+    { "id": 1, "body": "embedded databases keep the whole engine inside your process" },
+    { "id": 2, "body": "rust gives you memory safety without a garbage collector" },
+    { "id": 3, "body": "an embedded database written in rust with vector retrieval" },
+    { "id": 4, "body": "cast iron skillet cornbread recipe with buttermilk" },
+    { "id": 5, "body": "approximate nearest neighbour search over embeddings" },
+    { "id": 6, "body": "a web framework for building sites quickly" },
+    { "id": 7, "body": "write ahead logging and crash recovery in storage engines" },
+    { "id": 8, "body": "hybrid search combines keyword matching with embeddings" }
+  ]
+}

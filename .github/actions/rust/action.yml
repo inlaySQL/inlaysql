@@ -1,0 +1,77 @@
+name: Rust toolchain
+description: >
+  Put a Rust toolchain on the PATH, installing rustup first if the runner does
+  not have it.
+
+# The self-hosted runner does not ship `rustup`, which is why every CI run
+# before AHL-369 died on its first step with `rustup: command not found`. The
+# bootstrap below was copy-pasted into eight jobs across three workflows, and
+# one of them (`fuzz targets still build`) was missing it — the kind of drift
+# that only shows up as a red run. It lives here once instead.
+#
+# Installing rustup when it is absent means the workflow depends on the runner
+# having a network and a shell, rather than on somebody having provisioned it
+# by hand. That path is proven: a run on `joe-mac` logged "rustup not found;
+# installing" and went on to build the workspace, so the proxy does not block
+# `sh.rustup.rs`.
+
+inputs:
+  toolchain:
+    description: Toolchain to install, e.g. stable or nightly.
+    required: false
+    default: stable
+  components:
+    description: Comma-separated rustup components, e.g. rustfmt,clippy.
+    required: false
+    default: ""
+  targets:
+    description: Space-separated targets to add, e.g. wasm32-unknown-unknown.
+    required: false
+    default: ""
+  cache:
+    description: Cache ~/.cargo and target/ under this key. Empty disables it.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Ensure rustup is available
+      shell: bash
+      run: |
+        if command -v rustup >/dev/null 2>&1; then
+          echo "rustup: $(command -v rustup)"
+        elif [ -x "$HOME/.cargo/bin/rustup" ]; then
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        else
+          echo "rustup not found; installing"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        fi
+
+    - name: Install ${{ inputs.toolchain }}
+      shell: bash
+      run: |
+        args=(--profile minimal --no-self-update)
+        if [ -n "${{ inputs.components }}" ]; then
+          args+=(--component "${{ inputs.components }}")
+        fi
+        rustup toolchain install "${{ inputs.toolchain }}" "${args[@]}"
+        for target in ${{ inputs.targets }}; do
+          rustup target add --toolchain "${{ inputs.toolchain }}" "$target"
+        done
+        rustup run "${{ inputs.toolchain }}" rustc --version
+
+    # Keyed on Cargo.lock, and on the toolchain because a nightly `target/` and
+    # a stable one are not interchangeable.
+    - name: Cache cargo
+      if: inputs.cache != ''
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-${{ inputs.cache }}-${{ inputs.toolchain }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-${{ inputs.cache }}-${{ inputs.toolchain }}-

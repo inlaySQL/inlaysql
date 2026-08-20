@@ -1,0 +1,448 @@
+# Collations: `BINARY`, `NOCASE`, `RTRIM`, and SQLite's resolution rules.
+#
+# Every expected result in this file was produced by the sqlite3 binary
+# (3.54.0) running the same statements, not by this engine. An expectation
+# copied from the thing under test would only prove it agrees with itself.
+#
+# The motivating bug (AHL-469): text compared byte for byte here and
+# case-insensitively in MySQL, so `WHERE name = 'ADA'` returned fewer rows than
+# a caller expected and reported success while doing it.
+
+statement ok
+CREATE TABLE t (id INTEGER PRIMARY KEY, nc TEXT COLLATE NOCASE, bin TEXT, rt TEXT COLLATE RTRIM)
+
+statement ok
+INSERT INTO t VALUES (1, 'ada', 'ADA', 'a')
+
+statement ok
+INSERT INTO t VALUES (2, 'ADA', 'ada', 'a  ')
+
+statement ok
+INSERT INTO t VALUES (3, 'Grace', 'Grace', 'g')
+
+# ------------------------------------------------------- the declared collation
+
+# The bug, and its fix: a NOCASE column matches whatever the case.
+query I nosort
+SELECT id FROM t WHERE nc = 'ADA' ORDER BY id
+----
+1
+2
+
+# A column that declared nothing is BINARY, exactly as before.
+query I nosort
+SELECT id FROM t WHERE bin = 'ADA' ORDER BY id
+----
+1
+
+# ---------------------------------------------------------- explicit `COLLATE`
+
+# An explicit COLLATE overrides the column's, in both directions.
+query I nosort
+SELECT id FROM t WHERE bin = 'ADA' COLLATE NOCASE ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM t WHERE nc = 'ADA' COLLATE BINARY ORDER BY id
+----
+2
+
+# ------------------------------------------------------------ leftmost operand
+
+# "If either operand is a column, the collation of that column is used, with
+# precedence to the left operand" — so a plain column on the left wins over a
+# NOCASE column on the right. A column that declared no collation has the
+# *default* one, which is not the same as having none.
+query I nosort
+SELECT id FROM t WHERE bin = nc ORDER BY id
+----
+3
+
+query I nosort
+SELECT id FROM t WHERE nc = bin ORDER BY id
+----
+1
+2
+3
+
+# A literal has no collation at all, so the other operand decides however it is
+# written.
+query I nosort
+SELECT id FROM t WHERE 'ADA' = nc ORDER BY id
+----
+1
+2
+
+# `CAST` is transparent to a column's collation; `||` is not, because its
+# result is not a column.
+query I nosort
+SELECT id FROM t WHERE CAST(nc AS TEXT) = 'ADA' ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM t WHERE nc || '' = 'ADA' ORDER BY id
+----
+2
+
+# An explicit COLLATE *does* propagate out of an expression, which is the one
+# thing that separates it from an implicit one.
+query I nosort
+SELECT id FROM t WHERE (bin COLLATE NOCASE) || '' = 'ada' ORDER BY id
+----
+1
+2
+
+# --------------------------------------------------------------- IN and BETWEEN
+
+# `x IN (list)` takes the collation of `x` alone — SQLite codes every `OP_Eq`
+# from the left operand and never looks at the list.
+query I nosort
+SELECT id FROM t WHERE nc IN ('ADA') ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM t WHERE 'ADA' IN (bin) ORDER BY id
+----
+1
+
+# `IN (SELECT ...)` is different: the subquery's column is a real operand, so
+# it supplies the collation when the probe has none. Uncorrelated, so it is one
+# verdict for the whole table.
+query I nosort
+SELECT id FROM t WHERE 'ADA' IN (SELECT nc FROM t WHERE id = 1) ORDER BY id
+----
+1
+2
+3
+
+query I nosort
+SELECT id FROM t WHERE bin IN (SELECT nc FROM t WHERE id = 1) ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE nc IN (SELECT bin FROM t WHERE id = 1) ORDER BY id
+----
+1
+2
+
+# `x BETWEEN y AND z` is two comparisons and each resolves its own collation, so
+# a COLLATE on one bound applies to that bound alone.
+query I nosort
+SELECT id FROM t WHERE bin BETWEEN 'a' AND 'B' COLLATE NOCASE ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE bin BETWEEN 'a' COLLATE NOCASE AND 'B' ORDER BY id
+----
+1
+
+# ----------------------------------------------------------------------- CASE
+
+# A simple CASE compares with `=`, so it takes the operand's collation.
+query T nosort
+SELECT CASE nc WHEN 'ADA' THEN 'y' ELSE 'n' END FROM t ORDER BY id
+----
+y
+y
+n
+
+query T nosort
+SELECT CASE bin WHEN 'ADA' THEN 'y' ELSE 'n' END FROM t ORDER BY id
+----
+y
+n
+n
+
+# And each branch resolves separately: the first WHEN is NOCASE and matches
+# row 2, which the second (BINARY) branch would have caught otherwise.
+query T nosort
+SELECT CASE bin WHEN 'ADA' COLLATE NOCASE THEN 'y' WHEN 'ada' THEN 'z' ELSE 'n' END FROM t ORDER BY id
+----
+y
+y
+n
+
+# --------------------------------------------------- ORDER BY, GROUP BY, DISTINCT
+
+# NOCASE order puts 'ada' and 'ADA' together and 'Grace' after them; BINARY
+# puts every upper-case letter first.
+query I nosort
+SELECT id FROM t ORDER BY nc, id
+----
+1
+2
+3
+
+query I nosort
+SELECT id FROM t ORDER BY bin, id
+----
+1
+3
+2
+
+query I nosort
+SELECT id FROM t ORDER BY bin COLLATE NOCASE, id
+----
+1
+2
+3
+
+# A positional `ORDER BY` still resolves positionally through a `COLLATE`: the
+# term is the first output column, sorted under the collation written on it.
+query T nosort
+SELECT bin FROM t ORDER BY 1 COLLATE NOCASE, id
+----
+ADA
+ada
+Grace
+
+query T nosort
+SELECT bin FROM t ORDER BY 1
+----
+ADA
+Grace
+ada
+
+query I nosort
+SELECT count(*) FROM (SELECT DISTINCT nc FROM t)
+----
+2
+
+query I nosort
+SELECT count(*) FROM (SELECT DISTINCT bin FROM t)
+----
+3
+
+query I nosort
+SELECT count(*) FROM (SELECT nc FROM t GROUP BY nc)
+----
+2
+
+query I nosort
+SELECT count(*) FROM (SELECT bin FROM t GROUP BY bin)
+----
+3
+
+query I nosort
+SELECT count(*) FROM (SELECT bin FROM t GROUP BY bin COLLATE NOCASE)
+----
+2
+
+query I nosort
+SELECT count(DISTINCT nc) FROM t
+----
+2
+
+query I nosort
+SELECT count(DISTINCT bin) FROM t
+----
+3
+
+# The aggregate MIN/MAX order under the argument's collation too: under BINARY
+# the smallest of ('ada','ADA','Grace') is 'ADA', under NOCASE it is 'ada'.
+query T nosort
+SELECT min(nc) FROM t
+----
+ada
+
+query T nosort
+SELECT min(bin) FROM t
+----
+ADA
+
+query T nosort
+SELECT max(nc) FROM t
+----
+Grace
+
+# ---------------------------------------------------- the collation-aware scalars
+
+query T nosort
+SELECT ifnull(nullif(nc, 'ADA'), 'gone') FROM t WHERE id = 1
+----
+gone
+
+query T nosort
+SELECT ifnull(nullif(bin, 'ada'), 'gone') FROM t WHERE id = 1
+----
+ADA
+
+# -------------------------------------------------------------------- RTRIM
+
+# Trailing spaces are ignored, and only trailing spaces.
+query I nosort
+SELECT id FROM t WHERE rt = 'a' ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM t WHERE rt = 'a   ' ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM t WHERE rt = ' a' ORDER BY id
+----
+
+query I nosort
+SELECT count(*) FROM (SELECT DISTINCT rt FROM t)
+----
+2
+
+# --------------------------------------------------------------------- LIKE
+
+# LIKE does not use a collating sequence at all: it is case-insensitive over
+# ASCII whatever the column declared, in both engines. This is here because it
+# is the one comparison that looks like it should follow the rules above and
+# does not.
+query I nosort
+SELECT id FROM t WHERE bin LIKE 'ada' ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM t WHERE nc LIKE 'ada' ORDER BY id
+----
+1
+2
+
+# ------------------------------------------------------------- derived tables
+
+# A derived table's synthetic column carries the projected expression's
+# collation, so wrapping a query in `FROM (SELECT ...)` does not lose one.
+# Without this a collation would vanish the moment a query nested, silently —
+# the same shape as the bug this whole file is about.
+
+query I nosort
+SELECT id FROM (SELECT id, nc AS s FROM t) d WHERE d.s = 'ADA' ORDER BY id
+----
+1
+2
+
+query I nosort
+SELECT id FROM (SELECT id, bin AS s FROM t) d WHERE d.s = 'ADA' ORDER BY id
+----
+1
+
+# An expression's collation is the expression's, not its column's: `||` carries
+# none, and an explicit COLLATE carries its own.
+query I nosort
+SELECT id FROM (SELECT id, nc || '' AS s FROM t) d WHERE d.s = 'ADA' ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM (SELECT id, bin COLLATE NOCASE AS s FROM t) d WHERE d.s = 'ADA' ORDER BY id
+----
+1
+2
+
+# And it is honoured by everything downstream, not only by `=`.
+query I nosort
+SELECT count(*) FROM (SELECT DISTINCT s FROM (SELECT nc AS s FROM t) d)
+----
+2
+
+query I nosort
+SELECT count(*) FROM (SELECT s FROM (SELECT nc AS s FROM t) d GROUP BY s)
+----
+2
+
+query I nosort
+SELECT id FROM (SELECT id, nc AS s FROM t) d ORDER BY d.s, id
+----
+1
+2
+3
+
+# An explicit COLLATE on the subquery's projection beats an *implicit* one on
+# the probe, which is the third step of SQLite's rule.
+query I nosort
+SELECT id FROM t WHERE bin IN (SELECT nc COLLATE NOCASE FROM t WHERE id = 1) ORDER BY id
+----
+1
+2
+
+# ---------------------------------------------------------- non-ASCII stays out
+
+# NOCASE folds ASCII `A`-`Z` and nothing else, exactly as SQLite does. This is
+# the gap `docs/server.md` names for MySQL clients, and it is deliberate: the
+# differential fuzzer compares against SQLite, and inventing Unicode folding
+# would make the two disagree.
+
+statement ok
+CREATE TABLE accents (id INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE)
+
+statement ok
+INSERT INTO accents VALUES (1, 'élodie'), (2, 'ÉLODIE'), (3, 'elodie')
+
+query I nosort
+SELECT id FROM accents WHERE s = 'ÉLODIE' ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM accents WHERE s = 'ELODIE' ORDER BY id
+----
+3
+
+# --------------------------------------------------------------------- UNIQUE
+
+# A `UNIQUE` column collides under its own collation: on a NOCASE column,
+# 'Ada' and 'ADA' are one key.
+
+statement ok
+CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE UNIQUE)
+
+statement ok
+INSERT INTO u VALUES (1, 'Ada')
+
+statement error
+INSERT INTO u VALUES (2, 'ADA')
+
+statement ok
+INSERT INTO u VALUES (3, 'Grace')
+
+query I nosort
+SELECT count(*) FROM u
+----
+2
+
+# A NULL never collides, whatever the collation.
+statement ok
+INSERT INTO u VALUES (4, NULL)
+
+statement ok
+INSERT INTO u VALUES (5, NULL)
+
+query I nosort
+SELECT count(*) FROM u
+----
+4
+
+# The same table with no collation declared accepts both spellings.
+
+statement ok
+CREATE TABLE ub (id INTEGER PRIMARY KEY, name TEXT UNIQUE)
+
+statement ok
+INSERT INTO ub VALUES (1, 'Ada')
+
+statement ok
+INSERT INTO ub VALUES (2, 'ADA')
+
+query I nosort
+SELECT count(*) FROM ub
+----
+2

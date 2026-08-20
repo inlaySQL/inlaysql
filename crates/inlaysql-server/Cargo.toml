@@ -1,0 +1,16 @@
+[package]
+name = "inlaysql-server"
+description = "MySQL wire-protocol server mode for InlaySQL: point a framework's `mysql` driver at a database file."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# Deliberately no dependencies beyond the engine itself. `docs/server.md`
+# records the evaluation of `msql-srv` that led here: it resolves 190 packages
+# (rustls, chrono, regex, nom, ...) for a protocol subset that is a few hundred
+# lines, which is the same trade `inlaysql-mcp` already refused when it
+# hand-rolled JSON-RPC rather than taking the Tokio-based MCP SDK.
+[dependencies]
+inlaysql = { workspace = true }

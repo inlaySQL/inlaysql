@@ -1,0 +1,12 @@
+[package]
+name = "inlaysql-core"
+description = "Deterministic core of InlaySQL: SQL front end, planner and executor over pluggable storage and index traits."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sqlparser = { workspace = true }
+libm = { workspace = true }

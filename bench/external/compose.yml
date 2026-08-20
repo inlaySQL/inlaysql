@@ -1,0 +1,266 @@
+# The containerised half of the benchmark: DuckDB and pgvector on the corpus
+# InlaySQL was just measured on.
+#
+# Driven by `bench/compare.sh`; `docker compose` is not meant to be run here by
+# hand, because the corpus has to be exported first or the drivers have nothing
+# to read.
+name: inlaysql-bench
+
+services:
+  # PostgreSQL with pgvector already built in. Pinned: pgvector's index
+  # behaviour changes between releases, and a benchmark that silently followed
+  # `latest` would attribute those changes to us.
+  pgvector:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    # `fsync=off` because this measures query latency, not PostgreSQL's
+    # durability, and a server writing through a container filesystem would
+    # otherwise be measured on Docker's storage driver. The InlaySQL numbers it
+    # is compared against are query latencies too.
+    command: >
+      postgres -c fsync=off -c synchronous_commit=off
+      -c shared_buffers=512MB -c maintenance_work_mem=512MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /var/lib/postgresql/data
+
+  # Plain PostgreSQL — no pgvector extension — for the OLTP point-read/
+  # point-write comparison. Configured for real durability, the opposite of
+  # the `pgvector` service above: that container measures query latency and
+  # says so with `fsync=off`; this one measures a durable write, so it runs
+  # with `fsync=on` and `synchronous_commit=on`. See bench/README.md for the
+  # full rationale.
+  #
+  # Not tmpfs: a durable write to a RAM disk is not a durable write. This
+  # uses a normal named volume, backed by Docker's storage driver like any
+  # other container filesystem.
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: bench
+    command: >
+      postgres -c fsync=on -c synchronous_commit=on
+      -c shared_buffers=512MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - postgres-oltp-data:/var/lib/postgresql/data
+
+  # MySQL 8, for the other half of the OLTP comparison. Pinned to the major
+  # version rather than `latest`, for the same reason as pgvector above: a
+  # benchmark that silently followed a moving tag would attribute image
+  # changes to us instead of to the code.
+  #
+  # `innodb-flush-log-at-trx-commit=1` is InnoDB's most durable setting — the
+  # log buffer is written and fsynced at every transaction commit — and is
+  # already MySQL's default; it is set explicitly here so the comparison does
+  # not depend on that default never changing. The binary log is disabled
+  # (`skip-log-bin`) rather than enabled with `sync_binlog=1`: InlaySQL has no
+  # replication log, so a second fsync per commit for one would be measuring
+  # a durability feature neither engine in this comparison uses, not the
+  # commit path itself. See bench/README.md.
+  #
+  # Not tmpfs, for the same reason as postgres above.
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: bench
+    command: >
+      --innodb-flush-log-at-trx-commit=1
+      --skip-log-bin
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    volumes:
+      - mysql-oltp-data:/var/lib/mysql
+
+  # InlaySQL, served over its own MySQL wire protocol (`inlaysql serve
+  # --mysql`) — the server-to-server row (AHL-489, docs/architecture.md Phase 5.2). Every
+  # OLTP row above and below this one has InlaySQL as a library in the
+  # caller's own process against MySQL's/PostgreSQL's socket round trip, and
+  # `BENCHMARK.md` states that asymmetry rather than hiding it. This service
+  # is the one place InlaySQL is never called as a library: `server_driver.py`
+  # reaches it with `mysql.connector`, the identical client that reaches the
+  # `mysql` service above, so every row this service produces pays the same
+  # kind of socket round trip MySQL's rows do.
+  #
+  # A long-running server, not a one-shot job like `inlaysql-oltp` below, so
+  # it is *not* behind the `oltp-container` profile: `docker compose up --wait`
+  # brings it up and waits for it healthy alongside pgvector/postgres/mysql.
+  #
+  # Durability: InlaySQL has no separate durability knob to set here — every
+  # commit is synced before the statement returns, on the host, inside
+  # `inlaysql-oltp` below, and here, identically. That is already its most
+  # (only) durable setting, matched against MySQL's
+  # `innodb-flush-log-at-trx-commit=1` above. See bench/README.md.
+  #
+  # Security, stated rather than hidden (docs/server.md covers the rest): one
+  # shared user/password, given here as a fixed value for a benchmark
+  # container rather than anything meant to be a secret; no TLS, because the
+  # protocol does not implement any yet, not because it was turned off for
+  # this comparison.
+  #
+  # Reuses ../../docker/Dockerfile, the same pinned Linux build image
+  # `docker/test.sh` and `inlaysql-oltp` below use, rather than a second image.
+  inlaysql-server:
+    build: ../../docker
+    volumes:
+      - ../..:/workspace
+      - inlaysql-oltp-cargo:/usr/local/cargo/registry
+      - inlaysql-server-target:/target
+      # The named volume the served database file actually lives on and
+      # fsyncs to — the same class of volume `mysql-oltp-data` and
+      # `postgres-oltp-data` are, not a host bind mount.
+      - inlaysql-server-data:/data
+    working_dir: /workspace
+    command: >
+      cargo run --release --quiet -p inlaysql-mcp --bin inlaysql --
+      serve --mysql /data/bench-oltp-server.inlay
+      --bind 0.0.0.0 --port 3306 --user root --password bench
+      --max-connections 128
+    # No `mysqladmin` in this image (it is the Rust build image, not a MySQL
+    # client), and no Python either, so the check is a bare TCP connect
+    # through bash's own `/dev/tcp` — the MySQL wire protocol sends its
+    # handshake packet the instant a client connects, so a successful connect
+    # already proves the server accepted a connection. `start_period` is long
+    # because the command above is a cold `cargo build` of the whole
+    # workspace the first time this volume is created, which is minutes, not
+    # seconds, the same trade `docker/test.sh` documents for its own first run.
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ': < /dev/tcp/127.0.0.1/3306' 2>/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 900s
+
+  drivers:
+    build:
+      context: .
+    volumes:
+      - ${CORPUS_DIR:-../../target/bench-corpus}:/corpus
+    environment:
+      PG_DSN: postgresql://postgres:postgres@pgvector:5432/postgres
+      PG_OLTP_DSN: postgresql://postgres:postgres@postgres:5432/bench
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USER: root
+      MYSQL_PASSWORD: root
+      MYSQL_DB: bench
+      INLAYSQL_SERVER_HOST: inlaysql-server
+      INLAYSQL_SERVER_PORT: "3306"
+      INLAYSQL_SERVER_USER: root
+      INLAYSQL_SERVER_PASSWORD: bench
+      # `docker compose exec` does not forward the caller's shell
+      # environment into the container, so `server_driver.py`'s tuning
+      # variables have to arrive through compose's own `${VAR:-default}`
+      # interpolation instead — read from whatever `bench/compare.sh`'s own
+      # process environment has (its `SERVER_*=... ./bench/compare.sh`
+      # overrides included), same mechanism `${CORPUS_DIR:-...}` above uses.
+      SERVER_CONCURRENCY_LEVELS: ${SERVER_CONCURRENCY_LEVELS:-1,8}
+      SERVER_ROWS: ${SERVER_ROWS:-2000}
+      SERVER_LOOKUPS: ${SERVER_LOOKUPS:-1000}
+    depends_on:
+      pgvector:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      inlaysql-server:
+        condition: service_healthy
+    command: ["sleep", "infinity"]
+
+  # InlaySQL, measured a *second* time, inside a container, so its database
+  # file sits on the same class of Docker volume `postgres-oltp-data` and
+  # `mysql-oltp-data` do, instead of the host filesystem the plain
+  # `--export-oltp` measurement (run by `compare.sh` before this stack comes
+  # up) uses. That does not make this row hardware-durable — Docker
+  # Desktop's virtualised disk is still whatever it is — but it makes it
+  # *comparable*: every engine then pays whatever that virtualised fsync
+  # costs, instead of only two of the three paying it. The gap between this
+  # row and the host row is itself a measurement, of the virtualised fsync's
+  # cost, and both are reported. See bench/README.md.
+  #
+  # Reuses ../../docker/Dockerfile — the workspace's own pinned Linux build
+  # image, the same one docker/test.sh uses — rather than a second image, and
+  # bind-mounts the source the same way docker/test.sh does, so this measures
+  # the same build docker/test.sh would produce.
+  #
+  # Not started by a plain `docker compose up`: this is a one-shot job, not a
+  # server, and does not fit `up --wait` (which expects a running or healthy
+  # container, not one that runs to completion and exits). It sits behind a
+  # profile so `up` skips it, and `bench/compare.sh` runs it explicitly with
+  # `docker compose --profile oltp-container run --rm --build inlaysql-oltp`.
+  inlaysql-oltp:
+    profiles: ["oltp-container"]
+    build: ../../docker
+    volumes:
+      - ../..:/workspace
+      - inlaysql-oltp-cargo:/usr/local/cargo/registry
+      - inlaysql-oltp-target:/target
+      # The corpus bind mount: read the exported `oltp-rows.csv` and
+      # `oltp-lookup-keys.csv`, and write the result JSON here — same as the
+      # `drivers` service above, and *not* where the database file goes.
+      - ${CORPUS_DIR:-../../target/bench-corpus}:/corpus
+      # The named volume: where the database file this run creates and
+      # fsyncs actually lives. This is the entire point of this service —
+      # the same class of volume `postgres-oltp-data`/`mysql-oltp-data` are,
+      # not a host bind mount.
+      - inlaysql-oltp-data:/data
+    working_dir: /workspace
+    command: >
+      cargo run --release --quiet -p inlaysql-bench --
+      --oltp-replay /corpus --oltp-db /data/bench-oltp-container.inlay
+
+volumes:
+  # Named volumes, not tmpfs — durability has to write through a real
+  # filesystem to mean anything.
+  postgres-oltp-data:
+  mysql-oltp-data:
+  # Where the containerised InlaySQL run's database file lives — the volume
+  # `inlaysql-oltp` above fsyncs to, on the same footing as the two above.
+  inlaysql-oltp-data:
+  # Where `inlaysql-server`'s served database file lives — same footing again,
+  # kept separate from `inlaysql-oltp-data` because the two services run
+  # different comparisons (in-process containerised vs server-to-server) and
+  # a shared file would let one leave rows the other's `DROP TABLE IF EXISTS`
+  # setup step has to clean up before either result means what it claims.
+  inlaysql-server-data:
+  # Build output for `inlaysql-server`, kept separate from `inlaysql-oltp`'s
+  # own `inlaysql-oltp-target` below for the same reason `docker/test.sh`
+  # namespaces target directories per toolchain: `inlaysql-server` runs a
+  # long-lived `cargo run` for the whole life of a `compare.sh` invocation
+  # while `inlaysql-oltp` builds and runs later as a one-shot job, and giving
+  # each its own target volume means neither can contend for the other's
+  # cargo lock. Namespaced per checkout by `bench/compare.sh`, same reasoning
+  # as `inlaysql-oltp-target` below.
+  inlaysql-server-target:
+    name: ${INLAYSQL_SERVER_TARGET_VOLUME:-inlaysql-bench-server-target}
+  # Build cache for `inlaysql-oltp`, deliberately *not* sharing
+  # `docker/test.sh`'s `inlaysql-cargo` volume name even though it holds the
+  # same kind of thing: the final step of a `compare.sh` run is
+  # `docker compose down -v`, which deletes every volume this file declares,
+  # and a shared name would mean tearing down a benchmark run wipes the
+  # download cache other worktrees' `docker/test.sh` invocations depend on.
+  # Scoped to this compose project instead, so `down -v` only ever removes
+  # what `compare.sh` itself created. The target cache is additionally
+  # namespaced per checkout by `bench/compare.sh` (the same reason
+  # `docker/test.sh` namespaces its own target volume): several worktrees
+  # running `compare.sh` at once would otherwise fight over one `cargo` lock
+  # and rebuild over each other's artifacts.
+  inlaysql-oltp-cargo:
+  inlaysql-oltp-target:
+    name: ${INLAYSQL_OLTP_TARGET_VOLUME:-inlaysql-bench-target}

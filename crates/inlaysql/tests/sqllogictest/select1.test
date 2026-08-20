@@ -1,0 +1,87 @@
+# SELECT without FROM: scalar literals, arithmetic and comparison.
+# Mirrors a slice of SQLite's select1.test, in the standard format.
+
+query I nosort
+SELECT 1
+----
+1
+
+query I nosort
+SELECT 1 + 1
+----
+2
+
+query I nosort
+SELECT 2 * 3
+----
+6
+
+query I nosort
+SELECT 10 / 4
+----
+2
+
+query I nosort
+SELECT 10 % 3
+----
+1
+
+query I nosort
+SELECT 1 + 2 * 3
+----
+7
+
+query I nosort
+SELECT (1 + 2) * 3
+----
+9
+
+query R nosort
+SELECT 1.5 + 1
+----
+2.5
+
+query R nosort
+SELECT 10.0 / 4
+----
+2.5
+
+query I nosort
+SELECT -5
+----
+-5
+
+query I nosort
+SELECT 2 > 1
+----
+1
+
+query I nosort
+SELECT 2 = 1
+----
+0
+
+query I nosort
+SELECT 2 <= 2
+----
+1
+
+query T nosort
+SELECT 'hello'
+----
+hello
+
+query II nosort
+SELECT 1, 2
+----
+1 2
+
+query I nosort
+SELECT NULL
+----
+NULL
+
+query I nosort
+SELECT 1 / 0
+----
+NULL

@@ -1,0 +1,71 @@
+# `RETURNING` on INSERT, UPDATE and DELETE. In the dialect since SQLite 3.35.
+#
+# Replayed through the sqlite3 binary.
+#
+# This is a file of its own rather than a section of `write_statements.test`,
+# and the reason is a divergence worth naming: **InlaySQL's row-id counter is
+# one counter for the whole database, where SQLite's is per table.** So the
+# first key assigned in a new table here is one past the highest key assigned
+# anywhere, not one past the highest in that table. The value is still the
+# row's real key and `RETURNING id` still reports it — but it is not the number
+# SQLite would print, so a file that created other tables first could not
+# assert on it. Every table below is the first, and supplies its own keys, so
+# the two engines agree. See `TESTING.md`.
+
+statement ok
+CREATE TABLE ret(id INTEGER PRIMARY KEY, e TEXT, n INTEGER)
+
+statement ok
+INSERT INTO ret VALUES (1, 'a', 10), (2, 'b', 20)
+
+# An assigned key is visible, which is most of why anybody writes `RETURNING`.
+query IT nosort
+INSERT INTO ret (e, n) VALUES ('c', 30) RETURNING id, e
+----
+3 c
+
+# `UPDATE` returns the row *after* the change.
+query II nosort
+UPDATE ret SET n = n * 2 RETURNING id, n
+----
+1 20
+2 40
+3 60
+
+# `DELETE` can only return the row as it was.
+query ITI nosort
+DELETE FROM ret WHERE id = 2 RETURNING id, e, n
+----
+2 b 40
+
+query I nosort
+SELECT count(*) FROM ret
+----
+2
+
+# A statement that matched nothing returns no rows rather than failing.
+query I nosort
+DELETE FROM ret WHERE id = 99 RETURNING id
+----
+
+query I nosort
+UPDATE ret SET n = 0 WHERE id = 99 RETURNING id
+----
+
+# `RETURNING *` projects every column, in declaration order.
+query ITI nosort
+INSERT INTO ret VALUES (9, 'z', 5) RETURNING *
+----
+9 z 5
+
+# An expression is allowed, and takes the alias it is given.
+query IT nosort
+INSERT INTO ret (e, n) VALUES ('q', 2) RETURNING id, upper(e) AS shout
+----
+10 Q
+
+# An upsert reports the row it updated.
+query II nosort
+INSERT INTO ret VALUES (9, 'z', 100) ON CONFLICT (id) DO UPDATE SET n = n + excluded.n RETURNING id, n
+----
+9 105

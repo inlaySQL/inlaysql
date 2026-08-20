@@ -1,0 +1,68 @@
+# CREATE INDEX / DROP INDEX: the kind is inferred from the column type
+# (TEXT -> full-text, VECTOR -> ANN, anything else orderable -> B-tree), at most
+# one of each kind per column list, and droppable by name. `USING` overrides the
+# inference; see btree_index.test.
+
+statement ok
+CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT, embedding VECTOR(3))
+
+# Before an index is declared, scoring a column is an error, not a scan.
+statement error
+SELECT id, bm25_score(body, 'rust') FROM docs ORDER BY score DESC LIMIT 1
+
+statement error
+SELECT id, vector_score(embedding, vector('[1,0,0]')) FROM docs ORDER BY score DESC LIMIT 1
+
+statement ok
+CREATE INDEX docs_body ON docs (body)
+
+statement ok
+INSERT INTO docs (id, body, embedding) VALUES (1, 'rust database engine', vector('[1,0,0]'))
+
+# Now the full-text index answers the query.
+statement ok
+SELECT id, bm25_score(body, 'rust') FROM docs ORDER BY score DESC LIMIT 1
+
+# A column takes at most one index of a kind.
+statement error
+CREATE INDEX second_on_body ON docs (body)
+
+statement ok
+CREATE INDEX docs_embedding ON docs (embedding)
+
+statement ok
+SELECT id, vector_score(embedding, vector('[1,0,0]')) FROM docs ORDER BY score DESC LIMIT 1
+
+# An INTEGER column gets an ordered B-tree index — there is no other kind it
+# could mean. Indexing the INTEGER PRIMARY KEY is allowed and redundant for an
+# equality (the row id already is the key), the same as in SQLite.
+statement ok
+CREATE INDEX on_pk ON docs (id)
+
+statement ok
+DROP INDEX on_pk
+
+# Index names are unique (case-insensitively).
+statement error
+CREATE INDEX docs_body ON docs (embedding)
+
+# DROP INDEX removes the declaration; scoring the column errors again.
+statement ok
+DROP INDEX docs_body
+
+statement error
+SELECT id, bm25_score(body, 'rust') FROM docs ORDER BY score DESC LIMIT 1
+
+# The vector index is unaffected and still answers.
+statement ok
+SELECT id, vector_score(embedding, vector('[1,0,0]')) FROM docs ORDER BY score DESC LIMIT 1
+
+statement error
+DROP INDEX docs_body
+
+# A missing column or table is rejected at plan time.
+statement error
+CREATE INDEX on_missing ON docs (nope)
+
+statement error
+CREATE INDEX on_missing_table ON missing (body)

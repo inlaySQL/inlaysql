@@ -1,0 +1,60 @@
+# The scalar SELECT surface: projection, WHERE, ORDER BY, LIMIT, NULL.
+# A curated subset of the SQL Logic Test corpus in the standard format,
+# covering what the current dialect implements.
+
+statement ok
+CREATE TABLE t(a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')
+
+query IT rowsort
+SELECT a, b FROM t
+----
+1 one
+2 two
+3 three
+
+query IT nosort
+SELECT a, b FROM t ORDER BY a DESC
+----
+3 three
+2 two
+1 one
+
+query I rowsort
+SELECT a FROM t WHERE a >= 2
+----
+2
+3
+
+query I rowsort
+SELECT a FROM t WHERE a <> 2
+----
+1
+3
+
+query T
+SELECT b FROM t WHERE a = 1
+----
+one
+
+query I nosort
+SELECT a FROM t ORDER BY a LIMIT 2
+----
+1
+2
+
+statement ok
+INSERT INTO t(a, b) VALUES (4, NULL)
+
+query IT rowsort
+SELECT a, b FROM t
+----
+1 one
+2 two
+3 three
+4 NULL
+
+statement error
+SELECT a FROM missing_table

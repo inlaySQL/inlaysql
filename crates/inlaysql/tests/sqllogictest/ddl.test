@@ -1,0 +1,228 @@
+# DROP TABLE, CREATE TABLE IF NOT EXISTS, and SQLite's four ALTER TABLE
+# operations.
+#
+# Replayed through the sqlite3 binary, results and refusals alike. Three of the
+# four ALTERs rewrite every stored row here, because a row is a positional list
+# of values with no column directory — so every one of them reads the rows back
+# afterwards rather than only checking the catalog.
+
+# ------------------------------------------------ CREATE TABLE IF NOT EXISTS
+
+statement ok
+CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT)
+
+statement ok
+INSERT INTO t VALUES (1, 'kept')
+
+# A second definition with different columns does nothing at all: SQLite
+# compares the name, not the shape.
+statement ok
+CREATE TABLE IF NOT EXISTS t(x REAL)
+
+query T nosort
+SELECT a FROM t
+----
+kept
+
+statement error
+CREATE TABLE t(x REAL)
+
+# ---------------------------------------------------------------- DROP TABLE
+
+statement ok
+CREATE TABLE gone(id INTEGER PRIMARY KEY, a TEXT)
+
+statement ok
+INSERT INTO gone VALUES (1, 'x')
+
+statement ok
+DROP TABLE gone
+
+statement error
+SELECT a FROM gone
+
+# Recreating the name must not resurrect the rows.
+statement ok
+CREATE TABLE gone(id INTEGER PRIMARY KEY, a TEXT)
+
+query I nosort
+SELECT count(*) FROM gone
+----
+0
+
+statement ok
+DROP TABLE IF EXISTS absent
+
+statement error
+DROP TABLE absent
+
+# ------------------------------------------------------- ALTER ADD COLUMN
+
+statement ok
+CREATE TABLE a(id INTEGER PRIMARY KEY, x TEXT)
+
+statement ok
+INSERT INTO a VALUES (1, 'p'), (2, 'q')
+
+statement ok
+ALTER TABLE a ADD COLUMN n INTEGER DEFAULT 5
+
+statement ok
+ALTER TABLE a ADD COLUMN m TEXT
+
+statement ok
+INSERT INTO a (id, x) VALUES (3, 'r')
+
+query ITIT nosort
+SELECT id, x, n, m FROM a ORDER BY id
+----
+1 p 5 NULL
+2 q 5 NULL
+3 r 5 NULL
+
+# SQLite's restrictions, each because the rows already there were never written
+# under the new constraint.
+statement error
+ALTER TABLE a ADD COLUMN b INTEGER PRIMARY KEY
+
+statement error
+ALTER TABLE a ADD COLUMN b INTEGER UNIQUE
+
+statement error
+ALTER TABLE a ADD COLUMN b INTEGER NOT NULL
+
+statement error
+ALTER TABLE a ADD COLUMN x TEXT
+
+# NOT NULL with a real default is fine: every existing row gets it.
+statement ok
+ALTER TABLE a ADD COLUMN b INTEGER NOT NULL DEFAULT 0
+
+query II nosort
+SELECT id, b FROM a ORDER BY id
+----
+1 0
+2 0
+3 0
+
+# --------------------------------------------------------- ALTER RENAME TO
+
+statement ok
+CREATE TABLE old(id INTEGER PRIMARY KEY, body TEXT)
+
+statement ok
+INSERT INTO old VALUES (1, 'one'), (2, 'two')
+
+statement ok
+ALTER TABLE old RENAME TO renamed
+
+statement error
+SELECT id FROM old
+
+query IT nosort
+SELECT id, body FROM renamed ORDER BY id
+----
+1 one
+2 two
+
+# A new insert still gets a fresh key rather than colliding.
+statement ok
+INSERT INTO renamed (body) VALUES ('three')
+
+query I nosort
+SELECT count(*) FROM renamed
+----
+3
+
+statement ok
+CREATE TABLE taken(x INTEGER)
+
+statement error
+ALTER TABLE renamed RENAME TO taken
+
+# ----------------------------------------------------- ALTER RENAME COLUMN
+
+statement ok
+CREATE TABLE rc(id INTEGER PRIMARY KEY, a INTEGER CHECK (a > 0), b TEXT UNIQUE)
+
+statement ok
+INSERT INTO rc VALUES (1, 5, 'x')
+
+statement ok
+ALTER TABLE rc RENAME COLUMN a TO amount
+
+statement ok
+ALTER TABLE rc RENAME COLUMN b TO label
+
+query IIT nosort
+SELECT id, amount, label FROM rc
+----
+1 5 x
+
+# The CHECK followed the rename rather than naming a column that is gone.
+statement error
+UPDATE rc SET amount = -1
+
+# So did the UNIQUE.
+statement error
+INSERT INTO rc VALUES (2, 1, 'x')
+
+statement error
+SELECT a FROM rc
+
+# A string literal that spells the old name is not a reference to it.
+statement ok
+CREATE TABLE lit(a TEXT, b TEXT, CHECK (b <> 'a'))
+
+statement ok
+ALTER TABLE lit RENAME COLUMN a TO renamed_a
+
+statement error
+INSERT INTO lit VALUES ('x', 'a')
+
+statement ok
+INSERT INTO lit VALUES ('x', 'z')
+
+query TT nosort
+SELECT renamed_a, b FROM lit
+----
+x z
+
+# ------------------------------------------------------- ALTER DROP COLUMN
+
+statement ok
+CREATE TABLE dc(id INTEGER PRIMARY KEY, a TEXT, b INTEGER, c TEXT)
+
+statement ok
+INSERT INTO dc VALUES (1, 'x', 10, 'p'), (2, 'y', 20, 'q')
+
+statement ok
+ALTER TABLE dc DROP COLUMN b
+
+query ITT nosort
+SELECT id, a, c FROM dc ORDER BY id
+----
+1 x p
+2 y q
+
+statement error
+SELECT b FROM dc
+
+# A column something depends on cannot go.
+statement ok
+CREATE TABLE dep(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c INTEGER, UNIQUE (a), CHECK (c > 0))
+
+statement error
+ALTER TABLE dep DROP COLUMN id
+
+statement error
+ALTER TABLE dep DROP COLUMN a
+
+statement error
+ALTER TABLE dep DROP COLUMN c
+
+statement ok
+CREATE TABLE one(x INTEGER)
+
+statement error
+ALTER TABLE one DROP COLUMN x

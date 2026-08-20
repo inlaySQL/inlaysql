@@ -1,0 +1,689 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>InlaySQL — SQL, vectors and full-text search in one file</title>
+<meta name="description" content="An embedded SQL database in Rust. SQLite's model — one file, no server — with MVCC concurrent writers, native vector and BM25 retrieval, and a MySQL wire protocol.">
+
+<meta property="og:title" content="InlaySQL">
+<meta property="og:description" content="An embedded SQL database in Rust: one file, no server, concurrent writers, and hybrid vector + BM25 search in a single SQL statement.">
+<meta property="og:type" content="website">
+
+<style>
+  /* Everything below is hand-written and self-contained: this page is served
+     from GitHub Pages beside the WASM module it demonstrates, and a font CDN
+     or a CSS framework would be a third-party request the visitor did not ask
+     for. The engine in the demo is ~660 KiB gzipped; the page around it should
+     not be a meaningful fraction of that. */
+  :root {
+    --bg: #08080b;
+    --bg-raised: #101015;
+    --line: #23232c;
+    --ink: #e8e8ee;
+    --ink-dim: #9a9aab;
+    --ink-faint: #6b6b7b;
+    --accent: #a78bfa;
+    --accent-warm: #f0abfc;
+    --good: #6ee7b7;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.65 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  code, pre { font-family: var(--mono); }
+
+  .wrap { max-width: 68rem; margin: 0 auto; padding: 0 1.5rem; }
+  .narrow { max-width: 48rem; }
+
+  /* ---- hero ---- */
+
+  header.hero {
+    position: relative;
+    padding: 7rem 0 5rem;
+    text-align: center;
+    overflow: hidden;
+  }
+  /* A single soft radial wash rather than an image: it costs nothing to
+     download and degrades to a flat background if gradients are unsupported. */
+  header.hero::before {
+    content: "";
+    position: absolute;
+    inset: -40% 0 auto 50%;
+    width: 60rem; height: 40rem;
+    transform: translateX(-50%);
+    background: radial-gradient(closest-side, rgba(167, 139, 250, .16), transparent 70%);
+    pointer-events: none;
+  }
+  .hero > * { position: relative; }
+
+  .eyebrow {
+    display: inline-block;
+    font: 500 .78rem/1 var(--mono);
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: .5rem .9rem;
+    margin-bottom: 2rem;
+    background: var(--bg-raised);
+  }
+
+  h1 {
+    font-size: clamp(2.4rem, 6vw, 4rem);
+    line-height: 1.08;
+    letter-spacing: -.03em;
+    font-weight: 700;
+    margin: 0 0 1.25rem;
+  }
+  h1 .grad {
+    background: linear-gradient(100deg, var(--accent), var(--accent-warm));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .lede {
+    font-size: 1.18rem;
+    color: var(--ink-dim);
+    max-width: 40rem;
+    margin: 0 auto 2.5rem;
+  }
+
+  .cta { display: flex; gap: .75rem; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    display: inline-block;
+    font: 500 .95rem/1 var(--sans);
+    padding: .85rem 1.4rem;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    color: var(--ink);
+    background: var(--bg-raised);
+    transition: border-color .15s, background .15s;
+  }
+  .btn:hover { text-decoration: none; border-color: var(--accent); }
+  .btn.primary {
+    background: linear-gradient(100deg, var(--accent), var(--accent-warm));
+    border-color: transparent;
+    color: #17131f;
+    font-weight: 600;
+  }
+  .btn.primary:hover { filter: brightness(1.08); }
+
+  /* ---- numbers ---- */
+
+  .figures {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow: hidden;
+    margin: 4rem 0;
+  }
+  .figure { background: var(--bg-raised); padding: 1.6rem 1.4rem; }
+  .figure b {
+    display: block;
+    font: 700 1.75rem/1.1 var(--sans);
+    letter-spacing: -.02em;
+    color: var(--ink);
+    margin-bottom: .35rem;
+  }
+  .figure span { display: block; font-size: .87rem; color: var(--ink-dim); }
+  .figure em { display: block; font-size: .78rem; color: var(--ink-faint); font-style: normal; margin-top: .4rem; }
+
+  /* ---- sections ---- */
+
+  section.band { padding: 4.5rem 0; border-top: 1px solid var(--line); }
+
+  h2 {
+    font-size: clamp(1.6rem, 3.5vw, 2.1rem);
+    letter-spacing: -.02em;
+    margin: 0 0 .6rem;
+  }
+  h2 + .sub { color: var(--ink-dim); margin: 0 0 2.5rem; max-width: 42rem; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+    gap: 1.25rem;
+  }
+  .card {
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 1.5rem;
+    background: var(--bg-raised);
+  }
+  .card h3 { margin: 0 0 .5rem; font-size: 1.02rem; letter-spacing: -.01em; }
+  .card p { margin: 0; color: var(--ink-dim); font-size: .92rem; }
+
+  /* ---- code ---- */
+
+  pre.code {
+    background: var(--bg-raised);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 1.4rem 1.5rem;
+    overflow-x: auto;
+    font-size: .88rem;
+    line-height: 1.7;
+    margin: 0;
+  }
+  .kw { color: var(--accent); }
+  .fn { color: var(--accent-warm); }
+  .str { color: var(--good); }
+  .com { color: var(--ink-faint); }
+
+  /* ---- demo ---- */
+
+  .demo-field { margin-bottom: 1.75rem; }
+  .demo-field > label {
+    display: block;
+    font-size: .84rem;
+    color: var(--ink-dim);
+    margin-bottom: .55rem;
+  }
+  .row { display: flex; gap: .5rem; }
+  .row input { flex: 1; min-width: 0; }
+  input, button {
+    font: .9rem/1 var(--mono);
+    padding: .7rem .8rem;
+    border-radius: 8px;
+    border: 1px solid var(--line);
+    background: var(--bg);
+    color: var(--ink);
+  }
+  input:focus, button:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button { cursor: pointer; background: var(--bg-raised); white-space: nowrap; }
+  button:hover { border-color: var(--accent); }
+  pre.out {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: .9rem 1rem;
+    margin: .6rem 0 0;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    font-size: .82rem;
+    color: var(--ink-dim);
+    min-height: 1.2rem;
+  }
+  .note { font-size: .85rem; color: var(--ink-faint); margin: .7rem 0 0; }
+
+  /* ---- honesty ---- */
+
+  .limits { border-left: 2px solid var(--line); padding-left: 1.4rem; }
+  .limits li { color: var(--ink-dim); margin-bottom: .8rem; }
+  .limits strong { color: var(--ink); font-weight: 600; }
+
+  table.bench { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  table.bench th, table.bench td {
+    text-align: left;
+    padding: .7rem .6rem;
+    border-bottom: 1px solid var(--line);
+  }
+  table.bench th { color: var(--ink-faint); font-weight: 500; font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; }
+  table.bench td.win { color: var(--good); }
+  table.bench td.loss { color: var(--accent-warm); }
+  table.bench td.num { font-family: var(--mono); }
+
+  footer {
+    border-top: 1px solid var(--line);
+    padding: 3rem 0 4rem;
+    color: var(--ink-faint);
+    font-size: .88rem;
+  }
+  footer a { color: var(--ink-dim); }
+
+  .warn {
+    border: 1px solid var(--line);
+    border-left: 2px solid var(--accent-warm);
+    border-radius: 8px;
+    padding: 1rem 1.2rem;
+    color: var(--ink-dim);
+    font-size: .9rem;
+    background: var(--bg-raised);
+  }
+
+  @media (max-width: 40rem) {
+    header.hero { padding: 4.5rem 0 3rem; }
+    .row { flex-wrap: wrap; }
+    .row input { flex: 1 1 100%; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="eyebrow">Experimental · Rust · no_std core</span>
+    <h1>SQL, vectors and full-text search<br><span class="grad">in a single file</span></h1>
+    <p class="lede">
+      InlaySQL keeps SQLite's model — one file, no server, embed it anywhere —
+      and adds concurrent writers, native vector and BM25 retrieval, and a
+      MySQL wire protocol your ORM already speaks.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/inlaySQL/inlaysql">View on GitHub</a>
+      <a class="btn" href="#demo">Try it in your browser</a>
+      <a class="btn" href="https://github.com/inlaySQL/inlaysql/blob/main/BENCHMARK.md">Benchmarks</a>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="figures">
+    <div class="figure">
+      <b>1.66M</b>
+      <span>point reads per second</span>
+      <em>1.43× SQLite in WAL mode</em>
+    </div>
+    <div class="figure">
+      <b>9×</b>
+      <span>SQLite on concurrent writes</span>
+      <em>832 commits/s at 8 writers, 0% aborted</em>
+    </div>
+    <div class="figure">
+      <b>1</b>
+      <span>statement for hybrid search</span>
+      <em>vector + BM25 fused in the engine</em>
+    </div>
+    <div class="figure">
+      <b>1008</b>
+      <span>SQL Logic Tests passing</span>
+      <em>100%, against SQLite's own corpus</em>
+    </div>
+  </div>
+</div>
+
+<section class="band">
+  <div class="wrap">
+    <h2>Retrieval is not a bolt-on</h2>
+    <p class="sub">
+      A vector column and a full-text index live in the same file, in the same
+      transaction, behind the same SQL. Fusing them is one statement — not two
+      queries and a client-side merge.
+    </p>
+<pre class="code"><span class="com">-- A vector column is a column. An index is an index.</span>
+<span class="kw">CREATE TABLE</span> docs (
+  id        <span class="kw">INTEGER PRIMARY KEY</span>,
+  body      <span class="kw">TEXT</span>,
+  embedding <span class="kw">VECTOR</span>(384)
+);
+<span class="kw">CREATE INDEX</span> docs_body      <span class="kw">ON</span> docs (body);       <span class="com">-- BM25</span>
+<span class="kw">CREATE INDEX</span> docs_embedding <span class="kw">ON</span> docs (embedding);  <span class="com">-- HNSW</span>
+
+<span class="com">-- Hybrid search, ranked by reciprocal rank fusion, in the engine.</span>
+<span class="kw">SELECT</span> id, body,
+       <span class="fn">fuse</span>(<span class="fn">vector_score</span>(embedding, ?), <span class="fn">bm25_score</span>(body, ?)) <span class="kw">AS</span> score
+<span class="kw">FROM</span> docs
+<span class="kw">ORDER BY</span> score <span class="kw">DESC</span>
+<span class="kw">LIMIT</span> 10;</pre>
+  </div>
+</section>
+
+<section class="band">
+  <div class="wrap">
+    <h2>What you get</h2>
+    <p class="sub">Every claim here is backed by a test or a script in the repository.</p>
+    <div class="grid">
+      <div class="card">
+        <h3>One file, no server</h3>
+        <p>
+          Embed it in a binary, a CLI, or a browser tab. The same file opens
+          natively, over WASM, and through the MySQL server — byte for byte.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Writers that do not queue</h3>
+        <p>
+          MVCC by structure: writers touching disjoint rows commit concurrently
+          and are rebased rather than aborted. SQLite serialises at its file
+          lock; we measured 0% aborts at every writer count.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Your ORM already speaks it</h3>
+        <p>
+          <code>inlaysql serve --mysql</code> talks the MySQL wire protocol.
+          A stock Laravel migration and Eloquent CRUD — including
+          <code>upsert()</code>, eager loads and paginated reads — run over it.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Crash safety you can replay</h3>
+        <p>
+          The core is <code>no_std</code>, so it cannot read a clock or touch a
+          file except through a trait. That is what lets thousands of crash and
+          torn-write schedules replay byte-for-byte on any machine.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Tested against SQLite itself</h3>
+        <p>
+          1008 SQL Logic Tests at 100%, plus a differential fuzzer that runs
+          generated queries through both engines and compares the answers.
+        </p>
+      </div>
+      <div class="card">
+        <h3>No unsafe code</h3>
+        <p>
+          <code>inlaysql</code> and <code>inlaysql-core</code> are
+          <code>#![forbid(unsafe_code)]</code>. The one exception is the
+          <code>io_uring</code> backend, isolated behind a trait.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="band" id="demo">
+  <div class="wrap narrow">
+    <h2>Run it here</h2>
+    <p class="sub">
+      The engine below is compiled to WebAssembly and running in this tab —
+      no server, no network round trip. It seeds a small corpus, indexes it for
+      BM25 and vector search, and answers with the same code the native build
+      runs.
+    </p>
+
+    <div class="demo-field">
+      <label for="q">Hybrid search — BM25 over <code>body</code>, fused with vector similarity over <code>embedding</code></label>
+      <div class="row">
+        <input id="q" value="embedded database" spellcheck="false" aria-label="Search query">
+        <button id="search">search</button>
+      </div>
+      <pre class="out" id="results">loading the module…</pre>
+    </div>
+
+    <div class="demo-field">
+      <label for="sql">Any SQL you like</label>
+      <div class="row">
+        <input id="sql" value="SELECT id, body FROM docs WHERE id = 3" spellcheck="false" aria-label="SQL statement">
+        <button id="run">run</button>
+      </div>
+      <pre class="out" id="out"></pre>
+    </div>
+
+    <div class="demo-field">
+      <label>Persistence</label>
+      <div class="row">
+        <button id="save">save to OPFS</button>
+        <button id="load">load from OPFS</button>
+        <button id="download">download .inlay</button>
+      </div>
+      <p class="note">
+        The database is one file, in the same format the CLI reads. Saving hands
+        those bytes to the origin-private file system; downloading gives you a
+        file you can open with <code>inlaysql serve --mcp</code>.
+      </p>
+      <pre class="out" id="storage"></pre>
+    </div>
+  </div>
+</section>
+
+<section class="band">
+  <div class="wrap">
+    <h2>Measured, including where we lose</h2>
+    <p class="sub">
+      Every number regenerates from a script in the repository. A table that
+      contains only wins is advertising, so the losses are here too.
+    </p>
+    <table class="bench">
+      <thead>
+        <tr><th>Workload</th><th>InlaySQL</th><th>Compared with</th><th>Result</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Point read by primary key</td>
+          <td class="num">1,662,494 ops/s</td>
+          <td>SQLite, WAL</td>
+          <td class="win">1.43× faster</td>
+        </tr>
+        <tr>
+          <td>Concurrent writes, 8 writers</td>
+          <td class="num">832 commits/s</td>
+          <td>SQLite, journal</td>
+          <td class="win">9× faster</td>
+        </tr>
+        <tr>
+          <td>Vector search, recall@10 1.000</td>
+          <td class="num">71 µs</td>
+          <td><code>sqlite-vec</code></td>
+          <td class="win">9.4× faster</td>
+        </tr>
+        <tr>
+          <td>Hybrid search</td>
+          <td class="num">0.85 ms</td>
+          <td>DuckDB, pgvector</td>
+          <td class="win">~14× faster</td>
+        </tr>
+        <tr>
+          <td>Durable write, one row per commit</td>
+          <td class="num">529 ops/s</td>
+          <td>PostgreSQL 17</td>
+          <td class="win">beats it</td>
+        </tr>
+        <tr>
+          <td>Durable write, one row per commit</td>
+          <td class="num">529 ops/s</td>
+          <td>MySQL 8</td>
+          <td class="loss">2.7× slower</td>
+        </tr>
+        <tr>
+          <td>Join, 20k × 160k rows</td>
+          <td class="num">56 ms</td>
+          <td>SQLite</td>
+          <td class="loss">6× slower</td>
+        </tr>
+        <tr>
+          <td>Indexed range scan, 50 rows</td>
+          <td class="num">13.5 µs</td>
+          <td>SQLite, WAL</td>
+          <td class="loss">2.5× slower</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="note">
+      One developer machine, one commit, one sitting. Reproduce it; do not
+      trust it — <code>./bench/run.sh</code> and <code>./bench/compare.sh</code>
+      are in the repository, and
+      <a href="https://github.com/inlaySQL/inlaysql/blob/main/BENCHMARK.md">BENCHMARK.md</a>
+      records the machine, the durability settings and the asymmetries that
+      remain.
+    </p>
+  </div>
+</section>
+
+<section class="band">
+  <div class="wrap narrow">
+    <h2>What this is not, yet</h2>
+    <p class="sub">
+      Scheduled work rather than oversights — but you should know them before
+      you reach for this.
+    </p>
+    <ul class="limits">
+      <li>
+        <strong>Experimental.</strong> The on-disk format is pre-1.0 and the
+        policy is recreate, not migrate: a newer build refuses an older file
+        loudly rather than guessing.
+      </li>
+      <li>
+        <strong>Joins and range scans are slower than SQLite.</strong> Measured,
+        published above, and the current top priority.
+      </li>
+      <li>
+        <strong>No cost-based join planner.</strong> Joins run in the order
+        they are written; index selection is a small set of rules that pay.
+      </li>
+      <li>
+        <strong>The MySQL server is localhost-plaintext for now.</strong> No
+        TLS, a single credential from a flag, and it binds to 127.0.0.1 by
+        default. Do not put it on a network you do not own.
+      </li>
+      <li>
+        <strong>Recall on uniformly random vectors is poor</strong> — and
+        cannot be fixed by tuning, because distances in that corpus concentrate.
+        On text-derived embeddings it is 1.000.
+      </li>
+    </ul>
+  </div>
+</section>
+
+<section class="band">
+  <div class="wrap narrow">
+    <h2>Get started</h2>
+<pre class="code"><span class="com"># Not on crates.io yet — it is version 0.0.1 and the format is pre-1.0.</span>
+git clone https://github.com/inlaySQL/inlaysql
+<span class="kw">cd</span> inlaysql
+
+<span class="com"># Hybrid retrieval, end to end, in one example</span>
+cargo run --example hybrid_search
+
+<span class="com"># Or serve a database over the MySQL wire protocol,</span>
+<span class="com"># then point your ORM at 127.0.0.1:3306</span>
+cargo run -p inlaysql-mcp --bin inlaysql -- serve --mysql app.inlay</pre>
+    <p class="note" style="margin-top:1.2rem">
+      Reading order for the repository:
+      <a href="https://github.com/inlaySQL/inlaysql#readme">README</a> for the
+      pitch and the architecture,
+      <a href="https://github.com/inlaySQL/inlaysql/blob/main/TESTING.md">TESTING.md</a>
+      for what is covered and what is not, and
+      <a href="https://github.com/inlaySQL/inlaysql/blob/main/PLAN.md">PLAN.md</a>
+      for what is being built next and why.
+    </p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>
+      InlaySQL is dual licensed —
+      <a href="https://github.com/inlaySQL/inlaysql/blob/main/LICENSE">AGPLv3</a>
+      or a
+      <a href="https://github.com/inlaySQL/inlaysql/blob/main/LICENSE-COMMERCIAL.md">commercial licence</a>
+      — and built in the open at
+      <a href="https://github.com/inlaySQL/inlaysql">github.com/inlaySQL/inlaysql</a>.
+      This page runs the engine itself — the demo above is the WASM build, not a
+      recording.
+    </p>
+  </div>
+</footer>
+
+<script type="module">
+import init, { Database, embed } from "./pkg/inlaysql_wasm.js";
+
+const el = (id) => document.getElementById(id);
+const show = (id, value) =>
+  el(id).textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+
+// The same corpus the edge worker ships and the benchmarks index — fetched
+// rather than pasted here, so the demos cannot drift apart.
+const { dim, docs } = await (await fetch("./corpus.json")).json();
+
+function seed(db) {
+  db.execute(`CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT, embedding VECTOR(${dim}))`);
+  db.execute("CREATE INDEX docs_body ON docs (body)");
+  db.execute("CREATE INDEX docs_embedding ON docs (embedding)");
+  for (const { id, body } of docs) {
+    db.execute(
+      "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
+      // `embed` is the engine's own stand-in embedder, exported from the WASM
+      // module. Not a JavaScript lookalike: a file seeded here has to open in
+      // the CLI and rank the same way, which only holds if both sides bucket
+      // trigrams with the identical function. Real applications put their own
+      // model's output in this column and never call it.
+      JSON.stringify([id, body, Array.from(embed(body, dim))]),
+    );
+  }
+  db.checkpoint();
+}
+
+await init();
+let db = new Database();
+seed(db);
+
+el("search").onclick = () => {
+  const text = el("q").value;
+  try {
+    const rows = JSON.parse(db.query(
+      `SELECT id, body, fuse(vector_score(embedding, ?), bm25_score(body, ?)) AS score
+       FROM docs ORDER BY score DESC LIMIT 5`,
+      JSON.stringify([Array.from(embed(text, dim)), text]),
+    ));
+    show("results", rows.rows.map(([id, body, score]) =>
+      `${String(score.toFixed(4)).padStart(8)}  [${id}] ${body}`).join("\n") || "no matches");
+  } catch (error) {
+    show("results", String(error));
+  }
+};
+el("search").click();
+
+el("run").onclick = () => {
+  try {
+    show("out", JSON.parse(db.query(el("sql").value)));
+  } catch (error) {
+    show("out", String(error));
+  }
+};
+
+const FILE = "demo.inlay";
+
+el("save").onclick = async () => {
+  try {
+    const bytes = db.export();
+    const root = await navigator.storage.getDirectory();
+    const handle = await root.getFileHandle(FILE, { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(bytes);
+    await writable.close();
+    show("storage", `saved ${bytes.length} bytes to OPFS as ${FILE}`);
+  } catch (error) {
+    show("storage", `OPFS is unavailable here (${error}). The bytes are still\n` +
+                    `yours: use "download .inlay".`);
+  }
+};
+
+el("load").onclick = async () => {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const handle = await root.getFileHandle(FILE);
+    const bytes = new Uint8Array(await (await handle.getFile()).arrayBuffer());
+    db = Database.open(bytes);
+    show("storage", `loaded ${bytes.length} bytes from OPFS`);
+    el("search").click();
+  } catch (error) {
+    show("storage", `nothing to load: ${error}`);
+  }
+};
+
+el("download").onclick = () => {
+  const blob = new Blob([db.export()], { type: "application/octet-stream" });
+  const a = Object.assign(document.createElement("a"), {
+    href: URL.createObjectURL(blob),
+    download: FILE,
+  });
+  a.click();
+  URL.revokeObjectURL(a.href);
+  show("storage", "downloaded — open it with `inlaysql serve --mcp demo.inlay`");
+};
+</script>
+
+</body>
+</html>

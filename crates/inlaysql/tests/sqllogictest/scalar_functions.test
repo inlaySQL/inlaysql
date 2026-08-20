@@ -1,0 +1,172 @@
+# The scalar function library, with SQLite's names and semantics.
+#
+# Every expected value here was produced by SQLite, not by InlaySQL: a
+# self-blessed expectation would pass whatever the engine happened to do.
+
+statement ok
+CREATE TABLE s(id INTEGER PRIMARY KEY, t TEXT, n INTEGER, r REAL)
+
+statement ok
+INSERT INTO s VALUES (1, 'alpha', 3, 2.5)
+
+statement ok
+INSERT INTO s VALUES (2, '  pad  ', -7, -2.5)
+
+statement ok
+INSERT INTO s VALUES (3, NULL, NULL, NULL)
+
+statement ok
+INSERT INTO s VALUES (4, 'MixedCase', 0, 0.0)
+
+query I nosort
+SELECT length(t) FROM s ORDER BY id
+----
+5
+7
+NULL
+9
+
+query T nosort
+SELECT upper(t) FROM s WHERE id IN (1, 4) ORDER BY id
+----
+ALPHA
+MIXEDCASE
+
+query T nosort
+SELECT lower(t) FROM s WHERE id IN (1, 4) ORDER BY id
+----
+alpha
+mixedcase
+
+query T nosort
+SELECT substr(t, 2, 3) FROM s WHERE id IN (1, 4) ORDER BY id
+----
+lph
+ixe
+
+query T nosort
+SELECT substr(t, -3) FROM s WHERE id IN (1, 4) ORDER BY id
+----
+pha
+ase
+
+query T nosort
+SELECT trim(t) FROM s WHERE id = 2
+----
+pad
+
+query T nosort
+SELECT replace(ltrim(t), ' ', '.') FROM s WHERE id = 2
+----
+pad..
+
+query T nosort
+SELECT replace(rtrim(t), ' ', '.') FROM s WHERE id = 2
+----
+..pad
+
+query T nosort
+SELECT trim('xxaxx', 'x') FROM s WHERE id = 1
+----
+a
+
+query T nosort
+SELECT replace(t, 'a', 'A') FROM s WHERE id = 1
+----
+AlphA
+
+query I nosort
+SELECT instr(t, 'ph') FROM s WHERE id = 1
+----
+3
+
+query I nosort
+SELECT instr(t, 'zz') FROM s WHERE id = 1
+----
+0
+
+query T nosort
+SELECT hex(t) FROM s WHERE id = 1
+----
+616C706861
+
+query T nosort
+SELECT hex(n) FROM s WHERE id = 1
+----
+33
+
+query I nosort
+SELECT abs(n) FROM s WHERE id IN (1, 2, 4) ORDER BY id
+----
+3
+7
+0
+
+query R nosort
+SELECT abs(r) FROM s WHERE id IN (1, 2) ORDER BY id
+----
+2.5
+2.5
+
+query R nosort
+SELECT round(r) FROM s WHERE id IN (1, 2) ORDER BY id
+----
+3.0
+-3.0
+
+query I nosort
+SELECT coalesce(n, 99) FROM s ORDER BY id
+----
+3
+-7
+99
+0
+
+query T nosort
+SELECT ifnull(t, 'none') FROM s WHERE id <> 2 ORDER BY id
+----
+alpha
+none
+MixedCase
+
+query I nosort
+SELECT nullif(n, 0) FROM s ORDER BY id
+----
+3
+-7
+NULL
+NULL
+
+query I nosort
+SELECT min(n, 1) FROM s WHERE id <> 3 ORDER BY id
+----
+1
+-7
+0
+
+query I nosort
+SELECT max(n, 1) FROM s WHERE id <> 3 ORDER BY id
+----
+3
+1
+1
+
+query I nosort
+SELECT min(n, 1) FROM s WHERE id = 3
+----
+NULL
+
+query IT nosort
+SELECT length(t), upper(t) FROM s WHERE id = 4
+----
+9 MIXEDCASE
+
+query ITTTIR nosort
+SELECT length(t), upper(t), substr(t, 1, 2), trim(t), abs(n), round(r) FROM s WHERE id = 3
+----
+NULL NULL NULL NULL NULL NULL
+
+query T nosort
+SELECT '<' || hex(t) || '>' FROM s WHERE id = 3
+----
+<>
