@@ -534,20 +534,15 @@ LOOKUPS=50000 ./bench/run.sh      # points, indexed, joins, concurrency, vectors
 ```
 
 Every number below is [`BENCHMARK.md`](BENCHMARK.md), regenerated at commit
-`2ce978a` on a quiet machine (load average 2.5–3.8 across the runs). One
-developer machine — reproduce it, do not trust it. See
+`49e98e4` on a developer machine at load average 5.4 (running Chrome, LM
+Studio and other applications). One developer machine — reproduce it, do not
+trust it. The machine was loaded enough that absolute throughput is depressed
+relative to a quiet machine, but because every engine was measured in the same
+run under the same conditions, the comparisons remain fair. See
 [`bench/README.md`](bench/README.md) for how each comparison is kept fair:
 matched schema, prepared statements on both sides, matched durability
 (`fullfsync` on macOS, which is what makes these numbers mean anything at
 all), and each engine's own query plan checked rather than assumed.
-
-Several rounds of work aimed squarely at the losses below have landed on
-`main` since this commit — a clock-based page cache and a retained leaf
-cursor (AHL-472), `ValueRef` on the read path (AHL-478) and a cheaper index
-entry walk (AHL-479) moved the join and range numbers 4–30% each, and a
-double-`fsync` fix (AHL-480) targets the durable-write row — but none of it
-has been measured together on a quiet machine yet, so the table below is
-what stands until that regeneration runs.
 
 ### Against SQLite
 
@@ -558,13 +553,13 @@ harder target.
 
 | Workload | InlaySQL | SQLite, durable | SQLite, fastest |
 | --- | --- | --- | --- |
-| Point read by primary key | **1,662,494 ops/s**, 500 ns p50 | 305,370 ops/s (**5.4x**) | 1,165,810 ops/s (**1.43x**) |
-| Point read, secondary index | **499,740 ops/s**, 1.79 µs p50 | 223,877 ops/s (**2.2x**) | 667,768 ops/s (we lose 1.34x) |
-| Indexed range scan, 50 rows | 48,915 ops/s, 19.25 µs p50 | 112,915 ops/s (we lose 2.3x) | 179,641 ops/s (we lose 3.7x) |
-| Join, PK inner, full scan | 71.5 ms | 9.37 ms (we lose 7.6x) | — |
-| Join, secondary-index inner, full scan | 166.5 ms | 14.8 ms (we lose 11.4x) | — |
-| Durable write, one commit each | **241 ops/s**, 3.99 ms p50 | 93 ops/s (**2.6x**) | — |
-| Concurrent durable writers, 8 threads | **832 commits/s**, 0.0% aborted | 92 commits/s (**9.0x**) | — |
+| Point read by primary key | **1,363,754 ops/s**, 541 ns p50 | 274,272 ops/s (**4.97x**) | 1,023,733 ops/s (**1.33x**) |
+| Point read, secondary index | **451,602 ops/s**, 1.92 µs p50 | 272,933 ops/s (**1.66x**) | 692,973 ops/s (we lose 1.54x) |
+| Indexed range scan, 50 rows | 66,508 ops/s, 13.96 µs p50 | 136,527 ops/s (we lose 2.05x) | 187,926 ops/s (we lose 2.82x) |
+| Join, PK inner, full scan | 54.12 ms | 9.97 ms (we lose 5.56x) | — |
+| Join, secondary-index inner, full scan | 169.07 ms | 15.91 ms (we lose 10.71x) | — |
+| Durable write, one commit each | **239 ops/s**, 4.00 ms p50 | 91 ops/s (**2.63x**) | — |
+| Concurrent durable writers, 8 threads | **692 commits/s**, 0.0% aborted | 93 commits/s (**7.4x**) | — |
 
 A single indexed point probe wins — the index itself is worth roughly 1,500x
 over the engine's own unindexed scan. **Iterating rows is where we lose**: a
@@ -603,19 +598,19 @@ exhaustive oracle:
 
 | Corpus | recall@10 | InlaySQL p50 | vs `sqlite-vec` |
 | --- | --- | --- | --- |
-| Text-derived embeddings | 1.000 | 71.17 µs | **9.4x faster at 100% of its recall** |
-| Uniform random | 0.922 | 98.50 µs | 6.8x faster at 92.2% of its recall |
+| Text-derived embeddings | 1.000 | 70.83 µs | **9.52x faster at 100% of its recall** |
+| Uniform random | 0.922 | 98.00 µs | 6.88x faster at 92.2% of its recall |
 
 Both corpus shapes are published because only one of them flatters us:
 uniformly random vectors in 384 dimensions have no structure for a graph
 index to navigate, so recall falls and no tuning fixes it — text-derived
 embeddings are what an application actually stores. `VECTOR(n, INT8)`
-quantisation costs 0.014 recall on the realistic corpus for a 4x smaller
+quantisation costs 0.014 recall on the realistic corpus for a 3.96x smaller
 resident vector payload.
 
 Hybrid retrieval (vector + BM25, fused in one SQL statement) at 2,000
-documents: ingest 14,119 docs/s, vector p50 80.75 µs, BM25 p50 315.63 µs,
-hybrid p50 377.67 µs.
+documents: ingest 14,628 docs/s, vector p50 71.58 µs, BM25 p50 305.00 µs,
+hybrid p50 382.25 µs.
 
 Against DuckDB and pgvector, one corpus and one exhaustive ground truth
 shared by all three engines — see
@@ -624,15 +619,15 @@ for the full methodology. 5,000 documents, dim 128, 100 queries, top-10:
 
 | Engine | recall@10 | vector p50 | hybrid p50 |
 | --- | --- | --- | --- |
-| InlaySQL (HNSW + BM25) | 1.000 | 0.073 ms | **0.85 ms** |
-| DuckDB (`vss` HNSW + `fts`) | 0.993 | 3.89 ms | 11.69 ms |
-| pgvector (HNSW + `ts_rank`) | 0.989 | **0.17 ms** | 14.68 ms |
+| InlaySQL (HNSW + BM25) | 1.000 | **78.00 µs** | **875.00 µs** |
+| DuckDB (vss HNSW + `fts`) | 0.993 | 4.07 ms | 11.99 ms |
+| pgvector (HNSW + `ts_rank`) | 0.987 | 159.00 µs | 14.42 ms |
 
 **Hybrid is roughly 14–17x** the nearer baseline, because it is one statement
 here and two queries plus client-side rank fusion there — not a comparison of
 equal amounts of work either way, and `bench/README.md` says so.
-Vector-only, pgvector's 0.17 ms **includes a socket round trip** and is
-within touching distance of our 0.073 ms in-process; read that as close, not
+Vector-only, pgvector's 159 µs **includes a socket round trip** and is
+within touching distance of our 78 µs in-process; read that as close, not
 as a rout in either direction.
 
 Recall on uniformly random vectors is a structural, not a tuning, problem: on
@@ -652,17 +647,17 @@ servers, so all three pay the same virtualised fsync:
 
 | Engine | write ops/s | read ops/s |
 | --- | --- | --- |
-| InlaySQL, host (real `F_FULLFSYNC`) | 243 | 807,000 |
-| InlaySQL, containerised | **529** | 675,000 |
-| MySQL 8 (`innodb_flush_log_at_trx_commit=1`, binlog off) | **1,434** | 10,800 |
-| PostgreSQL 17 (`fsync=on`, `synchronous_commit=on`) | 475 | 20,600 |
+| InlaySQL, host (real `F_FULLFSYNC`) | 238.5 | 446,232 |
+| InlaySQL, containerised | **723.1** | 603,365 |
+| MySQL 8 (`innodb_flush_log_at_trx_commit=1`, binlog off) | **780.7** | 10,887 |
+| PostgreSQL 17 (`fsync=on`, `synchronous_commit=on`) | 730.9 | 53,155 |
 
-**Reads: ~62x MySQL and ~33x PostgreSQL**, containerised — an in-process
+**Reads: ~55x MySQL and ~11.3x PostgreSQL**, containerised — an in-process
 library against a socket round trip, an asymmetry that is structural and
-stated rather than hidden. **Writes: PostgreSQL is beaten** (529 vs 475);
-**MySQL is still 2.7x faster** — this workload is one commit at a time on one
-connection, so group commit cannot fire by design, and what is left is
-per-commit cost against InnoDB's own redo write.
+stated rather than hidden. **Writes: PostgreSQL is competitive** (730.9 vs
+723.1); **MySQL is still 1.08x faster** — this workload is one commit at a
+time on one connection, so group commit cannot fire by design, and what is
+left is per-commit cost against InnoDB's own redo write.
 
 What none of this proves: Docker Desktop's virtual disk was never
 independently verified to honour `fsync` as a barrier for any of the three

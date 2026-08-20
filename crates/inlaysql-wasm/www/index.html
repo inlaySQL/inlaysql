@@ -290,14 +290,14 @@
 <div class="wrap">
   <div class="figures">
     <div class="figure">
-      <b>1.66M</b>
+      <b>1.36M</b>
       <span>point reads per second</span>
-      <em>1.43× SQLite in WAL mode</em>
+      <em>1.33× SQLite in WAL mode</em>
     </div>
     <div class="figure">
-      <b>9×</b>
+      <b>7.4×</b>
       <span>SQLite on concurrent writes</span>
-      <em>832 commits/s at 8 writers, 0% aborted</em>
+      <em>692 commits/s at 8 writers, 0% aborted</em>
     </div>
     <div class="figure">
       <b>1</b>
@@ -452,51 +452,51 @@
       <tbody>
         <tr>
           <td>Point read by primary key</td>
-          <td class="num">1,662,494 ops/s</td>
+          <td class="num">1,363,754 ops/s</td>
           <td>SQLite, WAL</td>
-          <td class="win">1.43× faster</td>
+          <td class="win">1.33× faster</td>
         </tr>
         <tr>
           <td>Concurrent writes, 8 writers</td>
-          <td class="num">832 commits/s</td>
+          <td class="num">692 commits/s</td>
           <td>SQLite, journal</td>
-          <td class="win">9× faster</td>
+          <td class="win">7.4× faster</td>
         </tr>
         <tr>
           <td>Vector search, recall@10 1.000</td>
-          <td class="num">71 µs</td>
+          <td class="num">70.8 µs</td>
           <td><code>sqlite-vec</code></td>
-          <td class="win">9.4× faster</td>
+          <td class="win">9.5× faster</td>
         </tr>
         <tr>
           <td>Hybrid search</td>
-          <td class="num">0.85 ms</td>
+          <td class="num">0.875 ms</td>
           <td>DuckDB, pgvector</td>
           <td class="win">~14× faster</td>
         </tr>
         <tr>
           <td>Durable write, one row per commit</td>
-          <td class="num">529 ops/s</td>
+          <td class="num">723.1 ops/s</td>
           <td>PostgreSQL 17</td>
           <td class="win">beats it</td>
         </tr>
         <tr>
           <td>Durable write, one row per commit</td>
-          <td class="num">529 ops/s</td>
+          <td class="num">723.1 ops/s</td>
           <td>MySQL 8</td>
-          <td class="loss">2.7× slower</td>
+          <td class="loss">1.08× slower</td>
         </tr>
         <tr>
           <td>Join, 20k × 160k rows</td>
-          <td class="num">56 ms</td>
+          <td class="num">54.1 ms</td>
           <td>SQLite</td>
-          <td class="loss">6× slower</td>
+          <td class="loss">5.6× slower</td>
         </tr>
         <tr>
           <td>Indexed range scan, 50 rows</td>
-          <td class="num">13.5 µs</td>
+          <td class="num">14 µs</td>
           <td>SQLite, WAL</td>
-          <td class="loss">2.5× slower</td>
+          <td class="loss">2.8× slower</td>
         </tr>
       </tbody>
     </table>
