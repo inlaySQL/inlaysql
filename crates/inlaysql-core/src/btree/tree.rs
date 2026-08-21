@@ -35,6 +35,7 @@ use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::cmp::Ordering;
 
 use crate::error::{Error, Result};
 use crate::row::RowBuf;
@@ -1277,7 +1278,14 @@ impl<D: Device> CowBTree<D> {
             after,
             limit,
         };
-        self.walk(self.read_root(), &bounds, self.has_pending, &mut out)?;
+        self.walk(
+            self.read_root(),
+            &bounds,
+            self.has_pending,
+            &None,
+            &None,
+            &mut out,
+        )?;
         Ok(out)
     }
 
@@ -1332,7 +1340,14 @@ impl<D: Device> CowBTree<D> {
             after,
             limit,
         };
-        self.walk_row_ids(self.read_root(), &bounds, self.has_pending, &mut out)?;
+        self.walk_row_ids(
+            self.read_root(),
+            &bounds,
+            self.has_pending,
+            &None,
+            &None,
+            &mut out,
+        )?;
         Ok(out)
     }
 
@@ -2119,12 +2134,31 @@ impl<D: Device> CowBTree<D> {
     /// Pruning is decided from the separators of the node in hand: child slot
     /// `i` spans `[cells[i-1].key, cells[i].key)`, and it is descended only when
     /// that span overlaps the requested range. Each level narrows
-    /// independently, so no ancestor bounds have to be threaded down.
+    /// independently, so no ancestor bounds have to be threaded down *for
+    /// pruning*.
+    ///
+    /// `low`/`high` are a different, narrower kind of ancestor state: the same
+    /// separator sources [`CowBTree::get_from`]'s `low_source`/`high_source`
+    /// already track for [`CowBTree::retain_cursor`], reused here to name how
+    /// many of `bounds.start`/`end`/`after`'s leading bytes this call's whole
+    /// subtree is already proven to share with each of them — see
+    /// [`known_prefix`]. That count is what lets [`WalkBounds::admits`] and
+    /// [`WalkBounds::starts_below`] start their comparisons past the bytes a
+    /// shared index or table prefix would otherwise force every one of them to
+    /// re-walk (`PERF.md`, "The join and range profile", `memcmp` at 12% of a
+    /// join's self time). It changes what comparisons cost, never what they
+    /// mean: `low`/`high` absent is always sound (an unproven prefix is
+    /// treated as zero bytes proven, not guessed at), so a caller that cannot
+    /// be bothered to track them can always pass `&None, &None`, exactly as
+    /// every entry point below does.
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         &self,
         id: PageId,
         bounds: &WalkBounds<'_>,
         pending: bool,
+        low: &Option<(Rc<Node>, usize)>,
+        high: &Option<(Rc<Node>, usize)>,
         out: &mut Vec<(Vec<u8>, RowBuf)>,
     ) -> Result<()> {
         if id == 0 || out.len() >= bounds.limit {
@@ -2134,13 +2168,14 @@ impl<D: Device> CowBTree<D> {
         // than moved out. That is the same allocation the decode used to make
         // per entry — the walk pays it only for the entries it actually keeps.
         let node = self.node_at(id, pending)?;
+        let known = Known::for_node(bounds, low, high);
         match &*node {
             Node::Leaf(entries) => {
                 for entry in entries {
                     if out.len() >= bounds.limit {
                         return Ok(());
                     }
-                    if !bounds.admits(&entry.key) {
+                    if !bounds.admits(&entry.key, &known) {
                         continue;
                     }
                     let value = self.resolve_value_at(&entry.value, pending)?;
@@ -2149,26 +2184,45 @@ impl<D: Device> CowBTree<D> {
             }
             Node::Internal { leftmost, cells } => {
                 // Below the first separator, so only its lower edge constrains.
-                if cells.is_empty() || bounds.starts_below(&cells[0].key) {
-                    self.walk(*leftmost, bounds, pending, out)?;
+                if cells.is_empty() || bounds.starts_below(&cells[0].key, &known) {
+                    let child_high = if cells.is_empty() {
+                        high.clone()
+                    } else {
+                        Some((Rc::clone(&node), 0))
+                    };
+                    self.walk(*leftmost, bounds, pending, low, &child_high, out)?;
                 }
                 for (i, separator) in cells.iter().enumerate() {
                     if out.len() >= bounds.limit {
                         return Ok(());
                     }
                     let below_upper = match bounds.end {
-                        Some(end) => separator.key.as_slice() < end,
+                        Some(end) => {
+                            cmp_from(separator.key.as_slice(), end, known.end) == Ordering::Less
+                        }
                         None => true,
                     };
                     // The slot spans `[separator.key, next.key)`, so it is worth
                     // descending only when the caller's lower bounds fall inside
                     // it — `start` for the range, `after` for the resume.
                     let above_lower = match cells.get(i + 1) {
-                        Some(next) => bounds.starts_below(&next.key),
+                        Some(next) => bounds.starts_below(&next.key, &known),
                         None => true,
                     };
                     if below_upper && above_lower {
-                        self.walk(separator.child, bounds, pending, out)?;
+                        let child_low = Some((Rc::clone(&node), i));
+                        let child_high = match cells.get(i + 1) {
+                            Some(_) => Some((Rc::clone(&node), i + 1)),
+                            None => high.clone(),
+                        };
+                        self.walk(
+                            separator.child,
+                            bounds,
+                            pending,
+                            &child_low,
+                            &child_high,
+                            out,
+                        )?;
                     }
                 }
             }
@@ -2179,53 +2233,78 @@ impl<D: Device> CowBTree<D> {
     /// [`CowBTree::walk`]'s row-id-only sibling, for
     /// [`CowBTree::scan_range_row_ids_from`].
     ///
-    /// The internal-node branch is [`CowBTree::walk`]'s, unchanged: pruning is
-    /// entirely [`WalkBounds::admits`] and [`WalkBounds::starts_below`], so the
-    /// two walks visit exactly the same entries by construction and can only
-    /// ever differ in what they do with one once it is admitted. Only the leaf
-    /// branch differs — no key clone, no [`CowBTree::resolve_value_at`], just
-    /// the row id out of the entry already in hand.
+    /// The internal-node branch is [`CowBTree::walk`]'s, unchanged (including
+    /// the `low`/`high` prefix bookkeeping — see `walk`'s doc comment):
+    /// pruning is entirely [`WalkBounds::admits`] and
+    /// [`WalkBounds::starts_below`], so the two walks visit exactly the same
+    /// entries by construction and can only ever differ in what they do with
+    /// one once it is admitted. Only the leaf branch differs — no key clone,
+    /// no [`CowBTree::resolve_value_at`], just the row id out of the entry
+    /// already in hand.
+    #[allow(clippy::too_many_arguments)]
     fn walk_row_ids(
         &self,
         id: PageId,
         bounds: &WalkBounds<'_>,
         pending: bool,
+        low: &Option<(Rc<Node>, usize)>,
+        high: &Option<(Rc<Node>, usize)>,
         out: &mut Vec<RowId>,
     ) -> Result<()> {
         if id == 0 || out.len() >= bounds.limit {
             return Ok(());
         }
         let node = self.node_at(id, pending)?;
+        let known = Known::for_node(bounds, low, high);
         match &*node {
             Node::Leaf(entries) => {
                 for entry in entries {
                     if out.len() >= bounds.limit {
                         return Ok(());
                     }
-                    if !bounds.admits(&entry.key) {
+                    if !bounds.admits(&entry.key, &known) {
                         continue;
                     }
                     out.push(trailing_row_id(&entry.key)?);
                 }
             }
             Node::Internal { leftmost, cells } => {
-                if cells.is_empty() || bounds.starts_below(&cells[0].key) {
-                    self.walk_row_ids(*leftmost, bounds, pending, out)?;
+                if cells.is_empty() || bounds.starts_below(&cells[0].key, &known) {
+                    let child_high = if cells.is_empty() {
+                        high.clone()
+                    } else {
+                        Some((Rc::clone(&node), 0))
+                    };
+                    self.walk_row_ids(*leftmost, bounds, pending, low, &child_high, out)?;
                 }
                 for (i, separator) in cells.iter().enumerate() {
                     if out.len() >= bounds.limit {
                         return Ok(());
                     }
                     let below_upper = match bounds.end {
-                        Some(end) => separator.key.as_slice() < end,
+                        Some(end) => {
+                            cmp_from(separator.key.as_slice(), end, known.end) == Ordering::Less
+                        }
                         None => true,
                     };
                     let above_lower = match cells.get(i + 1) {
-                        Some(next) => bounds.starts_below(&next.key),
+                        Some(next) => bounds.starts_below(&next.key, &known),
                         None => true,
                     };
                     if below_upper && above_lower {
-                        self.walk_row_ids(separator.child, bounds, pending, out)?;
+                        let child_low = Some((Rc::clone(&node), i));
+                        let child_high = match cells.get(i + 1) {
+                            Some(_) => Some((Rc::clone(&node), i + 1)),
+                            None => high.clone(),
+                        };
+                        self.walk_row_ids(
+                            separator.child,
+                            bounds,
+                            pending,
+                            &child_low,
+                            &child_high,
+                            out,
+                        )?;
                     }
                 }
             }
@@ -2277,31 +2356,151 @@ struct WalkBounds<'a> {
 
 impl WalkBounds<'_> {
     /// Whether one leaf entry belongs in the answer.
-    fn admits(&self, key: &[u8]) -> bool {
-        if key < self.start {
+    ///
+    /// `known` names how many leading bytes of `self.start`/`self.end`/
+    /// `self.after` `key` is already proven to share — see [`Known`] and
+    /// [`cmp_from`]. It changes nothing about what `admits` decides, only how
+    /// many bytes each comparison has to look at to decide it.
+    fn admits(&self, key: &[u8], known: &Known) -> bool {
+        if cmp_from(key, self.start, known.start) == Ordering::Less {
             return false;
         }
-        if self.end.is_some_and(|end| key >= end) {
-            return false;
+        if let Some(end) = self.end {
+            if cmp_from(key, end, known.end) != Ordering::Less {
+                return false;
+            }
         }
         match self.after {
-            Some(after) => key > after,
+            Some(after) => cmp_from(key, after, known.after) == Ordering::Greater,
             None => true,
         }
     }
 
     /// Whether a subtree bounded above by `edge` (exclusive) can still hold a
     /// wanted key — that is, whether *both* lower bounds fall below that edge:
-    /// `start` for the range, `after` for the resume.
-    fn starts_below(&self, edge: &[u8]) -> bool {
-        if self.start >= edge {
+    /// `start` for the range, `after` for the resume. `known` is `admits`'s.
+    fn starts_below(&self, edge: &[u8], known: &Known) -> bool {
+        if cmp_from(self.start, edge, known.start) != Ordering::Less {
             return false;
         }
         match self.after {
-            Some(after) => after < edge,
+            Some(after) => cmp_from(after, edge, known.after) == Ordering::Less,
             None => true,
         }
     }
+}
+
+/// How many leading bytes of `bounds.start`/`end`/`after` a call to
+/// [`CowBTree::walk`] or [`CowBTree::walk_row_ids`] has already proven every
+/// key in its subtree must share with each of them, before it looks at a
+/// single entry or separator.
+///
+/// The proof is [`known_prefix`]'s: every key in a subtree bounded by a low
+/// and a high separator lies between them, so if both separators already
+/// agree with a target on its first `n` bytes, every key between them does
+/// too — the same "a page id names one immutable subtree" style of argument
+/// the rest of this module rests on, just applied to bytes within a key
+/// instead of pages within a tree. Nothing here is asserted from the key
+/// bytes alone; `known_prefix` derives it from the separators
+/// [`CowBTree::walk`]'s own recursion already had in hand, and [`cmp_from`]
+/// re-checks the claim in debug builds.
+struct Known {
+    start: usize,
+    end: usize,
+    after: usize,
+}
+
+impl Known {
+    /// The `Known` for one call to `walk`/`walk_row_ids`, from the low/high
+    /// separator sources that call's caller threaded down.
+    fn for_node(
+        bounds: &WalkBounds<'_>,
+        low: &Option<(Rc<Node>, usize)>,
+        high: &Option<(Rc<Node>, usize)>,
+    ) -> Known {
+        Known {
+            start: known_prefix(bounds.start, low, high),
+            end: bounds
+                .end
+                .map(|end| known_prefix(end, low, high))
+                .unwrap_or(0),
+            after: bounds
+                .after
+                .map(|after| known_prefix(after, low, high))
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// Borrow the separator key `source` names, if any — the read-only sibling of
+/// [`bound_key`] for a caller (`Known::for_node`) that only needs the bytes
+/// for one comparison and would rather not pay `bound_key`'s clone for them.
+fn bound_ref(source: &Option<(Rc<Node>, usize)>) -> Option<&[u8]> {
+    let (node, idx) = source.as_ref()?;
+    match &**node {
+        Node::Internal { cells, .. } => cells.get(*idx).map(|cell| cell.key.as_slice()),
+        // Unreachable by the same construction `bound_key`'s comment notes:
+        // a source only ever names an `Internal` node's own cell.
+        Node::Leaf(_) => None,
+    }
+}
+
+/// How many leading bytes of `target` a descent has already proven every key
+/// in the subtree bounded by `low` (below) and `high` (above, exclusive) must
+/// share with it.
+///
+/// Zero whenever either side is unbounded (`None`): an absent bound proves
+/// nothing about the subtree's edge on that side — it could run to the very
+/// start or end of the whole key space — so the honest answer is "nothing
+/// skippable yet", not a guess bounded by whichever side does have a
+/// separator. That is always sound to under-claim; the cost is only ever a
+/// comparison that does more work than it strictly had to, never one that
+/// does less than it needed to.
+fn known_prefix(
+    target: &[u8],
+    low: &Option<(Rc<Node>, usize)>,
+    high: &Option<(Rc<Node>, usize)>,
+) -> usize {
+    let (Some(low_key), Some(high_key)) = (bound_ref(low), bound_ref(high)) else {
+        return 0;
+    };
+    common_prefix_len(target, low_key).min(common_prefix_len(target, high_key))
+}
+
+/// The number of leading bytes `a` and `b` share.
+#[inline]
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// Compare `a` and `b`, given that both are already proven — by the tree
+/// structure a descent has already matched, not by inspecting these bytes —
+/// to agree on their first `known` bytes. Skips straight past those bytes on
+/// both sides instead of re-walking them, which is the redundant work
+/// `PERF.md`'s "The join and range profile" measured `memcmp` spending: every
+/// key inside one index or one table shares that index's or table's own
+/// prefix, and an ordinary `[u8]::cmp` re-checks it on every comparison at
+/// every level of every descent.
+///
+/// # Why this cannot go wrong silently
+///
+/// `known` is never taken on faith from a caller guessing at shared bytes —
+/// every call site derives it from [`known_prefix`], which only ever counts
+/// bytes two *separators the tree itself stored* — [`CowBTree::walk`]'s
+/// `low`/`high` — agree with `target` on, the same separators
+/// [`CowBTree::get_from`]'s `retain_cursor` already trusts for the same
+/// reason. A debug build still checks the claim against the real bytes rather
+/// than trusting it blindly — the cost a release build, and therefore every
+/// published benchmark number, never pays.
+#[inline]
+fn cmp_from(a: &[u8], b: &[u8], known: usize) -> Ordering {
+    debug_assert!(
+        a.len() >= known && b.len() >= known && a[..known] == b[..known],
+        "cmp_from claimed a {known}-byte shared prefix between {a:?} and {b:?} that is not real"
+    );
+    let a_rest = a.get(known..).unwrap_or(&[]);
+    let b_rest = b.get(known..).unwrap_or(&[]);
+    a_rest.cmp(b_rest)
 }
 
 /// A committed read's leaf, retained across [`CowBTree::get`] calls so the
@@ -3426,6 +3625,168 @@ mod tests {
             .is_empty());
     }
 
+    /// Prefix-skipping's own differential test (the untried angle `PERF.md`
+    /// names against `memcmp`'s 12–21% of a descent's self time): its claim
+    /// is that skipping bytes a descent has already matched via `Known`/
+    /// `cmp_from` changes how many bytes a comparison looks at, never which
+    /// keys a walk returns. Several namespaces of very different prefix
+    /// length are built — a short index name, two long index names that
+    /// share every byte but one right before their terminator (so a
+    /// confirmed shared prefix has to land on exactly the right boundary,
+    /// not just "a long common run"), and two row-key-shaped tables, one
+    /// short-named and one long — then `scan_range_from` and
+    /// `scan_range_row_ids_from` are hammered with pseudo-random windows,
+    /// including ones that straddle a namespace boundary, land exactly on a
+    /// stored key, or fall strictly between two.
+    ///
+    /// The oracle is a plain `Vec` this test built itself and filters with
+    /// nothing but `Vec<u8>`'s own `Ord` — not `db.scan()`, which would run
+    /// through the same `walk` under test and could agree with a bug rather
+    /// than catch one.
+    #[test]
+    fn prefix_skipped_walks_agree_with_a_naive_filter_across_random_windows() {
+        let mut db = CowBTree::create(disk(), PAGE).unwrap();
+        let mut all: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+        let index_entry = |name: &[u8], v: u32, offset: u64, id: u64| {
+            let mut key = b"\x01idx:".to_vec();
+            key.extend_from_slice(name);
+            key.push(0);
+            key.extend_from_slice(&v.to_be_bytes());
+            key.extend_from_slice(&(offset + v as u64 * 3 + id).to_be_bytes());
+            key
+        };
+
+        for v in 0u32..60 {
+            for id in 0u64..3 {
+                let key = index_entry(b"i", v, 0, id);
+                db.put(&key, b"").unwrap();
+                all.push((key, Vec::new()));
+            }
+        }
+        // Two index names identical up to their very last byte before the
+        // `\0` terminator — the confirmation in `known_prefix` has to notice
+        // that difference, not just that a long run of bytes matches.
+        for v in 0u32..60 {
+            for id in 0u64..3 {
+                let key = index_entry(b"orders_by_user_and_created_atx", v, 1_000_000, id);
+                db.put(&key, b"").unwrap();
+                all.push((key, Vec::new()));
+            }
+        }
+        for v in 0u32..60 {
+            for id in 0u64..3 {
+                let key = index_entry(b"orders_by_user_and_created_aty", v, 2_000_000, id);
+                db.put(&key, b"").unwrap();
+                all.push((key, Vec::new()));
+            }
+        }
+        // Two ordinary row-key-shaped tables, one short-named and one long —
+        // an eight-byte big-endian row id on the end, same as
+        // `crate::storage::row_key`, since `scan_range_row_ids_from` refuses
+        // anything shorter.
+        for i in 0u64..200 {
+            let key = [b"t\0".as_slice(), &i.to_be_bytes()].concat();
+            let value = i.to_le_bytes().to_vec();
+            db.put(&key, &value).unwrap();
+            all.push((key, value));
+        }
+        for i in 0u64..200 {
+            let key = [
+                b"posts_with_a_long_table_name\0".as_slice(),
+                &i.to_be_bytes(),
+            ]
+            .concat();
+            let value = i.to_le_bytes().to_vec();
+            db.put(&key, &value).unwrap();
+            all.push((key, value));
+        }
+        db.commit().unwrap();
+
+        all.sort();
+        for pair in all.windows(2) {
+            assert_ne!(
+                pair[0].0, pair[1].0,
+                "no duplicate keys — every window below assumes that"
+            );
+        }
+
+        let naive = |start: &[u8], end: Option<&[u8]>, after: Option<&[u8]>, limit: usize| {
+            all.iter()
+                .filter(|(k, _)| {
+                    k.as_slice() >= start
+                        && end.is_none_or(|end| k.as_slice() < end)
+                        && after.is_none_or(|after| k.as_slice() > after)
+                })
+                .take(limit)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        // The same coprime-stride trick
+        // `point_reads_agree_whether_ascending_descending_or_jumbled` uses,
+        // rather than a `rand` dependency for one test.
+        let n = all.len();
+        let pick = |step: usize| all[(step * 97) % n].0.clone();
+
+        for step in 0..n {
+            let start = pick(step);
+            let other = all[(step * 131 + 17) % n].0.clone();
+            let (lo, hi) = if start <= other {
+                (start, other)
+            } else {
+                (other, start)
+            };
+            let after = if step % 3 == 0 {
+                Some(pick(step + 50))
+            } else {
+                None
+            };
+            let limit = match step % 5 {
+                0 => 0,
+                1 => 1,
+                2 => 3,
+                3 => 17,
+                _ => usize::MAX,
+            };
+
+            let expected = naive(&lo, Some(&hi), after.as_deref(), limit);
+            let got = db
+                .scan_range_from(&lo, Some(&hi), after.as_deref(), limit)
+                .unwrap();
+            let got_vecs: Vec<(Vec<u8>, Vec<u8>)> = got
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_slice().to_vec()))
+                .collect();
+            assert_eq!(
+                got_vecs, expected,
+                "range [{lo:?}, {hi:?}) after {after:?} limit {limit}"
+            );
+
+            let ids = db
+                .scan_range_row_ids_from(&lo, Some(&hi), after.as_deref(), limit)
+                .unwrap();
+            let decoded: Vec<RowId> = got
+                .iter()
+                .map(|(k, _)| {
+                    let bytes: [u8; 8] = k[k.len() - 8..].try_into().unwrap();
+                    RowId::from_be_bytes(bytes)
+                })
+                .collect();
+            assert_eq!(ids, decoded, "row-id walk over [{lo:?}, {hi:?})");
+        }
+
+        // The whole keyspace, unbounded on both ends.
+        let expected_all: Vec<(Vec<u8>, Vec<u8>)> = all.clone();
+        let got_all: Vec<(Vec<u8>, Vec<u8>)> = db
+            .scan()
+            .unwrap()
+            .into_iter()
+            .map(|(k, v)| (k, v.into_vec()))
+            .collect();
+        assert_eq!(got_all, expected_all);
+    }
+
     /// A too-short key is corruption, not a panic — the row-id walk has to
     /// answer the same way [`row_id_from_entry`]-style decoding would rather
     /// than unwrap past a key the general walk would have accepted just fine
@@ -3447,6 +3808,112 @@ mod tests {
             .scan_range_row_ids_from(b"a", None, None, usize::MAX)
             .unwrap_err();
         assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
+    }
+
+    #[test]
+    fn common_prefix_len_stops_at_the_first_differing_byte() {
+        assert_eq!(common_prefix_len(b"", b""), 0);
+        assert_eq!(common_prefix_len(b"abc", b""), 0);
+        assert_eq!(common_prefix_len(b"abc", b"abd"), 2);
+        assert_eq!(common_prefix_len(b"abc", b"abc"), 3);
+        assert_eq!(common_prefix_len(b"abc", b"abcdef"), 3);
+        assert_eq!(common_prefix_len(b"\x01idx:i\0x", b"\x01idx:i\0y"), 7);
+    }
+
+    #[test]
+    fn cmp_from_agrees_with_an_ordinary_cmp_once_the_claimed_prefix_is_real() {
+        for (a, b) in [
+            (
+                b"\x01idx:i\0\x00\x00\x00\x01".as_slice(),
+                b"\x01idx:i\0\x00\x00\x00\x02".as_slice(),
+            ),
+            (
+                b"\x01idx:i\0\x00\x00\x00\x02".as_slice(),
+                b"\x01idx:i\0\x00\x00\x00\x01".as_slice(),
+            ),
+            (
+                b"\x01idx:i\0\x00\x00\x00\x01".as_slice(),
+                b"\x01idx:i\0\x00\x00\x00\x01".as_slice(),
+            ),
+            (b"abc".as_slice(), b"abc".as_slice()),
+            (b"abc".as_slice(), b"ab".as_slice()),
+        ] {
+            let known = common_prefix_len(a, b);
+            assert_eq!(
+                cmp_from(a, b, known),
+                a.cmp(b),
+                "{a:?} vs {b:?}, known {known}"
+            );
+            // Any smaller claim must agree too — under-claiming is always
+            // sound, per `known_prefix`'s own doc comment.
+            if known > 0 {
+                assert_eq!(
+                    cmp_from(a, b, known - 1),
+                    a.cmp(b),
+                    "{a:?} vs {b:?}, known {}",
+                    known - 1
+                );
+            }
+            assert_eq!(cmp_from(a, b, 0), a.cmp(b), "{a:?} vs {b:?}, known 0");
+        }
+    }
+
+    #[test]
+    fn known_prefix_is_zero_without_both_bounds_and_the_min_of_both_matches_when_present() {
+        // No bounds at all — the true root case.
+        assert_eq!(
+            known_prefix(b"\x01idx:i\0\x00\x00\x00\x05", &None, &None),
+            0
+        );
+
+        // A synthetic internal node stands in for a real one here — `bound_ref`
+        // only ever reads `cells[idx].key`, so a hand-built node with the
+        // separators this test cares about exercises exactly the same code as
+        // a real split would, without needing enough keys to force one.
+        let node = Rc::new(Node::Internal {
+            leftmost: 1,
+            cells: vec![
+                Separator {
+                    key: b"\x01idx:i\0aaaa".to_vec(),
+                    child: 2,
+                },
+                Separator {
+                    key: b"\x01idx:i\0zzzz".to_vec(),
+                    child: 3,
+                },
+            ],
+        });
+        let low = Some((Rc::clone(&node), 0));
+        let high = Some((Rc::clone(&node), 1));
+
+        // Only one side present: still zero, since an absent bound proves
+        // nothing about that edge of the subtree.
+        assert_eq!(known_prefix(b"\x01idx:i\0mmmm", &low, &None), 0);
+        assert_eq!(known_prefix(b"\x01idx:i\0mmmm", &None, &high), 0);
+        // Both sides present and both share the same `\x01idx:i\0` prefix
+        // with the target: known is the min of the two matches.
+        assert_eq!(
+            known_prefix(b"\x01idx:i\0mmmm", &low, &high),
+            common_prefix_len(b"\x01idx:i\0mmmm", b"\x01idx:i\0aaaa")
+                .min(common_prefix_len(b"\x01idx:i\0mmmm", b"\x01idx:i\0zzzz"))
+        );
+        // `\x01idx:i\0` (seven bytes) is the actual shared run before `mmmm`
+        // diverges from both `aaaa` and `zzzz`.
+        assert_eq!(known_prefix(b"\x01idx:i\0mmmm", &low, &high), 7);
+
+        // A high bound from a *different* namespace: the min collapses to
+        // whatever the two separators actually agree with the target on,
+        // never further than that.
+        let mixed_high = Some((Rc::clone(&node), 0)); // reuse `aaaa` as both sides
+        assert_eq!(
+            known_prefix(b"\x01idx:i\0mmmm", &low, &mixed_high),
+            common_prefix_len(b"\x01idx:i\0mmmm", b"\x01idx:i\0aaaa")
+        );
+
+        // A missing cell (index past the end) resolves to `None`, same as an
+        // absent source.
+        let past_end = Some((Rc::clone(&node), 5));
+        assert_eq!(known_prefix(b"\x01idx:i\0mmmm", &low, &past_end), 0);
     }
 
     #[test]
