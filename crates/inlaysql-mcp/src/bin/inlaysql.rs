@@ -4,6 +4,7 @@
 //! inlaysql serve --mcp app.inlay [--allow-writes] [--max-rows N] [--max-bytes N]
 //! inlaysql serve --mysql app.inlay [--port N] [--bind ADDR] [--user U]
 //! inlaysql changes app.inlay [--from N]
+//! inlaysql vacuum app.inlay
 //! ```
 
 use std::io::{self, BufReader};
@@ -20,6 +21,7 @@ USAGE:
     inlaysql serve --mcp <database> [OPTIONS]
     inlaysql serve --mysql <database> [OPTIONS]
     inlaysql changes <database> [--from <version>]
+    inlaysql vacuum <database>
 
 SERVE --mcp OPTIONS:
     --allow-writes     Expose the `execute` tool. Off by default: the client is
@@ -54,6 +56,14 @@ CHANGES OPTIONS:
     --from <version>   Start after this version. 0 (the default) means the whole
                        retained log.
 
+VACUUM:
+    Compacts the database file in place: copies every table, constraint and
+    index into a fresh file, then atomically replaces the original with it.
+    For shrinking a file after a large one-time DELETE — day-to-day growth
+    from ordinary churn is what EngineOptions::page_reuse is for, not this.
+    Needs an exclusive lock (refuses if another handle has the file open for
+    writing) and free disk space for a second full copy while it runs.
+
 The MCP server speaks JSON-RPC over stdin/stdout, so it is wired into a client
 by pointing that client's command at it. Nothing is written to stdout except
 protocol messages; diagnostics go to stderr.
@@ -74,6 +84,7 @@ fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("serve") => serve(&args[1..]),
         Some("changes") => changes(&args[1..]),
+        Some("vacuum") => vacuum(&args[1..]),
         Some("--help") | Some("-h") | None => {
             print!("{USAGE}");
             Ok(())
@@ -203,6 +214,22 @@ fn serve_mcp(args: &[String]) -> Result<(), String> {
     server
         .serve(BufReader::new(io::stdin()), io::stdout())
         .map_err(|error| error.to_string())
+}
+
+fn vacuum(args: &[String]) -> Result<(), String> {
+    let mut path = None;
+
+    for arg in args {
+        match arg.as_str() {
+            other if path.is_none() && !other.starts_with("--") => path = Some(other.to_string()),
+            other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
+        }
+    }
+
+    let path = path.ok_or_else(|| format!("vacuum needs a database\n\n{USAGE}"))?;
+    inlaysql::vacuum(&path).map_err(|e| e.to_string())?;
+    eprintln!("inlaysql: {path} vacuumed");
+    Ok(())
 }
 
 fn changes(args: &[String]) -> Result<(), String> {

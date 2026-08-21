@@ -53,6 +53,7 @@ mod device;
 pub mod sqllogictest;
 mod statement;
 mod storage;
+mod vacuum;
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -79,6 +80,7 @@ pub use inlaysql_core::{
 };
 pub use statement::Statement;
 pub use storage::RedbStorage;
+pub use vacuum::vacuum;
 
 /// An open database.
 pub struct Database {
@@ -209,9 +211,14 @@ impl Database {
     }
 
     fn open_on_with<D: Device + 'static>(device: D, options: EngineOptions) -> Result<Self> {
-        // The page cache belongs to the tree, which is built before the engine,
-        // so this option is applied here rather than inside `Engine`.
-        let storage = TreeStorage::open_on_with_cache(device, options.page_cache_bytes)?;
+        // The page cache and the free-list choice both belong to the tree,
+        // which is built before the engine, so they are applied here rather
+        // than inside `Engine`.
+        let storage = TreeStorage::open_on_with_options(
+            device,
+            options.page_cache_bytes,
+            options.page_reuse,
+        )?;
         Ok(Self {
             engine: Engine::open_with_options(
                 Box::new(storage),

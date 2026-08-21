@@ -738,12 +738,13 @@ below is a surprise to the project, it is the honest state of it:
    sharper item: eight connections warm eight page caches over the same pages,
    which is why server-to-server reads fall from 37,158 to 19,874. A shared
    read-only cache under several handles is the thing nothing has tried yet.
-3. **Wiring the free list into the public API.** The free list and page
-   reuse landed inside the engine (AHL-481), including the versioned page
-   cache and the DST sweep that reuse needs — but nothing reachable through
-   `EngineOptions`, `Database` or the SQL surface can turn it on for a real
-   user yet, and there is still no `VACUUM` for whole-file compaction. See
-   `docs/recovery.md` for what is and is not done.
+3. ~~**Wiring the free list into the public API.**~~ — **done.** The free
+   list and page reuse landed inside the engine (AHL-481); `EngineOptions::page_reuse`
+   now reaches it, and `inlaysql vacuum <path>` does whole-file compaction —
+   a copy into a fresh file and an atomic rename, the same algorithm real
+   SQLite's own `VACUUM` uses, so it never touches the copy-on-write tree's
+   crash-recovery path at all. See `docs/recovery.md` for what is and is not
+   done at the storage layer underneath it.
 4. **A cost-based join planner.** Joins run nested-loop in the order they are
    written; index selection is the narrow rule in
    [Scalar indexes and joins that use them](#scalar-indexes-and-joins-that-use-them).

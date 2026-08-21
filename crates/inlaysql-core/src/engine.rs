@@ -175,6 +175,28 @@ pub struct EngineOptions {
     /// Ignored by backends that are already in memory, such as
     /// [`crate::mem::MemStorage`].
     pub page_cache_bytes: usize,
+    /// Let this handle draw on the free list instead of always growing the
+    /// file (Phase 2 item 6, `CowBTree::set_page_reuse`).
+    ///
+    /// Without this, a page a commit stops using — because a row or an index
+    /// entry was deleted, or a copy-on-write update superseded it — is never
+    /// reclaimed: the file's high-water mark only ever grows, even under
+    /// steady-state churn where the *live* data size is flat. This is why
+    /// `false` (the default, and every existing caller before this option
+    /// existed) means a database file grows forever in normal use.
+    ///
+    /// # Read this before enabling it
+    ///
+    /// **Do not enable this on a file any process might open read-only while
+    /// a writer here has it on.** `Database::open_read_only` takes no OS
+    /// lock, by design, so a page this handle reclaims and overwrites could
+    /// be one a read-only reader — in this process or any other — still has
+    /// open. Reclamation can only prove liveness for readers this process's
+    /// reservation gate can see, which a lock-free read-only handle is not.
+    /// This is a real, load-bearing constraint, not a caveat: it is the
+    /// reason this defaults to off instead of being reclaimed automatically.
+    /// See `CowBTree::set_page_reuse`'s doc comment for the full argument.
+    pub page_reuse: bool,
 }
 
 impl Default for EngineOptions {
@@ -183,6 +205,7 @@ impl Default for EngineOptions {
             implicit_indexes: false,
             paged_vector_indexes: false,
             page_cache_bytes: crate::btree::DEFAULT_PAGE_CACHE_BYTES,
+            page_reuse: false,
         }
     }
 }

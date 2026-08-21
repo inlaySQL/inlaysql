@@ -1,19 +1,22 @@
 //! Proves the whole point of Phase 2 item 6 (AHL-481): with page reuse on, a
 //! sustained write/delete/write/checkpoint churn workload stops growing the
-//! file, where the same workload with reuse off (today's default, and
-//! today's only behaviour) grows it without bound.
+//! file, where the same workload with reuse off (still the default) grows it
+//! without bound.
 //!
-//! This runs directly on `CowBTree<FileDevice>`, the same layer
+//! The first two tests run directly on `CowBTree<FileDevice>`, the same layer
 //! `crates/inlaysql/tests/index_recovery_dst.rs` already uses to reach the
-//! storage engine below the SQL surface — `CowBTree::set_page_reuse` is not
-//! wired to `EngineOptions`/`Database` in this change (see the AHL-481
-//! report for why), so this is the only way to exercise it end to end
-//! against a real file today.
+//! storage engine below the SQL surface — that predates `page_reuse` reaching
+//! `EngineOptions`/`Database`, and stays because it isolates the mechanism
+//! from everything the SQL surface adds on top. The third proves the same
+//! thing through `Database::open_on_with_options`, which is what actually
+//! matters now that the option is public: a caller reaching this through
+//! ordinary `CREATE TABLE`/`INSERT`/`DELETE` gets the same win, not just
+//! `CowBTree` callers who already knew this existed.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use inlaysql::FileDevice;
+use inlaysql::{Database, EngineOptions, FileDevice, Value};
 use inlaysql_core::btree::{CowBTree, DEFAULT_PAGE_SIZE};
 
 /// A database file that deletes itself when the test ends, whatever the
@@ -156,6 +159,83 @@ fn the_smaller_file_is_explained_by_reclamation_actually_firing() {
         "reclamation never fired across {ROUNDS} rounds of churn — the file-size \
          win in `heavy_churn_stops_growing_the_file_once_reuse_is_on` would be \
          unexplained if this were ever zero"
+    );
+}
+
+/// The same churn shape as `heavy_churn_stops_growing_the_file_once_reuse_is_on`,
+/// but reached the way an application actually would: `EngineOptions::page_reuse`
+/// through `Database::open_on_with_options`, and ordinary `INSERT ... ON
+/// CONFLICT DO UPDATE`/`DELETE` rather than `CowBTree::put`/`delete` directly.
+/// This is the one that would have caught the gap this file's own doc comment
+/// used to name: the mechanism working at the tree level proves nothing about
+/// whether a real caller can reach it.
+fn run_sql(path: &Path, reuse: bool, rounds: usize, keys: usize, value_len: usize) -> u64 {
+    let device = FileDevice::open(path).expect("open");
+    let mut db = Database::open_on_with_options(
+        device,
+        EngineOptions {
+            page_reuse: reuse,
+            ..EngineOptions::default()
+        },
+    )
+    .expect("open");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB)", &[])
+        .expect("create table");
+
+    for round in 0..rounds {
+        for i in 0..keys {
+            let value: Vec<u8> = (0..value_len)
+                .map(|b| ((round * 31 + i * 7 + b) % 251) as u8)
+                .collect();
+            // A key this round's delete pass (below) just removed needs
+            // INSERT; every other key needs UPDATE — which of the two any
+            // given key needs changes round to round, so upsert is the one
+            // statement that is always right, matching `put`'s "set this
+            // key's value, whatever it was before" at the tree level.
+            db.execute(
+                "INSERT INTO t (id, v) VALUES (?, ?) \
+                 ON CONFLICT (id) DO UPDATE SET v = excluded.v",
+                &[Value::Integer(i as i64), Value::Blob(value)],
+            )
+            .expect("upsert");
+        }
+        let start = (round * keys / 4) % keys;
+        for offset in 0..keys / 4 {
+            let i = (start + offset) % keys;
+            db.execute("DELETE FROM t WHERE id = ?", &[Value::Integer(i as i64)])
+                .expect("delete");
+        }
+        if round.is_multiple_of(4) {
+            db.checkpoint().expect("checkpoint");
+        }
+    }
+    db.checkpoint().expect("final checkpoint");
+    drop(db);
+
+    fs::metadata(path).expect("stat").len()
+}
+
+#[test]
+fn the_public_api_gets_the_same_win_through_ordinary_sql() {
+    let reuse_off = TempDb::new("sql-reuse-off");
+    let reuse_on = TempDb::new("sql-reuse-on");
+
+    const ROUNDS: usize = 60;
+    const KEYS: usize = 40;
+    const VALUE_LEN: usize = 300;
+
+    let off_size = run_sql(reuse_off.path(), false, ROUNDS, KEYS, VALUE_LEN);
+    let on_size = run_sql(reuse_on.path(), true, ROUNDS, KEYS, VALUE_LEN);
+
+    assert!(
+        off_size > 0 && on_size > 0,
+        "both files should hold real data (off={off_size}, on={on_size})"
+    );
+    assert!(
+        on_size < off_size * 3 / 4,
+        "EngineOptions::page_reuse did not bound file growth reached through \
+         ordinary SQL: reuse off = {off_size} bytes, reuse on = {on_size} \
+         bytes (expected reuse-on well below 3/4 of reuse-off)"
     );
 }
 

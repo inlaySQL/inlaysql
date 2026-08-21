@@ -154,9 +154,19 @@ impl<D: Device> TreeStorage<D> {
     /// [`crate::btree::cache`] and
     /// [`EngineOptions::page_cache_bytes`](crate::EngineOptions).
     pub fn open_on_with_cache(device: D, cache_bytes: usize) -> Result<Self> {
-        Ok(Self {
-            tree: CowBTree::open_or_create_with_cache(device, DEFAULT_PAGE_SIZE, cache_bytes)?,
-        })
+        Self::open_on_with_options(device, cache_bytes, false)
+    }
+
+    /// Open (or create) a database with an explicit cache budget and free-list
+    /// choice, rather than either default.
+    ///
+    /// See [`EngineOptions::page_reuse`](crate::EngineOptions) before passing
+    /// `true` for `page_reuse` — it is a real, load-bearing safety constraint
+    /// on any file a reader might open read-only, not a tuning knob.
+    pub fn open_on_with_options(device: D, cache_bytes: usize, page_reuse: bool) -> Result<Self> {
+        let mut tree = CowBTree::open_or_create_with_cache(device, DEFAULT_PAGE_SIZE, cache_bytes)?;
+        tree.set_page_reuse(page_reuse);
+        Ok(Self { tree })
     }
 
     /// The underlying tree, for tests and tooling.

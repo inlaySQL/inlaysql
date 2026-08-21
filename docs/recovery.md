@@ -275,17 +275,24 @@ interleaving. Both run in CI.
   reconstruct those commits. Hardening this interaction is a follow-up; the
   sweep currently injects crash and torn-write faults, the two primary
   crash-safety concerns.
-* **Space reclamation is now opt-in and storage-engine-only** (Phase 2 item 6,
-  AHL-481) — see "The free list and page reuse" below for the design and its
-  proof. What remains a real limitation: it is not wired to `EngineOptions`
-  or `Database`, so no SQL statement or public API can turn it on today; a
-  full `VACUUM` (whole-file compaction, as opposed to reusing individual
-  freed pages) was not attempted in this pass; and reclamation can only prove
-  liveness for readers this process's reservation gate can see, so it is
-  unsound to enable beside a concurrent `FileDevice::open_read_only` on the
-  same file, in this process or any other — that mode takes no OS lock by
-  design (AHL-405) and is therefore invisible to the proof, not merely
-  untested.
+* **Space reclamation is opt-in, and now reachable from the public API**
+  (Phase 2 item 6, AHL-481) — see "The free list and page reuse" below for
+  the design and its proof. `EngineOptions::page_reuse` reaches it through
+  `Database::open_on_with_options`, and `inlaysql vacuum <path>` does
+  whole-file compaction, deliberately as a copy into a fresh file plus an
+  atomic rename rather than in-place page rewriting — see `crates/inlaysql/src/vacuum.rs`'s
+  module doc for why that keeps it outside this file's crash-recovery
+  surface entirely, needing none of the DST proof below. What remains true:
+  reclamation can only prove liveness for readers this process's reservation
+  gate can see, so it is unsound to enable `page_reuse` beside a concurrent
+  `FileDevice::open_read_only` on the same file, in this process or any
+  other — that mode takes no OS lock by design (AHL-405) and is therefore
+  invisible to the proof, not merely untested. `vacuum` itself does not have
+  this problem: see its module doc for why a lock-free reader is safe
+  through it. Also still true: no build older than this one can refuse to
+  open a file that has actually undergone page reuse — see "What this
+  deliberately does not include, still" below for why that is not a live
+  risk yet, and what would make it one.
 
 ## The free list and page reuse (Phase 2 item 6, AHL-481)
 
@@ -408,15 +415,33 @@ the whole transaction, not just until the first delete of it starts. It is
 recorded here because it is exactly the class of bug this feature is
 dangerous for: silent, and only reachable once genuine reuse is exercised.
 
-**What this deliberately does not include.** A `VACUUM` statement (whole-file
-compaction) was judged out of scope for this pass — landing a correct,
-DST-proven free list is worth more done alone than paired with compaction
-done hastily, and nothing above needs it. `EngineOptions`/`Database`/SQL
-surface wiring — and the accompanying catalog version bump an older build
-would need to refuse a reuse-enabled file — is also not done: reuse is
-reachable only through `CowBTree::set_page_reuse` directly, the same layer
-`index_recovery_dst.rs` already tests at, so no file a real InlaySQL user can
-produce today needs that refusal yet. See the AHL-481 report for the exact
-follow-up this leaves (`Catalog::reuse_freed_pages`, a new
+**What this deliberately does not include, still.** `EngineOptions::page_reuse`
+and `inlaysql vacuum` now exist (a later pass — see immediately above), so
+"reuse is reachable only through `CowBTree::set_page_reuse` directly" is no
+longer true, and it is worth being precise about what that changes and what
+it does not.
+
+**A version-gate that lets a build older than this one refuse to open a file
+that has actually undergone page reuse is still not implemented.** That
+build would trust the page-id-uniqueness invariant its own cache correctness
+depends on, and a page-reused file makes that invariant false for it — a
+silent-wrong-answer risk if it were ever opened by one, not merely a missing
+feature. Two things keep this from being a live risk today rather than a
+documented one: no build predating this one has ever been released (README:
+"never been run in production by anyone"), and the project's own pre-1.0
+policy is *recreate, not migrate* for every format change, not a guarantee
+this one specifically lacks. That policy is doing real work here, not standing
+in for the fix — the moment a real release makes "an older build might open a
+newer file" a real scenario rather than a hypothetical one, this stops being
+adequately covered and the version gate described in the AHL-481 report
+becomes a blocker, not a follow-up: `Catalog::reuse_freed_pages`, a new
 `CATALOG_VERSION_FREE_LIST`, `EngineOptions::reuse_freed_pages`, and the
-`Engine::open` wiring between them).
+`Engine::open` wiring between them.
+
+A `VACUUM` statement now exists too (`inlaysql vacuum <path>`,
+`crates/inlaysql/src/vacuum.rs`) — landed as a copy into a fresh file and an
+atomic rename, deliberately outside the copy-on-write tree's own
+crash-recovery surface, so it needed none of the DST proof above and carries
+none of the page-reuse version-gate concern either: it never enables
+`page_reuse` itself, and the file it produces is byte-for-byte an ordinary
+one any build understands.
