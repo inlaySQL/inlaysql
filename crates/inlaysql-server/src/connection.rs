@@ -331,6 +331,15 @@ impl<S: Read + Write> Connection<S> {
 
     /// Run one statement, through the shim first and the engine otherwise.
     fn run(&mut self, sql: &str, params: &[Value]) -> Result<Answer, MysqlError> {
+        // Resolved once, up front, so every path below — shim classification,
+        // a shim-rewritten DDL statement, and a plain pass-through — reads
+        // the same corrected text. See `rewrite_backslash_escapes`: a client
+        // that escapes literal values with a backslash (most that do not use
+        // a true binary-protocol prepared statement) means something specific
+        // by it, and the engine's SQLite dialect does not understand that
+        // syntax on its own.
+        let sql = &sqltext::rewrite_backslash_escapes(sql);
+
         // MySQL's rule: every statement starts with an empty warning list,
         // except the ones whose purpose is to read it.
         if !shim::reads_warnings(sql) {
@@ -509,6 +518,12 @@ impl<S: Read + Write> Connection<S> {
     }
 
     fn prepare(&mut self, sql: &str) -> io::Result<()> {
+        // A bound parameter never carries a client-side escape (it arrives as
+        // a typed binary value, not text), but a literal written directly
+        // into the prepared statement's own shape can — the same rewrite
+        // `run` applies to a text-protocol statement, applied here so a
+        // statement cannot mean one thing prepared and another sent plain.
+        let sql = &sqltext::rewrite_backslash_escapes(sql);
         let normalized = sqltext::normalize(sql);
 
         let prepared = if shim::handles(&normalized) {

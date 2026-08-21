@@ -10,6 +10,12 @@
 //! Every function here is quote-aware, because the failure mode of a
 //! quote-blind helper is not a parse error: it is finding a keyword inside a
 //! string literal and acting on it.
+//!
+//! [`rewrite_backslash_escapes`] is the one function here that changes what a
+//! statement *means* rather than just where its clauses are — string-literal
+//! escaping is a dialect difference the same way `AUTO_INCREMENT` is, and it
+//! has to be resolved before anything downstream, including the engine's own
+//! parser, ever reads the literal.
 
 /// Remove comments, outer whitespace and a trailing semicolon.
 ///
@@ -89,6 +95,121 @@ pub fn strip_comments(sql: &str) -> String {
                 }
                 i = (i + 2).min(chars.len());
                 out.push(' ');
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Rewrite MySQL's backslash-escaped single-quoted string literals into the
+/// doubled-quote form `sqlparser`'s `SQLiteDialect` actually understands.
+///
+/// Real MySQL escapes special characters in a single-quoted literal with a
+/// leading backslash (`NO_BACKSLASH_ESCAPES` is off by default), and every
+/// client that builds `COM_QUERY` text with client-side value escaping relies
+/// on the server understanding that — `mysql-connector-python`'s default
+/// cursor, all of PyMySQL (it has no true binary-protocol prepared statements
+/// at all), and PHP PDO's emulated-prepares default, which many real Laravel
+/// apps run under without ever setting `PDO::ATTR_EMULATE_PREPARES => false`.
+/// `inlaysql-core` parses with `SQLiteDialect`, whose
+/// `supports_string_literal_backslash_escape()` is `false` — correctly, for
+/// real SQLite, which has no backslash-escape syntax of its own — so a
+/// client-escaped literal reaching it unrewritten either corrupts silently
+/// (`\"` baked into the stored value verbatim) or breaks the statement
+/// outright (a client's `\'` reads as a real string terminator).
+///
+/// This decodes MySQL's escape table
+/// (<https://dev.mysql.com/doc/refman/8.0/en/string-literals.html>) inside
+/// every single-quoted run — accepting either spelling of an embedded quote,
+/// MySQL's `\'` or the SQL-standard `''`, since a well-behaved client may use
+/// either — and re-emits the run using only the doubled-quote form both
+/// MySQL and SQLite agree on. `\%` and `\_` are the one pair MySQL leaves as
+/// the literal two-character sequence rather than decoding (they matter to a
+/// later `LIKE`), so they pass through unchanged; any other `\c` decodes to
+/// `c` alone, backslash dropped, exactly as MySQL's manual specifies.
+///
+/// Double-quoted and backtick-quoted runs are copied verbatim, deliberately
+/// unrewritten: whether this server's SQLite dialect ever reads a
+/// double-quoted run as a *string* rather than an *identifier* is a separate
+/// question this function does not answer, and an identifier has no
+/// backslash-escape semantics to decode in the first place — rewriting one
+/// that happened to contain a literal backslash would corrupt a name that
+/// was never a string.
+pub fn rewrite_backslash_escapes(sql: &str) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '"' | '`' => {
+                let quote = c;
+                out.push(c);
+                i += 1;
+                while i < chars.len() {
+                    let inner = chars[i];
+                    if inner == '\\' && quote != '`' && i + 1 < chars.len() {
+                        out.push(inner);
+                        out.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    out.push(inner);
+                    i += 1;
+                    if inner == quote {
+                        if i < chars.len() && chars[i] == quote {
+                            out.push(quote);
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            '\'' => {
+                out.push('\'');
+                i += 1;
+                while i < chars.len() {
+                    let inner = chars[i];
+                    if inner == '\\' && i + 1 < chars.len() {
+                        let escaped = chars[i + 1];
+                        match escaped {
+                            '\'' => out.push_str("''"),
+                            '"' => out.push('"'),
+                            '0' => out.push('\u{0}'),
+                            'b' => out.push('\u{8}'),
+                            'n' => out.push('\n'),
+                            'r' => out.push('\r'),
+                            't' => out.push('\t'),
+                            'Z' => out.push('\u{1a}'),
+                            '\\' => out.push('\\'),
+                            '%' | '_' => {
+                                out.push('\\');
+                                out.push(escaped);
+                            }
+                            other => out.push(other),
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if inner == '\'' {
+                        out.push('\'');
+                        i += 1;
+                        if i < chars.len() && chars[i] == '\'' {
+                            out.push('\'');
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    out.push(inner);
+                    i += 1;
+                }
             }
             _ => {
                 out.push(c);
@@ -565,5 +686,98 @@ mod tests {
         assert!(like_matches("%abc", "xxabcxxabc"));
         assert!(like_matches("a%b%c", "aXXbYYc"));
         assert!(!like_matches("%abc", "xxabcxx"));
+    }
+
+    // -------------------------------------------- rewrite_backslash_escapes
+
+    /// The exact two repros a real MySQL client library produced against this
+    /// server before this existed: a value containing `"` silently gained a
+    /// stray literal backslash in the stored data, and a value containing `'`
+    /// broke the statement outright (the client's `\'` read as a real string
+    /// terminator). Both are `mysql-connector-python`'s default cursor
+    /// spelling of a client-side-escaped text-protocol `INSERT`.
+    #[test]
+    fn the_two_confirmed_client_repros_now_parse_correctly() {
+        assert_eq!(
+            rewrite_backslash_escapes(r#"INSERT INTO t VALUES ('a\"b')"#),
+            r#"INSERT INTO t VALUES ('a"b')"#
+        );
+        assert_eq!(
+            rewrite_backslash_escapes(r"INSERT INTO t VALUES ('a\'b')"),
+            "INSERT INTO t VALUES ('a''b')"
+        );
+    }
+
+    /// MySQL's escape table, decoded one at a time
+    /// (<https://dev.mysql.com/doc/refman/8.0/en/string-literals.html>).
+    #[test]
+    fn every_mysql_escape_decodes_to_its_real_character() {
+        assert_eq!(rewrite_backslash_escapes(r"'\0'"), "'\u{0}'");
+        assert_eq!(rewrite_backslash_escapes(r"'\b'"), "'\u{8}'");
+        assert_eq!(rewrite_backslash_escapes(r"'\n'"), "'\n'");
+        assert_eq!(rewrite_backslash_escapes(r"'\r'"), "'\r'");
+        assert_eq!(rewrite_backslash_escapes(r"'\t'"), "'\t'");
+        assert_eq!(rewrite_backslash_escapes(r"'\Z'"), "'\u{1a}'");
+        assert_eq!(rewrite_backslash_escapes(r"'\\'"), r"'\'");
+        assert_eq!(rewrite_backslash_escapes(r"'\''"), "''''");
+        assert_eq!(rewrite_backslash_escapes(r#"'\"'"#), "'\"'");
+    }
+
+    /// `\%` and `\_` are the one pair MySQL leaves as the literal two-byte
+    /// sequence rather than decoding — they matter to a later `LIKE`.
+    #[test]
+    fn percent_and_underscore_escapes_are_left_intact_for_like() {
+        assert_eq!(rewrite_backslash_escapes(r"'100\%'"), r"'100\%'");
+        assert_eq!(rewrite_backslash_escapes(r"'a\_b'"), r"'a\_b'");
+    }
+
+    /// Any other escaped character loses the backslash and stands for
+    /// itself, exactly as MySQL's manual specifies.
+    #[test]
+    fn an_unrecognised_escape_just_drops_the_backslash() {
+        assert_eq!(rewrite_backslash_escapes(r"'\x'"), "'x'");
+        assert_eq!(rewrite_backslash_escapes(r"'\q'"), "'q'");
+    }
+
+    /// A client may spell an embedded quote either way — MySQL's `\'` or the
+    /// SQL-standard `''` — and both mean the same one literal string.
+    #[test]
+    fn a_doubled_quote_is_already_valid_and_passes_through() {
+        assert_eq!(
+            rewrite_backslash_escapes("'it''s'"),
+            "'it''s'",
+            "already SQL-standard; must not be touched or doubled again"
+        );
+        assert_eq!(rewrite_backslash_escapes("''"), "''", "the empty string");
+    }
+
+    /// A double-quoted or backtick-quoted run is copied verbatim: whether
+    /// this dialect ever reads `"..."` as a string is a separate question,
+    /// and an identifier has no escape semantics to decode.
+    #[test]
+    fn double_quoted_and_backtick_runs_are_never_rewritten() {
+        assert_eq!(
+            rewrite_backslash_escapes(r#"SELECT "a\"b""#),
+            r#"SELECT "a\"b""#
+        );
+        assert_eq!(
+            rewrite_backslash_escapes(r"SELECT `a\`b`"),
+            r"SELECT `a\`b`"
+        );
+    }
+
+    /// Nothing outside a quoted run is touched, and a statement with no
+    /// backslash at all round-trips unchanged.
+    #[test]
+    fn a_statement_with_no_escapes_is_unchanged() {
+        let sql = "SELECT id, body FROM docs WHERE id = ? AND body = 'plain text'";
+        assert_eq!(rewrite_backslash_escapes(sql), sql);
+    }
+
+    /// A trailing lone backslash (malformed input, or the last byte of a
+    /// truncated statement) must not panic on the lookahead.
+    #[test]
+    fn a_trailing_backslash_does_not_panic() {
+        assert_eq!(rewrite_backslash_escapes(r"'a\"), r"'a\");
     }
 }

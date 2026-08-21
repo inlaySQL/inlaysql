@@ -617,6 +617,45 @@ translated the same way:
 SQLSTATE `22007` as "Invalid datetime format", so an integer/text mismatch was
 reaching users as a date error.
 
+### Client-side-escaped string literals are rewritten before the engine sees them
+
+Found the same way as the Laravel migration work above — driving
+`inlaysql serve --mysql` with two independent client libraries
+(`mysql-connector-python` and `PyMySQL`) rather than this project's own test
+client — and it was a real correctness gap, not a divergence: it could
+silently corrupt a value or break a statement outright.
+
+Real MySQL escapes special characters in a client-quoted text-protocol string
+with a leading backslash (`NO_BACKSLASH_ESCAPES` is off by default), and every
+client library that builds `COM_QUERY` text with client-side escaping relies
+on the server understanding that: `mysql-connector-python`'s default
+(non-`prepared=True`) cursor, all of `PyMySQL` (it has no true binary-protocol
+prepared statements at all), and PHP's PDO with emulated prepares — a common
+default, including for Laravel apps that have not explicitly set
+`PDO::ATTR_EMULATE_PREPARES => false`. `inlaysql-core` parses every statement
+with `sqlparser`'s `SQLiteDialect`, whose
+`supports_string_literal_backslash_escape()` is `false` — correctly, for real
+SQLite — so a client-escaped value used to reach the parser unrewritten: a
+value containing `"` got a spurious backslash silently baked into the stored
+data (send `{"role":"admin"}`, get back `{\"role\":\"admin\"}`), and a value
+containing `'` broke the statement outright, the client's `\'` reading as a
+real string terminator.
+
+Fixed in the shim, not the engine, per D1: `rewrite_backslash_escapes`
+(`crates/inlaysql-server/src/sqltext.rs`) decodes MySQL's escape table inside
+every single-quoted run — accepting either spelling of an embedded quote, a
+client's `\'` or the SQL-standard `''` — and re-emits it in the doubled-quote
+form both MySQL and SQLite agree on, before the statement reaches
+`shim::intercept` or the engine's parser either one. `\%`/`\_` are left as the
+literal two-character sequence MySQL itself leaves them (a later `LIKE`
+depends on it); double-quoted and backtick-quoted runs are left untouched
+entirely, since a MySQL client would not send an escape-looking sequence
+inside a SQLite *identifier*. A true binary-protocol prepared statement was
+never affected — bound values arrive as typed binary data, never as escaped
+text — and reconfirmed unaffected after the fix. Verified against a real,
+independent `mysql-connector-python` session (not this project's own test
+client) round-tripping `{"role":"admin"}`, `O'Brien` and `100%` correctly.
+
 ---
 
 ## Divergences
@@ -974,47 +1013,7 @@ corrected again here (that corpus is not committed — see "Interop, checked by
 hand" below — so this correction is targeted verification against specific
 statements, cited by file, rather than a fresh full run of it).
 
-### Text-protocol backslash escapes are not honoured (open, not yet fixed)
-
-**This is a real correctness gap, not a divergence — it can silently corrupt
-a value or break a statement outright, and it is not fixed yet.** Found by
-driving `inlaysql serve --mysql` with two independent client libraries
-(`mysql-connector-python` and `PyMySQL`) rather than this project's own test
-client.
-
-Real MySQL escapes special characters in a client-quoted text-protocol string
-with a leading backslash (`NO_BACKSLASH_ESCAPES` is off by default), and every
-client library that builds `COM_QUERY` text with client-side escaping relies
-on the server understanding that: `mysql-connector-python`'s default
-(non-`prepared=True`) cursor, all of `PyMySQL` (it has no true binary-protocol
-prepared statements at all), and PHP's PDO with emulated prepares — a common
-default, including for Laravel apps that have not explicitly set
-`PDO::ATTR_EMULATE_PREPARES => false`. This server parses every statement with
-`sqlparser`'s `SQLiteDialect` (`crates/inlaysql-core/src/sql.rs`), whose
-`supports_string_literal_backslash_escape()` is `false` — correctly, for real
-SQLite — so a client-escaped value reaches the parser unrewritten:
-
-- A value containing `"` silently gets a spurious backslash baked into the
-  stored data: send `{"role":"admin"}`, get back `{\"role\":\"admin\"}` — a
-  wrong value with no error, the exact failure class this file says it fears
-  most.
-- A value containing `'` breaks the statement outright: the client's `\'`
-  reads as a literal backslash followed by a real string terminator, so the
-  parser either refuses with `1064` or, worse, parses whatever follows as SQL.
-
-A true binary-protocol prepared statement (`cursor(prepared=True)` in
-`mysql-connector-python`) bypasses client-side text escaping entirely and is
-unaffected — this is specifically a text-protocol issue. Per D1 above
-(`inlaysql-core` stays faithful to SQLite's real dialect, always), the fix
-belongs in the shim: rewriting MySQL-escaped literals to SQLite-safe form
-before the statement reaches the parser, the same kind of quote-aware
-backslash scanning `crates/inlaysql-server/src/sqltext.rs` already does for
-comment-stripping — but applied to rewrite literals this time, which has to
-handle `\n \r \0 \t \Z \% \_ \\ \' \"`, SQL-standard doubled-quote escaping,
-and interaction with the existing comment/identifier scanner correctly. Not
-attempted yet; tracked here rather than fixed blind.
-
-**A `BLOB` column also cannot be written from a plain quoted string literal**
+**A `BLOB` column cannot be written from a plain quoted string literal**
 over the text protocol — `coerce()` in `crates/inlaysql-core/src/sql.rs`
 enforces `Value::Text` ≠ `Value::Blob` strictly, unlike real SQLite's weak
 BLOB affinity (which stores `TEXT` into a `BLOB` column unchanged). The MySQL

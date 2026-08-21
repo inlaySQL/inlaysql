@@ -3299,6 +3299,45 @@ fn json_functions_answer_what_laravel_over_mysql_needs() {
     );
 }
 
+/// The two shapes a real MySQL client library sent over this exact wire
+/// before `rewrite_backslash_escapes` existed: a text-protocol `INSERT`
+/// containing a client-side-escaped value. `mysql-connector-python`'s
+/// default cursor and every driver that does not use a true binary-protocol
+/// prepared statement build this SQL with a literal backslash in it, not
+/// through this test's Rust source — the query strings below contain a real
+/// `\` byte, the same one the client sent, not a Rust string escape.
+#[test]
+fn client_side_escaped_literals_round_trip_correctly() {
+    let server = TestServer::start("backslash-escapes");
+    let mut client = server.client();
+    client.ok_query("create table t (id integer primary key, v text)");
+
+    // A double quote silently corrupted the stored value: sent
+    // `{"role":"admin"}`, stored `{\"role\":\"admin\"}` (one byte too many)
+    // before this fix.
+    client.ok_query("insert into t (id, v) values (1, '{\\\"role\\\":\\\"admin\\\"}')");
+    assert_eq!(
+        value(&mut client, "v from t where id = 1"),
+        "{\"role\":\"admin\"}"
+    );
+
+    // A single quote broke the statement outright: the client's `\'` read as
+    // a real string terminator and the server answered `1064 Unterminated
+    // string literal` before this fix.
+    client.ok_query("insert into t (id, v) values (2, 'O\\'Brien')");
+    assert_eq!(value(&mut client, "v from t where id = 2"), "O'Brien");
+
+    // Both spellings of an embedded quote mean the same thing, and a client
+    // is free to use either — MySQL's `\'` and the SQL-standard `''`.
+    client.ok_query("insert into t (id, v) values (3, 'it''s here')");
+    assert_eq!(value(&mut client, "v from t where id = 3"), "it's here");
+
+    // `\%`/`\_` are the one pair MySQL leaves as the literal two-byte
+    // sequence, since they matter to a later LIKE — not decoded away here.
+    client.ok_query("insert into t (id, v) values (4, '100\\%')");
+    assert_eq!(value(&mut client, "v from t where id = 4"), "100\\%");
+}
+
 /// `JSON_QUOTE`/`JSON_TYPE`/`JSON_CONTAINS`/`JSON_OVERLAPS` are refused with
 /// MySQL's own `ER_NOT_SUPPORTED_YET` (1235) rather than silently answering
 /// under SQLite's different rules for the same name.
