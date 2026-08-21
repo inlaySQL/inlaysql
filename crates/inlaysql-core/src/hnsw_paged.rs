@@ -18,6 +18,15 @@
 //! memory, whatever the corpus size — the number the acceptance criteria ask to
 //! be *measured*, and which [`PagedHnswIndex::cache_len`] exposes.
 //!
+//! The vector itself is stored in whichever representation
+//! [`crate::hnsw::VectorEncoding`] the column declares —
+//! [`PagedHnswIndex::new`]/[`PagedHnswIndex::open`] for a plain `f32` vector,
+//! [`PagedHnswIndex::new_quantized`]/[`PagedHnswIndex::open_quantized`] for a
+//! `VECTOR(n, INT8)` column — the same choice [`crate::hnsw::HnswIndex`]
+//! already makes, and by the same [`crate::quantize::Q8Vector`] representation.
+//! Quantising shrinks the payload every node carries in both the cache and on
+//! disk, so it lowers `cache_capacity`'s bytes-per-node as well as file size.
+//!
 //! Two small structures stay in memory by design:
 //!
 //! * `live`, a `RowId -> node index` map used by insert/remove bookkeeping. It
@@ -67,7 +76,8 @@ use core::cmp::Reverse;
 
 use crate::error::{Error, Result};
 use crate::hnsw::{
-    distance, level_of, level_shift, max_level_for, normalise, Candidate, HnswParams, Visited,
+    decode_stored_vector, encode_stored_vector, level_of, level_shift, max_level_for, normalise,
+    stored_distance, Candidate, HnswParams, StoredVector, VectorEncoding, Visited,
 };
 use crate::row::{put_len, Cursor};
 use crate::traits::{RowId, RowScan, Scored, Storage, VectorIndex};
@@ -85,8 +95,9 @@ struct NodeRecord {
     /// search. Their vector is kept (it is stored inline, unlike the in-RAM
     /// index, which can recompute a live node's vector from its embedding).
     deleted: bool,
-    /// L2-normalised embedding.
-    vector: Vec<f32>,
+    /// L2-normalised embedding, in the encoding the whole index shares — see
+    /// [`PagedHnswIndex::encoding`].
+    vector: StoredVector,
     /// `neighbors[l]` are the node indices connected at layer `l`.
     neighbors: Vec<Vec<usize>>,
 }
@@ -95,9 +106,18 @@ impl NodeRecord {
     /// Encode the record.
     ///
     /// ```text
-    /// record := u8 deleted, u64 row id, u32 layer_count, layer*, f32 * dim
-    /// layer  := u32 neighbour_count, u32 * neighbour_count   (node indices)
+    /// record := u8 deleted, u64 row id, u32 layer_count, layer*, vector
+    /// layer   := u32 neighbour_count, u32 * neighbour_count   (node indices)
+    /// vector  := f32 * dim                    (`VectorEncoding::Exact`)
+    ///          | f32 scale, i8 * dim          (`VectorEncoding::Q8`)
     /// ```
+    ///
+    /// The vector's wire format is not tagged per record — it is a property of
+    /// the whole index, stored once in the header (see
+    /// [`PagedHnswIndex::write_header`]) and supplied to
+    /// [`NodeRecord::decode`] the same way `dim` already is. Only one encoding
+    /// is ever live for a given namespace, so tagging every record with it
+    /// would repeat the same byte node after node for nothing.
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(self.deleted as u8);
@@ -109,16 +129,20 @@ impl NodeRecord {
                 put_len(&mut out, *neighbor);
             }
         }
-        for value in &self.vector {
-            out.extend_from_slice(&value.to_le_bytes());
-        }
+        encode_stored_vector(&mut out, &self.vector);
         out
     }
 
     /// Parse a record produced by [`NodeRecord::encode`]. `node_count` bounds
     /// every neighbour index, so a corrupt record is refused rather than allowed
-    /// to send a search off the end of the graph.
-    fn decode(bytes: &[u8], dim: usize, node_count: usize) -> Result<Self> {
+    /// to send a search off the end of the graph. `encoding` picks the vector
+    /// tail's width, exactly as the caller that is decoding already knows `dim`.
+    fn decode(
+        bytes: &[u8],
+        dim: usize,
+        encoding: VectorEncoding,
+        node_count: usize,
+    ) -> Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let deleted = cursor.u8()? != 0;
         let id = RowId::from_le_bytes(cursor.array8()?);
@@ -138,10 +162,7 @@ impl NodeRecord {
             }
             neighbors.push(layer);
         }
-        let mut vector = Vec::with_capacity(dim);
-        for _ in 0..dim {
-            vector.push(f32::from_le_bytes(cursor.array4()?));
-        }
+        let vector = decode_stored_vector(&mut cursor, dim, encoding)?;
         Ok(Self {
             id,
             deleted,
@@ -230,6 +251,7 @@ impl NodeCache {
         &mut self,
         idx: usize,
         dim: usize,
+        encoding: VectorEncoding,
         node_count: usize,
         storage: &dyn Storage,
         namespace: &str,
@@ -243,7 +265,7 @@ impl NodeCache {
                 "paged HNSW node {idx} is referenced but absent from storage"
             ))
         })?;
-        let record = NodeRecord::decode(&bytes, dim, node_count)?;
+        let record = NodeRecord::decode(&bytes, dim, encoding, node_count)?;
         self.insert(idx, record.clone());
         Ok(record)
     }
@@ -258,6 +280,11 @@ pub struct PagedHnswIndex<S: Storage> {
     /// The synthetic table node records are stored under.
     namespace: String,
     dim: usize,
+    /// The representation every node's vector is stored in — a property of
+    /// the whole index, fixed at construction from the column's declared
+    /// type and checked against the header on [`PagedHnswIndex::open`]. See
+    /// [`crate::hnsw::VectorEncoding`].
+    encoding: VectorEncoding,
     /// Number of nodes in the graph (live plus tombstoned).
     node_count: usize,
     /// Node index of the entry point.
@@ -294,6 +321,20 @@ impl<S: Storage> PagedHnswIndex<S> {
         Self::with_params(storage, namespace, dim, HnswParams::DEFAULT)
     }
 
+    /// An empty int8-quantised index over vectors of `dim`, mirroring
+    /// [`crate::hnsw::HnswIndex::new_quantized`]: a `VECTOR(n, INT8)` column
+    /// gets the same ~4x storage/memory win here that it already gets from
+    /// the in-memory index.
+    pub fn new_quantized(storage: S, namespace: impl Into<String>, dim: usize) -> Self {
+        Self::with_encoding(
+            storage,
+            namespace,
+            dim,
+            HnswParams::DEFAULT,
+            VectorEncoding::Q8,
+        )
+    }
+
     /// An empty index with explicit tuning.
     pub fn with_params(
         storage: S,
@@ -301,10 +342,21 @@ impl<S: Storage> PagedHnswIndex<S> {
         dim: usize,
         params: HnswParams,
     ) -> Self {
+        Self::with_encoding(storage, namespace, dim, params, VectorEncoding::Exact)
+    }
+
+    fn with_encoding(
+        storage: S,
+        namespace: impl Into<String>,
+        dim: usize,
+        params: HnswParams,
+        encoding: VectorEncoding,
+    ) -> Self {
         Self {
             storage,
             namespace: namespace.into(),
             dim,
+            encoding,
             node_count: 0,
             entry: None,
             entry_level: 0,
@@ -327,6 +379,22 @@ impl<S: Storage> PagedHnswIndex<S> {
     /// and `live` map so it answers immediately without a rebuild.
     pub fn open(storage: S, namespace: impl Into<String>, dim: usize) -> Result<Self> {
         let mut index = Self::new(storage, namespace, dim);
+        index.restore()?;
+        Ok(index)
+    }
+
+    /// Open a previously committed int8-quantised index. See
+    /// [`PagedHnswIndex::new_quantized`].
+    ///
+    /// If the namespace instead holds a graph written under a different
+    /// encoding — most commonly a database created before quantised paged
+    /// indexes existed, where every paged graph was written exact regardless
+    /// of the column's declared type — [`PagedHnswIndex::restore`] purges it
+    /// and comes back empty rather than misreading it, and the caller's usual
+    /// stale-index handling rebuilds it from the rows. See the module note on
+    /// the header format.
+    pub fn open_quantized(storage: S, namespace: impl Into<String>, dim: usize) -> Result<Self> {
+        let mut index = Self::new_quantized(storage, namespace, dim);
         index.restore()?;
         Ok(index)
     }
@@ -363,9 +431,21 @@ impl<S: Storage> PagedHnswIndex<S> {
     /// nodes would tombstone each one and roughly double the node count for no
     /// gain. Like every other write here, the deletions go into the open
     /// transaction and become durable when it commits.
+    ///
+    /// Deletes every row the namespace actually holds, found by scanning it,
+    /// rather than trusting `0..self.node_count`. The two agree whenever this
+    /// index restored its own header, but not for one [`PagedHnswIndex::open`]
+    /// left at its constructed default of zero because [`PagedHnswIndex::restore`]
+    /// found a header written under a different [`VectorEncoding`] and refused
+    /// to trust it — the namespace can still hold that older graph's rows, and
+    /// they have to go before the rebuild-from-rows this call is always a
+    /// prelude to writes fresh ones on top.
     pub fn clear(&mut self) -> Result<()> {
-        for idx in 0..self.node_count {
-            self.storage.delete_row(&self.namespace, idx as RowId)?;
+        let stale: Vec<RowId> = RowScan::new(&self.storage, &self.namespace)
+            .map(|row| row.map(|(id, _)| id))
+            .collect::<Result<_>>()?;
+        for idx in stale {
+            self.storage.delete_row(&self.namespace, idx)?;
         }
         self.node_count = 0;
         self.pending_inserts.clear();
@@ -385,6 +465,21 @@ impl<S: Storage> PagedHnswIndex<S> {
     /// The bound `cache_len` will never exceed.
     pub fn cache_capacity(&self) -> usize {
         self.cache.borrow().capacity()
+    }
+
+    /// Bytes occupied by vector payloads currently resident in the node
+    /// cache. Everything outside the cache lives in `storage`, not in memory —
+    /// that bound is the whole point of this backend, see the
+    /// [module note](self). Container and adjacency overhead are intentionally
+    /// excluded so exact and int8 columns are directly comparable, mirroring
+    /// [`crate::hnsw::HnswIndex::resident_vector_bytes`].
+    pub fn resident_vector_bytes(&self) -> usize {
+        self.cache
+            .borrow()
+            .entries
+            .values()
+            .map(|record| record.vector.payload_bytes())
+            .sum()
     }
 
     /// Number of live indexed embeddings.
@@ -434,6 +529,17 @@ impl<S: Storage> PagedHnswIndex<S> {
     }
 
     /// Restore node count, entry point and the `live` map from a prior commit.
+    ///
+    /// The header carries an encoding tag as its very last byte — appended
+    /// there, after the (already optional) write-version stamp, rather than
+    /// up front where `dim` is. Every earlier field's position and width
+    /// predates this change, so a leading tag would shift them for a header
+    /// this method still has to read; a trailing one lets an absent byte mean
+    /// exactly what it always did before quantised paged indexes existed:
+    /// exact. See the [module note](self) — there is no
+    /// `CATALOG_VERSION_*`-style version number for this header at all, so
+    /// this mirrors the one compatibility trick the format already used
+    /// (the write-version stamp is read the same optional-trailing-byte way).
     fn restore(&mut self) -> Result<()> {
         let Some(bytes) = self.storage.get_meta(&self.header_key())? else {
             return Ok(());
@@ -457,6 +563,41 @@ impl<S: Storage> PagedHnswIndex<S> {
             Ok(1) => Some(u64::from_le_bytes(cursor.array8()?)),
             _ => None,
         };
+        // Absent entirely on a header written before quantised paged indexes
+        // existed: every paged graph was implicitly exact then, whatever the
+        // column declared, because the engine did not yet wire the column's
+        // encoding through to this backend.
+        let encoding = match cursor.u8() {
+            Ok(0) => VectorEncoding::Exact,
+            Ok(1) => VectorEncoding::Q8,
+            Ok(_) => {
+                return Err(Error::Corrupt(alloc::format!(
+                    "paged HNSW header for {} has an unrecognised vector encoding tag",
+                    self.namespace
+                )))
+            }
+            Err(_) => VectorEncoding::Exact,
+        };
+        if encoding != self.encoding {
+            // The graph on disk was written under a different encoding than
+            // the column now declares. There is nothing to salvage: a Q8
+            // node's payload is the wrong width to reinterpret as `f32`s (and
+            // vice versa).
+            //
+            // Purge it here rather than just leaving `self` at its
+            // constructed default: every other reason this method leaves
+            // `node_count` at zero (a fresh namespace, or one `clear` already
+            // emptied) also means the namespace itself is empty, and losing
+            // that invariant would leave the wrong-encoding rows for
+            // `PagedHnswIndex::build` to trip over the moment a caller
+            // commits without first calling `reset` — the standard protocol
+            // (`Engine::reset_self_persisting_indexes`) always does, but this
+            // type's own invariants should not depend on every caller
+            // following it. `clear` leaves `stored_version: None`, so the
+            // caller's existing "the saved copy is not current" handling
+            // still rebuilds it from the rows. See `Engine::load_saved_indexes`.
+            return self.clear();
+        }
 
         self.node_count = node_count;
         self.entry = has_entry.then_some(entry);
@@ -478,7 +619,7 @@ impl<S: Storage> PagedHnswIndex<S> {
             if index as usize >= node_count {
                 continue;
             }
-            let record = NodeRecord::decode(&bytes, self.dim, node_count)?;
+            let record = NodeRecord::decode(&bytes, self.dim, self.encoding, node_count)?;
             if !record.deleted {
                 self.live.insert(record.id, index as usize);
             }
@@ -491,6 +632,7 @@ impl<S: Storage> PagedHnswIndex<S> {
         self.cache.borrow_mut().fetch(
             idx,
             self.dim,
+            self.encoding,
             self.node_count,
             &self.storage,
             &self.namespace,
@@ -498,7 +640,7 @@ impl<S: Storage> PagedHnswIndex<S> {
     }
 
     /// Read a node's vector, through the cache.
-    fn fetch_vector(&self, idx: usize) -> Result<Vec<f32>> {
+    fn fetch_vector(&self, idx: usize) -> Result<StoredVector> {
         self.fetch_node(idx).map(|record| record.vector)
     }
 
@@ -552,6 +694,9 @@ impl<S: Storage> PagedHnswIndex<S> {
     /// `version` is the write version the graph describes, or `None` for a
     /// graph that is not (yet) complete — see
     /// [`PagedHnswIndex::flush_if_transaction_is_full`].
+    ///
+    /// The encoding tag is written last, and always — see
+    /// [`PagedHnswIndex::restore`] for why its position is load-bearing.
     fn write_header(&mut self, version: Option<u64>) -> Result<()> {
         let mut out = Vec::new();
         put_len(&mut out, self.dim);
@@ -575,6 +720,10 @@ impl<S: Storage> PagedHnswIndex<S> {
             }
             None => out.push(0),
         }
+        out.push(match self.encoding {
+            VectorEncoding::Exact => 0,
+            VectorEncoding::Q8 => 1,
+        });
         self.storage.put_meta(&self.header_key(), &out)
     }
 
@@ -593,11 +742,11 @@ impl<S: Storage> PagedHnswIndex<S> {
     fn build(&mut self) -> Result<()> {
         // The final live set: committed live nodes from storage, minus pending
         // removes, plus pending inserts (whose embeddings are still in memory).
-        let mut live: BTreeMap<RowId, Vec<f32>> = BTreeMap::new();
+        let mut live: BTreeMap<RowId, StoredVector> = BTreeMap::new();
         let old_count = self.node_count;
         for row in RowScan::new(&self.storage, &self.namespace) {
             let (_, bytes) = row?;
-            let record = NodeRecord::decode(&bytes, self.dim, old_count)?;
+            let record = NodeRecord::decode(&bytes, self.dim, self.encoding, old_count)?;
             if !record.deleted {
                 live.insert(record.id, record.vector);
             }
@@ -606,7 +755,10 @@ impl<S: Storage> PagedHnswIndex<S> {
             live.remove(id);
         }
         for (id, embedding) in &self.pending_inserts {
-            live.insert(*id, normalise(embedding));
+            live.insert(
+                *id,
+                StoredVector::from_f32(&normalise(embedding), self.encoding),
+            );
         }
 
         self.reset_graph();
@@ -631,7 +783,7 @@ impl<S: Storage> PagedHnswIndex<S> {
     fn insert_node(
         &mut self,
         id: RowId,
-        vector: Vec<f32>,
+        vector: StoredVector,
         level: usize,
         visited: &mut Visited,
     ) -> Result<()> {
@@ -693,9 +845,14 @@ impl<S: Storage> PagedHnswIndex<S> {
     }
 
     /// Best-first search of one layer, fetching node records on demand.
+    ///
+    /// `query` stays exact even when the index is quantised, for the same
+    /// reason [`crate::hnsw::HnswIndex::search`] keeps it exact: quantising
+    /// the corpus is the declared storage trade-off, and throwing away query
+    /// precision too would add recall loss without saving resident memory.
     fn search_layer(
         &self,
-        query: &[f32],
+        query: &StoredVector,
         entry: usize,
         ef: usize,
         layer: usize,
@@ -709,7 +866,7 @@ impl<S: Storage> PagedHnswIndex<S> {
 
         let entry_vector = self.fetch_vector(entry)?;
         let start = Candidate {
-            distance: distance(&self.distance_calls, query, &entry_vector),
+            distance: stored_distance(&self.distance_calls, query, &entry_vector),
             node: entry,
         };
         visited.visit(entry);
@@ -729,7 +886,7 @@ impl<S: Storage> PagedHnswIndex<S> {
                 }
                 let neighbor_vector = self.fetch_vector(neighbor)?;
                 let candidate = Candidate {
-                    distance: distance(&self.distance_calls, query, &neighbor_vector),
+                    distance: stored_distance(&self.distance_calls, query, &neighbor_vector),
                     node: neighbor,
                 };
                 let worst = results.peek().expect("non-empty").distance;
@@ -761,7 +918,7 @@ impl<S: Storage> PagedHnswIndex<S> {
             let mut diverse = true;
             for &kept in &selected {
                 let kept_vector = self.fetch_vector(kept)?;
-                if distance(&self.distance_calls, &candidate_vector, &kept_vector)
+                if stored_distance(&self.distance_calls, &candidate_vector, &kept_vector)
                     <= candidate.distance
                 {
                     diverse = false;
@@ -808,7 +965,7 @@ impl<S: Storage> PagedHnswIndex<S> {
         for &other in &record.neighbors[layer] {
             let other_vector = self.fetch_vector(other)?;
             candidates.push(Candidate {
-                distance: distance(&self.distance_calls, &neighbor_vector, &other_vector),
+                distance: stored_distance(&self.distance_calls, &neighbor_vector, &other_vector),
                 node: other,
             });
         }
@@ -924,7 +1081,7 @@ impl<S: Storage> VectorIndex for PagedHnswIndex<S> {
         let ceiling = max_level_for(self.live.len() + inserts.len(), self.params.m);
         let mut visited = Visited::new(self.node_count);
         for (id, embedding) in inserts {
-            let vector = normalise(&embedding);
+            let vector = StoredVector::from_f32(&normalise(&embedding), self.encoding);
             let level = level_of(id, shift, ceiling);
             // A replace without an intervening remove retires the old node the
             // same way a remove would.
@@ -961,7 +1118,7 @@ impl<S: Storage> VectorIndex for PagedHnswIndex<S> {
             return Ok(Vec::new());
         }
 
-        let query = normalise(query);
+        let query = StoredVector::Exact(normalise(query));
         let mut visited = Visited::new(self.node_count);
         for layer in (1..=self.entry_level).rev() {
             let nearest = self.search_layer(&query, ep, 1, layer, &mut visited)?;
@@ -981,6 +1138,10 @@ impl<S: Storage> VectorIndex for PagedHnswIndex<S> {
             }
         }
         Ok(scored)
+    }
+
+    fn resident_vector_bytes(&self) -> Option<usize> {
+        Some(PagedHnswIndex::resident_vector_bytes(self))
     }
 
     fn is_self_persisting(&self) -> bool {
@@ -1228,5 +1389,237 @@ mod tests {
             "inserting one row into a {count}-node graph cost {calls} distance \
              computations; touching every node would be {count}"
         );
+    }
+
+    // ------------------------------------------------------- quantisation
+
+    /// A fresh in-memory-backed *quantised* paged index over `dim` dimensions.
+    fn quantized_index(dim: usize) -> PagedHnswIndex<MemStorage> {
+        PagedHnswIndex::new_quantized(MemStorage::new(), "hnsw", dim)
+    }
+
+    #[test]
+    fn quantized_index_round_trips_and_shrinks_resident_bytes() {
+        let dim = 384;
+        let rows = vectors(256, dim);
+
+        let mut exact = index(dim);
+        let mut quantized = quantized_index(dim);
+        for (id, vector) in rows.iter().enumerate() {
+            exact.insert(id as u64 + 1, vector).unwrap();
+            quantized.insert(id as u64 + 1, vector).unwrap();
+        }
+        exact.commit().unwrap();
+        quantized.commit().unwrap();
+
+        // Warm both caches over the whole corpus so `resident_vector_bytes`
+        // is comparing the same thing on both sides, not "whatever a handful
+        // of searches happened to touch".
+        for idx in 0..rows.len() {
+            exact.fetch_node(idx).unwrap();
+            quantized.fetch_node(idx).unwrap();
+        }
+        let exact_bytes = exact.resident_vector_bytes();
+        let q8_bytes = quantized.resident_vector_bytes();
+        assert!(
+            exact_bytes * 100 >= q8_bytes * 390,
+            "exact={exact_bytes} q8={q8_bytes}, expected roughly a 4x reduction"
+        );
+
+        // The graph still answers the same query the same way after a
+        // save/reload of the quantised index — the round-trip pattern used
+        // throughout this module's other tests, extended to Q8.
+        let query = &rows[rows.len() - 1];
+        let before: Vec<RowId> = quantized
+            .search(query, 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+
+        let storage = quantized.into_storage();
+        let restored = PagedHnswIndex::open_quantized(storage, "hnsw", dim).unwrap();
+        let after: Vec<RowId> = restored
+            .search(query, 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(before, after, "reopened quantised graph diverged");
+    }
+
+    /// The paged quantised index must not lose meaningfully more recall than
+    /// the in-memory quantised index over the same corpus and queries — see
+    /// `hnsw::tests::quantized_graph_round_trips_and_shrinks_vector_memory`
+    /// for the in-memory-only version of this property.
+    #[test]
+    fn quantized_paged_recall_matches_the_in_memory_quantized_index() {
+        let dim = 32;
+        let rows = vectors(512, dim);
+
+        let mut paged = quantized_index(dim);
+        let mut in_memory = crate::hnsw::HnswIndex::new_quantized(dim);
+        for (id, vector) in rows.iter().enumerate() {
+            paged.insert(id as u64 + 1, vector).unwrap();
+            in_memory.insert(id as u64 + 1, vector).unwrap();
+        }
+        paged.commit().unwrap();
+        in_memory.commit().unwrap();
+
+        let mut paged_hits = 0usize;
+        let mut in_memory_hits = 0usize;
+        let mut brute = BruteForceVectorIndex::new(dim);
+        for (id, vector) in rows.iter().enumerate() {
+            brute.insert(id as u64 + 1, vector).unwrap();
+        }
+        brute.commit().unwrap();
+
+        for seed in 0..10 {
+            let query: Vec<f32> = (0..dim).map(|i| ((seed * dim + i) as f32).sin()).collect();
+            let truth: Vec<RowId> = brute
+                .search(&query, 10)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.id)
+                .collect();
+            let paged_found: Vec<RowId> = paged
+                .search(&query, 10)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.id)
+                .collect();
+            let in_memory_found: Vec<RowId> = in_memory
+                .search(&query, 10)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.id)
+                .collect();
+            paged_hits += paged_found.iter().filter(|id| truth.contains(id)).count();
+            in_memory_hits += in_memory_found
+                .iter()
+                .filter(|id| truth.contains(id))
+                .count();
+        }
+
+        // Both are the same algorithm over the same encoding, so their recall
+        // should be close, not merely "both non-zero".
+        let paged_recall = paged_hits as f64 / 100.0;
+        let in_memory_recall = in_memory_hits as f64 / 100.0;
+        assert!(
+            (paged_recall - in_memory_recall).abs() <= 0.1,
+            "paged recall {paged_recall:.3} diverged from in-memory recall {in_memory_recall:.3}"
+        );
+        assert!(
+            paged_recall >= 0.7,
+            "paged recall too low: {paged_recall:.3}"
+        );
+    }
+
+    /// A paged header written before quantised paged indexes existed has no
+    /// encoding tag at all — the trailing byte [`PagedHnswIndex::restore`]
+    /// looks for simply is not there. It must still open, as exact, rather
+    /// than fail or misread: this is the compatibility property the whole
+    /// module note on the header format exists to state.
+    #[test]
+    fn a_header_without_an_encoding_tag_opens_as_exact() {
+        let dim = 6;
+        let storage = MemStorage::new();
+        let mut original = PagedHnswIndex::new(storage.clone(), "hnsw", dim);
+        for (id, vector) in vectors(32, dim).into_iter().enumerate() {
+            original.insert(id as u64 + 1, &vector).unwrap();
+        }
+        original.commit().unwrap();
+
+        let query = |seed: usize| -> Vec<f32> {
+            (0..dim).map(|i| ((seed * dim + i) as f32).sin()).collect()
+        };
+        let expected: Vec<RowId> = original
+            .search(&query(0), 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+
+        // Simulate a header written before this change existed: strip the
+        // trailing encoding byte this change appends.
+        let header_key = original.header_key();
+        let mut storage = original.into_storage();
+        let header = storage.get_meta(&header_key).unwrap().unwrap();
+        storage
+            .put_meta(&header_key, &header[..header.len() - 1])
+            .unwrap();
+        storage.commit().unwrap();
+
+        let restored = PagedHnswIndex::open(storage, "hnsw", dim).unwrap();
+        let got: Vec<RowId> = restored
+            .search(&query(0), 10)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(got, expected, "pre-encoding-tag header failed to restore");
+    }
+
+    /// A graph written exact — which is what every paged index wrote before
+    /// the column's encoding was threaded through, whatever the column
+    /// declared — must not be misread as quantised. Opening it with
+    /// `open_quantized` has to come back empty (forcing the caller's usual
+    /// rebuild-from-rows path), not an error and not silently wrong vectors.
+    #[test]
+    fn opening_an_exact_graph_as_quantized_forces_a_rebuild_rather_than_misreading() {
+        let dim = 6;
+        let storage = MemStorage::new();
+        let mut original = PagedHnswIndex::new(storage.clone(), "hnsw", dim);
+        for (id, vector) in vectors(32, dim).into_iter().enumerate() {
+            original.insert(id as u64 + 1, &vector).unwrap();
+        }
+        original.commit().unwrap();
+        let storage = original.into_storage();
+
+        let mut mismatched = PagedHnswIndex::open_quantized(storage, "hnsw", dim)
+            .expect("a mismatched encoding must not be a hard error");
+        assert!(
+            mismatched.is_empty(),
+            "mismatched graph should not resurrect the old vectors"
+        );
+        assert_eq!(
+            mismatched.stored_write_version(),
+            None,
+            "an encoding mismatch must look exactly like \"nothing saved\", so the \
+             caller's normal staleness check rebuilds it"
+        );
+        assert!(mismatched.search(&[1.0; 6], 10).unwrap().is_empty());
+
+        // And a rebuild — re-index every row, then commit, deliberately
+        // *without* calling `reset()` first — must complete and answer
+        // correctly. `Engine::reset_self_persisting_indexes` always calls
+        // `reset()` before this in the real recovery sequence, but this
+        // type's own invariants should not depend on every caller following
+        // that protocol: `open_quantized` already purged the stale
+        // exact-format rows above, which is what makes skipping `reset()`
+        // here safe rather than a rebuild that either misreads the leftover
+        // rows (if a purge trusted a stale `node_count`) or double-counts
+        // them.
+        let mut rows = vectors(32, dim);
+        for (id, vector) in rows.iter().enumerate() {
+            mismatched.insert(id as u64 + 1, vector).unwrap();
+        }
+        mismatched.commit().unwrap();
+        assert_eq!(mismatched.len(), 32, "rebuild did not index every row");
+
+        let query = rows.pop().unwrap();
+        let hits = mismatched.search(&query, 1).unwrap();
+        assert_eq!(
+            hits[0].id, 32,
+            "rebuilt quantised graph answered incorrectly"
+        );
+
+        // The rebuild is durable and reopens as quantised from here on: no
+        // more leftover exact rows to trip over, and the header now agrees
+        // with the column.
+        let storage = mismatched.into_storage();
+        let reopened = PagedHnswIndex::open_quantized(storage, "hnsw", dim).unwrap();
+        assert_eq!(reopened.len(), 32);
+        assert_eq!(reopened.search(&query, 1).unwrap()[0].id, 32);
     }
 }

@@ -1229,9 +1229,10 @@ impl Engine {
                         index.column()
                     )));
                 };
+                let quantized = column.ty.is_quantized_vector();
                 let backend = if self.options.paged_vector_indexes {
-                    self.open_paged_vector_index(&index.table, index.column(), dim)?
-                } else if column.ty.is_quantized_vector() {
+                    self.open_paged_vector_index(&index.table, index.column(), dim, quantized)?
+                } else if quantized {
                     self.factory
                         .quantized_vector(&index.table, index.column(), dim)?
                 } else {
@@ -1249,17 +1250,25 @@ impl Engine {
     /// It shares the engine's storage handle and does not commit: its node
     /// writes join whatever transaction the engine has open, so the graph and
     /// the rows it describes reach the log together.
+    ///
+    /// `quantized` mirrors what the same column already gets from the
+    /// in-memory backend (see [`IndexFactory::quantized_vector`]): a
+    /// `VECTOR(n, INT8)` column gets a [`PagedHnswIndex`] that stores int8
+    /// nodes, not the exact `f32` every paged index used to store regardless
+    /// of the column's declared type.
     fn open_paged_vector_index(
         &self,
         table: &str,
         column: &str,
         dim: usize,
+        quantized: bool,
     ) -> Result<Box<dyn VectorIndex>> {
-        let index = PagedHnswIndex::open(
-            self.storage.clone(),
-            vector_index_namespace(table, column),
-            dim,
-        )?
+        let namespace = vector_index_namespace(table, column);
+        let index = if quantized {
+            PagedHnswIndex::open_quantized(self.storage.clone(), namespace, dim)?
+        } else {
+            PagedHnswIndex::open(self.storage.clone(), namespace, dim)?
+        }
         .joined_to_caller_transaction();
         Ok(Box::new(index))
     }
