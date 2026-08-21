@@ -1128,9 +1128,9 @@ const LANES: usize = 8;
 pub(crate) fn distance(counter: &Cell<u64>, a: &[f32], b: &[f32]) -> f32 {
     counter.set(counter.get().saturating_add(1));
     let mut lanes = [0.0f32; LANES];
-    let mut left = a.chunks_exact(LANES);
-    let mut right = b.chunks_exact(LANES);
-    for (x, y) in left.by_ref().zip(right.by_ref()) {
+    let (left_chunks, left_rem) = a.as_chunks::<LANES>();
+    let (right_chunks, right_rem) = b.as_chunks::<LANES>();
+    for (x, y) in left_chunks.iter().zip(right_chunks) {
         for lane in 0..LANES {
             lanes[lane] += x[lane] * y[lane];
         }
@@ -1141,7 +1141,7 @@ pub(crate) fn distance(counter: &Cell<u64>, a: &[f32], b: &[f32]) -> f32 {
         dot += lane;
     }
     // Whatever a dimension that is not a multiple of `LANES` leaves over.
-    for (x, y) in left.remainder().iter().zip(right.remainder()) {
+    for (x, y) in left_rem.iter().zip(right_rem) {
         dot += x * y;
     }
     1.0 - dot

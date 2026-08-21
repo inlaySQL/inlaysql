@@ -2241,7 +2241,7 @@ fn unhex(value: &Value) -> Result<Value> {
         return Ok(Value::Null);
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         match (hex_digit(pair[0]), hex_digit(pair[1])) {
             (Some(hi), Some(lo)) => out.push((hi << 4) | lo),
             _ => return Ok(Value::Null),
@@ -2761,7 +2761,7 @@ fn json_put_fn(
     let Some(mut doc) = json_doc(&doc_value)? else {
         return Ok(Value::Null);
     };
-    for pair in args[1..].chunks_exact(2) {
+    for pair in args[1..].as_chunks::<2>().0 {
         let path_value = evaluate(&pair[0], row, computed, env)?;
         // A `NULL` path skips this pair, leaving `doc` untouched by it —
         // checked against sqlite3; it is *not* `NULL`-propagating the way
@@ -2799,7 +2799,7 @@ fn json_object_fn(
     env: &Env<'_>,
 ) -> Result<Value> {
     let mut members = Vec::with_capacity(args.len() / 2);
-    for pair in args.chunks_exact(2) {
+    for pair in args.as_chunks::<2>().0 {
         let key_value = evaluate(&pair[0], row, computed, env)?;
         let Value::Text(key) = key_value else {
             return Err(Error::Type("json_object() labels must be TEXT".to_string()));

@@ -928,10 +928,10 @@ fn sha1(message: &[u8]) -> [u8; 20] {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 80];
-        for (word, bytes) in w.iter_mut().zip(chunk.chunks_exact(4)) {
-            *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        for (word, bytes) in w.iter_mut().zip(chunk.as_chunks::<4>().0) {
+            *word = u32::from_be_bytes(*bytes);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
@@ -963,8 +963,8 @@ fn sha1(message: &[u8]) -> [u8; 20] {
         h[4] = h[4].wrapping_add(e);
     }
     let mut out = [0u8; 20];
-    for (slot, word) in out.chunks_exact_mut(4).zip(h) {
-        slot.copy_from_slice(&word.to_be_bytes());
+    for (slot, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
+        *slot = word.to_be_bytes();
     }
     out
 }
@@ -1054,10 +1054,10 @@ fn sha256(message: &[u8]) -> [u8; 32] {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (word, bytes) in w.iter_mut().take(16).zip(chunk.chunks_exact(4)) {
-            *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        for (word, bytes) in w.iter_mut().take(16).zip(chunk.as_chunks::<4>().0) {
+            *word = u32::from_be_bytes(*bytes);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -1098,8 +1098,8 @@ fn sha256(message: &[u8]) -> [u8; 32] {
         h[7] = h[7].wrapping_add(hh);
     }
     let mut out = [0u8; 32];
-    for (slot, word) in out.chunks_exact_mut(4).zip(h) {
-        slot.copy_from_slice(&word.to_be_bytes());
+    for (slot, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
+        *slot = word.to_be_bytes();
     }
     out
 }
