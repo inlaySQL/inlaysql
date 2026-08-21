@@ -623,9 +623,11 @@ order of expected value:
    during a graph walk, so the prefetcher works for us.
 3. **Quantised paged nodes**  — `PagedHnswIndex` stores exact
    `f32` even for an int8 column, so the paged path currently forfeits the 4x.
-4. **Filter-aware walks** instead of over-fetching. Today a restrictive `WHERE`
-   widens the probe until enough rows survive; on a selective filter that is
-   enormously more work than pushing the predicate into the walk.
+4. ~~**Filter-aware walks** instead of over-fetching.~~ — **done.** The
+   `WHERE` is compiled into a row predicate and pushed into the index walk:
+   rejected rows are traversed but neither returned nor counted, so a
+   selective filter no longer widens the probe in geometric re-runs. See
+   `Engine::retrieve_filtered`.
 
 ---
 

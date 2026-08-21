@@ -113,7 +113,7 @@ fn measure(
     let mut total = 0.0;
     for (query, truth) in queries.iter().zip(truth) {
         let at = Instant::now();
-        let hits = index.search(query, k)?;
+        let hits = index.search(query, k, None)?;
         samples.push(at.elapsed());
         let ids: Vec<u64> = hits.into_iter().map(|hit| hit.id).collect();
         total += recall(&ids, truth);

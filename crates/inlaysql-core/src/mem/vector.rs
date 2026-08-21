@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use crate::error::{Error, Result};
 use crate::fusion::sort_by_score_desc;
 use crate::row::{put_len, Cursor};
-use crate::traits::{RowId, Scored, VectorIndex};
+use crate::traits::{RowFilter, RowId, Scored, VectorIndex};
 
 /// Exhaustive cosine-similarity search.
 ///
@@ -100,7 +100,7 @@ impl VectorIndex for BruteForceVectorIndex {
         Ok(())
     }
 
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<Scored>> {
+    fn search(&self, query: &[f32], k: usize, filter: Option<&RowFilter>) -> Result<Vec<Scored>> {
         if query.len() != self.dim {
             return Err(Error::Type(alloc::format!(
                 "query has dimension {} but the index expects {}",
@@ -108,11 +108,15 @@ impl VectorIndex for BruteForceVectorIndex {
                 self.dim
             )));
         }
-        let mut hits: Vec<Scored> = self
-            .embeddings
-            .iter()
-            .map(|(id, embedding)| Scored::new(*id, cosine_similarity(query, embedding)))
-            .collect();
+        let mut hits: Vec<Scored> = Vec::with_capacity(self.embeddings.len());
+        for (id, embedding) in &self.embeddings {
+            if let Some(filter) = filter {
+                if !filter(*id)? {
+                    continue;
+                }
+            }
+            hits.push(Scored::new(*id, cosine_similarity(query, embedding)));
+        }
         sort_by_score_desc(&mut hits);
         hits.truncate(k);
         Ok(hits)
@@ -166,7 +170,7 @@ mod tests {
         index.insert(1, &[1.0, 0.0]).unwrap();
         index.insert(2, &[0.0, 1.0]).unwrap();
         index.insert(3, &[0.9, 0.1]).unwrap();
-        let hits = index.search(&[1.0, 0.0], 2).unwrap();
+        let hits = index.search(&[1.0, 0.0], 2, None).unwrap();
         assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1, 3]);
     }
 
@@ -175,6 +179,6 @@ mod tests {
         let mut index = BruteForceVectorIndex::new(3);
         assert!(index.insert(1, &[1.0]).is_err());
         index.insert(1, &[1.0, 0.0, 0.0]).unwrap();
-        assert!(index.search(&[1.0, 0.0], 1).is_err());
+        assert!(index.search(&[1.0, 0.0], 1, None).is_err());
     }
 }

@@ -61,7 +61,7 @@ use core::cmp::{Ordering, Reverse};
 use crate::error::{Error, Result};
 use crate::quantize::Q8Vector;
 use crate::row::{put_len, Cursor};
-use crate::traits::{RowId, Scored, VectorIndex};
+use crate::traits::{RowFilter, RowId, Scored, VectorIndex};
 
 /// On-disk format of the persisted index. Bumped whenever the layout changes;
 /// a mismatch makes the engine rebuild rather than misread.
@@ -528,7 +528,7 @@ impl HnswIndex {
     /// Rebuild the graph from the current embeddings. Deterministic: rows are
     /// visited in row-id order, and each node's layer is a pure function of its
     /// row id and the corpus size.
-    fn build(&mut self) {
+    fn build(&mut self) -> Result<()> {
         self.nodes.clear();
         self.node_ids.clear();
         self.entry = None;
@@ -558,8 +558,9 @@ impl HnswIndex {
         let mut visited = Visited::new(count);
         self.nodes.reserve(count);
         for (id, vector, level) in pending {
-            self.insert_node(id, vector, level, &mut visited);
+            self.insert_node(id, vector, level, &mut visited)?;
         }
+        Ok(())
     }
 
     /// Greedily insert one node into the graph.
@@ -569,14 +570,14 @@ impl HnswIndex {
         vector: StoredVector,
         level: usize,
         visited: &mut Visited,
-    ) {
+    ) -> Result<()> {
         // The first node is the entry point at its own level.
         let Some(mut ep) = self.entry else {
             self.nodes.push(Node::new(id, vector, level));
             self.entry = Some(0);
             self.entry_level = level;
             self.node_ids.insert(id, 0);
-            return;
+            return Ok(());
         };
 
         // Descend from the graph's top layer to this node's top layer. When the
@@ -590,9 +591,10 @@ impl HnswIndex {
                 ep,
                 1,
                 current,
+                None,
                 visited,
                 &self.distance_calls,
-            );
+            )?;
             ep = nearest[0].node;
             current -= 1;
         }
@@ -608,9 +610,10 @@ impl HnswIndex {
                 ep,
                 self.params.ef_construction,
                 layer,
+                None,
                 visited,
                 &self.distance_calls,
-            );
+            )?;
             // The nearest node at this layer seeds the next layer's search.
             ep = candidates[0].node;
 
@@ -626,6 +629,7 @@ impl HnswIndex {
             self.entry = Some(new_index);
             self.entry_level = level;
         }
+        Ok(())
     }
 
     /// Add the reverse edge `neighbor -> new_index`, pruning `neighbor`'s list
@@ -711,18 +715,40 @@ impl HnswIndex {
 /// Best-first search of one layer: up to `ef` nodes nearest to `query` at
 /// `layer`, nearest first.
 ///
+/// With a `filter`, only rows the filter admits (and, among them, only live
+/// nodes) may enter `results` or count toward `ef` — but every node visited
+/// is still expanded and may still enter the frontier, so a rejected node
+/// routes the walk to admissible neighbours on its far side. Cutting rejected
+/// nodes out of the graph instead would sever that connectivity and silently
+/// drop matches, which is precisely the failure this design exists to prevent.
+///
+/// The walk ends one of two ways:
+///
+/// * the beam fills (`ef` admissible results) and the nearest unexpanded
+///   frontier node is farther than the worst of them — the ordinary HNSW
+///   stop, which is exactly what a permissive filter costs (the unfiltered
+///   walk, byte for byte);
+/// * the frontier drains — with a filter that admits few rows this means
+///   every node in the graph has been seen and the admissible set returned is
+///   complete for that filter, not a partial probe. One pass, where the
+///   pre-pushdown engine re-walked the graph once per doubling round of its
+///   over-fetch loop.
+///
+///
 /// A free function rather than a method so that the caller can hold the scratch
 /// [`Visited`] mutably while `nodes` is borrowed shared — the graph build needs
 /// both at once.
+#[allow(clippy::too_many_arguments)]
 fn search_layer(
     nodes: &[Node],
     query: &StoredVector,
     entry: usize,
     ef: usize,
     layer: usize,
+    filter: Option<&RowFilter>,
     visited: &mut Visited,
     distance_calls: &Cell<u64>,
-) -> Vec<Candidate> {
+) -> Result<Vec<Candidate>> {
     let ef = ef.max(1);
     visited.restart(nodes.len());
 
@@ -731,8 +757,20 @@ fn search_layer(
     // than two sorted vectors: the sorted-vector version re-sorted the whole
     // frontier on every expansion, which is what made a 5,000-row build take
     // three quarters of a minute.
+    //
+    // With a filter, `results` holds only admissible nodes — a rejected node
+    // rides the frontier but is never an answer — and the admission check
+    // below runs once per node visited, never per expansion.
     let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
     let mut results: BinaryHeap<Candidate> = BinaryHeap::new();
+    let admits = |node: usize| -> Result<bool> {
+        match filter {
+            // Unfiltered keeps every node, tombstones included: they are
+            // dropped after the walk, exactly as before the filter existed.
+            None => Ok(true),
+            Some(filter) => Ok(!nodes[node].deleted && filter(nodes[node].id)?),
+        }
+    };
 
     let start = Candidate {
         distance: stored_distance(distance_calls, query, &nodes[entry].vector),
@@ -740,14 +778,22 @@ fn search_layer(
     };
     visited.visit(entry);
     frontier.push(Reverse(start));
-    results.push(start);
+    if admits(entry)? {
+        results.push(start);
+    }
 
     while let Some(Reverse(current)) = frontier.pop() {
         // Everything still in the frontier is at least this far away, so once
         // the nearest of them is worse than the worst result we hold, no
-        // expansion can improve the answer.
-        if results.len() >= ef && current.distance > results.peek().expect("non-empty").distance {
-            break;
+        // expansion can improve the answer. The comparison is against the
+        // worst *admissible* result, so a filter that admits few nodes keeps
+        // the walk going past the rejected ones instead of stopping with an
+        // under-filled (or empty) answer — until the frontier itself runs
+        // out, which is the exact-scan fallback.
+        if let Some(worst) = results.peek() {
+            if results.len() >= ef && current.distance > worst.distance {
+                break;
+            }
         }
         for &neighbor in neighbors_at(nodes, current.node, layer) {
             if !visited.visit(neighbor) {
@@ -757,9 +803,21 @@ fn search_layer(
                 distance: stored_distance(distance_calls, query, &nodes[neighbor].vector),
                 node: neighbor,
             };
-            let worst = results.peek().expect("non-empty").distance;
-            if results.len() < ef || candidate.distance < worst {
-                frontier.push(Reverse(candidate));
+            // Enter the frontier when the results are not yet full or the
+            // candidate is closer than the worst admissible result — rejected
+            // nodes ride the frontier under the same rule, because they still
+            // route. Once the admissible results are full, farther nodes are
+            // dropped as before: they cannot be answers, and keeping them
+            // would turn a selective filter into an unbounded walk.
+            let enters = match results.peek() {
+                None => true,
+                Some(worst) => results.len() < ef || candidate.distance < worst.distance,
+            };
+            if !enters {
+                continue;
+            }
+            frontier.push(Reverse(candidate));
+            if admits(neighbor)? {
                 results.push(candidate);
                 if results.len() > ef {
                     results.pop();
@@ -770,7 +828,7 @@ fn search_layer(
 
     let mut out = results.into_vec();
     out.sort_unstable();
-    out
+    Ok(out)
 }
 
 /// A node's links at `layer`, or nothing if it does not reach that layer.
@@ -818,7 +876,7 @@ impl VectorIndex for HnswIndex {
         // The first commit has no graph to grow, and a retune has to re-derive
         // the whole graph under the new parameters. Either way: rebuild.
         if self.nodes.is_empty() || reshaped {
-            self.build();
+            self.build()?;
             self.pending_inserts.clear();
             self.pending_removes.clear();
             return Ok(());
@@ -851,13 +909,13 @@ impl VectorIndex for HnswIndex {
             if let Some(&old) = self.node_ids.get(&id) {
                 self.tombstone(old);
             }
-            self.insert_node(id, vector, level, &mut visited);
+            self.insert_node(id, vector, level, &mut visited)?;
         }
 
         // Repair. More tombstones than live nodes means over half the graph is
         // dead and search spends most of its budget walking past it: rebuild.
         if self.tombstones * 2 >= self.nodes.len() {
-            self.build();
+            self.build()?;
         } else if let Some(entry) = self.entry {
             if self.nodes[entry].deleted {
                 self.repick_entry();
@@ -897,7 +955,7 @@ impl VectorIndex for HnswIndex {
         Ok(())
     }
 
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<Scored>> {
+    fn search(&self, query: &[f32], k: usize, filter: Option<&RowFilter>) -> Result<Vec<Scored>> {
         if query.len() != self.dim {
             return Err(Error::Type(alloc::format!(
                 "query has dimension {} but the index expects {}",
@@ -918,15 +976,21 @@ impl VectorIndex for HnswIndex {
         let query = StoredVector::Exact(normalise(query));
         let mut visited = Visited::new(self.nodes.len());
         for layer in (1..=self.entry_level).rev() {
+            // The descent is unfiltered: it only picks where layer 0 starts,
+            // and a rejected node is a fine place to start from, because the
+            // layer-0 walk expands through rejected nodes. Filtering here
+            // would cost predicate evaluations on upper-layer nodes without
+            // changing which rows the walk can reach.
             let nearest = search_layer(
                 &self.nodes,
                 &query,
                 ep,
                 1,
                 layer,
+                None,
                 &mut visited,
                 &self.distance_calls,
-            );
+            )?;
             ep = nearest[0].node;
         }
 
@@ -936,13 +1000,16 @@ impl VectorIndex for HnswIndex {
             ep,
             self.params.ef_for(k),
             0,
+            filter,
             &mut visited,
             &self.distance_calls,
-        );
+        )?;
         // Tombstoned nodes still route the search but are not answers. They
         // can be safely dropped here because `ef_for` over-fetches: the rebuild
         // threshold keeps tombstones below half the graph and `ef >= 2k`, so
         // there are always at least `k` live candidates among the hits.
+        // Filter-rejected nodes never made it into `hits` at all — the walk
+        // held them in the frontier only.
         Ok(hits
             .into_iter()
             .filter(|hit| !self.nodes[hit.node].deleted)
@@ -1246,7 +1313,7 @@ mod tests {
         index.insert(3, &[0.9, 0.1, 0.0]).unwrap();
         index.insert(4, &[0.0, 0.0, 1.0]).unwrap();
         index.commit().unwrap();
-        let hits = index.search(&[1.0, 0.0, 0.0], 2).unwrap();
+        let hits = index.search(&[1.0, 0.0, 0.0], 2, None).unwrap();
         assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1, 3]);
     }
 
@@ -1255,7 +1322,7 @@ mod tests {
         let mut index = index(3);
         index.insert(1, &[1.0, 0.0, 0.0]).unwrap();
         index.commit().unwrap();
-        let hits = index.search(&[1.0, 0.0, 0.0], 1).unwrap();
+        let hits = index.search(&[1.0, 0.0, 0.0], 1, None).unwrap();
         assert!(
             (hits[0].score - 1.0).abs() < 1e-5,
             "score was {}",
@@ -1267,9 +1334,9 @@ mod tests {
     fn searching_before_commit_returns_nothing() {
         let mut index = index(3);
         index.insert(1, &[1.0, 0.0, 0.0]).unwrap();
-        assert!(index.search(&[1.0, 0.0, 0.0], 1).unwrap().is_empty());
+        assert!(index.search(&[1.0, 0.0, 0.0], 1, None).unwrap().is_empty());
         index.commit().unwrap();
-        assert_eq!(index.search(&[1.0, 0.0, 0.0], 1).unwrap().len(), 1);
+        assert_eq!(index.search(&[1.0, 0.0, 0.0], 1, None).unwrap().len(), 1);
     }
 
     #[test]
@@ -1280,7 +1347,7 @@ mod tests {
         index.commit().unwrap();
         index.remove(1).unwrap();
         index.commit().unwrap();
-        let hits = index.search(&[1.0, 0.0, 0.0], 4).unwrap();
+        let hits = index.search(&[1.0, 0.0, 0.0], 4, None).unwrap();
         assert!(hits.iter().all(|hit| hit.id != 1));
     }
 
@@ -1288,7 +1355,7 @@ mod tests {
     fn dimension_mismatch_is_an_error() {
         let mut index = index(3);
         assert!(index.insert(1, &[1.0]).is_err());
-        assert!(index.search(&[1.0], 1).is_err());
+        assert!(index.search(&[1.0], 1, None).is_err());
     }
 
     #[test]
@@ -1303,7 +1370,7 @@ mod tests {
             }
             index.commit().unwrap();
             index
-                .search(&[1.0, 0.0, 0.0, 0.0], 5)
+                .search(&[1.0, 0.0, 0.0, 0.0], 5, None)
                 .unwrap()
                 .into_iter()
                 .map(|h| h.id)
@@ -1342,13 +1409,13 @@ mod tests {
             v
         };
         let approx: Vec<RowId> = index
-            .search(&query, 10)
+            .search(&query, 10, None)
             .unwrap()
             .into_iter()
             .map(|h| h.id)
             .collect();
         let exact: Vec<RowId> = brute
-            .search(&query, 10)
+            .search(&query, 10, None)
             .unwrap()
             .into_iter()
             .map(|h| h.id)
@@ -1388,8 +1455,8 @@ mod tests {
         for seed in 0..8 {
             let query: Vec<f32> = (0..8).map(|i| ((seed * 8 + i) as f32).sin()).collect();
             assert_eq!(
-                original.search(&query, 10).unwrap(),
-                restored.search(&query, 10).unwrap(),
+                original.search(&query, 10, None).unwrap(),
+                restored.search(&query, 10, None).unwrap(),
                 "restored graph diverged on query {seed}"
             );
         }
@@ -1417,8 +1484,8 @@ mod tests {
         restored.load(&saved).unwrap();
         let query = exact.embeddings[&1].to_f32();
         assert_eq!(
-            quantized.search(&query, 10).unwrap(),
-            restored.search(&query, 10).unwrap()
+            quantized.search(&query, 10, None).unwrap(),
+            restored.search(&query, 10, None).unwrap()
         );
     }
 
@@ -1428,7 +1495,7 @@ mod tests {
         restored.load(&HnswIndex::new(4).save().unwrap()).unwrap();
         assert!(restored.is_empty());
         assert!(restored
-            .search(&[1.0, 0.0, 0.0, 0.0], 5)
+            .search(&[1.0, 0.0, 0.0, 0.0], 5, None)
             .unwrap()
             .is_empty());
     }
@@ -1573,7 +1640,7 @@ mod tests {
             exact.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
             let truth: Vec<RowId> = exact.into_iter().take(k).map(|(_, id)| id).collect();
 
-            let found = index.search(&query, k).unwrap();
+            let found = index.search(&query, k, None).unwrap();
             let hit = found.iter().filter(|s| truth.contains(&s.id)).count();
             total += hit as f64 / k as f64;
         }
@@ -1583,6 +1650,214 @@ mod tests {
     #[test]
     fn recall_does_not_fall_as_the_corpus_grows() {
         recall_holds_across([400, 1_600]);
+    }
+
+    // -------------------------------------------------------- filtered search
+
+    /// Mean recall@k of a *filtered* search against the brute-force oracle
+    /// restricted to the same filter, over `queries` deterministic queries.
+    ///
+    /// The oracle is exhaustive filtered-then-ranked — the answer the old
+    /// engine-side over-fetch loop degraded to when the filter was selective
+    /// enough — so this measures exactly what the filter pushdown is not
+    /// allowed to lose.
+    fn measured_filtered_recall(
+        index: &HnswIndex,
+        dim: usize,
+        k: usize,
+        queries: usize,
+        filter: &dyn Fn(RowId) -> bool,
+    ) -> f64 {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 33) as f32 / u32::MAX as f32) - 0.5
+        };
+        let oracle: Vec<(RowId, Vec<f32>)> = index
+            .embeddings
+            .iter()
+            .filter(|(id, _)| filter(**id))
+            .map(|(id, embedding)| (*id, normalise(&embedding.to_f32())))
+            .collect();
+
+        let counter = Cell::new(0);
+        let mut total = 0.0;
+        for _ in 0..queries {
+            let query: Vec<f32> = (0..dim).map(|_| next()).collect();
+            let normalised = normalise(&query);
+
+            let mut exact: Vec<(f32, RowId)> = oracle
+                .iter()
+                .map(|(id, embedding)| (distance(&counter, &normalised, embedding), *id))
+                .collect();
+            exact.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let truth: Vec<RowId> = exact.into_iter().take(k).map(|(_, id)| id).collect();
+            if truth.is_empty() {
+                total += 1.0;
+                continue;
+            }
+
+            let found = index.search(&query, k, Some(&|id| Ok(filter(id)))).unwrap();
+            let hit = found.iter().filter(|s| truth.contains(&s.id)).count();
+            total += hit as f64 / truth.len() as f64;
+        }
+        total / queries as f64
+    }
+
+    #[test]
+    fn a_filter_that_accepts_everything_returns_the_unfiltered_answer() {
+        // The tie to the slow path: a filter that admits every row must make
+        // the filtered search agree with the unfiltered one exactly — same
+        // rows, same order, same scores. One beam, one walk.
+        let index = built(256, 12);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 33) as f32 / u32::MAX as f32) - 0.5
+        };
+        for _ in 0..16 {
+            let query: Vec<f32> = (0..12).map(|_| next()).collect();
+            assert_eq!(
+                index.search(&query, 10, None).unwrap(),
+                index.search(&query, 10, Some(&|_| Ok(true))).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn a_filter_that_rejects_everything_returns_nothing_and_terminates() {
+        // The pathological case the old over-fetch loop's doc comment names:
+        // a filter nothing satisfies must end with an empty answer, not hang.
+        let index = built(256, 8);
+        let query = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        let hits = index.search(&query, 10, Some(&|_| Ok(false))).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn a_walk_through_rejected_nodes_reaches_any_admitted_row() {
+        // Connectivity is the whole point of traversing *through* rejected
+        // nodes: for a filter admitting exactly one row, the search must find
+        // that row wherever it sits in the graph. With the result budget
+        // (ef >= 64) never filled, the walk drains the frontier — and a
+        // drained walk on a connected graph has seen every node, so a miss
+        // here is a severed graph, the silent recall regression this design
+        // exists to prevent.
+        let index = built(200, 8);
+        let mut state = 0x5eed_5eed_5eed_5eedu64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 33) as f32 / u32::MAX as f32) - 0.5
+        };
+        for round in 0..8 {
+            let query: Vec<f32> = (0..8).map(|_| next()).collect();
+            for target in (1..=200).step_by(25) {
+                let hits = index
+                    .search(&query, 10, Some(&|id| Ok(id == target)))
+                    .unwrap();
+                assert_eq!(
+                    hits.len(),
+                    1,
+                    "round {round}: filter admitting only {target} returned {hits:?}"
+                );
+                assert_eq!(hits[0].id, target);
+            }
+        }
+    }
+
+    #[test]
+    fn a_failing_filter_propagates_the_error() {
+        let index = built(16, 4);
+        let query = vec![0.1, 0.2, 0.3, 0.4];
+        let result = index.search(
+            &query,
+            5,
+            Some(&|_| Err(Error::Type(alloc::string::String::from("boom")))),
+        );
+        assert!(matches!(result, Err(Error::Type(message)) if message == "boom"));
+    }
+
+    #[test]
+    fn filtered_recall_holds_across_selectivities() {
+        // Recall@10 against the exhaustive filtered oracle, at a permissive
+        // (100%), a moderate (10%) and a selective (1%) filter. The filtered
+        // walk holds the same beam over admitted rows the unfiltered search
+        // holds over all rows, so recall must not fall with selectivity —
+        // the selective case used to cost the engine its whole over-fetch
+        // loop and still saw a narrower beam than this.
+        let index = built(1_600, 12);
+        let k = 10;
+        let baseline = measured_recall(&index, 12, k, 12);
+
+        let permissive = measured_filtered_recall(&index, 12, k, 12, &|_| true);
+        let moderate = measured_filtered_recall(&index, 12, k, 12, &|id| id % 10 == 0);
+        let selective = measured_filtered_recall(&index, 12, k, 12, &|id| id % 100 == 0);
+
+        assert!(
+            (permissive - baseline).abs() < 0.001,
+            "permissive filtered recall {permissive:.3} drifted from unfiltered {baseline:.3}"
+        );
+        for (label, recall) in [("moderate", moderate), ("selective", selective)] {
+            assert!(
+                recall >= baseline - 0.05,
+                "{label} filter recall {recall:.3} fell below the unfiltered index's own {baseline:.3}"
+            );
+        }
+    }
+
+    #[test]
+    fn filtered_search_is_deterministic() {
+        let index = built(256, 8);
+        let query = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        let run = || {
+            index
+                .search(&query, 10, Some(&|id| Ok(id % 3 == 0)))
+                .unwrap()
+        };
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn a_filter_selective_enough_to_drain_does_it_in_one_pass() {
+        // The old over-fetch loop paid one full walk per doubling round once
+        // the filter outlasted the candidate budget — several times the graph
+        // size for a filter nothing admits. The pushdown walks the graph
+        // once and stops. Pinned as a count, not a time (the project's
+        // convention for a number that has to survive a noisy machine).
+        let count = 4_000u64;
+        let index = built(count, 12);
+        index.reset_distance_calls();
+        let query: Vec<f32> = (0..12).map(|i| ((i as f32) + 0.5).sin()).collect();
+        // A filter admitting ~1% of the corpus: the candidate beam (ef = 80
+        // for k = 40) can never fill, so the walk must drain the graph and
+        // answer exactly — in one pass.
+        let hits = index
+            .search(&query, 40, Some(&|id| Ok(id % 100 == 0)))
+            .unwrap();
+        assert_eq!(hits.len(), 40, "1% of the corpus admits 40 rows");
+        assert!(hits.iter().all(|hit| hit.id % 100 == 0));
+        let calls = index.distance_calls();
+        assert!(
+            calls < count + count / 10,
+            "a 1%-filtered search cost {calls} distance computations; one pass \
+             over a {count}-node graph costs ~{count}, and the old over-fetch \
+             loop paid one such walk per doubling round"
+        );
+    }
+
+    /// A filtered search over an index with tombstones routes through them
+    /// but never answers with one, and still reaches live rows behind them.
+    #[test]
+    fn filtered_search_skips_tombstoned_nodes_but_still_finds_live_rows() {
+        let mut index = built(64, 8);
+        for id in 1..=32 {
+            index.remove(id).unwrap();
+        }
+        index.commit().unwrap();
+        let query = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        let hits = index.search(&query, 10, Some(&|_| Ok(true))).unwrap();
+        assert!(!hits.is_empty(), "live rows were unreachable");
+        assert!(hits.iter().all(|hit| hit.id > 32));
     }
 
     /// The same property over a 64x range rather than a 4x one.
@@ -1760,7 +2035,7 @@ mod tests {
             }
             index.commit().unwrap();
             index
-                .search(&[1.0, 0.0, 0.0, 0.0], 5)
+                .search(&[1.0, 0.0, 0.0, 0.0], 5, None)
                 .unwrap()
                 .into_iter()
                 .map(|h| h.id)
@@ -1787,7 +2062,7 @@ mod tests {
             10
         );
         assert!(original
-            .search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 100)
+            .search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 100, None)
             .unwrap()
             .iter()
             .all(|hit| hit.id > 10));
@@ -1797,14 +2072,14 @@ mod tests {
         for seed in 0..8 {
             let query: Vec<f32> = (0..8).map(|i| ((seed * 8 + i) as f32).sin()).collect();
             assert_eq!(
-                original.search(&query, 10).unwrap(),
-                restored.search(&query, 10).unwrap(),
+                original.search(&query, 10, None).unwrap(),
+                restored.search(&query, 10, None).unwrap(),
                 "restored graph diverged on query {seed}"
             );
         }
         // The deleted rows stay deleted after the round trip.
         assert!(restored
-            .search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 100)
+            .search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 100, None)
             .unwrap()
             .iter()
             .all(|hit| hit.id > 10));
@@ -1824,7 +2099,7 @@ mod tests {
 
         // And the surviving rows still answer.
         let hits = index
-            .search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 10)
+            .search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 10, None)
             .unwrap();
         assert!(!hits.is_empty());
         assert!(hits.iter().all(|hit| hit.id > 500));

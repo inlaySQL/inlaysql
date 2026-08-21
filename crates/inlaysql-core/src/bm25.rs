@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use crate::error::{Error, Result};
 use crate::fusion::sort_by_score_desc;
 use crate::row::{put_len, put_string, Cursor};
-use crate::traits::{FullTextIndex, RowId, Scored};
+use crate::traits::{FullTextIndex, RowFilter, RowId, Scored};
 
 /// Term-frequency saturation. The Robertson/Zaragoza default.
 const K1: f32 = 1.2;
@@ -173,7 +173,7 @@ impl FullTextIndex for Bm25Index {
         Ok(())
     }
 
-    fn search(&self, query: &str, k: usize) -> Result<Vec<Scored>> {
+    fn search(&self, query: &str, k: usize, filter: Option<&RowFilter>) -> Result<Vec<Scored>> {
         let doc_count = self.lengths.len();
         if doc_count == 0 || k == 0 {
             return Ok(Vec::new());
@@ -190,6 +190,17 @@ impl FullTextIndex for Bm25Index {
                 1.0 + (doc_count as f32 - document_frequency + 0.5) / (document_frequency + 0.5),
             );
             for (id, frequency) in postings {
+                // A posting the filter rejects is skipped without consuming a
+                // result slot — there is no graph here to keep connected, so
+                // "filtered" is exactly this: keep scanning the postings, only
+                // score what the filter admits. The scan is exhaustive either
+                // way, so a selective filter changes the answer's size, never
+                // the index's own cost, and can never return a partial probe.
+                if let Some(filter) = filter {
+                    if !filter(*id)? {
+                        continue;
+                    }
+                }
                 let frequency = *frequency as f32;
                 let length = *self.lengths.get(id).unwrap_or(&0) as f32;
                 let normalisation = K1 * (1.0 - B + B * length / average_length.max(f32::EPSILON));
@@ -222,27 +233,27 @@ mod tests {
 
     #[test]
     fn ranks_the_more_specific_match_first() {
-        let hits = index().search("embedded database", 10).unwrap();
+        let hits = index().search("embedded database", 10, None).unwrap();
         assert_eq!(hits[0].id, 1);
     }
 
     #[test]
     fn rare_terms_outweigh_common_ones() {
         // "rust" appears in two documents, "framework" in one.
-        let hits = index().search("rust framework", 10).unwrap();
+        let hits = index().search("rust framework", 10, None).unwrap();
         assert_eq!(hits[0].id, 2);
     }
 
     #[test]
     fn unknown_terms_match_nothing() {
-        assert!(index().search("quantum", 10).unwrap().is_empty());
+        assert!(index().search("quantum", 10, None).unwrap().is_empty());
     }
 
     #[test]
     fn reindexing_replaces_the_old_document() {
         let mut index = index();
         index.insert(1, "cooking").unwrap();
-        let hits = index.search("embedded", 10).unwrap();
+        let hits = index.search("embedded", 10, None).unwrap();
         assert!(hits.is_empty(), "stale postings survived: {hits:?}");
     }
 
@@ -250,7 +261,7 @@ mod tests {
     fn removal_drops_the_document() {
         let mut index = index();
         index.remove(2).unwrap();
-        let hits = index.search("rust", 10).unwrap();
+        let hits = index.search("rust", 10, None).unwrap();
         assert_eq!(
             hits.iter().map(|h| h.id).collect::<Vec<_>>(),
             alloc::vec![1]
@@ -259,7 +270,7 @@ mod tests {
 
     #[test]
     fn results_respect_k() {
-        assert_eq!(index().search("rust", 1).unwrap().len(), 1);
+        assert_eq!(index().search("rust", 1, None).unwrap().len(), 1);
     }
 
     #[test]
@@ -270,8 +281,8 @@ mod tests {
 
         for query in ["rust", "embedded database", "cooking iron", "absent"] {
             assert_eq!(
-                original.search(query, 10).unwrap(),
-                restored.search(query, 10).unwrap(),
+                original.search(query, 10, None).unwrap(),
+                restored.search(query, 10, None).unwrap(),
                 "scores diverged for `{query}`"
             );
         }
@@ -303,5 +314,66 @@ mod tests {
             Bm25Index::decode(&bytes),
             Err(crate::error::Error::Corrupt(_))
         ));
+    }
+
+    // --------------------------------------------------------- filtered search
+
+    #[test]
+    fn a_filter_that_accepts_everything_returns_the_unfiltered_answer() {
+        // The tie to the unfiltered path: same rows, same order, same scores.
+        let index = index();
+        for query in ["rust", "embedded database", "cooking iron", "absent"] {
+            assert_eq!(
+                index.search(query, 10, None).unwrap(),
+                index.search(query, 10, Some(&|_| Ok(true))).unwrap(),
+                "filtered path diverged for `{query}`"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_document_is_skipped_without_consuming_a_slot() {
+        // Doc 2 ranks first for "rust framework"; rejecting it must promote
+        // doc 1 into the result rather than leave a hole the k budget ate.
+        let index = index();
+        let hits = index
+            .search("rust framework", 10, Some(&|id| Ok(id != 2)))
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            alloc::vec![1]
+        );
+        assert_eq!(hits.len(), 1, "the rejected doc's slot must not stay empty");
+    }
+
+    #[test]
+    fn a_filter_that_rejects_everything_returns_nothing() {
+        let index = index();
+        let hits = index.search("rust", 10, Some(&|_| Ok(false))).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn a_filter_admitting_one_document_finds_it_wherever_it_ranks() {
+        // The worst-ranked match for "rust" is doc 2 (it shares the term with
+        // doc 1 but nothing else) — and it must still be found, because the
+        // postings scan is exhaustive regardless of the filter.
+        let index = index();
+        let hits = index.search("rust", 10, Some(&|id| Ok(id == 2))).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            alloc::vec![2]
+        );
+    }
+
+    #[test]
+    fn a_failing_filter_propagates_the_error() {
+        let index = index();
+        let result = index.search(
+            "rust",
+            10,
+            Some(&|_| Err(Error::Type(alloc::string::String::from("boom")))),
+        );
+        assert!(matches!(result, Err(Error::Type(message)) if message == "boom"));
     }
 }

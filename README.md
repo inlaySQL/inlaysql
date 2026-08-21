@@ -28,9 +28,9 @@ extension bolted on the side.
 >   a good way to find bugs and is **not** the same as years of real hardware,
 >   real power cuts and real filesystems. SQLite has those; this does not.
 > - **Known gaps are listed, not hidden.** See
->   [What this is not](#what-this-is-not). Some of them will bite you: filtered
->   retrieval over-fetches rather than pre-filters, recall on uniformly random
->   vectors is poor, and there is no cost-based join planner.
+>   [What this is not](#what-this-is-not). Some of them will bite you: recall
+>   on uniformly random vectors is poor, and there is no cost-based join
+>   planner.
 >
 > Use it for experiments, prototypes, and anything you can rebuild from source
 > data. Keep a backup you can restore from something else. If you find a bug,
@@ -783,9 +783,10 @@ below is a surprise to the project, it is the honest state of it:
 7. **Multi-column and composite retrieval indexes.** `CREATE INDEX` for
    BM25/ANN is single-column only — the scalar B-tree index already supports
    composite keys.
-8. **Filter-aware graph walks and per-value sub-indexes.** A restrictive
-   `WHERE` on a retrieval query over-fetches from the index rather than
-   pre-filtering it.
+8. ~~**Filter-aware graph walks.**~~ — **done.** A restrictive `WHERE` on a
+   retrieval query is now pushed into the index walk rather than answered by
+   over-fetching: rejected rows are traversed but not returned or counted,
+   for the vector and BM25 indexes alike and on both sides of `fuse`.
 9. ~~**Quantised paged index nodes.**~~ — **done.** `PagedHnswIndex` stored
    exact `f32` even for an `INT8` column; it now shares the same
    `Q8Vector`/`VectorEncoding` quantisation the in-memory index already had.
@@ -835,13 +836,17 @@ than oversights:
   costs an `ef_search` that grows with the corpus. `bench/README.md`
   measures both and explains the difference; the first is what an
   application sees.
-- **Filtered retrieval over-fetches rather than pre-filters.** A `WHERE` on a
-  retrieval query is applied by widening the index probe until the filter admits
-  `LIMIT` rows or the index is exhausted, so a restrictive filter returns the
-  rows that match it instead of an empty result. When no amount of over-fetching
-  satisfies the filter, the query falls back to scanning every row the index can
-  rank — correct, at the cost of the full scan. Filter-aware graph walks and
-  per-value sub-indexes are later-stage work.
+- **Filtered retrieval is pushed into the index walk.** A `WHERE` on a
+  retrieval query is compiled into a row predicate and pushed into the
+  retriever itself: a row the filter rejects is excluded from the result set
+  and from the candidate budget but is still traversed, so its neighbours
+  stay reachable and a selective filter cannot sever the graph (the classic
+  filtered-ANN connectivity trap). The walk keeps going until enough rows
+  pass or the index is genuinely exhausted, so a filter too selective for any
+  bounded probe degrades to scanning every row the index can rank — correct,
+  at the cost of the full walk — rather than to a partial answer. The
+  unfiltered path is untouched: passing no filter is exactly the old search,
+  behaviour and cost included.
 - **Vector quantisation is explicit per column.** `VECTOR(n)` remains exact;
   `VECTOR(n, INT8)` reduces row and HNSW vector payloads by about 4x using a
   symmetric per-vector scale. Queries stay `f32`, and the vectors benchmark
