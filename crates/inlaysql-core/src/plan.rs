@@ -287,7 +287,9 @@ pub struct CreateIndexPlan {
     /// Lowercased target table name.
     pub table: String,
     /// Target column ordinals, in written order, resolved against the table at
-    /// plan time. Never empty; only [`IndexKind::BTree`] has more than one.
+    /// plan time. Never empty; a [`IndexKind::Vector`] plan always has
+    /// exactly one, but [`IndexKind::BTree`] and [`IndexKind::FullText`] may
+    /// both have more.
     pub columns: Vec<usize>,
     /// The index kind, inferred from the column's type unless `USING` said so.
     pub kind: IndexKind,
@@ -2001,16 +2003,27 @@ impl SelectItem {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScoreExpr {
     /// `vector_score(column, embedding)` — approximate nearest neighbours.
+    ///
+    /// Always one column: a vector index never covers more than one (see
+    /// [`crate::catalog::IndexKind::Vector`]), so there is nothing to make
+    /// this variant plural for.
     Vector {
         /// Vector column ordinal.
         column: usize,
         /// Query embedding: a literal, or the `?` it will be bound from.
         query: Expr,
     },
-    /// `bm25_score(column, 'terms')` — full-text relevance.
+    /// `bm25_score(column [, column ...], 'terms')` — full-text relevance.
+    ///
+    /// One or more columns, matching a full-text index of the same column
+    /// set (order does not matter — see `Engine::text_index`) declared over
+    /// the driving table. `bm25_score(body, ?)` — the single-column case — is
+    /// exactly what this has always meant; naming more than one column asks
+    /// for a multi-column index's combined score, MySQL's
+    /// `MATCH(a, b) AGAINST(...)`.
     Text {
-        /// Text column ordinal.
-        column: usize,
+        /// Text column ordinals, as named in the call, in written order.
+        columns: Vec<usize>,
         /// Query string: a literal, or the `?` it will be bound from.
         query: Expr,
     },

@@ -780,9 +780,26 @@ below is a surprise to the project, it is the honest state of it:
    (threaded Python client concurrency) is a confound serious enough that a
    repeat needs a process-based driver before the number can be trusted,
    not just a quieter machine.
-7. **Multi-column and composite retrieval indexes.** `CREATE INDEX` for
-   BM25/ANN is single-column only — the scalar B-tree index already supports
-   composite keys.
+7. ~~**Multi-column and composite retrieval indexes.**~~ — **the BM25 half is
+   done; ANN is scoped out, on purpose.** `CREATE INDEX idx ON docs (title,
+   body) USING FULLTEXT` now builds one combined BM25 index over the
+   concatenation of every named column's text — MySQL's `FULLTEXT(title,
+   body)`: a query term that only matches one column still ranks the row.
+   `bm25_score(title, body, ?)` finds it regardless of which order the
+   columns are named in, and a bare `CREATE INDEX idx ON docs (title, body)`
+   (no `USING`) still means a B-tree, exactly as it always has — inferring
+   `FullText` for it the way a single `TEXT` column already does would have
+   silently changed that long-standing default. This needed no on-disk
+   format change of its own: the multi-column column-list encoding the
+   scalar B-tree index already forces (`Catalog::required_version`) was
+   never B-tree-specific, and a single-column retrieval index's persisted key
+   (`index:<table>:<column>`) is untouched — a multi-column index's key is
+   additive, built so it can never collide with it. `VECTOR` stays
+   single-column: two embedding columns are generally two different vector
+   spaces, and there is no standard meaning for one HNSW graph over both —
+   concatenated or weighted-sum embeddings are technically possible but not a
+   default anyone should get without asking for it by name — so this was
+   left undone rather than guessed at.
 8. **Filter-aware graph walks and per-value sub-indexes.** A restrictive
    `WHERE` on a retrieval query over-fetches from the index rather than
    pre-filtering it.

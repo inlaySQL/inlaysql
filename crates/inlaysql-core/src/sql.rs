@@ -1040,8 +1040,31 @@ fn plan_create_index(create: sqlparser::ast::CreateIndex, catalog: &Catalog) -> 
         collations.push(written.unwrap_or(resolved.collation));
     }
     let [(first_name, first_type)] = types.as_slice() else {
-        // More than one column can only mean a B-tree index: a retrieval
-        // index is over one column by construction.
+        // More than one column means a B-tree index by default: a bare
+        // `CREATE INDEX idx ON t (a, b)` has meant a scalar index for as long
+        // as this engine has had one, and inferring `FullText` for two `TEXT`
+        // columns the way a *single* `TEXT` column already does would
+        // silently change what that long-standing default means. So a
+        // multi-column full-text index — MySQL's `FULLTEXT(a, b)`, one
+        // combined relevance score over the concatenation of every named
+        // column's text — has to be asked for explicitly: `USING FULLTEXT`
+        // or `USING BM25`.
+        if requested == Some(IndexKind::FullText) {
+            return fulltext_plan(name, table_name, ordinals, &names, &types, create.unique);
+        }
+        // A vector index cannot cover more than one column at all — two
+        // embedding columns are generally two different vector spaces, and
+        // there is no defensible meaning for one ANN graph over both. Named
+        // here rather than left to fall through to `btree_plan`, which would
+        // report "a B-tree index needs an orderable column" about a request
+        // that never asked for a B-tree.
+        if requested == Some(IndexKind::Vector) {
+            return Err(Error::Unsupported(String::from(
+                "a vector index covers exactly one column; two embedding columns are generally \
+                 two different vector spaces and there is no single defensible meaning for one \
+                 ANN graph over both",
+            )));
+        }
         return btree_plan(
             name,
             table_name,
@@ -1148,6 +1171,53 @@ fn requested_index_kind(using: Option<&sqlparser::ast::IndexType>) -> Result<Opt
             )))
         }
     })
+}
+
+/// A multi-column `CREATE INDEX ... USING FULLTEXT` (or `USING BM25`) —
+/// MySQL's `FULLTEXT(a, b, ...)`: one combined BM25 relevance score over the
+/// concatenation of every named column's text, so a query term matching
+/// either column contributes to the same rank
+/// (the engine's `concatenated_full_text` does the concatenation).
+/// Every named column has to be `TEXT` — there is no such thing as a
+/// full-text index over a non-text column, multi-column or not — and, like
+/// the single-column case, it cannot be `UNIQUE` and cannot carry `COLLATE`
+/// (a retrieval index has no ordered key for a collation to apply to).
+fn fulltext_plan(
+    name: String,
+    table_name: String,
+    ordinals: Vec<usize>,
+    names: &[(String, Option<Collation>)],
+    types: &[(String, DataType)],
+    unique: bool,
+) -> Result<Plan> {
+    if unique {
+        return Err(Error::Unsupported(String::from(
+            "only a B-tree index can be UNIQUE; a full-text index is not a constraint",
+        )));
+    }
+    if let Some((column, _)) = names.iter().find(|(_, written)| written.is_some()) {
+        return Err(Error::Unsupported(alloc::format!(
+            "COLLATE on `{column}` needs an ordered index; write USING BTREE, or drop the \
+             clause — a full-text index has no collated key"
+        )));
+    }
+    for (column, ty) in types {
+        if *ty != DataType::Text {
+            return Err(Error::Type(alloc::format!(
+                "a full-text index needs TEXT columns, but `{column}` is {ty}"
+            )));
+        }
+    }
+    Ok(Plan::CreateIndex(CreateIndexPlan {
+        name,
+        table: table_name.to_ascii_lowercase(),
+        columns: ordinals,
+        kind: IndexKind::FullText,
+        unique: false,
+        // A retrieval index has no collated key; the list is kept the same
+        // length as the column list so the catalog's own check passes.
+        collations: alloc::vec![Collation::Binary; types.len()],
+    }))
 }
 
 /// A `CREATE [UNIQUE] INDEX` that resolves to a scalar B-tree index, or the
@@ -5235,25 +5305,41 @@ fn resolve_score_expr(
             query,
         }
     } else if name.eq_ignore_ascii_case("bm25_score") {
-        let (column, query) = expect_two(&name, args)?;
-        let (index, column) = resolve_retrieval_column(column, scope)?;
-        if column.ty != DataType::Text {
+        // `bm25_score(column, 'terms')` is the single-column call this has
+        // always accepted; `bm25_score(a, b, ..., 'terms')` is its
+        // multi-column extension — every argument but the last names a
+        // column, MySQL's `MATCH(a, b, ...)`, and the last is the query. The
+        // two-argument case is exactly the one-column instance of this, so
+        // nothing about it changes.
+        let (query, column_args) = args.split_last().ok_or_else(|| arity_error(&name, 2, 0))?;
+        if column_args.is_empty() {
             return Err(Error::Type(alloc::format!(
-                "bm25_score() needs a TEXT column, but `{}` is {}",
-                column.name,
-                column.ty
+                "bm25_score() takes at least 2 arguments (one or more TEXT columns, then the \
+                 query), got {}",
+                args.len()
             )));
         }
+        let mut columns = Vec::with_capacity(column_args.len());
+        for column in column_args {
+            let column = unnamed_arg(&name, column)?;
+            let (index, column) = resolve_retrieval_column(column, scope)?;
+            if column.ty != DataType::Text {
+                return Err(Error::Type(alloc::format!(
+                    "bm25_score() needs a TEXT column, but `{}` is {}",
+                    column.name,
+                    column.ty
+                )));
+            }
+            columns.push(index);
+        }
+        let query = unnamed_arg(&name, query)?;
         let query = bind_value(query, binder)?;
         if matches!(&query, PlanExpr::Literal(literal) if !matches!(literal, Value::Text(_))) {
             return Err(Error::Type(
-                "bm25_score() needs a text query as its second argument".to_string(),
+                "bm25_score() needs a text query as its final argument".to_string(),
             ));
         }
-        ScoreExpr::Text {
-            column: index,
-            query,
-        }
+        ScoreExpr::Text { columns, query }
     } else if name.eq_ignore_ascii_case("fuse") || name.eq_ignore_ascii_case("rrf") {
         let mut parts = Vec::with_capacity(args.len());
         for arg in args {
@@ -6579,7 +6665,7 @@ mod tests {
             panic!("expected a fused score")
         };
         assert!(matches!(parts[0], ScoreExpr::Vector { column: 2, .. }));
-        assert!(matches!(parts[1], ScoreExpr::Text { column: 1, .. }));
+        assert!(matches!(&parts[1], ScoreExpr::Text { columns, .. } if columns.as_slice() == [1]));
     }
 
     #[test]
@@ -7406,5 +7492,120 @@ mod tests {
             create.collations,
             vec![Collation::NoCase, Collation::Binary, Collation::RTrim]
         );
+    }
+
+    /// `USING FULLTEXT` (or `USING BM25`) is what turns a multi-column
+    /// `CREATE INDEX` into a combined BM25 index — a bare one still means a
+    /// B-tree, exactly as it always has, even over two `TEXT` columns.
+    #[test]
+    fn using_fulltext_makes_a_multi_column_create_index_a_full_text_one() {
+        for using in ["USING FULLTEXT", "USING BM25"] {
+            let Plan::CreateIndex(create) = plan(
+                &alloc::format!("CREATE INDEX i ON t (bin, rt) {using}"),
+                &[],
+                &collated_catalog(),
+            )
+            .unwrap() else {
+                panic!("expected a CREATE INDEX for {using}")
+            };
+            assert_eq!(create.kind, IndexKind::FullText, "for {using}");
+            assert_eq!(create.columns.len(), 2, "for {using}");
+            assert!(!create.unique, "for {using}");
+        }
+    }
+
+    #[test]
+    fn a_bare_multi_column_create_index_stays_a_b_tree() {
+        let Plan::CreateIndex(create) =
+            plan("CREATE INDEX i ON t (bin, rt)", &[], &collated_catalog()).unwrap()
+        else {
+            panic!("expected a CREATE INDEX")
+        };
+        assert_eq!(create.kind, IndexKind::BTree);
+    }
+
+    #[test]
+    fn a_multi_column_full_text_index_may_not_be_unique() {
+        let error = plan(
+            "CREATE UNIQUE INDEX i ON t (bin, rt) USING FULLTEXT",
+            &[],
+            &collated_catalog(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_multi_column_full_text_index_may_not_carry_collate() {
+        let error = plan(
+            "CREATE INDEX i ON t (bin COLLATE NOCASE, rt) USING FULLTEXT",
+            &[],
+            &collated_catalog(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+        assert!(error.to_string().contains("has no collated key"), "{error}");
+    }
+
+    #[test]
+    fn a_multi_column_full_text_index_needs_every_column_to_be_text() {
+        let error = plan(
+            "CREATE INDEX i ON t (bin, id) USING FULLTEXT",
+            &[],
+            &collated_catalog(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Type(_)), "{error:?}");
+    }
+
+    /// A vector index still covers exactly one column — two `VECTOR` columns
+    /// are generally two different embedding spaces — and the message names
+    /// that reason rather than reporting the `B-tree` error a fallthrough to
+    /// `btree_plan` would give.
+    #[test]
+    fn using_vector_on_two_columns_is_refused_with_its_own_reason() {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(Table {
+                name: "vecs".to_string(),
+                columns: vec![
+                    Column::new("a", DataType::Vector(4)),
+                    Column::new("b", DataType::Vector(4)),
+                ],
+            })
+            .unwrap();
+        let error = plan("CREATE INDEX i ON vecs (a, b) USING VECTOR", &[], &catalog).unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)), "{error:?}");
+        assert!(error.to_string().contains("exactly one column"), "{error}");
+    }
+
+    /// `bm25_score(a, b, ..., query)` — every argument but the last names a
+    /// column; the two-argument case is the single-column call this has
+    /// always accepted.
+    #[test]
+    fn bm25_score_accepts_more_than_one_column() {
+        let Plan::Select(select) = plan(
+            "SELECT id, bm25_score(bin, rt, 'x') AS score FROM t",
+            &[],
+            &collated_catalog(),
+        )
+        .unwrap() else {
+            panic!("expected a SELECT")
+        };
+        let Some(ScoreExpr::Text { columns, .. }) = select.score else {
+            panic!("expected a text score")
+        };
+        assert_eq!(columns, vec![2, 3]);
+    }
+
+    #[test]
+    fn bm25_score_needs_at_least_one_column_and_a_query() {
+        let error = plan(
+            "SELECT bm25_score('just-a-query') FROM t",
+            &[],
+            &collated_catalog(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Type(_)), "{error:?}");
     }
 }

@@ -14,7 +14,11 @@
 //! affinity that SQLite's type rules produce for every name it does not
 //! recognise. Version 5 adds scalar B-tree indexes ([`IndexKind::BTree`]),
 //! which brought the first index declaration that can name more than one
-//! column and the first that can be `UNIQUE`. Version 6 adds declared
+//! column and the first that can be `UNIQUE`. The multi-column encoding it
+//! introduced is generic in [`IndexKind`], not B-tree-specific — see
+//! [`Catalog::required_version`] — so a multi-column `FullText` index
+//! (composite/multi-column retrieval indexes) also forces version 5 and
+//! needed no format change of its own. Version 6 adds declared
 //! collations ([`crate::collation::Collation`]) on a column and on each column
 //! of an index.
 //!
@@ -285,8 +289,21 @@ impl Table {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexKind {
     /// An Okapi BM25 full-text index.
+    ///
+    /// Usually one column, but — unlike [`IndexKind::Vector`] — it can name
+    /// several: `CREATE INDEX idx ON docs (title, body) USING FULLTEXT` is
+    /// MySQL's `FULLTEXT(title, body)`, one combined relevance score over the
+    /// concatenation of every named column's text. There is no ambiguity in
+    /// what that means the way there is for two embedding columns, so this is
+    /// the one retrieval kind the single-column restriction does not apply
+    /// to.
     FullText,
     /// An approximate-nearest-neighbour vector index.
+    ///
+    /// Always exactly one column. Two `VECTOR` columns are, in general, two
+    /// different embedding spaces; there is no standard meaning for one HNSW
+    /// graph over both, so unlike [`IndexKind::FullText`] this kind keeps the
+    /// single-column restriction.
     Vector,
     /// An ordered scalar index: entries in the same copy-on-write tree as the
     /// rows, keyed by [`crate::index`]'s memcomparable encoding. This is the
@@ -317,8 +334,10 @@ pub struct Index {
     pub table: String,
     /// Lowercased column names it indexes, in declaration order. Never empty.
     ///
-    /// Only [`IndexKind::BTree`] ever has more than one; a retrieval index is
-    /// over exactly one column and the catalog enforces that.
+    /// [`IndexKind::BTree`] and [`IndexKind::FullText`] can both have more
+    /// than one; [`IndexKind::Vector`] is always exactly one, and the catalog
+    /// enforces that — see the two variants' docs for why the line falls
+    /// there and not in the same place for both retrieval kinds.
     pub columns: Vec<String>,
     /// Which structure backs it.
     pub kind: IndexKind,
@@ -367,8 +386,14 @@ impl Index {
         crate::collation::at(&self.collations, position)
     }
 
-    /// The first (often only) column, for the retrieval backends that are
-    /// keyed by `(table, column)`.
+    /// The first (often only) column.
+    ///
+    /// A [`IndexKind::Vector`] index has exactly one column, so this is
+    /// always *the* column for one; a [`IndexKind::FullText`] index may have
+    /// more, and callers that need all of them should read [`Index::columns`]
+    /// instead — the retrieval backends are keyed by `(table, columns)`, not
+    /// `(table, column)`, precisely so a multi-column `FullText` index is not
+    /// forced through this method.
     pub fn column(&self) -> &str {
         self.columns.first().map_or("", String::as_str)
     }
@@ -742,14 +767,14 @@ impl Catalog {
             )));
         }
         let table = self.require_table(&index.table)?;
-        if index.kind.is_retrieval() && index.columns.len() > 1 {
-            return Err(Error::Unsupported(alloc::format!(
-                "a {} index covers exactly one column",
-                if index.kind == IndexKind::Vector {
-                    "vector"
-                } else {
-                    "full-text"
-                }
+        // A vector index covers exactly one column: two `VECTOR` columns are
+        // generally two different embedding spaces, and there is no
+        // defensible meaning for one ANN graph over both — unlike
+        // `FullText`, which has an obvious one (see `IndexKind::FullText`'s
+        // docs) and so is not restricted here.
+        if index.kind == IndexKind::Vector && index.columns.len() > 1 {
+            return Err(Error::Unsupported(String::from(
+                "a vector index covers exactly one column",
             )));
         }
         if index.unique && index.kind != IndexKind::BTree {
@@ -1521,6 +1546,98 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, Error::Type(_)), "got {err}");
+    }
+
+    /// A table with two `TEXT` columns, for the multi-column `FullText`
+    /// tests below — `sample()` only has one.
+    fn sample_with_two_text_columns() -> Catalog {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(Table {
+                name: "docs".to_string(),
+                columns: vec![
+                    Column::primary_key("id", DataType::Integer),
+                    Column::new("title", DataType::Text),
+                    Column::new("body", DataType::Text),
+                ],
+            })
+            .unwrap();
+        catalog
+    }
+
+    #[test]
+    fn a_multi_column_full_text_index_is_accepted() {
+        let mut catalog = sample_with_two_text_columns();
+        catalog
+            .create_index(Index {
+                name: "docs_search".to_string(),
+                table: "docs".to_string(),
+                columns: vec!["title".to_string(), "body".to_string()],
+                kind: IndexKind::FullText,
+                unique: false,
+                collations: vec![Collation::Binary, Collation::Binary],
+            })
+            .unwrap();
+        let index = catalog.indexes_for("docs")[0];
+        assert_eq!(index.columns, vec!["title", "body"]);
+
+        // Multi-column encoding is generic in `IndexKind`, not B-tree
+        // specific (see `Catalog::required_version`), so this needed no
+        // catalog format change: it round-trips like anything else.
+        let decoded = Catalog::decode(&catalog.encode()).unwrap();
+        assert_eq!(decoded, catalog);
+    }
+
+    #[test]
+    fn a_column_can_be_named_by_a_single_and_a_multi_column_full_text_index_at_once() {
+        // `(body)` and `(title, body)` answer different questions, so both
+        // are allowed — the catalog's dup-check compares the whole column
+        // list, not "is this column already indexed".
+        let mut catalog = sample_with_two_text_columns();
+        catalog
+            .create_index(Index::single(
+                "docs_body".to_string(),
+                "docs".to_string(),
+                "body".to_string(),
+                IndexKind::FullText,
+            ))
+            .unwrap();
+        catalog
+            .create_index(Index {
+                name: "docs_search".to_string(),
+                table: "docs".to_string(),
+                columns: vec!["title".to_string(), "body".to_string()],
+                kind: IndexKind::FullText,
+                unique: false,
+                collations: vec![Collation::Binary, Collation::Binary],
+            })
+            .unwrap();
+        assert_eq!(catalog.indexes_for("docs").len(), 2);
+    }
+
+    #[test]
+    fn a_multi_column_vector_index_is_still_refused() {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(Table {
+                name: "docs".to_string(),
+                columns: vec![
+                    Column::new("a", DataType::Vector(4)),
+                    Column::new("b", DataType::Vector(4)),
+                ],
+            })
+            .unwrap();
+        let err = catalog
+            .create_index(Index {
+                name: "bad".to_string(),
+                table: "docs".to_string(),
+                columns: vec!["a".to_string(), "b".to_string()],
+                kind: IndexKind::Vector,
+                unique: false,
+                collations: vec![Collation::Binary, Collation::Binary],
+            })
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err}");
     }
 
     #[test]

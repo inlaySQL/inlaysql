@@ -244,8 +244,23 @@ pub struct Engine {
     /// by every path that replaces the catalog — which is the only way it can
     /// be wrong, and the only reason it is safe to hold at all.
     rules: BTreeMap<String, Rc<TableRules>>,
-    text_indexes: BTreeMap<(String, String), Box<dyn FullTextIndex>>,
-    vector_indexes: BTreeMap<(String, String), Box<dyn VectorIndex>>,
+    /// Keyed by table name and the index's *full* column list, in the order
+    /// the index declared it — not by a single column. A single-column index
+    /// (still, by far, the common case) keys under a one-element list, which
+    /// is a different Rust type but the same identity a `(table, column)` key
+    /// always meant; nothing about matching changed. What this makes
+    /// possible is a multi-column `FullText` index living beside a
+    /// single-column one over one of its own columns (`(body)` and
+    /// `(title, body)` can coexist — see `Catalog::create_index`), which a
+    /// key of just the column could not have told apart. See
+    /// `Engine::index_meta_key_for` for why the *persisted* key format for a
+    /// single column is untouched by this.
+    text_indexes: BTreeMap<(String, Vec<String>), Box<dyn FullTextIndex>>,
+    /// See [`Engine::text_indexes`]. Always a one-element column list in
+    /// practice — [`IndexKind::Vector`] stays single-column, see its docs —
+    /// but kept the same key shape as the full-text map so every retrieval
+    /// index goes through one maintenance path rather than two.
+    vector_indexes: BTreeMap<(String, Vec<String>), Box<dyn VectorIndex>>,
     /// Set by writes, cleared by [`Engine::refresh_indexes`].
     indexes_dirty: bool,
     next_row_id: RowId,
@@ -375,7 +390,7 @@ impl Engine {
     /// Backends that cannot measure this return `None`.
     pub fn vector_index_resident_bytes(&self, table: &str, column: &str) -> Option<usize> {
         self.vector_indexes
-            .get(&(table.to_ascii_lowercase(), column.to_ascii_lowercase()))
+            .get(&retrieval_key(table, &[column.to_string()]))
             .and_then(|index| index.resident_vector_bytes())
     }
 
@@ -1039,7 +1054,7 @@ impl Engine {
     /// it. Chunks are left behind unreachable; the header is what makes them
     /// an index.
     fn forget_index(&mut self, index: &Index) -> Result<()> {
-        let key = (index.table.clone(), index.column().to_string());
+        let key = retrieval_key(&index.table, &index.columns);
         match index.kind {
             IndexKind::FullText => {
                 self.text_indexes.remove(&key);
@@ -1058,7 +1073,7 @@ impl Engine {
             IndexKind::BTree => return Ok(()),
         }
         self.storage
-            .put_meta(&index_meta_key_for(&index.table, index.column()), &[])
+            .put_meta(&index_meta_key_for(&index.table, &index.columns), &[])
     }
 
     /// Delete every entry of one B-tree index.
@@ -1213,9 +1228,13 @@ impl Engine {
         if index.kind == IndexKind::BTree {
             return Ok(());
         }
-        let key = (index.table.clone(), index.column().to_string());
+        let key = retrieval_key(&index.table, &index.columns);
         match index.kind {
             IndexKind::FullText => {
+                // `factory.full_text` takes a single column name for logging
+                // purposes only — neither shipped `IndexFactory` reads it —
+                // so a multi-column index just passes its first; nothing
+                // downstream keys on this value, `key` above does that.
                 let backend = self.factory.full_text(&index.table, index.column())?;
                 self.text_indexes.insert(key, backend);
             }
@@ -1356,9 +1375,13 @@ impl Engine {
                 return Err(error);
             }
         } else {
+            // Every named column, not just the first: a single-column index
+            // (`index.columns` has one entry) behaves exactly as before, and a
+            // multi-column `FullText` index gets every existing row's combined
+            // text the same way a freshly inserted row would.
             for (id, bytes) in &rows {
                 let row = decode_row(bytes)?;
-                self.index_column(&table, create.columns[0], *id, &row)?;
+                self.index_row_for_index(&table, &index, *id, &row)?;
             }
         }
 
@@ -1534,7 +1557,7 @@ impl Engine {
             }
             Err(error) => return Err(error),
         };
-        let key = (index.table.clone(), index.column().to_string());
+        let key = retrieval_key(&index.table, &index.columns);
         match index.kind {
             IndexKind::FullText => {
                 self.text_indexes.remove(&key);
@@ -1559,7 +1582,7 @@ impl Engine {
         // not attempt to build it at all. Stale chunks are left behind; they
         // are unreachable without a header pointing at them.
         self.storage
-            .put_meta(&index_meta_key_for(&index.table, index.column()), &[])?;
+            .put_meta(&index_meta_key_for(&index.table, &index.columns), &[])?;
 
         self.storage.put_meta(CATALOG_KEY, &self.catalog.encode())?;
         self.end_write()?;
@@ -1611,7 +1634,7 @@ impl Engine {
             if index.kind != IndexKind::Vector {
                 continue;
             }
-            let key = (index.table.clone(), index.column().to_string());
+            let key = retrieval_key(&index.table, &index.columns);
             if let Some(backend) = self.vector_indexes.get_mut(&key) {
                 if backend.is_self_persisting() {
                     backend.reset()?;
@@ -1651,7 +1674,7 @@ impl Engine {
             // committed rows, or it is stale and the table is rebuilt.
             if let Some(backend) = self
                 .vector_indexes
-                .get(&(index.table.clone(), index.column().to_string()))
+                .get(&retrieval_key(&index.table, &index.columns))
             {
                 if backend.is_self_persisting() {
                     if backend.stored_write_version() == Some(self.write_version) {
@@ -1660,7 +1683,7 @@ impl Engine {
                     return Ok(false);
                 }
             }
-            let Some(payload) = self.read_saved_index(&index.table, index.column())? else {
+            let Some(payload) = self.read_saved_index(&index.table, &index.columns)? else {
                 return Ok(false);
             };
             restored.push((index.clone(), payload));
@@ -1675,7 +1698,7 @@ impl Engine {
         // failure here abandons the whole table rather than leaving half its
         // indexes loaded and half empty.
         for (index, payload) in restored {
-            let key = (index.table.clone(), index.column().to_string());
+            let key = retrieval_key(&index.table, &index.columns);
             let outcome = match index.kind {
                 IndexKind::FullText => self
                     .text_indexes
@@ -1698,10 +1721,10 @@ impl Engine {
         Ok(true)
     }
 
-    /// Read a column's saved index back, or `None` if there is not a current,
-    /// complete one to read.
-    fn read_saved_index(&self, table: &str, column: &str) -> Result<Option<Vec<u8>>> {
-        let base = index_meta_key_for(table, column);
+    /// Read an index's saved backend back, or `None` if there is not a
+    /// current, complete one to read.
+    fn read_saved_index(&self, table: &str, columns: &[String]) -> Result<Option<Vec<u8>>> {
+        let base = index_meta_key_for(table, columns);
         let Some(header) = self.storage.get_meta(&base)? else {
             return Ok(None);
         };
@@ -1745,7 +1768,7 @@ impl Engine {
                 .cloned()
                 .collect();
             for index in declared {
-                let key = (index.table.clone(), index.column().to_string());
+                let key = retrieval_key(&index.table, &index.columns);
                 let bytes = match index.kind {
                     IndexKind::FullText => {
                         self.text_indexes.get(&key).and_then(|index| index.save())
@@ -1758,7 +1781,7 @@ impl Engine {
                     IndexKind::BTree => None,
                 };
                 if let Some(bytes) = bytes {
-                    saved.push((index_meta_key_for(&index.table, index.column()), bytes));
+                    saved.push((index_meta_key_for(&index.table, &index.columns), bytes));
                 }
             }
         }
@@ -2806,10 +2829,23 @@ impl Engine {
 
     /// The retrieval half alone: the BM25 and ANN backends, which are rebuilt
     /// from the rows on open and so are the only half a rebuild has to redo.
+    ///
+    /// Walks the *declared indexes*, not the table's columns: a single column
+    /// can now be named by more than one `FullText` index at once (a
+    /// single-column `(body)` index and a multi-column `(title, body)` one
+    /// can coexist — see `Catalog::create_index`'s dup-check), so "one index
+    /// per column" is no longer the shape to iterate, "one index" is.
     fn index_row_retrieval(&mut self, table: &Table, id: RowId, row: &[Value]) -> Result<()> {
         self.indexes_dirty = true;
-        for ordinal in 0..table.columns.len() {
-            self.index_column(table, ordinal, id, row)?;
+        let declared: Vec<Index> = self
+            .catalog
+            .indexes_for(&table.name)
+            .into_iter()
+            .filter(|index| index.kind.is_retrieval())
+            .cloned()
+            .collect();
+        for index in &declared {
+            self.index_row_for_index(table, index, id, row)?;
         }
         Ok(())
     }
@@ -2841,30 +2877,40 @@ impl Engine {
         Ok(keys)
     }
 
-    /// Add a row's value for one column to that column's index, if it has one.
-    fn index_column(
+    /// Add a row's contribution to one declared retrieval index, if its
+    /// backend is open.
+    ///
+    /// For `FullText` this is [`concatenated_full_text`] over every named
+    /// column — MySQL's `FULLTEXT(a, b)`: one combined relevance score over
+    /// the concatenation, so a query term matching either column ranks the
+    /// row. For `Vector` it is the one named column's embedding, unchanged
+    /// from before this existed — a vector index is always exactly one
+    /// column (see `IndexKind::Vector`'s docs).
+    fn index_row_for_index(
         &mut self,
         table: &Table,
-        ordinal: usize,
+        index: &Index,
         id: RowId,
         row: &[Value],
     ) -> Result<()> {
-        let key = (
-            table.name.to_ascii_lowercase(),
-            table.columns[ordinal].name.to_ascii_lowercase(),
-        );
-        match row.get(ordinal) {
-            Some(Value::Text(text)) => {
-                if let Some(index) = self.text_indexes.get_mut(&key) {
-                    index.insert(id, text)?;
+        let key = retrieval_key(&index.table, &index.columns);
+        match index.kind {
+            IndexKind::FullText => {
+                if let Some(text) = concatenated_full_text(table, &index.columns, row)? {
+                    if let Some(backend) = self.text_indexes.get_mut(&key) {
+                        backend.insert(id, &text)?;
+                    }
                 }
             }
-            Some(Value::Vector(embedding)) => {
-                if let Some(index) = self.vector_indexes.get_mut(&key) {
-                    index.insert(id, embedding)?;
+            IndexKind::Vector => {
+                let (ordinal, _) = table.require_column(index.column())?;
+                if let Some(Value::Vector(embedding)) = row.get(ordinal) {
+                    if let Some(backend) = self.vector_indexes.get_mut(&key) {
+                        backend.insert(id, embedding)?;
+                    }
                 }
             }
-            _ => {}
+            IndexKind::BTree => {}
         }
         Ok(())
     }
@@ -2877,36 +2923,55 @@ impl Engine {
     /// that hid the ordering is what made the DST sweep fail once already.
     fn deindex_row_retrieval(&mut self, table: &Table, id: RowId, row: &[Value]) -> Result<()> {
         self.indexes_dirty = true;
-        for ordinal in 0..table.columns.len() {
-            self.deindex_column(table, ordinal, id, row)?;
+        let declared: Vec<Index> = self
+            .catalog
+            .indexes_for(&table.name)
+            .into_iter()
+            .filter(|index| index.kind.is_retrieval())
+            .cloned()
+            .collect();
+        for index in &declared {
+            self.deindex_row_for_index(table, index, id, row)?;
         }
         Ok(())
     }
 
-    /// Remove a row's value for one column from that column's index, if any.
-    fn deindex_column(
+    /// Remove a row's contribution to one declared retrieval index, if its
+    /// backend is open.
+    ///
+    /// Gated on the same condition [`Engine::index_row_for_index`] inserted
+    /// under — "at least one named column holds text" for `FullText`, "the
+    /// one named column holds a vector" for `Vector` — so a row that never
+    /// contributed to an index is never asked to remove itself from one.
+    /// `FullTextIndex::remove`/`VectorIndex::remove` are no-ops for an
+    /// absent id regardless, so this gate is a cheap skip, not a correctness
+    /// requirement — but matching the insert side's condition exactly is
+    /// what keeps the two paths from silently drifting apart.
+    fn deindex_row_for_index(
         &mut self,
         table: &Table,
-        ordinal: usize,
+        index: &Index,
         id: RowId,
         row: &[Value],
     ) -> Result<()> {
-        let key = (
-            table.name.to_ascii_lowercase(),
-            table.columns[ordinal].name.to_ascii_lowercase(),
-        );
-        match row.get(ordinal) {
-            Some(Value::Text(_)) => {
-                if let Some(index) = self.text_indexes.get_mut(&key) {
-                    index.remove(id)?;
+        let key = retrieval_key(&index.table, &index.columns);
+        match index.kind {
+            IndexKind::FullText => {
+                if concatenated_full_text(table, &index.columns, row)?.is_some() {
+                    if let Some(backend) = self.text_indexes.get_mut(&key) {
+                        backend.remove(id)?;
+                    }
                 }
             }
-            Some(Value::Vector(_)) => {
-                if let Some(index) = self.vector_indexes.get_mut(&key) {
-                    index.remove(id)?;
+            IndexKind::Vector => {
+                let (ordinal, _) = table.require_column(index.column())?;
+                if matches!(row.get(ordinal), Some(Value::Vector(_))) {
+                    if let Some(backend) = self.vector_indexes.get_mut(&key) {
+                        backend.remove(id)?;
+                    }
                 }
             }
-            _ => {}
+            IndexKind::BTree => {}
         }
         Ok(())
     }
@@ -3713,11 +3778,11 @@ impl Engine {
                 sort_by_score_desc(&mut hits);
                 Ok(hits)
             }
-            ScoreExpr::Text { column, query } => {
-                let index = self.text_index(table, *column)?;
+            ScoreExpr::Text { columns, query } => {
+                let index = self.text_index(table, columns)?;
                 let Value::Text(query) = eval::evaluate(query, &[], Computed::NONE, env)? else {
                     return Err(Error::Type(
-                        "bm25_score() needs a text query as its second argument".to_string(),
+                        "bm25_score() needs a text query as its final argument".to_string(),
                     ));
                 };
                 let mut hits = index.search(&query, k)?;
@@ -3736,12 +3801,69 @@ impl Engine {
         }
     }
 
-    fn text_index(&self, table: &Table, column: usize) -> Result<&dyn FullTextIndex> {
-        let key = index_key(table, column)?;
+    /// The `FullText` backend that answers `bm25_score(columns..., query)`.
+    ///
+    /// Resolves which *declared* index the named columns mean first (see
+    /// [`Engine::resolve_full_text_index`]), then looks up that index's own
+    /// backend under its own key — never a key built straight from the
+    /// query's ordinals, so a query naming the same columns in a different
+    /// order still finds the one backend that indexes them.
+    fn text_index(&self, table: &Table, columns: &[usize]) -> Result<&dyn FullTextIndex> {
+        let index = self.resolve_full_text_index(table, columns)?;
+        let key = retrieval_key(&index.table, &index.columns);
         self.text_indexes
             .get(&key)
             .map(|index| index.as_ref())
-            .ok_or_else(|| Error::Index(alloc::format!("no full-text index on `{}`", key.1)))
+            .ok_or_else(|| {
+                Error::Index(alloc::format!(
+                    "no full-text index on ({})",
+                    index.columns.join(", ")
+                ))
+            })
+    }
+
+    /// The declared `FullText` index of `table` that covers exactly the named
+    /// `columns` — order-independent, since a combined BM25 score does not
+    /// depend on which order the columns were named in: `bm25_score(title,
+    /// body, ?)` and `bm25_score(body, title, ?)` mean the same query and find
+    /// the same index. `bm25_score(body, ?)`, the single-column call this has
+    /// always accepted, finds the single-column index over `body` by the same
+    /// rule — a set of one, matched the same way it always was.
+    fn resolve_full_text_index(&self, table: &Table, columns: &[usize]) -> Result<&Index> {
+        let mut names: Vec<String> = Vec::with_capacity(columns.len());
+        for &ordinal in columns {
+            let column = table
+                .columns
+                .get(ordinal)
+                .ok_or_else(|| Error::Catalog("column ordinal out of range".to_string()))?;
+            names.push(column.name.to_ascii_lowercase());
+        }
+        let mut matches = self
+            .catalog
+            .indexes_for(&table.name)
+            .into_iter()
+            .filter(|index| {
+                index.kind == IndexKind::FullText && same_column_set(&index.columns, &names)
+            });
+        let found = matches.next().ok_or_else(|| {
+            Error::Index(alloc::format!(
+                "no full-text index on ({})",
+                names.join(", ")
+            ))
+        })?;
+        if matches.next().is_some() {
+            // Only reachable if two `FullText` indexes were declared over the
+            // same columns in different orders — the catalog's dup-check
+            // compares column lists positionally (`Index::covers`), so it
+            // does not refuse that the way it refuses a true duplicate. There
+            // is nothing to prefer between them, so this is reported rather
+            // than guessed at.
+            return Err(Error::Index(alloc::format!(
+                "more than one full-text index covers ({}); this cannot be resolved automatically",
+                names.join(", ")
+            )));
+        }
+        Ok(found)
     }
 
     fn vector_index(&self, table: &Table, column: usize) -> Result<&dyn VectorIndex> {
@@ -3749,7 +3871,9 @@ impl Engine {
         self.vector_indexes
             .get(&key)
             .map(|index| index.as_ref())
-            .ok_or_else(|| Error::Index(alloc::format!("no vector index on `{}`", key.1)))
+            .ok_or_else(|| {
+                Error::Index(alloc::format!("no vector index on `{}`", key.1.join(", ")))
+            })
     }
 }
 
@@ -4259,6 +4383,42 @@ fn index_values<'a>(table: &Table, index: &Index, row: &'a [Value]) -> Result<Ve
     Ok(values)
 }
 
+/// The text one row contributes to a (possibly multi-column) `FullText`
+/// index: every named column's `TEXT` value, in the index's own declared
+/// order, joined by a single space.
+///
+/// A space is enough of a boundary — not a distinct marker token — because
+/// [`crate::bm25::tokenize`] splits on any non-alphanumeric character, so a
+/// term can never straddle the join the way it could if the columns were
+/// glued together bare (`"circus"` + `"clown"` must never read as one term
+/// `"circusclown"`). This is the same convention Postgres's own guidance for
+/// concatenating several columns into one `to_tsvector` input gives.
+///
+/// A column that is `NULL` or holds a non-text value contributes nothing —
+/// not even an empty piece to join — so a single-column index over a `NULL`
+/// column still indexes nothing, exactly as it always has. `None` when *no*
+/// named column held text, which is when the row is skipped entirely: this
+/// is one function for both the insert side (skip means "do not index yet")
+/// and the delete side (skip means "cannot have been indexed").
+fn concatenated_full_text(
+    table: &Table,
+    columns: &[String],
+    row: &[Value],
+) -> Result<Option<String>> {
+    let mut parts: Vec<&str> = Vec::with_capacity(columns.len());
+    for column in columns {
+        let (ordinal, _) = table.require_column(column)?;
+        if let Some(Value::Text(text)) = row.get(ordinal) {
+            parts.push(text.as_str());
+        }
+    }
+    Ok(if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    })
+}
+
 /// Read a `u64` counter out of engine metadata.
 fn read_counter(storage: &dyn Storage, key: &str, what: &str) -> Result<Option<u64>> {
     match storage.get_meta(key)? {
@@ -4273,17 +4433,74 @@ fn read_counter(storage: &dyn Storage, key: &str, what: &str) -> Result<Option<u
     }
 }
 
-/// Metadata key a column's persisted index lives under.
+/// Metadata key an index's persisted backend lives under.
 ///
-/// Keyed by table and column names, never by index name: there is at most one
-/// index per column, and the name is a user-facing handle that can change the
-/// spelling between writes.
-fn index_meta_key_for(table: &str, column: &str) -> String {
-    alloc::format!(
-        "index:{}:{}",
+/// Keyed by table and column names, never by index name: a name is a
+/// user-facing handle that can change spelling between writes, and would
+/// strand a saved index under the old one.
+///
+/// **A single-column index keeps the exact key it has always had** —
+/// `index:<table>:<column>` — because that is this key's on-disk identity and
+/// existing databases depend on it never moving; see `docs/indexes.md`. A
+/// multi-column index (only [`IndexKind::FullText`] can be one; see
+/// [`Index::columns`]) needs a key of its own, and it is built so it can
+/// never collide with a legacy single-column key no matter what the columns
+/// are named: the third segment begins with `\u{2}`, one column per
+/// `\u{2}`-terminated run, and a real column's name — which is exactly what a
+/// single-column key's third segment *is* — cannot begin with a control
+/// character, the same invariant [`vector_index_namespace`] already relies on
+/// for its own leading `\u{1}`.
+///
+/// This needed no catalog format change to support (`Catalog::required_version`
+/// already forces the same version bump a multi-column *B-tree* index does,
+/// because the column-list encoding it introduced was never kind-specific);
+/// this key is the one place a multi-column retrieval index is genuinely new
+/// on disk, and it is additive by construction — nothing about the
+/// single-column format moved to make room for it.
+fn index_meta_key_for(table: &str, columns: &[String]) -> String {
+    let table = table.to_ascii_lowercase();
+    match columns {
+        [column] => alloc::format!("index:{table}:{}", column.to_ascii_lowercase()),
+        columns => {
+            let mut key = alloc::format!("index:{table}:\u{2}");
+            for column in columns {
+                key.push_str(&column.to_ascii_lowercase());
+                key.push('\u{2}');
+            }
+            key
+        }
+    }
+}
+
+/// The in-memory key one retrieval index's backend lives under: table name
+/// plus its full, lowercased column list, in the order the index declares
+/// them. See [`Engine::text_indexes`] for why this is a list rather than one
+/// column.
+fn retrieval_key(table: &str, columns: &[String]) -> (String, Vec<String>) {
+    (
         table.to_ascii_lowercase(),
-        column.to_ascii_lowercase()
+        columns
+            .iter()
+            .map(|column| column.to_ascii_lowercase())
+            .collect(),
     )
+}
+
+/// Whether `a` and `b` name the same columns, order and case aside.
+///
+/// Used only to resolve which declared `FullText` index a query's
+/// `bm25_score(columns..., query)` means — the concatenation a combined
+/// score is built from does not depend on which order the columns were
+/// named in, so neither should finding the index.
+fn same_column_set(a: &[String], b: &[String]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a: Vec<String> = a.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let mut b: Vec<String> = b.iter().map(|c| c.to_ascii_lowercase()).collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    a == b
 }
 
 /// Metadata key one chunk of a saved index lives under.
@@ -4336,14 +4553,20 @@ impl IndexHeader {
     }
 }
 
-fn index_key(table: &Table, column: usize) -> Result<(String, String)> {
+/// The map key one column's own single-column retrieval index lives under.
+///
+/// Used only for [`IndexKind::Vector`] lookups, which are always exactly one
+/// column (see that variant's docs). A `FullText` lookup goes through
+/// [`Engine::resolve_full_text_index`] instead, because it may have to find a
+/// *multi*-column index from several columns named in one query.
+fn index_key(table: &Table, column: usize) -> Result<(String, Vec<String>)> {
     let column = table
         .columns
         .get(column)
         .ok_or_else(|| Error::Catalog("column ordinal out of range".to_string()))?;
     Ok((
         table.name.to_ascii_lowercase(),
-        column.name.to_ascii_lowercase(),
+        alloc::vec![column.name.to_ascii_lowercase()],
     ))
 }
 

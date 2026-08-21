@@ -136,9 +136,22 @@ index:<table>:<column>/1      next 2 KiB
 ...
 ```
 
-The key is the *column*, never the index name: there is at most one index per
-column (its kind is fixed by the column type), so a rename or a differently
-spelled name cannot strand a saved index.
+The key is the *column*, never the index name: a rename or a differently
+spelled name cannot strand a saved index. This is a single-column index's
+on-disk identity, and it is untouched by multi-column `FullText` indexes
+(`CREATE INDEX idx ON docs (title, body) USING FULLTEXT` — MySQL's
+`FULLTEXT(title, body)`, the one retrieval kind that can name more than one
+column; see the README's Next list): a multi-column index's key cannot be
+just the column, since more than one is named, so it gets a key of its own
+that is built to never collide with a single-column one no matter what the
+columns are called — the third segment begins with a `\u{2}` control byte,
+which (like the `\u{1}` [`vector_index_namespace`](#backends-that-persist-themselves)
+already relies on) a real column's name cannot. Nothing about the
+single-column format above moved to make room for it, and it needed no
+catalog format change either — `Catalog::required_version`'s multi-column
+encoding was never B-tree-specific, so a multi-column `FullText` index forces
+the same version bump a multi-column B-tree index already does, for the same
+"an older build must refuse this, not misread it" reason.
 
 Reading checks the header's version first, then reassembles the chunks and
 checks the total length matches. A chunk that went missing shortens the
