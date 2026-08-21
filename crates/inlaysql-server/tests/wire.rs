@@ -1914,6 +1914,212 @@ fn concurrent_connections_write_disjoint_rows() {
     }
 }
 
+/// AHL-495 investigation: aggregate prepared point-read throughput over the
+/// wire at 1 and 8 connections, on the machine the test runs on. Not a CI
+/// test — ignored, run by hand with `cargo test --release -p inlaysql-server
+/// --test wire -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn read_throughput_one_vs_eight_connections() {
+    const ROWS: i64 = 2000;
+    let reads_per_conn: i64 = std::env::var("READS_PER_CONN")
+        .map(|v| v.parse().expect("READS_PER_CONN"))
+        .unwrap_or(1000);
+
+    let server = TestServer::start("throughput");
+    let mut setup = server.client();
+    setup.ok_query("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)");
+    for start in (1..=ROWS).step_by(100) {
+        let end = (start + 99).min(ROWS);
+        let mut sql = String::from("INSERT INTO kv (id, body) VALUES ");
+        for id in start..=end {
+            if id > start {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("({id}, 'body-{id}')"));
+        }
+        setup.ok_query(&sql);
+    }
+    drop(setup);
+
+    for connections in [1usize, 8usize] {
+        let addr = server.addr;
+        let password = server.password.clone();
+        let elapsed = std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..connections {
+                let password = password.clone();
+                workers.push(scope.spawn(move || {
+                    let mut client =
+                        Client::connect(addr, "root", &password, None).expect("connect");
+                    let stmt = client
+                        .prepare("SELECT body FROM kv WHERE id = ?")
+                        .expect("prepare");
+                    for _ in 0..100 {
+                        client
+                            .execute(&stmt, &[Param::Int(1)])
+                            .expect("warmup read");
+                    }
+                    let start = std::time::Instant::now();
+                    for key in 0..reads_per_conn {
+                        client
+                            .execute(&stmt, &[Param::Int(key % ROWS + 1)])
+                            .expect("read");
+                    }
+                    start.elapsed()
+                }));
+            }
+            workers
+                .into_iter()
+                .fold(std::time::Duration::ZERO, |acc, w| {
+                    acc.max(w.join().expect("worker"))
+                })
+        });
+        let ops = reads_per_conn * connections as i64;
+        let rate = ops as f64 / elapsed.as_secs_f64();
+        println!("connections={connections}: {ops} reads in {elapsed:?} = {rate:.1} ops/s");
+    }
+}
+
+/// AHL-495 investigation, part two: the shape a shared page cache is actually
+/// for — many short-lived connections, each of which would otherwise re-read
+/// the pages its first descent needs from the device. Every round opens a
+/// fresh connection, runs one point read, and closes it again.
+///
+/// Run it twice to see the shared cache's effect: once as is, once with
+/// `INLAYSQL_DISABLE_SHARED_READ_CACHE=1` — the knob
+/// `inlaysql::device::shared_read_cache_budget` reads, which pins the cache
+/// budget to zero. Two separate process runs are required, not one, because
+/// the budget is fixed when the first handle on the file opens.
+#[test]
+#[ignore]
+fn cold_connection_throughput_shared_cache_on_vs_off() {
+    const ROWS: i64 = 2000;
+    let rounds: i64 = std::env::var("COLD_ROUNDS")
+        .map(|v| v.parse().expect("COLD_ROUNDS"))
+        .unwrap_or(300);
+
+    let server = TestServer::start("cold-connections");
+    let mut setup = server.client();
+    setup.ok_query("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)");
+    for start in (1..=ROWS).step_by(100) {
+        let end = (start + 99).min(ROWS);
+        let mut sql = String::from("INSERT INTO kv (id, body) VALUES ");
+        for id in start..=end {
+            if id > start {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("({id}, 'body-{id}')"));
+        }
+        setup.ok_query(&sql);
+    }
+    drop(setup);
+
+    let addr = server.addr;
+    let password = server.password.clone();
+    let start = std::time::Instant::now();
+    for round in 0..rounds {
+        let mut client = Client::connect(addr, "root", &password, None).expect("connect");
+        let stmt = client
+            .prepare("SELECT body FROM kv WHERE id = ?")
+            .expect("prepare");
+        let reply = client
+            .execute(&stmt, &[Param::Int(round % ROWS + 1)])
+            .expect("read");
+        assert_eq!(reply.rows().rows.len(), 1);
+        drop(client);
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "cold connections: {rounds} in {elapsed:?} = {:.1} connections/s",
+        rounds as f64 / elapsed.as_secs_f64()
+    );
+}
+
+/// Concurrent readers, each on its own connection, all see the same committed
+/// rows — the shape that exercises the shared raw-page cache: every
+/// connection's descent reads pages another connection may have cached, and a
+/// wrong or stale page served from that cache would surface here as a wrong
+/// row, not as an error.
+#[test]
+fn concurrent_readers_share_pages_and_all_see_every_row() {
+    const ROWS: i64 = 500;
+    const READERS: i64 = 4;
+
+    let server = TestServer::start("shared-reads");
+    let mut setup = server.client();
+    setup.ok_query("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)");
+    for start in (1..=ROWS).step_by(100) {
+        let end = (start + 99).min(ROWS);
+        let mut sql = String::from("INSERT INTO kv (id, body) VALUES ");
+        for id in start..=end {
+            if id > start {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("({id}, 'body-{id}')"));
+        }
+        setup.ok_query(&sql);
+    }
+    drop(setup);
+
+    let addr = server.addr;
+    let password = server.password.clone();
+    std::thread::scope(|scope| {
+        for reader in 0..READERS {
+            let password = password.clone();
+            scope.spawn(move || {
+                let mut client = Client::connect(addr, "root", &password, None).expect("connect");
+                let stmt = client
+                    .prepare("SELECT body FROM kv WHERE id = ?")
+                    .expect("prepare");
+                for round in 0..10 {
+                    let id = (round * READERS + reader) % ROWS + 1;
+                    let reply = client.execute(&stmt, &[Param::Int(id)]).expect("read");
+                    let rows = reply.rows();
+                    assert_eq!(
+                        rows.column("body"),
+                        vec![format!("body-{id}")],
+                        "reader {reader} round {round}"
+                    );
+                }
+            });
+        }
+    });
+}
+
+/// A brand-new connection — nothing warmed in its own decoded cache — reads
+/// rows a connection that has since closed committed and read. Every page its
+/// first descent needs comes out of the shared raw cache, so a stale entry
+/// would show up here as a wrong row.
+#[test]
+fn a_fresh_connection_reads_pages_cached_by_a_closed_one() {
+    let server = TestServer::start("fresh-reads");
+    let mut first = server.client();
+    first.ok_query("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)");
+    for start in (1..=200).step_by(100) {
+        let end = (start + 99).min(200);
+        let mut sql = String::from("INSERT INTO kv (id, body) VALUES ");
+        for id in start..=end {
+            if id > start {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("({id}, 'body-{id}')"));
+        }
+        first.ok_query(&sql);
+    }
+    let rows = first.ok_query("SELECT body FROM kv WHERE id = 150").rows();
+    assert_eq!(rows.column("body"), vec!["body-150"]);
+    drop(first);
+
+    let mut fresh = server.client();
+    for id in [1, 50, 150, 200] {
+        let rows = fresh
+            .ok_query(&format!("SELECT body FROM kv WHERE id = {id}"))
+            .rows();
+        assert_eq!(rows.column("body"), vec![format!("body-{id}")]);
+    }
+}
+
 /// One connection sees another's committed writes — the snapshot refresh that
 /// makes thread-per-connection viable at all.
 #[test]

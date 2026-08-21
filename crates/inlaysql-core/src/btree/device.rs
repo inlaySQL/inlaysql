@@ -274,6 +274,26 @@ pub trait Device {
     fn min_reader_seq(&self) -> Option<u64> {
         None
     }
+
+    /// A handle on this device has opted into page reuse
+    /// ([`crate::btree::CowBTree::set_page_reuse`]), so data-area page ids may
+    /// now be reissued with new content.
+    ///
+    /// Any device-level cache of data-area pages keyed by page id or offset
+    /// must flush and stay off from this moment: with reuse possible, an
+    /// entry can describe the previous occupant of a page, and a lookup that
+    /// trusts it serves the wrong bytes with no error anywhere (`super::cache`'s
+    /// free-list warning, one level below the decoded cache). This is a
+    /// one-way trip — disabling reuse on the handle must not re-enable the
+    /// device cache, because it may already hold stale entries.
+    ///
+    /// The default is to do nothing, so no existing device has to change: a
+    /// device that never caches data pages has nothing to flush. Called by
+    /// [`crate::btree::CowBTree::set_page_reuse`] exactly when a handle turns
+    /// reuse on, before that handle's first commit could possibly reissue an
+    /// id, so "check this flag before serving, set it before reuse is
+    /// possible" is enough of an ordering proof to need no per-entry version.
+    fn note_page_reuse_enabled(&self) {}
 }
 
 /// A device shared by many trees through reference counting and interior
@@ -340,5 +360,9 @@ impl<T: Device> Device for Rc<RefCell<T>> {
 
     fn min_reader_seq(&self) -> Option<u64> {
         self.borrow().min_reader_seq()
+    }
+
+    fn note_page_reuse_enabled(&self) {
+        self.borrow().note_page_reuse_enabled();
     }
 }

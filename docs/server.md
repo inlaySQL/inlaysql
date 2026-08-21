@@ -129,6 +129,31 @@ A lost write race arrives at the client as `1213` (deadlock), whose documented
 remedy is to retry the transaction — which is exactly the correct response to
 first-committer-wins, and what every ORM's retry logic already recognises.
 
+**Each handle keeps its own decoded page cache, but the raw page bytes behind
+it are shared.** `FileDevice` holds a per-file raw-page read cache on the
+`CommitCoordinator` every handle on one file already shares (`coordinator_for`
+in `crates/inlaysql/src/device.rs`): decoded-cache misses in any connection are
+served the page bytes from RAM — read from the device once per file instead of
+once per handle — so a freshly opened connection warms up without re-reading
+the pages a previous connection already pulled in. It sits strictly *behind*
+the per-handle decoded cache, which is why it costs nothing on the hot path:
+only a read that would otherwise pay a `pread` syscall touches its lock.
+
+That cache is sound only because page ids are never reused: the tree is
+copy-on-write and a data-area page is immutable for the file's lifetime
+(`crates/inlaysql-core/src/btree/cache.rs`, decision D4). It therefore caches
+only data-area pages — the header, the state block and the WAL regions are
+rewritten in place and are never served from it — and it is gated off the
+moment any handle opts into page reuse (`EngineOptions` has no such option
+today, and this server never opts in): `CowBTree::set_page_reuse` tells the
+device, the device flushes the cache and bypasses it from then on, one-way.
+If page reuse is ever wired through the server's open path, that gate is what
+keeps a reissued page id from being served its previous occupant's bytes.
+
+The page cache budget is the default `DEFAULT_PAGE_CACHE_BYTES` (8 MiB) per
+file, not per connection; `INLAYSQL_DISABLE_SHARED_READ_CACHE=1` pins it to
+zero for benchmarking the difference.
+
 ### The dependency choice: hand-rolled, not `msql-srv`
 
 `msql-srv` is the obvious candidate and it was measured rather than assumed:
