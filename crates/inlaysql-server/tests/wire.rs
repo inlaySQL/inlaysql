@@ -207,7 +207,7 @@ impl Client {
         // of greeting it — "too many connections" arrives here, before any
         // handshake, and a client has to be ready for that.
         if greeting.first() == Some(&0xff) {
-            return Err(parse_error(&greeting));
+            return Err(parse_pre_handshake_error(&greeting));
         }
         let challenge = parse_handshake(&greeting);
 
@@ -252,7 +252,7 @@ impl Client {
         };
         let greeting = client.read_packet().expect("handshake");
         if greeting.first() == Some(&0xff) {
-            return Err(parse_error(&greeting));
+            return Err(parse_pre_handshake_error(&greeting));
         }
         let _ = parse_handshake(&greeting);
 
@@ -307,7 +307,7 @@ impl Client {
         };
         let greeting = client.read_packet().expect("handshake");
         if greeting.first() == Some(&0xff) {
-            return Err(parse_error(&greeting));
+            return Err(parse_pre_handshake_error(&greeting));
         }
         let challenge = parse_handshake(&greeting);
 
@@ -340,7 +340,7 @@ impl Client {
         };
         let greeting = client.read_packet().expect("handshake");
         if greeting.first() == Some(&0xff) {
-            return Err(parse_error(&greeting));
+            return Err(parse_pre_handshake_error(&greeting));
         }
         let _ = parse_handshake(&greeting);
 
@@ -380,7 +380,7 @@ impl Client {
         };
         let greeting = client.read_packet().expect("handshake");
         if greeting.first() == Some(&0xff) {
-            return Err(parse_error(&greeting));
+            return Err(parse_pre_handshake_error(&greeting));
         }
         let _ = parse_handshake(&greeting);
 
@@ -417,7 +417,7 @@ impl Client {
         };
         let greeting = client.read_packet().expect("handshake");
         if greeting.first() == Some(&0xff) {
-            return Err(parse_error(&greeting));
+            return Err(parse_pre_handshake_error(&greeting));
         }
         let _ = parse_handshake(&greeting);
 
@@ -752,6 +752,9 @@ fn put_lenenc_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+/// Parses an ERR packet that follows a successful handshake exchange, where
+/// `CLIENT_PROTOCOL_41` has been negotiated and the SQLSTATE marker is always
+/// present.
 fn parse_error(packet: &[u8]) -> ServerError {
     let code = u16::from_le_bytes([packet[1], packet[2]]);
     assert_eq!(packet[3], b'#', "a 4.1 error carries a SQLSTATE marker");
@@ -760,6 +763,21 @@ fn parse_error(packet: &[u8]) -> ServerError {
         code,
         sqlstate,
         message: String::from_utf8_lossy(&packet[9..]).to_string(),
+    }
+}
+
+/// Parses an ERR packet that arrives **before** any handshake — the only
+/// packet shape this server ever sends in that position (`--max-connections`,
+/// or the database file itself failing to open). Nothing has negotiated
+/// `CLIENT_PROTOCOL_41` yet at that point in the exchange, so — unlike
+/// [`parse_error`] — this packet carries no SQLSTATE marker at all: just the
+/// error code and the message, back to back.
+fn parse_pre_handshake_error(packet: &[u8]) -> ServerError {
+    let code = u16::from_le_bytes([packet[1], packet[2]]);
+    ServerError {
+        code,
+        sqlstate: String::new(),
+        message: String::from_utf8_lossy(&packet[3..]).to_string(),
     }
 }
 
@@ -1401,6 +1419,107 @@ fn an_unparsable_metadata_filter_fails_instead_of_answering_wrongly() {
     assert_eq!(rows.rows.len(), 1);
 }
 
+/// The views an ORM reads for foreign-key discovery answer with real rows
+/// over the wire — and the object views the engine cannot have answer zero
+/// rows in the shapes MySQL 8 defines.
+#[test]
+fn information_schema_constraint_views_answer_over_the_wire() {
+    let server = TestServer::start("infoschema-constraints");
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)");
+    client.ok_query(
+        "CREATE TABLE books (\
+           id INTEGER PRIMARY KEY, \
+           author_id INTEGER REFERENCES authors(id), \
+           title TEXT UNIQUE, \
+           edition INTEGER, \
+           UNIQUE (author_id, edition), \
+           CHECK (edition > 0))",
+    );
+    client.ok_query("CREATE UNIQUE INDEX ux_authors_name ON authors (name)");
+
+    // Foreign-key discovery, the query a migration tool sends. The unnamed
+    // UNIQUE constraints carry the engine's generated index names, which is
+    // exactly what STATISTICS reports as their INDEX_NAME.
+    let rows = client
+        .ok_query(
+            "SELECT constraint_name, table_name, column_name, ordinal_position, \
+                    position_in_unique_constraint, referenced_table_name, referenced_column_name \
+             FROM information_schema.key_column_usage \
+             WHERE table_name = 'books' ORDER BY constraint_name, ordinal_position",
+        )
+        .rows();
+    assert_eq!(
+        rows.column("CONSTRAINT_NAME"),
+        vec![
+            "__inlaysql_uniq_books_author_id_edition_1",
+            "__inlaysql_uniq_books_author_id_edition_1",
+            "__inlaysql_uniq_books_title_0",
+            "books_ibfk_1",
+            "PRIMARY",
+        ]
+    );
+    assert_eq!(
+        rows.column("REFERENCED_TABLE_NAME"),
+        vec!["NULL", "NULL", "NULL", "authors", "NULL"]
+    );
+    assert_eq!(
+        rows.column("REFERENCED_COLUMN_NAME"),
+        vec!["NULL", "NULL", "NULL", "id", "NULL"]
+    );
+    assert_eq!(
+        rows.column("POSITION_IN_UNIQUE_CONSTRAINT"),
+        vec!["NULL", "NULL", "NULL", "1", "NULL"]
+    );
+
+    // ENFORCED names the engine's real behaviour: foreign keys are recorded
+    // but never checked (README, TESTING.md), everything else really is.
+    let rows = client
+        .ok_query(
+            "SELECT constraint_name, constraint_type, enforced \
+             FROM information_schema.table_constraints \
+             WHERE table_name = 'books' ORDER BY constraint_name",
+        )
+        .rows();
+    assert_eq!(
+        rows.column("CONSTRAINT_TYPE"),
+        vec!["UNIQUE", "UNIQUE", "CHECK", "FOREIGN KEY", "PRIMARY KEY"]
+    );
+    assert_eq!(
+        rows.column("ENFORCED"),
+        vec!["YES", "YES", "YES", "NO", "YES"]
+    );
+
+    // OR across two tables answers both, which an AND could never do.
+    let rows = client
+        .ok_query(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_name = 'authors' OR table_name = 'books' ORDER BY table_name",
+        )
+        .rows();
+    assert_eq!(rows.column("TABLE_NAME"), vec!["authors", "books"]);
+
+    // Object kinds the engine does not have answer zero rows, in the shapes
+    // MySQL 8 defines.
+    for view in ["views", "triggers", "routines"] {
+        let rows = client
+            .ok_query(&format!("SELECT * FROM information_schema.{view}"))
+            .rows();
+        assert_eq!(rows.rows.len(), 0, "{view} must be empty");
+    }
+
+    // And the refusal that keeps all of the above honest: an OR nested inside
+    // an AND-group is refused rather than silently evaluated as something
+    // else.
+    let error = client
+        .query(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE (table_name = 'authors' OR table_name = 'books') AND table_schema = 'inlaysql'",
+        )
+        .unwrap_err();
+    assert_eq!(error.code, 1235);
+}
+
 #[test]
 fn transactions_map_onto_the_engine_and_rollback_really_rolls_back() {
     let server = TestServer::start("transactions");
@@ -1823,6 +1942,47 @@ fn connections_past_the_limit_are_refused_with_a_proper_error() {
         .err()
         .expect("the second connection must be refused");
     assert_eq!(error.code, 1040, "ER_CON_COUNT_ERROR");
+}
+
+/// The `--max-connections` refusal is the one packet this server ever sends
+/// before a handshake, so nothing has negotiated `CLIENT_PROTOCOL_41` yet,
+/// and the SQLSTATE marker every other error packet carries must not be
+/// there. This reads the raw bytes off the socket directly, independent of
+/// this file's own `parse_pre_handshake_error` and `parse_error` helpers, so
+/// the test does not just prove the two agree with each other — it proves
+/// the wire format itself.
+///
+/// A real client cares: mysql-connector-python mis-parses a `#`-marked
+/// packet at this point in the exchange, rendering `1040 (HY000):
+/// #08004Too many connections` instead of a clean message, because it
+/// (correctly) does not expect a SQLSTATE marker before any capability
+/// negotiation has happened.
+#[test]
+fn the_connection_cap_refusal_carries_no_sqlstate_marker_on_the_wire() {
+    let server = TestServer::start_with("limit-bytes", "s3cret", 1);
+    let _first = server.client();
+
+    let mut raw = TcpStream::connect(server.addr).expect("tcp connect");
+    raw.set_nodelay(true).ok();
+    let mut header = [0u8; 4];
+    raw.read_exact(&mut header).expect("packet header");
+    let length = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+    let mut payload = vec![0u8; length];
+    raw.read_exact(&mut payload).expect("packet payload");
+
+    assert_eq!(payload[0], 0xff, "an ERR packet");
+    assert_eq!(
+        u16::from_le_bytes([payload[1], payload[2]]),
+        1040,
+        "ER_CON_COUNT_ERROR"
+    );
+    // No `#` marker and no 5-byte SQLSTATE: the message starts immediately
+    // after the 2-byte error code.
+    assert_eq!(
+        &payload[3..],
+        b"Too many connections",
+        "a pre-handshake ERR packet must not carry the 4.1 SQLSTATE marker"
+    );
 }
 
 /// A statement larger than one packet has to be reassembled from its

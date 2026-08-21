@@ -263,14 +263,20 @@ fn serve_connection(
 }
 
 /// Send one error packet to a client that will not be served, and hang up.
+///
+/// This always runs before any handshake packet is sent, so nothing has
+/// negotiated `CLIENT_PROTOCOL_41` yet — the packet must not carry the
+/// SQLSTATE marker that capability implies, or a real client mis-parses it
+/// (checked against mysql-connector-python: a marked packet here comes back
+/// as the SQLSTATE's five bytes glued onto the front of the message rather
+/// than a clean error). See [`protocol::err_packet_before_handshake`].
 fn refuse(stream: TcpStream, error: &MysqlError) {
     let Ok(write_half) = stream.try_clone() else {
         return;
     };
     let mut framed = packet::Stream::new(stream, write_half);
-    let _ = framed.write_message(&protocol::err_packet(
+    let _ = framed.write_message(&protocol::err_packet_before_handshake(
         error.code,
-        error.sqlstate,
         &error.message,
     ));
     let _ = framed.flush();

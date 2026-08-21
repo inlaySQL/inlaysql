@@ -225,6 +225,40 @@ pub fn find_keyword(text: &str, keyword: &str) -> Option<usize> {
     None
 }
 
+/// The byte offset of the `)` matching the `(` at `open_at`, skipping quoted
+/// text and any nested parentheses in between — the span counterpart to
+/// [`find_keyword`]'s depth tracking, for a caller that needs to cut out a
+/// whole parenthesised subquery rather than find a clause keyword.
+///
+/// `text[open_at..]` must start with `(`; anything else returns `None`.
+pub fn matching_close_paren(text: &str, open_at: usize) -> Option<usize> {
+    if !text[open_at..].starts_with('(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    for (offset, c) in text[open_at..].char_indices() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => quote = Some(c),
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open_at + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn matches_at(haystack: &[char], at: usize, needle: &[char]) -> bool {
     if at + needle.len() > haystack.len() {
         return false;

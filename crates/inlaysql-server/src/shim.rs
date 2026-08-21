@@ -23,8 +23,8 @@ use crate::{mysqlddl, mysqlfunc};
 
 use crate::session::{Session, Warning, SERVER_VERSION};
 use crate::sqltext::{
-    find_keyword, first_word, like_matches, normalize, split_top_level, starts_with_keyword,
-    strip_keyword, unquote_identifier, unquote_string,
+    find_keyword, first_word, like_matches, matching_close_paren, normalize, split_top_level,
+    starts_with_keyword, strip_keyword, unquote_identifier, unquote_string,
 };
 
 /// What the connection should do with a statement.
@@ -112,6 +112,15 @@ enum SelectTarget {
     Engine,
     /// An `information_schema` view.
     InfoSchema,
+    /// `EXISTS (SELECT ... FROM information_schema...) [[AS] alias]` filling
+    /// the whole projection list — see [`existence_probe`].
+    InfoSchemaExists {
+        /// The subquery's own text, cut out of the statement (the span
+        /// between the parentheses, not including them).
+        subquery: (usize, usize),
+        /// The alias the client gave the boolean result, if any.
+        alias: Option<String>,
+    },
     /// A projection of session state, with no table behind it.
     Session {
         /// The projection list, already cut out of the statement.
@@ -128,6 +137,19 @@ fn select_target(sql: &str) -> SelectTarget {
     // `SELECT` is six bytes; the projection starts after it.
     const LIST_START: usize = 6;
     let from = find_keyword(sql, "from");
+
+    // An `EXISTS (subquery)` filling the whole projection has no top-level
+    // `FROM` of its own — the subquery's `FROM` sits at parenthesis depth 1,
+    // invisible to the search above by design (see `find_keyword`). Checked
+    // before the `mentions_session_state` fallback below on purpose: that
+    // heuristic has no notion of `EXISTS` and would otherwise sometimes
+    // accept this shape by accident, whenever the subquery's own `WHERE`
+    // happened to mention `schema()`/`database()`/`@@...`.
+    if from.is_none() {
+        if let Some(target) = existence_probe(sql, LIST_START) {
+            return target;
+        }
+    }
 
     if let Some(at) = from {
         let target = sql[at + 4..]
@@ -150,6 +172,96 @@ fn select_target(sql: &str) -> SelectTarget {
     }
     SelectTarget::Session {
         select_list: (LIST_START, list_end),
+    }
+}
+
+/// `EXISTS (SELECT ... FROM ...) [[AS] alias]` filling the whole projection
+/// list — the shape an existence check like Laravel's
+/// `hasTable()`/`hasColumn()` (and most MySQL-targeting ORMs' schema
+/// builders) compiles to. `select_list_start` is where the projection begins
+/// (`LIST_START` in [`select_target`]; a parameter here only so this stays
+/// testable on its own).
+///
+/// Recognised narrowly, by exact shape, in keeping with this shim's rule of
+/// refusing anything it does not understand rather than guessing: trailing
+/// text after the closing `)` that is not a clean alias means this function
+/// simply does not match, and the statement falls through to the ordinary
+/// paths below exactly as it did before this function existed.
+///
+/// When the subquery targets `information_schema`, this shim answers it
+/// itself (`InfoSchemaExists`). Otherwise the whole original statement is
+/// handed to the engine unchanged (`Engine`) — a scalar `EXISTS (...)` over a
+/// real table is already something `inlaysql-core` understands (`README.md`,
+/// "Subqueries too"), and was never this shim's business; it only reached
+/// here because the same false positive above can misfire on a real table's
+/// subquery too, whenever that subquery's `WHERE` mentions a session-state
+/// marker.
+fn existence_probe(sql: &str, select_list_start: usize) -> Option<SelectTarget> {
+    if sql.len() < select_list_start {
+        return None;
+    }
+    let rest = strip_keyword(&sql[select_list_start..], "EXISTS")?;
+    let open_at = sql.len() - rest.len();
+    if !rest.starts_with('(') {
+        return None;
+    }
+    let close_at = matching_close_paren(sql, open_at)?;
+
+    let trailer = sql[close_at + 1..].trim();
+    let alias = if trailer.is_empty() {
+        None
+    } else {
+        let named = strip_keyword(trailer, "AS").unwrap_or(trailer);
+        let alias_like = !named.is_empty()
+            && named
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '$' || c == '`' || c == '"');
+        if !alias_like {
+            // Not a clean alias — do not guess what this shape means.
+            return None;
+        }
+        Some(unquote_identifier(named))
+    };
+
+    let subquery = &sql[open_at + 1..close_at];
+    let sub_from = find_keyword(subquery, "from")?;
+    let sub_target = subquery[sub_from + 4..]
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if sub_target.contains("information_schema") {
+        Some(SelectTarget::InfoSchemaExists {
+            subquery: (open_at + 1, close_at),
+            alias,
+        })
+    } else {
+        Some(SelectTarget::Engine)
+    }
+}
+
+/// Answer `EXISTS (subquery)` by running `subquery` through the
+/// `information_schema` evaluator and reporting whether it returned any
+/// rows, the way MySQL's own `EXISTS` does. A refusal from the subquery
+/// itself (an unsupported clause, an unknown relation, ...) propagates
+/// unchanged — an honest error either way.
+fn existence_result(
+    subquery: &str,
+    alias: Option<&str>,
+    params: &[Value],
+    catalog: &Catalog,
+    session: &Session,
+) -> Intercepted {
+    match crate::infoschema::query(subquery, params, catalog, session) {
+        Intercepted::Rows(result) => {
+            let exists = !result.rows.is_empty();
+            rows(
+                &[alias.unwrap_or("EXISTS")],
+                vec![vec![Value::Integer(exists as i64)]],
+            )
+        }
+        other => other,
     }
 }
 
@@ -1066,6 +1178,10 @@ fn handle_select(sql: &str, params: &[Value], catalog: &Catalog, session: &Sessi
     let select_list = match select_target(sql) {
         SelectTarget::Engine => return handle_engine_statement(sql, catalog),
         SelectTarget::InfoSchema => return crate::infoschema::query(sql, params, catalog, session),
+        SelectTarget::InfoSchemaExists {
+            subquery: (start, end),
+            alias,
+        } => return existence_result(&sql[start..end], alias.as_deref(), params, catalog, session),
         SelectTarget::Session {
             select_list: (start, end),
         } => &sql[start..end],
@@ -1962,5 +2078,91 @@ mod tests {
             Intercepted::Failed(error) => assert_eq!(error.code, 1044),
             other => panic!("{other:?}"),
         }
+    }
+
+    // ------------------------------------------------- EXISTS(information_schema)
+
+    /// The exact statement `Illuminate\Database\Schema\Builder::hasTable()`
+    /// sends — verbatim from a real Laravel 11 migration run against this
+    /// server, which is how this was found: it reached `session_expression`
+    /// (not `infoschema::query`) and failed there, because the subquery's own
+    /// `schema()` call made `mentions_session_state` true for the *outer*
+    /// statement even though the outer statement has no top-level `FROM` for
+    /// the ordinary dispatch to see. `docs` exists in `catalog()`, `nope`
+    /// does not — both directions are asserted so a fix that always returns
+    /// `true` would be caught.
+    #[test]
+    fn exists_wrapping_an_information_schema_subquery_answers_has_table() {
+        let rows = result(
+            "select exists (select 1 from information_schema.tables where \
+             table_schema = schema() and table_name = 'docs' and table_type \
+             in ('BASE TABLE', 'SYSTEM VERSIONED')) as `exists`",
+        );
+        assert_eq!(rows.columns, vec!["exists"]);
+        assert_eq!(column(&rows, "exists"), vec!["1"]);
+
+        let rows = result(
+            "select exists (select 1 from information_schema.tables where \
+             table_schema = schema() and table_name = 'nope' and table_type \
+             in ('BASE TABLE', 'SYSTEM VERSIONED')) as `exists`",
+        );
+        assert_eq!(column(&rows, "exists"), vec!["0"]);
+    }
+
+    /// The same idiom without `EXISTS` — `SELECT 1 FROM information_schema...`
+    /// — which some ORMs use directly as an existence probe. `1` is a
+    /// constant projected once per matching row, not a column reference;
+    /// before this was recognised the shim tried to resolve `"1"` as a column
+    /// name against `TABLES_COLUMNS` and refused with error 1054.
+    #[test]
+    fn a_bare_literal_projects_once_per_row_in_an_information_schema_query() {
+        let rows = result("select 1 from information_schema.tables where table_name = 'docs'");
+        assert_eq!(column(&rows, "1"), vec!["1"]);
+    }
+
+    /// `EXISTS (subquery)` over a *real* table must still reach the engine,
+    /// unaffected by the `information_schema` special case above — the same
+    /// dispatch bug this shim carried would have misrouted this one too,
+    /// since its `WHERE` also mentions `schema()`.
+    #[test]
+    fn exists_over_a_real_table_is_not_claimed_by_the_shim() {
+        assert!(!handles(
+            "select exists (select 1 from docs where body = schema()) as `exists`"
+        ));
+    }
+
+    /// An alias-free `EXISTS (...)` still gets a sane column name.
+    #[test]
+    fn exists_probe_defaults_its_column_name_when_unaliased() {
+        let rows = result(
+            "select exists (select 1 from information_schema.tables where \
+             table_name = 'docs')",
+        );
+        assert_eq!(rows.columns, vec!["EXISTS"]);
+    }
+
+    /// A trailer after the closing `)` that is not a clean alias (here,
+    /// arithmetic on the boolean) means `existence_probe` does not recognise
+    /// the shape at all — per this shim's rule of refusing to guess, it must
+    /// not silently drop the `+ 1` and answer as if it were not there.
+    /// `select_target` is exercised directly because the honest outcome from
+    /// here on (the whole statement passed to the real engine, which this
+    /// unit test harness does not run) is `PassThrough`, not a value this
+    /// test could otherwise distinguish from "answered wrong".
+    #[test]
+    fn exists_probe_refuses_a_dirty_trailer_rather_than_guessing() {
+        let clean = "select exists (select 1 from information_schema.tables \
+                      where table_name = 'docs') as `exists`";
+        assert!(matches!(
+            select_target(clean),
+            SelectTarget::InfoSchemaExists { .. }
+        ));
+
+        let dirty = "select exists (select 1 from information_schema.tables \
+                      where table_name = 'docs') + 1";
+        assert!(!matches!(
+            select_target(dirty),
+            SelectTarget::InfoSchemaExists { .. }
+        ));
     }
 }

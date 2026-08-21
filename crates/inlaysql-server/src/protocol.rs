@@ -413,6 +413,32 @@ pub fn err_packet(code: u16, sqlstate: &str, message: &str) -> Vec<u8> {
     out
 }
 
+/// An ERR packet sent **before** any handshake has been exchanged — the only
+/// way this server ever refuses a connection outright, at `--max-connections`
+/// or when the database file itself cannot be opened.
+///
+/// The SQLSTATE marker in [`err_packet`] is a `CLIENT_PROTOCOL_41` feature
+/// (see that capability's doc comment above): the client only asks for it in
+/// its handshake *response*, and this packet is sent before that response
+/// ever arrives, so nothing has negotiated the marker's presence yet. Real
+/// MySQL's own pre-handshake refusal (`ER_CON_COUNT_ERROR`) is the old-style
+/// packet this function writes; a `#`-marked one here reads as protocol
+/// version confusion to a real client rather than as a clean error — checked
+/// against mysql-connector-python, which mis-parses a `#`-marked packet at
+/// this point in the exchange as `"1040 (HY000): #08004Too many
+/// connections"` instead of the clean `"Too many connections"` this format
+/// gives it.
+pub fn err_packet_before_handshake(code: u16, message: &str) -> Vec<u8> {
+    let mut out = vec![0xff];
+    out.extend_from_slice(&code.to_le_bytes());
+    out.extend(
+        message
+            .bytes()
+            .map(|b| if b == b'\n' || b == b'\r' { b' ' } else { b }),
+    );
+    out
+}
+
 /// The initial handshake the server sends before anything else.
 ///
 /// Advertises `caching_sha2_password` — MySQL 8+'s own default — as the
