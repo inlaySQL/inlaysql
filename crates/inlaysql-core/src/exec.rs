@@ -346,6 +346,24 @@ impl<'a> JoinInner<'a> {
         }
     }
 
+    /// Take ownership of one candidate, cloning only when the row has to
+    /// survive to be paired again.
+    ///
+    /// A materialised side (and a probe's table-scan fallback) is replayed
+    /// once per outer row, so this clones, exactly as reading through
+    /// [`JoinInner::rows`] and cloning always has. A probe's matched rows are
+    /// rebuilt fresh by [`JoinInner::prepare`] for every outer row and never
+    /// read again after this outer row's pairing loop moves past them — they
+    /// were already decoded once, by `IndexProbe::fetch`, so cloning them a
+    /// second time into the pairing buffer was pure waste. This takes instead:
+    /// one decode per row, not one decode plus one clone.
+    fn take_row(&mut self, index: usize) -> Vec<Value> {
+        match self {
+            JoinInner::Materialised { rows, .. } => rows[index].clone(),
+            JoinInner::Probe(probe) => probe.take_row(index),
+        }
+    }
+
     /// How many columns an unmatched `LEFT JOIN` row is padded with.
     fn width(&self) -> usize {
         match self {
@@ -540,6 +558,21 @@ impl<'a> IndexProbe<'a> {
             _ => &self.matched,
         }
     }
+
+    /// Take ownership of one candidate at `index`.
+    ///
+    /// The fallback table scan is cached and replayed for every outer row
+    /// that reaches it, so that clones, same as [`IndexProbe::rows`] always
+    /// did. `self.matched` is rebuilt by [`IndexProbe::prepare`] for every
+    /// outer row and each entry is read exactly once — by the pairing loop
+    /// that calls this — so taking it is sound: nothing later in this outer
+    /// row's iteration, or the next one, reads `self.matched[index]` again.
+    fn take_row(&mut self, index: usize) -> Vec<Value> {
+        match (self.scanning, &mut self.fallback) {
+            (true, Some(rows)) => rows[index].clone(),
+            _ => core::mem::take(&mut self.matched[index]),
+        }
+    }
 }
 
 /// The row id a key names, when it names one.
@@ -663,15 +696,18 @@ impl Iterator for NestedLoopJoin<'_> {
                 }
             }
 
-            let candidates = self.inner.rows();
+            let count = self.inner.rows().len();
             let outer = self.current.as_mut()?;
-            while outer.next < candidates.len() {
-                let inner = &candidates[outer.next];
+            while outer.next < count {
+                let index = outer.next;
                 outer.next += 1;
                 // Truncate rather than reallocate: the outer half is already
-                // there and only the inner half changes per pair.
+                // there and only the inner half changes per pair. The inner
+                // half is taken, not cloned — see `JoinInner::take_row` for
+                // why that is sound here.
                 outer.joined.truncate(outer.values.len());
-                outer.joined.extend(inner.iter().cloned());
+                let inner = self.inner.take_row(index);
+                outer.joined.extend(inner);
                 let keep = match self.on {
                     Some(on) => match eval::evaluate(on, &outer.joined, Computed::NONE, self.env) {
                         Ok(value) => eval::is_truthy(&value),
