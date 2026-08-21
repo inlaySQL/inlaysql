@@ -239,13 +239,16 @@ engines. "Comparable" is not "hardware-durable".
 
 ## What is not measured here
 
-- **No server-to-server numbers.** Everything InlaySQL wins on reads above it
-  wins partly by being in-process. The harness to benchmark `inlaysql serve
-  --mysql` against MySQL over the same wire, at the same client, now exists
-  (AHL-489, `bench/external/server_driver.py`, "Server-to-server" in
-  `bench/README.md`) and was smoke-tested, not measured — the number that
-  would back a public claim is a `./bench/compare.sh` run on a quiet machine,
-  still to be done.
+- **No server-to-server numbers on a quiet machine.** The server-to-server
+  table above (AHL-495) is the first such run this project has had, and it was
+  measured under the same load average of 5.4 as everything else on this page.
+  It is enough to retire the older "we win reads only by being in-process"
+  caveat — those rows pay a socket round trip on both sides — but a repeat on
+  an idle machine is still what a stronger claim would need.
+- **No server-to-server PostgreSQL row.** `inlaysql serve` speaks the MySQL
+  wire protocol and nothing else, so there is no like-for-like transport to
+  measure PostgreSQL over; `bench/README.md` says so under
+  "Server-to-server".
 - **No sustained or multi-core saturation workload.** Everything here is a
   latency-shaped micro-benchmark on one machine.
 - **Cold-cache reads.** The point-read rows are warm; an application that

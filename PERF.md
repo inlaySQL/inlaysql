@@ -51,9 +51,15 @@ Two things follow, and the second is the uncomfortable one.
 The virtualised fsync is worth about **2x**, not the ~14x the original
 cross-check implied — so most of the apparent 7x gap was real after all, not
 measurement artifact. And **with the asymmetry removed, MySQL and PostgreSQL
-still write 2–2.4x faster than we do.** That is a genuine loss, not an artifact,
-and it is the one place where this project's ambition to beat both engines is
-currently not met.
+still write 2–2.4x faster than we do.** That is a genuine loss, not an
+artifact.
+
+**Group commit closed most of it** (AHL-461/AHL-468, item 7 of section 5). The
+current published run has InlaySQL containerised at 723.1 durable writes/s
+against PostgreSQL's 730.9 — level — and MySQL's 780.7, **1.08x** rather than
+2–2.4x. The paragraph above is kept because it is the reasoning that promoted
+group commit, and because the sequential single-connection shape is still the
+one place the ambition to beat both engines is not met.
 
 The likely cause is that every InlaySQL commit pays its own `fsync` while both
 servers batch commits from concurrent clients into shared flushes. **Group
@@ -118,8 +124,10 @@ Raising the suite's default lookup count so the published number looks better
 would be exactly the kind of methodology change this file exists to prevent.
 Report both, and say which is which.
 
-**Against pgvector on vector-only search** we currently lose ~4x (0.17 ms vs
-0.73 ms) and that row predates a tuning pass, so it understates us. Section 4.
+**Against pgvector on vector-only search** this paragraph recorded a ~4x loss
+(0.17 ms vs 0.73 ms) until the tuning pass and the AHL-495 regeneration
+reversed it: 78 µs here against 159 µs there, close rather than decisive
+because their figure includes a socket round trip. Section 4.
 
 ---
 
@@ -217,9 +225,11 @@ attempted yet:
 ## The join and range profile (AHL-472 step 1, 2026-08-19)
 
 `BENCHMARK.md` publishes two losses to SQLite that the point-read table above
-does not explain: a full join is 7.6–11.4x slower and a 50-row indexed range
-2.3–3.7x, while a *single* indexed point probe wins. So the cost is per row,
-not per query, and the `LIMIT` shapes narrowing to 2.3–3.8x agree.
+does not explain: a full join was 7.6–11.4x slower and a 50-row indexed range
+2.3–3.7x when this was profiled (5.56–10.71x and 2.05–2.82x in the current
+run, after AHL-478 and AHL-479), while a *single* indexed point probe wins. So
+the cost is per row, not per query, and the `LIMIT` shapes narrowing — 2.3–3.8x
+then, 1.86–3.56x now — agree.
 
 Profiled with `sample(1)` over a 30 s window covering the query phase of
 `inlaysql-bench --suite joins --rows 20000 --queries 100 --limit 10`, 20,532
@@ -367,8 +377,10 @@ than call count, or the measurement is noisy. The *mechanism* is solid and
 directly measured; the magnitude needs a quiet machine before it goes into
 `BENCHMARK.md`.
 
-**What stays structural.** MySQL is 2.7x ahead on this shape and this change
-does not close it. Every InlaySQL WAL record embeds a full `page_size` copy of
+**What stays structural.** MySQL was 2.7x ahead on this shape when this was
+written and is 1.08x ahead containerised in the current run (1.43x server to
+server at one connection); this change does not close what remains. Every
+InlaySQL WAL record embeds a full `page_size` copy of
 each dirty page — that is what makes a record self-contained for recovery —
 where InnoDB's redo log carries small physiological diffs. Per-commit bytes
 are therefore structurally larger here, and that is a page-format question, not
@@ -462,14 +474,14 @@ shared buffer without the bounds-checked indirection that costs the 20.5 ns →
 22.6 ns per probe.
 
 So the cold path and the index-key path want opposite representations. Landing
-this would trade a published claim — 1.66M point reads, 1.43x SQLite in WAL
+this would trade a published claim — 1.36M point reads, 1.33x SQLite in WAL
 mode — and a 41% cut to small joins, in exchange for a cold-path gain on a
 workload nobody has reported as a problem. The branch
 (`agent/phase2-page-decode-views`) is kept for whoever revisits it, most
 plausibly if the WASM or edge story ever makes short-lived processes the
 priority, since those are exactly the cold-start case.
 
-### The structural fix: stop allocating per row### The structural fix: stop allocating per row
+### The structural fix: stop allocating per row
 
 The deepest issue is that `Value` owns its data — `Text(String)`, `Blob(Vec<u8>)`,
 `Vector(Vec<f32>)`. Every row that crosses the executor is therefore a set of
@@ -539,12 +551,13 @@ doing one sync per commit where the journal does several. There is no
 algorithmic win left; the remaining lever is not syncing more often than
 required.
 
-**Concurrent writers** currently reach ~1.45x single-writer throughput at eight
-writers, with 0% aborts on disjoint rows (`rebase_pending` handles those). The
-ceiling is that every writer still pays its own `fsync`. **Group commit** —
-leader/follower batching, where followers whose region synced inside the
-leader's window skip their own sync — is the change that lifts it, and is
-Phase 2 item 5.
+**Concurrent writers** read ~1.45x single-writer throughput at eight writers
+when this paragraph was written, with 0% aborts on disjoint rows
+(`rebase_pending` handles those). **Group commit** (Phase 2 item 5, AHL-461)
+and the commit-gate rework behind it (AHL-468) lifted that to **2.8x** — 692
+commits/s at eight writers against 246 at one, still 0% aborted. The two-writer
+case stays flat (253 vs 246) because the follower's write usually lands after
+the leader captured its flush target, and that is the next thing on this path.
 
 **Scans, joins and aggregates are the untested embarrassment**, and AHL-462 and
 AHL-464 made them less embarrassing without making them measured. Joins are
@@ -559,10 +572,11 @@ truncating the answer: `SELECT ... LIMIT 5` over a 2,000-row table reads 32
 rows, and a probed join under a `LIMIT 2` fetches two inner rows out of 2,000 —
 both counted deterministically in `crates/inlaysql-core/tests/streaming.rs`.
 
-**There is still no join or scan row in any benchmark**, which is the only
-reason none of this shows up as a number either way. Adding those rows is
-Phase 2 item 7, and it is now worth doing: the access path the row would
-measure exists. **A hash join still does not**, so a join workload whose `ON`
+**The join and scan rows exist now** (Phase 2 item 7, AHL-470: `SUITE=joins`
+and `SUITE=indexed`), and they publish losses — 5.56x on a full PK inner join
+and 10.71x on the secondary-index shape, against journal-mode SQLite. That is
+what the profile in "The join and range profile" above is chasing. **A hash
+join still does not exist**, so a join workload whose `ON`
 the rule declines — anything but an equality on a key or an indexed column —
 is still O(n×m) and would still lose to MySQL or PostgreSQL, and deserve to.
 
@@ -591,12 +605,17 @@ an entry range it has already read.
 
 ## 4. Retrieval
 
-Already winning where it is measured: ~15.8x over `sqlite-vec` at 100k vectors,
-~10x over both DuckDB and pgvector on hybrid, because hybrid is one statement
-here and two queries plus client-side fusion there.
+Already winning where it is measured: ~15.8x over `sqlite-vec` at 100k vectors
+(9.52x on the 2,000-vector suite `BENCHMARK.md` publishes), and 14–17x over
+both DuckDB and pgvector on hybrid, because hybrid is one statement here and
+two queries plus client-side fusion there.
 
-The open loss is **pgvector on vector-only search, ~4x**. Avenues, in order of
-expected value:
+**The pgvector vector-only loss is closed.** This section read "the open loss
+is pgvector on vector-only search, ~4x" until the AHL-495 regeneration: the
+current published pair is 78 µs here against pgvector's 159 µs, and the honest
+reading is *close, not a rout* — their number includes a socket round trip and
+ours does not. The avenues below are still the ones that would widen it, in
+order of expected value:
 1. **Quantised distance kernels.** `VECTOR(n, INT8)` already shrinks storage 4x;
    computing distances *in* int8 with SIMD, rather than converting to `f32`
    first, makes the memory-bandwidth win a compute win too.
@@ -638,18 +657,22 @@ expected value:
 4. ~~**Secondary B-tree indexes**~~ — **done (AHL-423)**, and it was the
    biggest *application-visible* win: `WHERE email = ?` is a range probe rather
    than a scan that decodes every row, which is what an ORM emits all day. The
-   number is in `docs/architecture.md`; it is not repeated here because there is still no
-   scalar-index row in `bench/run.sh` (Phase 2 item 7). Merging it with AHL-462
+   number is in `docs/architecture.md`; `bench/run.sh` grew the row that
+   measures it with AHL-470 (`SUITE=indexed`), and `BENCHMARK.md` publishes
+   both halves of it — the point probe wins, the range scan loses. Merging it with AHL-462
    put the probe *inside* the pipeline, so an indexed `LIMIT` fetches only the
    rows it returns.
 5. Cheaper key comparison (the ~21% `memcmp`) and a cheaper cache hit (the ~9%
    `PageCache::get`) — the two the AHL-422 profile newly justified.
 6. Index nested-loop join, then hash join.
-7. **Group commit.** Promoted on evidence: with the container fsync asymmetry
-   removed, MySQL and PostgreSQL still write 2–2.4x faster than we do
-   (section 1), and the likely reason is that they batch concurrent commits
-   into shared flushes where every InlaySQL commit pays its own `fsync`. This
-   is the only measured loss against those two engines.
+7. ~~**Group commit.**~~ — **done (AHL-461, with the commit-gate rework of
+   AHL-468 that gave it something to batch)**. Promoted on the evidence that
+   with the container fsync asymmetry removed, MySQL and PostgreSQL wrote
+   2–2.4x faster than we did (section 1). It paid where predicted: eight
+   concurrent writers now reach 2.8x one writer rather than 1.45x, PostgreSQL
+   is level (723.1 vs 730.9 ops/s containerised) and MySQL is 1.08x ahead
+   rather than 2–2.4x. What group commit cannot touch is the single-connection
+   shape, where there is nothing to batch by construction.
 8. ~~Projection pushdown, then the streaming executor~~ — **done (AHL-462)**,
    and it moved the *scan* path rather than the point-read path. Point read is
    inside the noise band (`LOOKUPS=50000 SUITE=points ./bench/run.sh`, two runs

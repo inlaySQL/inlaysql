@@ -209,13 +209,19 @@ splices a nested `json_object()`/`json_extract()`/`->` call as raw JSON
 instead of stringifying it. `json_each`/`json_tree` (table-valued — no
 mechanism for a function that returns rows in `FROM`) and `json_patch` (not
 implemented) are pinned as refusals in `unsupported.test` instead, not
-included in this file's count. The number to watch is the subset growing,
-not the percentage staying at 100.
+included in this file's count. Since AHL-494 it covers
+`window_functions.test`: the ranking family (`row_number`, `rank`,
+`dense_rank`, `ntile`), `lag`/`lead`, `first_value`/`last_value`/`nth_value`,
+the aggregate family `OVER (...)`, `ROWS` frames and SQLite's implicit default
+frame, named windows and `FILTER (WHERE ...)` — with `percent_rank()`,
+`cume_dist()` and explicit `RANGE`/`GROUPS` frames pinned as refusals in
+`unsupported.test`. The number to watch is the subset growing, not the
+percentage staying at 100.
 
 Every expected value in `scalar_functions.test`, `datetime.test`,
 `distinct.test`, `order_by_paging.test`, `constraints.test`, `ddl.test`,
 `write_statements.test`, `returning.test`, `affinity.test`, `collation.test`,
-`set_operations.test`, `ctes.test`, `json.test` and
+`set_operations.test`, `ctes.test`, `json.test`, `window_functions.test`,
 `index_join.test` and `subqueries.test` were produced by
 running the same SQL through SQLite, not by recording what InlaySQL printed. An
 expectation copied from the engine under test passes whatever that engine
@@ -802,33 +808,35 @@ plans checked rather than assumed — and [`BENCHMARK.md`](BENCHMARK.md)
 publishes the results we lose as well as the ones we win, regenerated on a
 quiet machine (AHL-452) and kept in sync with the harness as suites are
 added; the numbers below are a summary of that file, not a second source of
-truth, and it is the one to trust if the two ever disagree. Today: 2.6x
-faster on durable point writes than journal-mode SQLite, and 5.4x faster on
-point reads (1.43x faster than WAL-mode SQLite) since the page cache — but
+truth, and it is the one to trust if the two ever disagree. Today: 2.63x
+faster on durable point writes than journal-mode SQLite, and 4.97x faster on
+point reads (1.33x faster than WAL-mode SQLite) since the page cache — but
 that is the *warm* number, and a cold handle is much weaker because our miss
 path is dearer than SQLite's. A B-tree secondary index beats our own full
-scan ~1,500x and beats journal-mode SQLite's indexed point reads 2.2x, but
-sits 1.34x behind WAL-mode SQLite on the same point lookup, and **range scans
-lose outright** (2.3x behind journal-mode, 3.7x behind WAL). Still losing:
-**joins**, 2.3x to 11.4x slower than journal-mode SQLite depending on shape —
-the top open performance target, published because it is true, even though
+scan ~851x and beats journal-mode SQLite's indexed point reads 1.66x, but
+sits 1.54x behind WAL-mode SQLite on the same point lookup, and **range scans
+lose outright** (2.05x behind journal-mode, 2.82x behind WAL). Still losing:
+**joins**, 1.86x to 10.71x slower than journal-mode SQLite depending on shape
+— the top open performance target, published because it is true, even though
 the index nested-loop join itself (AHL-464) beat this engine's own previous
-executor 6.6–100x. Vector search beats `sqlite-vec` 6.8–9.4x depending on
+executor 6.6–100x. Vector search beats `sqlite-vec` 6.88–9.52x depending on
 corpus shape; against pgvector it is close rather than a rout — pgvector's
-0.17 ms *includes* a socket round trip and is within touching distance of our
-0.073 ms in-process. **Concurrent writers now scale rather than merely not
-losing**: 8 writers on one file reach 832 commits/s against SQLite's flat 92
-(**9.0x**, 0.0% aborted) — reworking the commit gate so it stops
+159 µs *includes* a socket round trip and is within touching distance of our
+78 µs in-process. **Concurrent writers now scale rather than merely not
+losing**: 8 writers on one file reach 692 commits/s against SQLite's flat 93
+(**7.4x**, 0.0% aborted) — reworking the commit gate so it stops
 re-deriving committed state on every commit (AHL-468) freed group commit
 (AHL-461) to actually batch fsyncs, where before it had nothing to batch.
 Against MySQL and PostgreSQL, containerised so all three pay the same
-virtualised `fsync`: reads win by ~62x MySQL and ~33x PostgreSQL (in-process
+virtualised `fsync`: reads win by ~55x MySQL and ~11.3x PostgreSQL (in-process
 against a socket round trip, an asymmetry stated rather than hidden);
-sequential durable writes now beat PostgreSQL (529 vs 475 ops/s) but MySQL is
-still 2.7x faster, single-connection so group commit cannot fire by design.
-On the other side: hybrid retrieval roughly 14–17x faster than either
-DuckDB or pgvector, because it is one statement rather than two queries and a
-fusion step in the client.
+sequential durable writes now match PostgreSQL (723.1 vs 730.9 ops/s) and
+MySQL is 1.08x faster, single-connection so group commit cannot fire by
+design. Server to server over the MySQL wire (AHL-495), where both sides pay a
+socket round trip, we win reads 1.52x at one connection and 1.10x at eight,
+and lose writes 1.43x and 4.76x respectively. On the other side: hybrid
+retrieval roughly 14–17x faster than either DuckDB or pgvector, because it is
+one statement rather than two queries and a fusion step in the client.
 
 Both scripts run nightly in [`trust.yml`](.github/workflows/trust.yml), which
 uploads every result file as a `benchmark-results` artifact.

@@ -305,7 +305,7 @@
       <em>vector + BM25 fused in the engine</em>
     </div>
     <div class="figure">
-      <b>1008</b>
+      <b>1145</b>
       <span>SQL Logic Tests passing</span>
       <em>100%, against SQLite's own corpus</em>
     </div>
@@ -362,8 +362,10 @@
         <h3>Your ORM already speaks it</h3>
         <p>
           <code>inlaysql serve --mysql</code> talks the MySQL wire protocol.
-          A stock Laravel migration and Eloquent CRUD — including
-          <code>upsert()</code>, eager loads and paginated reads — run over it.
+          The statements a Laravel migration and Eloquent CRUD emit — including
+          <code>upsert()</code>, eager loads and paginated reads — run over it,
+          asserted end to end from Laravel 11's own grammars. Nobody has yet
+          pointed a real <code>php artisan migrate</code> at it.
         </p>
       </div>
       <div class="card">
@@ -377,7 +379,7 @@
       <div class="card">
         <h3>Tested against SQLite itself</h3>
         <p>
-          1008 SQL Logic Tests at 100%, plus a differential fuzzer that runs
+          1145 SQL Logic Tests at 100%, plus a differential fuzzer that runs
           generated queries through both engines and compares the answers.
         </p>
       </div>

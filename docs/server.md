@@ -10,11 +10,15 @@ mysqli, JDBC, `mysql2` — can talk to this instead.
 
 **Read [What does not work yet](#what-does-not-work-yet) before you plan
 anything around it.** The protocol is complete enough for real clients; the SQL
-surface underneath it is not. **A stock ORM's migrations still do not
-complete.** That section says exactly where they stop, and
-[Divergences](#divergences) says where this server accepts a statement and
-means something slightly different by it. Nothing here claims Laravel
-compatibility.
+surface underneath it is not. **A Laravel-shaped migration sequence now runs
+end to end over the wire** — `a_realistic_laravel_migration_sequence_runs_end_to_end`
+in `crates/inlaysql-server/tests/wire.rs` — but that sequence is SQL written
+by hand from Laravel 11's own grammars, not the output of a real
+`php artisan migrate` against a stock skeleton, which nothing here has run.
+So this is evidence about statements, not a compatibility claim about the
+framework. [What does not work yet](#what-does-not-work-yet) says which
+statements still stop, and [Divergences](#divergences) says where this server
+accepts a statement and means something slightly different by it.
 
 ---
 

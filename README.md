@@ -222,16 +222,21 @@ dialect (`inlaysql-core` gains nothing from this crate, which is what the
 `determinism` CI job polices); a dropped clause is never silent — it comes
 back as a MySQL `1618` warning naming it, visible in `SHOW WARNINGS`.
 
-It is real enough to run a stock framework now: a Laravel migration —
-`bigint unsigned auto_increment`, `timestamp`, `engine=InnoDB default
-charset=utf8mb4`, a fluent `->unique()`/`->index()`/`->foreign()`,
-`TRUNCATE`, `RENAME TABLE` — completes over the wire, and so does ordinary
-Eloquent CRUD after it: create, find, a model save with a qualified
-`updated_at`, a paginated `whereIn`/`JOIN`/`whereHas` query, and `upsert()`'s
-own `ON DUPLICATE KEY UPDATE`. Window functions (`ROW_NUMBER() OVER (...)`)
-are the current wall — nothing in the dialect has them yet — and the
-collation mapping only folds ASCII case: `WHERE name = 'ADA'` matches a
-stored `'ada'` under a `*_ci` collation the way MySQL does, but not an accent
+The statements a stock framework sends now complete over the wire: a Laravel
+migration — `bigint unsigned auto_increment`, `timestamp`, `engine=InnoDB
+default charset=utf8mb4`, a fluent `->unique()`/`->index()`/`->foreign()`,
+`TRUNCATE`, `RENAME TABLE` — and ordinary Eloquent CRUD after it: create,
+find, a model save with a qualified `updated_at`, a paginated
+`whereIn`/`JOIN`/`whereHas` query, and `upsert()`'s own `ON DUPLICATE KEY
+UPDATE`. **Read that as a claim about statements, not about the framework:**
+the sequence in `a_realistic_laravel_migration_sequence_runs_end_to_end`
+(`crates/inlaysql-server/tests/wire.rs`) is SQL written by hand from Laravel
+11's own grammars, and nobody has pointed a real `php artisan migrate` at this
+server yet. Window functions (`ROW_NUMBER() OVER (...)`) were the wall until
+AHL-494 and now go through byte-for-byte, because MySQL 8 spells them the way
+SQLite does and the shim has no reason to touch them. The collation mapping
+still folds ASCII case only: `WHERE name = 'ADA'` matches a stored `'ada'`
+under a `*_ci` collation the way MySQL does, but not an accent
 (`'é' = 'e'`). It is plaintext, single-user and binds `127.0.0.1` by default.
 [`docs/server.md`](docs/server.md) has the full security posture, the
 function-by-function mapping and the complete divergence list, each checked
@@ -319,7 +324,7 @@ for a composite key — builds an ordinary ordered B-tree over one or more
 `INTEGER`/`REAL`/`TEXT` columns (AHL-423), living in the same copy-on-write
 tree as the rows, so it gets WAL, crash recovery and MVCC rebase for free. A
 top-level equality or range predicate on an indexed column becomes a range
-probe instead of a full scan — worth roughly 1,500x over the engine's own
+probe instead of a full scan — worth roughly 851x over the engine's own
 unindexed scan (`BENCHMARK.md`) — and `CREATE UNIQUE INDEX` enforces a
 uniqueness constraint at insert time. The same index also answers the inner
 side of a join: `FROM posts JOIN users ON posts.user_id = users.id` probes
@@ -390,6 +395,17 @@ correlated form of each. They are not decorrelated — a correlated subquery is
 re-evaluated per outer row — and one in an `UPDATE`, `DELETE` or
 `INSERT ... VALUES` is refused rather than half-run.
 
+Window functions too, since AHL-494: `OVER (PARTITION BY ... ORDER BY ...)`
+under SQLite's own grammar — `row_number`, `rank`, `dense_rank`, `ntile`,
+`lag`/`lead`, `first_value`/`last_value`/`nth_value`, the aggregate family
+(`sum`/`count`/`avg`/`min`/`max`/`group_concat`) `OVER (...)`, `ROWS` frames
+and SQLite's implicit default frame, named windows (`WINDOW w AS (...)`), and
+`FILTER (WHERE ...)` on an aggregate whether or not it is windowed.
+`percent_rank()`, `cume_dist()` and an explicit `RANGE`/`GROUPS` frame are
+refused by name rather than approximated with the `ROWS` frame this engine
+has. They reach the MySQL server unchanged, since MySQL 8 spells every one of
+them the same way — [`docs/server.md`](docs/server.md) has that argument.
+
 `UNION`/`INTERSECT`/`EXCEPT` and non-recursive `WITH`, since AHL-473. Every
 compound operator shares one precedence and chains left-associatively; the
 per-column comparison — for dedup and for the compound's own `ORDER BY` — is
@@ -402,8 +418,9 @@ pinned as such in `ctes.test`. `WITH RECURSIVE` is refused, named in the
 message.
 
 Not yet, and refused explicitly rather than silently ignored: `WITH
-RECURSIVE`, window functions (`ROW_NUMBER() OVER (...)`) and aggregate
-`FILTER`, `SAVEPOINT`, the partial-write conflict resolutions (`INSERT OR
+RECURSIVE`, `percent_rank()`/`cume_dist()` and explicit `RANGE`/`GROUPS`
+window frames (the rest of the window family landed with AHL-494, above),
+`SAVEPOINT`, the partial-write conflict resolutions (`INSERT OR
 ROLLBACK`/`OR FAIL`, `UPDATE OR REPLACE`/`OR IGNORE` — a statement here is
 already atomic, so they cannot mean what they say), `CREATE TABLE ... AS
 SELECT`, `TEMPORARY`, `WITHOUT ROWID`, `STRICT`, the `AUTOINCREMENT` keyword,
@@ -426,7 +443,7 @@ cargo run -p inlaysql --bin sqllogictest -- \
   crates/inlaysql/tests/sqllogictest/*.test          # print the pass rate
 ```
 
-Current pass rate over the subset: **1008/1008 (100%)** — covering `CREATE TABLE`,
+Current pass rate over the subset: **1145/1145 (100%)** — covering `CREATE TABLE`,
 `INSERT`, projection, `WHERE`, `DISTINCT`, `ORDER BY` (column, expression,
 alias, multi-key, `NULLS FIRST`/`LAST`), `LIMIT`/`OFFSET` (literal or bound),
 type coercion and affinity, `SELECT`-without-`FROM` scalar expressions,
@@ -444,10 +461,11 @@ SQLite's own rules, declared constraints (`DEFAULT`, `NOT NULL`, `UNIQUE`,
 `BEGIN`/`COMMIT`/`ROLLBACK`, every conflict clause (`INSERT OR IGNORE`/
 `REPLACE`, `ON CONFLICT DO NOTHING`/`DO UPDATE`) and `RETURNING`, subqueries
 in every read position (scalar, `IN (SELECT ...)`, `EXISTS`, derived tables,
-correlated and uncorrelated), and `UNION`/`INTERSECT`/`EXCEPT`/non-recursive
-`WITH`. The number is meant to grow (and be reported) as the dialect
-matures — it does not yet include the parts of the corpus that exercise
-`WITH RECURSIVE` or window functions, because the dialect does not have them.
+correlated and uncorrelated), `UNION`/`INTERSECT`/`EXCEPT`/non-recursive
+`WITH`, and the window functions of AHL-494 (`window_functions.test`). The
+number is meant to grow (and be reported) as the dialect matures — it does not
+yet include the parts of the corpus that exercise `WITH RECURSIVE`, because
+the dialect does not have it.
 
 One file in that subset asserts **refusals** rather than results, because the
 alternative was worse than a missing feature: `INSERT ... ON CONFLICT`,
@@ -561,11 +579,11 @@ harder target.
 | Durable write, one commit each | **239 ops/s**, 4.00 ms p50 | 91 ops/s (**2.63x**) | — |
 | Concurrent durable writers, 8 threads | **692 commits/s**, 0.0% aborted | 93 commits/s (**7.4x**) | — |
 
-A single indexed point probe wins — the index itself is worth roughly 1,500x
+A single indexed point probe wins — the index itself is worth roughly 851x
 over the engine's own unindexed scan. **Iterating rows is where we lose**: a
 50-row range scan and both join shapes above are slower than SQLite, and the
-`LIMIT 10` form of the same two joins narrows from 7.6–11.4x down to
-2.3–3.8x, which is what pins the cost as per-row rather than per-query. This
+`LIMIT 10` form of the same two joins narrows from 5.6–10.7x down to
+1.9–3.6x, which is what pins the cost as per-row rather than per-query. This
 is the top open performance target — [`PERF.md`](PERF.md) has the profile,
 and index selection stops at the narrow rule in
 [What this is not](#what-this-is-not).
@@ -584,12 +602,12 @@ handle warms up more slowly.
 
 Durable writes win because we pay one `fsync` per commit against the
 journal's several; batching the same workload into one commit per many rows
-reaches 32,586 ops/s at 21.8 µs (**135x**) — a bulk-load number, not the
+reaches 33,888 ops/s at 21.21 µs (**142x**) — a bulk-load number, not the
 transaction one above. Concurrent writers now scale where they used to
 flatten: the reservation gate used to hold ~100% of wall clock re-deriving
 committed state on every commit, so no two commits ever overlapped in the
 sync window; with the gate down to ~0.9 ms (AHL-468), group commit (AHL-461)
-batches most fsyncs and 8 writers do 3.4x the work of one instead of 1.45x.
+batches most fsyncs and 8 writers do 2.8x the work of one instead of 1.45x.
 
 ### Against `sqlite-vec`, DuckDB and pgvector
 
@@ -659,16 +677,36 @@ stated rather than hidden. **Writes: PostgreSQL is competitive** (730.9 vs
 time on one connection, so group commit cannot fire by design, and what is
 left is per-commit cost against InnoDB's own redo write.
 
+Every row above measures InlaySQL as a *library* against two servers, so the
+reads win partly by paying no socket round trip. **Server to server, over the
+wire, that advantage is smaller and still real** (AHL-495):
+[`inlaysql serve --mysql`](#speaking-mysql-over-the-wire) reached over a
+compose network by `mysql.connector`, against MySQL 8 on the same driver and
+the same transport:
+
+| Engine | Connections | write ops/s | read ops/s |
+| --- | --- | --- | --- |
+| InlaySQL, `serve --mysql` | 1 | 1,085.5 | **37,157.8** |
+| InlaySQL, `serve --mysql` | 8 | 1,391.2 | **19,874.0** |
+| MySQL 8 | 1 | **1,554.4** | 24,481.3 |
+| MySQL 8 | 8 | **6,630.4** | 18,028.8 |
+
+Reads win at one connection (1.52x) and still edge it at eight (1.10x);
+writes lose at one (0.70x) and badly at eight (4.76x), which is
+thread-per-connection against a worker pool. The finding that matters most is
+against ourselves: **our read throughput nearly halves from one connection to
+eight** where MySQL gives up 26%, because each connection gets its own handle
+and therefore its own page cache. `BENCHMARK.md` and `bench/README.md` have
+the methodology and the remaining asymmetries; PostgreSQL has no row because
+this server speaks only the MySQL wire protocol.
+
 What none of this proves: Docker Desktop's virtual disk was never
-independently verified to honour `fsync` as a barrier for any of the three
-engines, and there is still no **server-to-server** number —
-[`inlaysql serve --mysql`](#speaking-mysql-over-the-wire) exists, but
-benchmarking it against MySQL/PostgreSQL over the same wire, rather than
-InlaySQL as a library, is still open . Also
-not measured anywhere here: sustained or multi-core saturation, and
-cold-cache reads — the point-read rows throughout this section are warm, and
-an application that opens a handle, reads a handful of rows and exits sees
-something weaker, because our miss path is dearer than SQLite's.
+independently verified to honour `fsync` as a barrier for any of the engines
+measured in a container. Also not measured anywhere here: sustained or
+multi-core saturation, and cold-cache reads — the point-read rows throughout
+this section are warm, and an application that opens a handle, reads a handful
+of rows and exits sees something weaker, because our miss path is dearer than
+SQLite's.
 
 ## Next
 
@@ -685,10 +723,14 @@ below is a surprise to the project, it is the honest state of it:
    SQLite's" story the point read had, now showing up in a workload big
    enough to miss. [`PERF.md`](PERF.md) has the profile and the
    cache-budget arithmetic that settled it.
-2. **The sequential-commit gap to MySQL.** One write shape is still
-   behind — 1,434 vs 529 containerised ops/s, 2.7x. Group commit cannot fire
-   on a single connection, so what is left is per-commit cost against
-   InnoDB's own redo write.
+2. **The sequential-commit gap to MySQL**, and the server's per-connection
+   page cache. As a library the write gap is now 1.08x containerised (780.7
+   vs 723.1); over the wire it is 1.43x at one connection and 4.76x at eight.
+   Group commit cannot fire on a single connection, so what is left there is
+   per-commit cost against InnoDB's own redo write — but the read side is the
+   sharper item: eight connections warm eight page caches over the same pages,
+   which is why server-to-server reads fall from 37,158 to 19,874. A shared
+   read-only cache under several handles is the thing nothing has tried yet.
 3. **Wiring the free list into the public API.** The free list and page
    reuse landed inside the engine (AHL-481), including the versioned page
    cache and the DST sweep that reuse needs — but nothing reachable through
@@ -700,10 +742,10 @@ below is a surprise to the project, it is the honest state of it:
    [Scalar indexes and joins that use them](#scalar-indexes-and-joins-that-use-them).
    This is what the join losses in [Performance](#performance) are waiting
    on.
-5. **A server-to-server benchmark**, once the items above settle —
-   [`inlaysql serve --mysql`](#speaking-mysql-over-the-wire) against
-   MySQL/PostgreSQL over the same wire, the apples-to-apples this file does
-   not claim yet .
+5. **A server-to-server benchmark on a quiet machine.** The first one exists
+   now (AHL-495, in [Performance](#performance)), measured under the same load
+   as everything else on the page; a repeat on an idle machine is what a
+   stronger claim would rest on.
 6. **Multi-column and composite retrieval indexes.** `CREATE INDEX` for
    BM25/ANN is single-column only — the scalar B-tree index already supports
    composite keys.
@@ -718,9 +760,9 @@ below is a surprise to the project, it is the honest state of it:
    [`docs/sqlancer.md`](docs/sqlancer.md)).
 
 Full Postgres parity is deliberately not on this list — see the last point in
-[What this is not](#what-this-is-not). Neither are window functions and
-`WITH RECURSIVE`: nothing in the Laravel corpus that motivated Phase 1 needs
-them yet.
+[What this is not](#what-this-is-not). Neither is `WITH RECURSIVE`: nothing in
+the Laravel corpus that motivated Phase 1 needs it yet. Window functions were
+in this paragraph until AHL-494 implemented them.
 
 ## What this is not
 

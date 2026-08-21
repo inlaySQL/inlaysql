@@ -704,9 +704,10 @@ transport (a Unix socket, or a real network rather than a container bridge)
 the same reason. It is a genuine difference between the two designs, not a
 measurement artifact, and running InlaySQL inside a container alongside the
 servers does not touch it: it cannot be engineered away without giving
-InlaySQL a server to compare against instead of a library call — that
-server-to-server comparison is future work, once InlaySQL has a wire protocol
-of its own to reach over.
+InlaySQL a server to compare against instead of a library call — which is
+exactly what "Server-to-server" below now does, over `inlaysql serve --mysql`,
+so both sides pay a socket round trip and the asymmetry disappears from that
+table alone.
 
 Both drivers prepare their statements once, outside the timed loop, and bind
 per iteration (MySQL via the connector's binary-protocol prepared cursor,
@@ -847,15 +848,12 @@ reader to discover in a suspicious ratio:
 ### Numbers
 
 Not included here, for the same reason the OLTP section above withholds its
-own: a number only belongs in this file once it regenerates from
-`./bench/compare.sh` on a machine that is not otherwise under load. The
-harness itself — `inlaysql-server` building and answering the MySQL
-handshake, `server_driver.py` measuring both engines at every configured
-concurrency level, `report.py` printing the merged table — was verified
-end to end while other work was running on the development machine, which is
-exactly the condition that makes a timing from that run unpublishable. Run
-`./bench/compare.sh` yourself, on a quiet machine, for the first real
-server-to-server table.
+own: this file describes methodology, and `BENCHMARK.md` is where a
+regenerated number lives. The first server-to-server run (AHL-495) is
+published there — reads 1.52x MySQL at one connection and 1.10x at eight,
+writes 0.70x and 0.21x — measured under a load average of 5.4, which is
+stated on that page and is the reason a repeat on a quiet machine is still
+worth doing. Run `./bench/compare.sh` yourself to reproduce it.
 
 ## What these numbers are not
 
