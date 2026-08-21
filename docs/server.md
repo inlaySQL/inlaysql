@@ -10,14 +10,25 @@ mysqli, JDBC, `mysql2` — can talk to this instead.
 
 **Read [What does not work yet](#what-does-not-work-yet) before you plan
 anything around it.** The protocol is complete enough for real clients; the SQL
-surface underneath it is not. **A Laravel-shaped migration sequence now runs
-end to end over the wire** — `a_realistic_laravel_migration_sequence_runs_end_to_end`
-in `crates/inlaysql-server/tests/wire.rs` — but that sequence is SQL written
-by hand from Laravel 11's own grammars, not the output of a real
-`php artisan migrate` against a stock skeleton, which nothing here has run.
-So this is evidence about statements, not a compatibility claim about the
-framework. [What does not work yet](#what-does-not-work-yet) says which
-statements still stop, and [Divergences](#divergences) says where this server
+surface underneath it still has real gaps. **A stock Laravel 11 skeleton now
+runs for real**: `composer create-project laravel/laravel`, `.env` pointed at
+`inlaysql serve --mysql`, `php artisan migrate` completes the default
+`users`/`cache`/`jobs` migrations plus a `posts` table with a foreign key, and
+ordinary Eloquent traffic afterward — `create`/`find`/`update`/`delete`,
+`whereIn`, a raw `JOIN`, `whereHas`, `withCount`, eager loading, `paginate()`
+and `upsert()` — all work. This found two real bugs in the shim, both fixed:
+`EXISTS (SELECT ... FROM information_schema...)` (the exact shape
+`hasTable()`/`hasColumn()` compile to) was misrouted by a heuristic the
+subquery's own `schema()` call fooled, and a bare literal in an
+`information_schema` projection (`SELECT 1 FROM ...`, the other existence-check
+idiom) was rejected as an unresolvable column. It also confirmed a documented,
+deliberate limitation is real in practice: Laravel's `->foreignId()->constrained()`
+compiles to a standalone `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY`,
+which this server cannot record after the fact — see
+["ADD CONSTRAINT ... FOREIGN KEY" below](#mysql-only-ddl-is-translated-not-invented)
+for why, and declare the foreign key inside the initial `Schema::create()`
+if you need it recorded. [What does not work yet](#what-does-not-work-yet)
+says which statements still stop, and [Divergences](#divergences) says where this server
 accepts a statement and means something slightly different by it.
 
 ---
@@ -962,6 +973,55 @@ Laravel migration and Eloquent statements through the shim and the engine, and
 corrected again here (that corpus is not committed — see "Interop, checked by
 hand" below — so this correction is targeted verification against specific
 statements, cited by file, rather than a fresh full run of it).
+
+### Text-protocol backslash escapes are not honoured (open, not yet fixed)
+
+**This is a real correctness gap, not a divergence — it can silently corrupt
+a value or break a statement outright, and it is not fixed yet.** Found by
+driving `inlaysql serve --mysql` with two independent client libraries
+(`mysql-connector-python` and `PyMySQL`) rather than this project's own test
+client.
+
+Real MySQL escapes special characters in a client-quoted text-protocol string
+with a leading backslash (`NO_BACKSLASH_ESCAPES` is off by default), and every
+client library that builds `COM_QUERY` text with client-side escaping relies
+on the server understanding that: `mysql-connector-python`'s default
+(non-`prepared=True`) cursor, all of `PyMySQL` (it has no true binary-protocol
+prepared statements at all), and PHP's PDO with emulated prepares — a common
+default, including for Laravel apps that have not explicitly set
+`PDO::ATTR_EMULATE_PREPARES => false`. This server parses every statement with
+`sqlparser`'s `SQLiteDialect` (`crates/inlaysql-core/src/sql.rs`), whose
+`supports_string_literal_backslash_escape()` is `false` — correctly, for real
+SQLite — so a client-escaped value reaches the parser unrewritten:
+
+- A value containing `"` silently gets a spurious backslash baked into the
+  stored data: send `{"role":"admin"}`, get back `{\"role\":\"admin\"}` — a
+  wrong value with no error, the exact failure class this file says it fears
+  most.
+- A value containing `'` breaks the statement outright: the client's `\'`
+  reads as a literal backslash followed by a real string terminator, so the
+  parser either refuses with `1064` or, worse, parses whatever follows as SQL.
+
+A true binary-protocol prepared statement (`cursor(prepared=True)` in
+`mysql-connector-python`) bypasses client-side text escaping entirely and is
+unaffected — this is specifically a text-protocol issue. Per D1 above
+(`inlaysql-core` stays faithful to SQLite's real dialect, always), the fix
+belongs in the shim: rewriting MySQL-escaped literals to SQLite-safe form
+before the statement reaches the parser, the same kind of quote-aware
+backslash scanning `crates/inlaysql-server/src/sqltext.rs` already does for
+comment-stripping — but applied to rewrite literals this time, which has to
+handle `\n \r \0 \t \Z \% \_ \\ \' \"`, SQL-standard doubled-quote escaping,
+and interaction with the existing comment/identifier scanner correctly. Not
+attempted yet; tracked here rather than fixed blind.
+
+**A `BLOB` column also cannot be written from a plain quoted string literal**
+over the text protocol — `coerce()` in `crates/inlaysql-core/src/sql.rs`
+enforces `Value::Text` ≠ `Value::Blob` strictly, unlike real SQLite's weak
+BLOB affinity (which stores `TEXT` into a `BLOB` column unchanged). The MySQL
+wire's text protocol has no separate binary-literal syntax, so a `BLOB` column
+is only writable through the true binary protocol today; this looks like a
+deliberate strictness choice rather than an oversight, so it is recorded
+rather than changed.
 
 **A stock ORM's migrations get further now, but ordinary Eloquent traffic
 after them gets further still — the wall has moved six times: past

@@ -222,17 +222,24 @@ dialect (`inlaysql-core` gains nothing from this crate, which is what the
 `determinism` CI job polices); a dropped clause is never silent — it comes
 back as a MySQL `1618` warning naming it, visible in `SHOW WARNINGS`.
 
-The statements a stock framework sends now complete over the wire: a Laravel
-migration — `bigint unsigned auto_increment`, `timestamp`, `engine=InnoDB
-default charset=utf8mb4`, a fluent `->unique()`/`->index()`/`->foreign()`,
-`TRUNCATE`, `RENAME TABLE` — and ordinary Eloquent CRUD after it: create,
-find, a model save with a qualified `updated_at`, a paginated
-`whereIn`/`JOIN`/`whereHas` query, and `upsert()`'s own `ON DUPLICATE KEY
-UPDATE`. **Read that as a claim about statements, not about the framework:**
-the sequence in `a_realistic_laravel_migration_sequence_runs_end_to_end`
-(`crates/inlaysql-server/tests/wire.rs`) is SQL written by hand from Laravel
-11's own grammars, and nobody has pointed a real `php artisan migrate` at this
-server yet. Window functions (`ROW_NUMBER() OVER (...)`) were the wall until
+**A stock Laravel 11 app runs against this for real now** — not an
+approximation of one. `composer create-project laravel/laravel`, `.env`
+pointed at `inlaysql serve --mysql`, and `php artisan migrate` completes the
+default `users`/`cache`/`jobs` migrations, plus a `posts` table with a foreign
+key; ordinary Eloquent traffic afterward — `create`, `find`, a model save with
+a qualified `updated_at`, `whereIn`, a raw `JOIN`, `whereHas`, `withCount`,
+eager loading, `paginate()`, and `upsert()`'s own `ON DUPLICATE KEY UPDATE` —
+all work. Running the real thing found two shim bugs that a hand-written
+approximation of Laravel's SQL had missed for the same reason PLAN.md warned
+it would: `EXISTS (SELECT ... FROM information_schema...)`, the exact shape
+`hasTable()`/`hasColumn()` compile to, was misrouted by a heuristic the
+subquery's own `schema()` call fooled; both are fixed. Laravel's
+`->foreignId()->constrained()` still does not get its foreign key recorded —
+it compiles to a standalone `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY`,
+which is a documented, deliberate limitation
+([`docs/server.md`](docs/server.md#mysql-only-ddl-is-translated-not-invented)) —
+declare it inside the initial `Schema::create()` instead. Window functions
+(`ROW_NUMBER() OVER (...)`) were the wall until
 AHL-494 and now go through byte-for-byte, because MySQL 8 spells them the way
 SQLite does and the shim has no reason to touch them. The collation mapping
 still folds ASCII case only: `WHERE name = 'ADA'` matches a stored `'ada'`
