@@ -51,16 +51,22 @@
 //! that was *meant* to be uniform on the sphere and, through an off-by-one-bit
 //! divisor, was neither that nor realistic — see [`uniform_corpus`].
 //!
-//! # The filtered case
+//! # The filtered cases
 //!
-//! After the unfiltered comparison, a second pass runs the same corpus with a
-//! `WHERE tenant = id % 100` filter, so each tenant owns ~1% of the rows. A
-//! filter that selective is the failure mode AHL-379 is about: a fixed
+//! After the unfiltered comparison, three filtered passes run the same
+//! corpus again, at ~10%, ~1% and ~0.1% of rows per bucket (`WHERE tenant %
+//! ? = ?`). The ~1% pass is the failure mode AHL-379 is about: a fixed
 //! candidate budget contains essentially none of one tenant, so filtering
-//! *after* retrieval returns nothing. The engine now over-fetches adaptively
-//! until the filter admits `LIMIT` rows, so the filtered pass reports both
-//! recall (against the tenant's own exhaustive top-k) and the extra latency
-//! that over-fetching costs — the whole question.
+//! *after* retrieval returns nothing. The engine now pushes the filter into
+//! the index walk — rejected rows are traversed but neither returned nor
+//! counted — so each pass reports both recall (against the bucket's own
+//! exhaustive top-k) and the latency the filtered walk costs. The ~0.1%
+//! bucket is the pathological end: the filter admits fewer rows than the
+//! `LIMIT`, so the walk drains the whole graph and answers exactly — the
+//! case where the old over-fetch loop re-walked the graph once per doubling
+//! round before giving up. The unfiltered row above is the permissive end:
+//! a filter that admits everything costs one walk, and the engine's tie
+//! test pins filtered-everything to unfiltered exactly.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -75,10 +81,13 @@ use crate::{percentiles, Config, VOCABULARY};
 /// A corpus entry: a row id and its embedding.
 pub type Vector = (u64, Vec<f32>);
 
-/// How many tenants the filtered case partitions the corpus into. Each owns
-/// ~1% of the rows — the selectivity AHL-379 is about: a fixed candidate
+/// The tenant column's modulus: `tenant = id % TENANTS`. The filtered passes
+/// bucket it further with `tenant % buckets`, for `buckets` in {10, 100,
+/// 1000} — each bucket then owns ~10%, ~1% and ~0.1% of the rows, and every
+/// bucket is an exact `id % buckets` set because `buckets` divides `TENANTS`.
+/// The ~1% bucket is the selectivity AHL-379 is about: a fixed candidate
 /// budget filtered afterwards contains essentially none of one tenant.
-const TENANTS: u64 = 100;
+const TENANTS: u64 = 1000;
 
 /// The two data shapes this suite measures. See the module note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,7 +156,7 @@ fn run_shape(
     // engines are scored against the same answer.
     let truth: Vec<Vec<u64>> = queries.iter().map(|q| exact_top_k(&corpus, q, k)).collect();
 
-    let (ours, ours_filtered) = inlaysql_vectors(
+    let (ours, ours_moderate, ours_selective, ours_pathological) = inlaysql_vectors(
         &dir.join("vectors-inlaysql.inlay"),
         &corpus,
         &queries,
@@ -155,7 +164,7 @@ fn run_shape(
         &truth,
         false,
     )?;
-    let (quantized, _) = inlaysql_vectors(
+    let (quantized, _, _, _) = inlaysql_vectors(
         &dir.join("vectors-inlaysql-int8.inlay"),
         &corpus,
         &queries,
@@ -212,26 +221,29 @@ fn run_shape(
         ours.recall * 100.0
     );
 
-    // The filtered case, measured against the same oracle restricted to one
-    // tenant. This is the question AHL-379 asks: what does pushing a `WHERE`
-    // into the probe cost, and how much recall survives it?
-    let (p50, p95, max) = percentiles(&ours_filtered.samples);
-    println!(
-        "\n=== filtered: WHERE tenant = id % {TENANTS} (each tenant owns ~{:.0}% of the corpus) ===",
-        100.0 / TENANTS as f64
-    );
-    println!(
-        "{:<28} {:>10} {:>10} {:>10} {:>10}",
-        "engine", "recall@k", "p50", "p95", "max"
-    );
-    println!(
-        "{:<28} {:>10.3} {:>10} {:>10} {:>10}",
-        ours_filtered.label,
-        ours_filtered.recall,
-        format!("{p50:.2?}"),
-        format!("{p95:.2?}"),
-        format!("{max:.2?}")
-    );
+    // The filtered cases, measured against the same oracle restricted to one
+    // bucket each. This is the question AHL-379 asks: what does pushing a
+    // `WHERE` into the probe cost, and how much recall survives it?
+    for (label, filtered) in [
+        ("~10%", &ours_moderate),
+        ("~1%", &ours_selective),
+        ("~0.1%", &ours_pathological),
+    ] {
+        let (p50, p95, max) = percentiles(&filtered.samples);
+        println!("\n=== filtered ({label} of rows per bucket) ===");
+        println!(
+            "{:<28} {:>10} {:>10} {:>10} {:>10}",
+            "engine", "recall@k", "p50", "p95", "max"
+        );
+        println!(
+            "{:<28} {:>10.3} {:>10} {:>10} {:>10}",
+            filtered.label,
+            filtered.recall,
+            format!("{p50:.2?}"),
+            format!("{p95:.2?}"),
+            format!("{max:.2?}")
+        );
+    }
 
     if auxiliary {
         incremental_maintenance(&corpus);
@@ -278,7 +290,7 @@ fn paged_memory(corpus: &[Vector], shape: Shape) {
     for _ in 0..25 {
         let query: Vec<f32> = (0..dim).map(|_| next()).collect();
         let truth = exact_top_k(corpus, &query, 10);
-        let hits = index.search(&query, 10).unwrap();
+        let hits = index.search(&query, 10, None).unwrap();
         let got: Vec<u64> = hits.iter().map(|hit| hit.id).collect();
         recall_sum += recall(&got, &truth);
         peak_cache = peak_cache.max(index.cache_len());
@@ -525,11 +537,23 @@ pub fn exact_top_k(corpus: &[Vector], query: &[f32], k: usize) -> Vec<u64> {
 }
 
 /// The true top-k for a filter: [`exact_top_k`] restricted to the rows whose
-/// `id % TENANTS` is `tenant`.
-fn exact_filtered_top_k(corpus: &[Vector], tenant: u64, query: &[f32], k: usize) -> Vec<u64> {
+/// tenant bucket is `bucket` — `tenant = id % TENANTS`, bucketed by
+/// `tenant % buckets`, which is `id % buckets` because `buckets` divides
+/// `TENANTS`.
+///
+/// Deliberately NOT filtered to `id % buckets == bucket` directly: this is
+/// the same arithmetic the SQL side evaluates, so a mismatch between the two
+/// would show up as a recall number rather than a silent disagreement.
+fn exact_filtered_top_k(
+    corpus: &[Vector],
+    buckets: u64,
+    bucket: u64,
+    query: &[f32],
+    k: usize,
+) -> Vec<u64> {
     let mut scored: Vec<(f32, u64)> = corpus
         .iter()
-        .filter(|(id, _)| id % TENANTS == tenant)
+        .filter(|(id, _)| id % TENANTS % buckets == bucket)
         .map(|(id, embedding)| (cosine_similarity(query, embedding), *id))
         .collect();
     scored.sort_by(|a, b| {
@@ -555,7 +579,7 @@ fn inlaysql_vectors(
     k: usize,
     truth: &[Vec<u64>],
     quantized: bool,
-) -> Result<(Outcome, Outcome), Box<dyn std::error::Error>> {
+) -> Result<(Outcome, Outcome, Outcome, Outcome), Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(path);
     let dim = corpus[0].1.len();
     let mut db = Database::open(path)?;
@@ -602,25 +626,12 @@ fn inlaysql_vectors(
         total_recall += recall(&row_ids(&rows), truth);
     }
 
-    // The filtered pass reuses the same index: `WHERE tenant = ?` on a corpus
-    // where each tenant owns ~1% of the rows. Scored against the tenant's own
-    // top-k, so recall measures the filter, not the approximation.
-    let filtered_sql = format!(
-        "SELECT id, vector_score(embedding, ?) AS score FROM vecs WHERE tenant = ? ORDER BY score DESC LIMIT {k}"
-    );
-    let mut filtered_samples = Vec::with_capacity(queries.len());
-    let mut filtered_recall = 0.0;
-    for (index, query) in queries.iter().enumerate() {
-        let tenant = (index as u64) % TENANTS;
-        let truth = exact_filtered_top_k(corpus, tenant, query, k);
-        let at = Instant::now();
-        let rows = db.query(
-            &filtered_sql,
-            &[Value::Vector(query.clone()), Value::Integer(tenant as i64)],
-        )?;
-        filtered_samples.push(at.elapsed());
-        filtered_recall += recall(&row_ids(&rows), &truth);
-    }
+    // The filtered passes reuse the same index. Each query is pinned to a
+    // bucket (`tenant % BUCKETS`) and scored against that bucket's own
+    // exhaustive top-k, so recall measures the filter, not the approximation.
+    let moderate = filtered_pass(&mut db, corpus, queries, k, TENANTS / 100, quantized)?;
+    let selective = filtered_pass(&mut db, corpus, queries, k, TENANTS / 10, quantized)?;
+    let pathological = filtered_pass(&mut db, corpus, queries, k, TENANTS, quantized)?;
 
     let resident_vector_bytes = db.vector_index_resident_bytes("vecs", "embedding");
     let file_bytes = std::fs::metadata(path)?.len();
@@ -639,19 +650,56 @@ fn inlaysql_vectors(
             file_bytes,
             resident_vector_bytes,
         },
-        Outcome {
-            label: if quantized {
-                "InlaySQL (HNSW int8, filtered)"
-            } else {
-                "InlaySQL (HNSW exact, filtered)"
-            },
-            build: Duration::ZERO,
-            samples: filtered_samples,
-            recall: filtered_recall / queries.len() as f64,
-            file_bytes,
-            resident_vector_bytes,
-        },
+        moderate,
+        selective,
+        pathological,
     ))
+}
+
+/// One filtered pass: `WHERE tenant % buckets = ?` on a corpus whose tenant
+/// column holds `id % TENANTS`, so each bucket owns exactly `TENANTS /
+/// buckets` of the tenants and the bucket a query lands in is a pure function
+/// of its row id. Scored against the bucket's own exhaustive top-k.
+fn filtered_pass(
+    db: &mut Database,
+    corpus: &[Vector],
+    queries: &[Vec<f32>],
+    k: usize,
+    buckets: u64,
+    quantized: bool,
+) -> Result<Outcome, Box<dyn std::error::Error>> {
+    let filtered_sql = format!(
+        "SELECT id, vector_score(embedding, ?) AS score FROM vecs WHERE tenant % ? = ? ORDER BY score DESC LIMIT {k}"
+    );
+    let mut samples = Vec::with_capacity(queries.len());
+    let mut filtered_recall = 0.0;
+    for (index, query) in queries.iter().enumerate() {
+        let bucket = (index as u64) % buckets;
+        let truth = exact_filtered_top_k(corpus, buckets, bucket, query, k);
+        let at = Instant::now();
+        let rows = db.query(
+            &filtered_sql,
+            &[
+                Value::Vector(query.clone()),
+                Value::Integer(buckets as i64),
+                Value::Integer(bucket as i64),
+            ],
+        )?;
+        samples.push(at.elapsed());
+        filtered_recall += recall(&row_ids(&rows), &truth);
+    }
+    Ok(Outcome {
+        label: if quantized {
+            "InlaySQL (HNSW int8, filtered)"
+        } else {
+            "InlaySQL (HNSW exact, filtered)"
+        },
+        build: Duration::ZERO,
+        samples,
+        recall: filtered_recall / queries.len() as f64,
+        file_bytes: 0,
+        resident_vector_bytes: None,
+    })
 }
 
 fn row_ids(rows: &inlaysql::ResultSet) -> Vec<u64> {

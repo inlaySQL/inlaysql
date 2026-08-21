@@ -3586,7 +3586,7 @@ impl Engine {
             .unwrap_or(DEFAULT_CANDIDATES)
             .max(1);
         let mut rows = Vec::new();
-        for scored in self.evaluate_score(table, score, candidate_limit, env)? {
+        for scored in self.evaluate_score(table, score, candidate_limit, None, env)? {
             if let Some(bytes) = self.storage.get_row(&table.name, scored.id)? {
                 rows.push(ExecRow {
                     id: scored.id,
@@ -3690,20 +3690,36 @@ impl Engine {
         Ok(out)
     }
 
-    /// Retrieve and filter in one pass, over-fetching until the filter admits
-    /// enough rows.
+    /// Retrieve and filter in one pass: the filter is pushed *into* the
+    /// retriever's walk rather than applied to its output.
     ///
-    /// A fixed candidate budget cannot serve a filtered query: the retriever is
-    /// asked for the best matches overall, and a filter that keeps a small
-    /// fraction of them can discard every one, so `LIMIT 10` returns nothing at
-    /// all. Instead the budget doubles each round until the filter admits
-    /// `limit` rows, or until the retriever reports it has nothing more to give
-    /// (its `search` returns fewer than asked). That second case is the
-    /// exact-scan fallback: every row the index can rank has been seen, so the
-    /// rows that passed the filter are the complete answer for that filter — a
-    /// filter too selective for any bounded over-fetch degrades to correctness,
-    /// never to an empty result. Rows are only ever ranked within one probe, so
-    /// the answer is a deterministic function of the query and the corpus.
+    /// This replaced the over-fetch loop of earlier revisions. Asking the
+    /// retriever for `limit * 4` candidates and filtering afterwards can
+    /// discard every one of them when the filter is selective, so the engine
+    /// used to double the candidate budget each round and re-run the search
+    /// from scratch until the filter admitted `limit` rows — geometrically
+    /// re-walking the index, once per round, for filters that keep a small
+    /// fraction of rows.
+    ///
+    /// Now the engine compiles the `WHERE` predicate into a
+    /// [`RowFilter`](crate::traits::RowFilter) and hands it to the retriever,
+    /// which keeps walking past rejected rows instead of re-running. The
+    /// index's contract is that a rejected row is excluded from the result
+    /// set and from the candidate budget but never from the traversal, and
+    /// the walk ends in a single pass once the filter's answer is secured:
+    ///
+    /// * a permissive filter costs the same walk an unfiltered query does,
+    ///   and returns the same rows it would have;
+    /// * a selective filter keeps the walk going until its candidate beam is
+    ///   full of matching rows, or the index genuinely runs out of
+    ///   candidates — and "ran out" means every row the index can rank has
+    ///   been seen, so the surviving rows are the complete answer for that
+    ///   filter, exactly as the old loop's exhaustion round was;
+    /// * a filter nothing satisfies still terminates: the walk is bounded by
+    ///   the visited set and returns an empty answer, never a hang.
+    ///
+    /// Rows are only ever ranked within one probe, so the answer is a
+    /// deterministic function of the query and the corpus.
     fn retrieve_filtered(
         &self,
         table: &Table,
@@ -3720,41 +3736,44 @@ impl Engine {
             return Ok(Vec::new());
         }
 
-        let mut overfetch = CANDIDATE_OVERFETCH;
-        loop {
-            let k = want.saturating_mul(overfetch).max(1);
-            let hits = self.evaluate_score(table, score, k, env)?;
-            // Fewer than asked for means the retriever has run dry: everything
-            // it can rank is already in `hits`, so this round's filtered result
-            // is complete and the loop must end here.
-            let exhausted = hits.len() < k;
+        // The retriever is asked for the same over-fetched budget an
+        // unfiltered query gets, in filter-passing rows rather than plain
+        // rows, so a permissive filter sees exactly the candidate set (and
+        // recall) an unfiltered query would.
+        let candidate_limit = want.saturating_mul(CANDIDATE_OVERFETCH).max(1);
 
-            let mut matched = Vec::with_capacity(hits.len());
-            for hit in &hits {
-                if let Some(bytes) = self.storage.get_row(&table.name, hit.id)? {
+        // The index stays ignorant of SQL: it only knows row ids, and this
+        // closure is where they become rows and a `WHERE`. It runs inside the
+        // walk — once per candidate the walk visits — so decode and predicate
+        // cost is paid for visited candidates, not for the whole corpus.
+        let predicate: &dyn Fn(RowId) -> Result<bool> =
+            &|id| match self.storage.get_row(&table.name, id)? {
+                Some(bytes) => {
                     let row = decode_row_masked(&bytes, mask)?;
-                    if eval::is_truthy(&eval::evaluate(filter, &row, Computed::NONE, env)?) {
-                        matched.push(ExecRow {
-                            id: hit.id,
-                            score: Some(hit.score),
-                            values: row,
-                            aggregates: Vec::new(),
-                            windows: Vec::new(),
-                        });
-                    }
+                    Ok(eval::is_truthy(&eval::evaluate(
+                        filter,
+                        &row,
+                        Computed::NONE,
+                        env,
+                    )?))
                 }
-            }
+                None => Ok(false),
+            };
 
-            if matched.len() >= want || exhausted {
-                matched.truncate(want);
-                return Ok(matched);
+        let hits = self.evaluate_score(table, score, candidate_limit, Some(predicate), env)?;
+        let mut matched = Vec::with_capacity(hits.len().min(want));
+        for hit in hits.into_iter().take(want) {
+            if let Some(bytes) = self.storage.get_row(&table.name, hit.id)? {
+                matched.push(ExecRow {
+                    id: hit.id,
+                    score: Some(hit.score),
+                    values: decode_row_masked(&bytes, mask)?,
+                    aggregates: Vec::new(),
+                    windows: Vec::new(),
+                });
             }
-
-            // The budget doubles geometrically, so it reaches the index size in
-            // O(log n) rounds and then trips `exhausted`; it cannot loop
-            // forever.
-            overfetch = overfetch.saturating_mul(2);
         }
+        Ok(matched)
     }
 
     /// Evaluate a retrieval expression into a ranked candidate list.
@@ -3763,18 +3782,23 @@ impl Engine {
     /// search string can be bound per execution. Its type — and, for a vector,
     /// its dimension — is checked here rather than at prepare time, because
     /// that is the first moment a `?` has a value at all.
+    ///
+    /// `filter`, when present, is pushed into every underlying retriever —
+    /// for a [`ScoreExpr::Fuse`], into each part's search, so the fused
+    /// ranking only ever sees rows that passed it.
     fn evaluate_score(
         &self,
         table: &Table,
         expr: &ScoreExpr,
         k: usize,
+        filter: Option<&dyn Fn(RowId) -> Result<bool>>,
         env: &Env<'_>,
     ) -> Result<Vec<Scored>> {
         match expr {
             ScoreExpr::Vector { column, query } => {
                 let index = self.vector_index(table, *column)?;
                 let query = bind_embedding(table, *column, query, env)?;
-                let mut hits = index.search(&query, k)?;
+                let mut hits = index.search(&query, k, filter)?;
                 sort_by_score_desc(&mut hits);
                 Ok(hits)
             }
@@ -3785,14 +3809,14 @@ impl Engine {
                         "bm25_score() needs a text query as its final argument".to_string(),
                     ));
                 };
-                let mut hits = index.search(&query, k)?;
+                let mut hits = index.search(&query, k, filter)?;
                 sort_by_score_desc(&mut hits);
                 Ok(hits)
             }
             ScoreExpr::Fuse { parts, k: rrf_k } => {
                 let mut lists = Vec::with_capacity(parts.len());
                 for part in parts {
-                    lists.push(self.evaluate_score(table, part, k, env)?);
+                    lists.push(self.evaluate_score(table, part, k, filter, env)?);
                 }
                 let mut fused = reciprocal_rank_fusion(&lists, *rrf_k);
                 fused.truncate(k);

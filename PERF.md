@@ -481,6 +481,60 @@ workload nobody has reported as a problem. The branch
 plausibly if the WASM or edge story ever makes short-lived processes the
 priority, since those are exactly the cold-start case.
 
+### Prefix-skipping key comparison during descent, and why it was a wash
+
+The remaining untried angle this document named — "a key layout whose
+discriminating bytes come first, or a comparison that skips the shared table
+prefix a descent has already matched" — was tried in its lower-risk form
+(comparison, not layout: no on-disk format change) and **did not clear the
+bar**. Written up for the same reason AHL-493 above is: so the next person
+starts from the numbers.
+
+The idea is a real, established technique ("prefix truncation during
+search"): within one root-to-leaf descent, once a boundary key at one level
+has matched N bytes of the search key, every key at every deeper level is
+provably guaranteed to share those same N bytes — the tree structure proves
+it — so a descent can track "bytes already known to match" and start each
+comparison from that offset instead of byte 0. Implemented scoped to
+`CowBTree::walk`/`walk_row_ids` (the recursive entry-range walk behind range
+scans, index probes and join probes), leaving `get_from` (the point-read row-key
+path) untouched.
+
+Interleaved baseline/modified release binaries, 3 rounds, `inlaysql-bench
+--suite joins --rows 20000 --queries 100 --limit 10` and `--suite indexed
+--rows 100000`:
+
+| Shape | Baseline | Modified | Verdict |
+| --- | --- | --- | --- |
+| PK-inner full join p50 | 63.4ms | 58.5ms | ~8% faster, but within the baseline's own 54.6–63.7ms spread — weak signal |
+| PK-inner join, `LIMIT 10` p50 | 5.4µs | 6.7µs | **regression, ~24%, reproducible across all 3 rounds** |
+| Secondary-index-inner full join p50 | 220.1ms | 220.1ms | flat |
+| Secondary-index-inner join, `LIMIT 10` p50 | 13.0µs | 14.2µs | regression, ~9% |
+| Indexed point probe / 50-row range | flat | flat | noise |
+
+A `sample`(1) profile confirmed the mechanism itself is real — `memcmp`
+self-time share dropped 16.2% → 12.0%, exactly as the theory predicts — but
+the bookkeeping needed to compute the skip safely (threading a proven-match
+count through the recursion) grew from 8.2% to 13.3% of the same profile,
+erasing the saving: combined comparison-plus-bookkeeping share moved 24.4% →
+25.3%, net flat to worse.
+
+**Why it does not pay off here.** This technique's cost is roughly
+`O(descent depth)` per walk call and its saving is `O(entries actually
+compared)` — it pays off when one walk call examines many entries. This
+join workload's dominant cost, named earlier in this document, is instead
+*re-descending from the root once per outer row*: each descent touches very
+few entries, which is the worst case for a technique with fixed per-node
+overhead. Point reads and small joins were confirmed unaffected at the code
+level (`get_from` was never touched), so this does not reproduce AHL-493's
+regression shape — it simply does not help the workload it targeted.
+
+**The next untried idea, not this one again**: extend `get_from`'s
+already-proven retained-cursor technique to the entry-range walk itself — a
+retained cursor for `walk`/`walk_row_ids` — attacking the re-descend-per-outer-row
+cost directly rather than making each individual descent's comparisons
+marginally cheaper.
+
 ### The structural fix: stop allocating per row
 
 The deepest issue is that `Value` owns its data — `Text(String)`, `Blob(Vec<u8>)`,
@@ -623,9 +677,11 @@ order of expected value:
    during a graph walk, so the prefetcher works for us.
 3. **Quantised paged nodes**  — `PagedHnswIndex` stores exact
    `f32` even for an int8 column, so the paged path currently forfeits the 4x.
-4. **Filter-aware walks** instead of over-fetching. Today a restrictive `WHERE`
-   widens the probe until enough rows survive; on a selective filter that is
-   enormously more work than pushing the predicate into the walk.
+4. ~~**Filter-aware walks** instead of over-fetching.~~ — **done.** The
+   `WHERE` is compiled into a row predicate and pushed into the index walk:
+   rejected rows are traversed but neither returned nor counted, so a
+   selective filter no longer widens the probe in geometric re-runs. See
+   `Engine::retrieve_filtered`.
 
 ---
 
@@ -662,8 +718,13 @@ order of expected value:
    both halves of it — the point probe wins, the range scan loses. Merging it with AHL-462
    put the probe *inside* the pipeline, so an indexed `LIMIT` fetches only the
    rows it returns.
-5. Cheaper key comparison (the ~21% `memcmp`) and a cheaper cache hit (the ~9%
-   `PageCache::get`) — the two the AHL-422 profile newly justified.
+5. ~~Cheaper key comparison~~ — **tried, and it was a wash; see "Prefix-skipping
+   key comparison during descent, and why it was a wash" above.** The
+   mechanism works (`memcmp` share did drop) but its own bookkeeping cost
+   erases the gain on this join workload's dominant cost, which is
+   re-descending per outer row rather than comparing many entries per descent.
+   A cheaper cache hit (the ~9% `PageCache::get`) — the other candidate the
+   AHL-422 profile justified — remains untried.
 6. Index nested-loop join, then hash join.
 7. ~~**Group commit.**~~ — **done (AHL-461, with the commit-gate rework of
    AHL-468 that gave it something to batch)**. Promoted on the evidence that

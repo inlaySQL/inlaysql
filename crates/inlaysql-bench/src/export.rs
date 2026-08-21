@@ -176,7 +176,7 @@ fn reference_hybrid_top_k(
         .collect();
     inlaysql_core::fusion::sort_by_score_desc(&mut vector);
     let text = index
-        .search(&query.text, corpus.len())
+        .search(&query.text, corpus.len(), None)
         .expect("bm25 search");
 
     reciprocal_rank_fusion(&[vector, text], DEFAULT_RRF_K)

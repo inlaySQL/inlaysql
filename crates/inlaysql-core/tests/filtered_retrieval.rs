@@ -1,15 +1,17 @@
 //! Filtered retrieval: a restrictive `WHERE` must not under-fill a `LIMIT`.
 //!
 //! A retrieval query (`vector_score`, `bm25_score`, `fuse`) ranks the whole
-//! corpus and returns the best `limit * 4` matches, so applying a `WHERE`
-//! afterwards can discard every one and return nothing at all. The engine fixes
-//! this by over-fetching adaptively — see `Engine::retrieve_filtered` — and
-//! these tests pin the behaviour down against an in-memory environment whose
-//! vector index is exact (brute force), so the "correct top-k for the filter"
-//! can be asserted exactly rather than by recall.
+//! corpus, so a `WHERE` applied to its output can discard every candidate.
+//! The engine fixes this by pushing the filter *into* the retriever — see
+//! `Engine::retrieve_filtered` — and these tests pin the behaviour down
+//! against an in-memory environment whose vector index is exact (brute
+//! force), so the "correct top-k for the filter" can be asserted exactly
+//! rather than by recall.
 
+use inlaysql_core::bm25::Bm25Index;
+use inlaysql_core::fusion::{reciprocal_rank_fusion, DEFAULT_RRF_K};
 use inlaysql_core::mem::cosine_similarity;
-use inlaysql_core::{mem, Engine, ResultSet, Rng, Value};
+use inlaysql_core::{mem, Engine, FullTextIndex, ResultSet, Rng, Scored, Value};
 
 const DIM: usize = 4;
 
@@ -170,7 +172,7 @@ fn a_filtered_fuse_query_returns_limit_rows() {
 
 #[test]
 fn filtered_retrieval_is_deterministic() {
-    // The over-fetch loop has branching control flow; the same query twice must
+    // The filtered walk has branching control flow; the same query twice must
     // return the same rows, order included.
     let run = |seed: u64| {
         let (mut engine, _, query) = build(500, 100, seed);
@@ -183,4 +185,144 @@ fn filtered_retrieval_is_deterministic() {
             .rows
     };
     assert_eq!(run(99), run(99));
+}
+
+#[test]
+fn a_permissive_filter_answers_like_the_unfiltered_query() {
+    // The tie to the unfiltered path, at engine level: a `WHERE` every row
+    // satisfies must return the same rows, in the same order, as the query
+    // with no `WHERE` at all. The filtered path is the fast path; this pins
+    // it to the slow one.
+    let (mut engine, _, query) = build(200, 10, 21);
+    let unfiltered = engine
+        .query(
+            "SELECT id, vector_score(embedding, ?) AS score FROM docs ORDER BY score DESC LIMIT 10",
+            &[Value::Vector(query.clone())],
+        )
+        .expect("unfiltered vector query");
+    let filtered = engine
+        .query(
+            "SELECT id, vector_score(embedding, ?) AS score FROM docs WHERE id = id ORDER BY score DESC LIMIT 10",
+            &[Value::Vector(query)],
+        )
+        .expect("permissively filtered vector query");
+
+    assert_eq!(ids(&filtered), ids(&unfiltered));
+}
+
+#[test]
+fn a_filter_matching_no_rows_returns_an_empty_result() {
+    // The pathological end: the walk must terminate and report nothing, not
+    // hang and not fabricate a tenant.
+    let (mut engine, _, query) = build(100, 10, 3);
+    let result = engine
+        .query(
+            "SELECT id, vector_score(embedding, ?) AS score FROM docs WHERE tenant = ? ORDER BY score DESC LIMIT 10",
+            &[Value::Vector(query), Value::Integer(999)],
+        )
+        .expect("filtered vector query");
+    assert!(result.rows.is_empty());
+}
+
+#[test]
+fn a_filter_matching_one_row_returns_exactly_it() {
+    // `WHERE id = 5` pins one row out of the corpus; the answer is that row
+    // and only that row — no padding, no under-fill.
+    let (mut engine, _, query) = build(100, 10, 4);
+    let result = engine
+        .query(
+            "SELECT id, vector_score(embedding, ?) AS score FROM docs WHERE id = ? ORDER BY score DESC LIMIT 10",
+            &[Value::Vector(query), Value::Integer(5)],
+        )
+        .expect("filtered vector query");
+    assert_eq!(ids(&result), vec![5]);
+}
+
+#[test]
+fn filtered_bm25_ranking_matches_the_oracle() {
+    // The text side gets the same pushdown: the filtered result must equal
+    // the exhaustive BM25 ranking restricted to the tenant, truncated to the
+    // limit. Bm25Index is exact, so this pins the whole filtered text path.
+    let (mut engine, corpus, _) = build(300, 10, 8);
+    let tenant = 3;
+    let query_text = "document word1";
+
+    let mut oracle = Bm25Index::new();
+    for (id, _, _) in &corpus {
+        oracle
+            .insert(*id as u64, &format!("document {id} word{}", id % 4))
+            .unwrap();
+    }
+    let expected: Vec<i64> = oracle
+        .search(query_text, 10, Some(&|id| Ok((id as i64) % 10 == tenant)))
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.id as i64)
+        .collect();
+
+    let result = engine
+        .query(
+            "SELECT id, bm25_score(body, ?) AS score FROM docs WHERE tenant = ? ORDER BY score DESC LIMIT 10",
+            &[
+                Value::Text(query_text.to_string()),
+                Value::Integer(tenant),
+            ],
+        )
+        .expect("filtered text query");
+    assert_eq!(ids(&result), expected);
+}
+
+#[test]
+fn filtered_fusion_matches_the_rrf_over_exact_filtered_lists() {
+    // Both sides of a `fuse` must receive the same filter, and the fused
+    // answer must equal reciprocal rank fusion over each side's *exact*
+    // filtered candidate list — the same budget the engine uses.
+    let (mut engine, corpus, query) = build(300, 10, 8);
+    let tenant = 3;
+    let query_text = "document word1";
+
+    // The exact vector side: exhaustive cosine over the tenant's rows.
+    let mut vector_list: Vec<Scored> = corpus
+        .iter()
+        .filter(|(_, t, _)| *t == tenant)
+        .map(|(id, _, embedding)| Scored::new(*id as u64, cosine_similarity(&query, embedding)))
+        .collect();
+    vector_list.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.id.cmp(&b.id))
+    });
+    vector_list.truncate(40);
+
+    // The exact text side: the same Bm25Index the engine uses.
+    let mut oracle = Bm25Index::new();
+    for (id, _, _) in &corpus {
+        oracle
+            .insert(*id as u64, &format!("document {id} word{}", id % 4))
+            .unwrap();
+    }
+    let text_list = oracle
+        .search(query_text, 40, Some(&|id| Ok((id as i64) % 10 == tenant)))
+        .unwrap();
+
+    let mut fused = reciprocal_rank_fusion(&[vector_list, text_list], DEFAULT_RRF_K);
+    fused.truncate(40);
+    let expected: Vec<i64> = fused
+        .into_iter()
+        .take(10)
+        .map(|hit| hit.id as i64)
+        .collect();
+
+    let result = engine
+        .query(
+            "SELECT id, fuse(vector_score(embedding, ?), bm25_score(body, ?)) AS score FROM docs WHERE tenant = ? ORDER BY score DESC LIMIT 10",
+            &[
+                Value::Vector(query),
+                Value::Text(query_text.to_string()),
+                Value::Integer(tenant),
+            ],
+        )
+        .expect("filtered hybrid query");
+    assert_eq!(ids(&result), expected);
 }

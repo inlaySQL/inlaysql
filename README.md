@@ -28,9 +28,9 @@ extension bolted on the side.
 >   a good way to find bugs and is **not** the same as years of real hardware,
 >   real power cuts and real filesystems. SQLite has those; this does not.
 > - **Known gaps are listed, not hidden.** See
->   [What this is not](#what-this-is-not). Some of them will bite you: filtered
->   retrieval over-fetches rather than pre-filters, recall on uniformly random
->   vectors is poor, and there is no cost-based join planner.
+>   [What this is not](#what-this-is-not). Some of them will bite you: recall
+>   on uniformly random vectors is poor, and there is no cost-based join
+>   planner.
 >
 > Use it for experiments, prototypes, and anything you can rebuild from source
 > data. Keep a backup you can restore from something else. If you find a bug,
@@ -739,9 +739,15 @@ below is a surprise to the project, it is the honest state of it:
    inner row was being cloned twice, once by the probe and again by the
    pairing loop — landed a small, safe (zero risk to the point-read path by
    construction), consistent-but-modest ~3–5% win on both full-join shapes,
-   measured on a quiet machine; it is not what closes this gap. The
-   remaining, still-untried angle: a cheaper key comparison (`memcmp` is
-   12–21% of the miss path's self-time).
+   measured on a quiet machine; it is not what closes this gap. A third
+   attempt — prefix-skipping key comparison during descent (`memcmp` is
+   12–21% of the miss path's self-time) — was also tried and was also a
+   wash: the mechanism measurably works, but its own bookkeeping cost erases
+   the gain, because this workload's dominant cost is re-descending from the
+   root once per outer row rather than comparing many entries per descent.
+   See [`PERF.md`](PERF.md) for the numbers and the next, different angle:
+   extending the point-read path's already-proven retained-cursor technique
+   to the entry-range walk itself, to attack the re-descend cost directly.
 2. ~~**The server's per-connection page cache.**~~ — **investigated, and
    the diagnosis behind it did not hold up.** The 1-to-8-connection read
    drop this item used to cite (37,158 → 19,874, "each connection warms its
@@ -800,9 +806,13 @@ below is a surprise to the project, it is the honest state of it:
    concatenated or weighted-sum embeddings are technically possible but not a
    default anyone should get without asking for it by name — so this was
    left undone rather than guessed at.
-8. **Filter-aware graph walks and per-value sub-indexes.** A restrictive
-   `WHERE` on a retrieval query over-fetches from the index rather than
-   pre-filtering it.
+8. ~~**Filter-aware graph walks.**~~ — **done.** A restrictive `WHERE` on a
+   retrieval query is now pushed into the index walk rather than answered by
+   over-fetching: rejected rows are traversed but not returned or counted,
+   for the vector and BM25 indexes alike and on both sides of `fuse`.
+   Per-value sub-indexes — a further speedup on top of pushdown, for a
+   filter selective enough that even a single filtered walk is more work
+   than probing a per-value structure directly — remain later-stage work.
 9. ~~**Quantised paged index nodes.**~~ — **done.** `PagedHnswIndex` stored
    exact `f32` even for an `INT8` column; it now shares the same
    `Q8Vector`/`VectorEncoding` quantisation the in-memory index already had.
@@ -814,6 +824,15 @@ below is a surprise to the project, it is the honest state of it:
 10. **Deeper SQL Logic Test coverage, real SQLancer runs and continuous
     fuzzing** beyond what `trust.yml` runs today (see
     [`docs/sqlancer.md`](docs/sqlancer.md)).
+11. **Read replicas over the existing CDC log.** `cdc.rs` is already
+    pull-based and bounded, so the shape of the work is shipping records and
+    tracking replica position — the Turso model, no consensus and no fork.
+    The blocker to design around first: `open_read_only` takes no OS lock by
+    design, so a reader in another process cannot be proven absent — fine
+    on one machine today, unavoidable to answer once a second machine is
+    reading the same file. Durable storage/compute separation (an
+    object-storage-backed device, for corpora too large to ship as an edge
+    asset) is the same category of work, longer.
 
 Full Postgres parity is deliberately not on this list — see the last point in
 [What this is not](#what-this-is-not). Neither is `WITH RECURSIVE`: nothing in
@@ -852,13 +871,17 @@ than oversights:
   costs an `ef_search` that grows with the corpus. `bench/README.md`
   measures both and explains the difference; the first is what an
   application sees.
-- **Filtered retrieval over-fetches rather than pre-filters.** A `WHERE` on a
-  retrieval query is applied by widening the index probe until the filter admits
-  `LIMIT` rows or the index is exhausted, so a restrictive filter returns the
-  rows that match it instead of an empty result. When no amount of over-fetching
-  satisfies the filter, the query falls back to scanning every row the index can
-  rank — correct, at the cost of the full scan. Filter-aware graph walks and
-  per-value sub-indexes are later-stage work.
+- **Filtered retrieval is pushed into the index walk.** A `WHERE` on a
+  retrieval query is compiled into a row predicate and pushed into the
+  retriever itself: a row the filter rejects is excluded from the result set
+  and from the candidate budget but is still traversed, so its neighbours
+  stay reachable and a selective filter cannot sever the graph (the classic
+  filtered-ANN connectivity trap). The walk keeps going until enough rows
+  pass or the index is genuinely exhausted, so a filter too selective for any
+  bounded probe degrades to scanning every row the index can rank — correct,
+  at the cost of the full walk — rather than to a partial answer. The
+  unfiltered path is untouched: passing no filter is exactly the old search,
+  behaviour and cost included.
 - **Vector quantisation is explicit per column.** `VECTOR(n)` remains exact;
   `VECTOR(n, INT8)` reduces row and HNSW vector payloads by about 4x using a
   symmetric per-vector scale. Queries stay `f32`, and the vectors benchmark
@@ -884,6 +907,15 @@ than oversights:
   node records do not quantise yet, so on an int8 column the paged index trades
   away the 4x the quantisation was for. Results are unaffected — queries are
   `f32` on both paths.
+- **No clustering or multi-node replication.** InlaySQL runs in one process
+  against one file — no leader election, no consensus, no built-in read
+  replica. This is not the same gap as serverless: [On an edge
+  runtime](#on-an-edge-runtime) is delivered today and does not need any of
+  the above, because a retrieval index is built once, shipped as a static
+  asset, and answered from the isolate that took the request — there is no
+  node to be a replica of. Multi-node deployment (read replicas over the
+  existing CDC log; durable storage/compute separation for corpora too large
+  to ship as an asset) is later-stage work — see [Next](#next).
 - **Full Postgres parity is not a goal**, now or later.
 
 ## Licence

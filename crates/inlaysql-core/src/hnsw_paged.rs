@@ -80,7 +80,7 @@ use crate::hnsw::{
     stored_distance, Candidate, HnswParams, StoredVector, VectorEncoding, Visited,
 };
 use crate::row::{put_len, Cursor};
-use crate::traits::{RowId, RowScan, Scored, Storage, VectorIndex};
+use crate::traits::{RowFilter, RowId, RowScan, Scored, Storage, VectorIndex};
 
 /// How many decoded nodes the cache holds by default. At dim 384 a node record
 /// is ~1.5 KiB, so this is ~6 MiB of working set.
@@ -818,14 +818,20 @@ impl<S: Storage> PagedHnswIndex<S> {
         // Descend from the top layer to this node's top layer.
         let mut current = self.entry_level;
         while current > level {
-            let nearest = self.search_layer(&vector, ep, 1, current, visited)?;
+            let nearest = self.search_layer(&vector, ep, 1, current, None, visited)?;
             ep = nearest[0].node;
             current -= 1;
         }
 
         for layer in (0..=current).rev() {
-            let candidates =
-                self.search_layer(&vector, ep, self.params.ef_construction, layer, visited)?;
+            let candidates = self.search_layer(
+                &vector,
+                ep,
+                self.params.ef_construction,
+                layer,
+                None,
+                visited,
+            )?;
             ep = candidates[0].node;
             let degree = self.params.degree(layer);
             let selected = self.select_neighbors(&candidates, degree)?;
@@ -850,12 +856,23 @@ impl<S: Storage> PagedHnswIndex<S> {
     /// reason [`crate::hnsw::HnswIndex::search`] keeps it exact: quantising
     /// the corpus is the declared storage trade-off, and throwing away query
     /// precision too would add recall loss without saving resident memory.
+    ///
+    /// With a `filter`, only live rows the filter admits enter `results` and
+    /// count toward `ef`; rejected rows are still expanded, so the walk
+    /// reaches admissible neighbours on their far side — see
+    /// [`crate::hnsw::search_layer`] for why severing that connectivity would
+    /// silently drop matches, and for the two stop rules (beam full, frontier
+    /// drained). The record fetch a filtered walk needs for the row id is the
+    /// same one the distance already needs, so the filter costs predicate
+    /// evaluations, not extra reads.
+    #[allow(clippy::too_many_arguments)]
     fn search_layer(
         &self,
         query: &StoredVector,
         entry: usize,
         ef: usize,
         layer: usize,
+        filter: Option<&RowFilter>,
         visited: &mut Visited,
     ) -> Result<Vec<Candidate>> {
         let ef = ef.max(1);
@@ -863,20 +880,33 @@ impl<S: Storage> PagedHnswIndex<S> {
 
         let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new();
         let mut results: BinaryHeap<Candidate> = BinaryHeap::new();
+        let admits = |record: &NodeRecord| -> Result<bool> {
+            match filter {
+                None => Ok(true),
+                Some(filter) => Ok(!record.deleted && filter(record.id)?),
+            }
+        };
 
-        let entry_vector = self.fetch_vector(entry)?;
+        let entry_record = self.fetch_node(entry)?;
         let start = Candidate {
-            distance: stored_distance(&self.distance_calls, query, &entry_vector),
+            distance: stored_distance(&self.distance_calls, query, &entry_record.vector),
             node: entry,
         };
         visited.visit(entry);
         frontier.push(Reverse(start));
-        results.push(start);
+        if admits(&entry_record)? {
+            results.push(start);
+        }
 
         while let Some(Reverse(current)) = frontier.pop() {
-            if results.len() >= ef && current.distance > results.peek().expect("non-empty").distance
-            {
-                break;
+            // See [`crate::hnsw::search_layer`]: the beam-full stop compares
+            // against the worst *admissible* result, so a filter that admits
+            // few rows keeps the walk going past the rejected ones — until
+            // the frontier runs out, which is the exact-scan fallback.
+            if let Some(worst) = results.peek() {
+                if results.len() >= ef && current.distance > worst.distance {
+                    break;
+                }
             }
             let record = self.fetch_node(current.node)?;
             let neighbors = record.neighbors.get(layer).cloned().unwrap_or_default();
@@ -884,14 +914,20 @@ impl<S: Storage> PagedHnswIndex<S> {
                 if !visited.visit(neighbor) {
                     continue;
                 }
-                let neighbor_vector = self.fetch_vector(neighbor)?;
+                let neighbor_record = self.fetch_node(neighbor)?;
                 let candidate = Candidate {
-                    distance: stored_distance(&self.distance_calls, query, &neighbor_vector),
+                    distance: stored_distance(&self.distance_calls, query, &neighbor_record.vector),
                     node: neighbor,
                 };
-                let worst = results.peek().expect("non-empty").distance;
-                if results.len() < ef || candidate.distance < worst {
-                    frontier.push(Reverse(candidate));
+                let enters = match results.peek() {
+                    None => true,
+                    Some(worst) => results.len() < ef || candidate.distance < worst.distance,
+                };
+                if !enters {
+                    continue;
+                }
+                frontier.push(Reverse(candidate));
+                if admits(&neighbor_record)? {
                     results.push(candidate);
                     if results.len() > ef {
                         results.pop();
@@ -1103,7 +1139,7 @@ impl<S: Storage> VectorIndex for PagedHnswIndex<S> {
         self.finish()
     }
 
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<Scored>> {
+    fn search(&self, query: &[f32], k: usize, filter: Option<&RowFilter>) -> Result<Vec<Scored>> {
         if query.len() != self.dim {
             return Err(Error::Type(alloc::format!(
                 "query has dimension {} but the index expects {}",
@@ -1121,11 +1157,14 @@ impl<S: Storage> VectorIndex for PagedHnswIndex<S> {
         let query = StoredVector::Exact(normalise(query));
         let mut visited = Visited::new(self.node_count);
         for layer in (1..=self.entry_level).rev() {
-            let nearest = self.search_layer(&query, ep, 1, layer, &mut visited)?;
+            // Unfiltered descent, as in the in-memory index: it only picks
+            // where layer 0 starts, and layer 0 expands through rejected
+            // nodes, so filtering here would cost without buying reach.
+            let nearest = self.search_layer(&query, ep, 1, layer, None, &mut visited)?;
             ep = nearest[0].node;
         }
 
-        let hits = self.search_layer(&query, ep, self.params.ef_for(k), 0, &mut visited)?;
+        let hits = self.search_layer(&query, ep, self.params.ef_for(k), 0, filter, &mut visited)?;
         let mut scored = Vec::with_capacity(k.min(hits.len()));
         for hit in hits {
             let record = self.fetch_node(hit.node)?;
@@ -1200,7 +1239,7 @@ mod tests {
         index.insert(3, &[0.9, 0.1, 0.0]).unwrap();
         index.insert(4, &[0.0, 0.0, 1.0]).unwrap();
         index.commit().unwrap();
-        let hits = index.search(&[1.0, 0.0, 0.0], 2).unwrap();
+        let hits = index.search(&[1.0, 0.0, 0.0], 2, None).unwrap();
         assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1, 3]);
     }
 
@@ -1208,16 +1247,16 @@ mod tests {
     fn searching_before_commit_returns_nothing() {
         let mut index = index(3);
         index.insert(1, &[1.0, 0.0, 0.0]).unwrap();
-        assert!(index.search(&[1.0, 0.0, 0.0], 1).unwrap().is_empty());
+        assert!(index.search(&[1.0, 0.0, 0.0], 1, None).unwrap().is_empty());
         index.commit().unwrap();
-        assert_eq!(index.search(&[1.0, 0.0, 0.0], 1).unwrap().len(), 1);
+        assert_eq!(index.search(&[1.0, 0.0, 0.0], 1, None).unwrap().len(), 1);
     }
 
     #[test]
     fn dimension_mismatch_is_an_error() {
         let mut index = index(3);
         assert!(index.insert(1, &[1.0]).is_err());
-        assert!(index.search(&[1.0], 1).is_err());
+        assert!(index.search(&[1.0], 1, None).is_err());
     }
 
     #[test]
@@ -1232,7 +1271,7 @@ mod tests {
             }
             index.commit().unwrap();
             index
-                .search(&[1.0, 0.0, 0.0, 0.0], 5)
+                .search(&[1.0, 0.0, 0.0, 0.0], 5, None)
                 .unwrap()
                 .into_iter()
                 .map(|h| h.id)
@@ -1255,13 +1294,13 @@ mod tests {
 
         let query = &rows[rows.len() - 1];
         let approx: Vec<RowId> = index
-            .search(query, 10)
+            .search(query, 10, None)
             .unwrap()
             .into_iter()
             .map(|h| h.id)
             .collect();
         let exact: Vec<RowId> = brute
-            .search(query, 10)
+            .search(query, 10, None)
             .unwrap()
             .into_iter()
             .map(|h| h.id)
@@ -1272,6 +1311,118 @@ mod tests {
             overlap >= 8,
             "recall too low: approx {approx:?} exact {exact:?}"
         );
+    }
+
+    // -------------------------------------------------------- filtered search
+
+    #[test]
+    fn a_filter_that_accepts_everything_returns_the_unfiltered_answer() {
+        // The tie to the unfiltered path: same rows, same order, same scores.
+        let dim = 8;
+        let rows = vectors(128, dim);
+        let mut index = index(dim);
+        for (id, vector) in rows.iter().enumerate() {
+            index.insert(id as u64 + 1, vector).unwrap();
+        }
+        index.commit().unwrap();
+        for seed in 0..8 {
+            let query: Vec<f32> = (0..dim).map(|i| ((seed * dim + i) as f32).sin()).collect();
+            assert_eq!(
+                index.search(&query, 10, None).unwrap(),
+                index.search(&query, 10, Some(&|_| Ok(true))).unwrap(),
+                "filtered path diverged from unfiltered on query {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_walk_through_rejected_nodes_reaches_any_admitted_row() {
+        // The paged twin of the connectivity test: with a filter admitting
+        // exactly one row, the walk must traverse rejected records (fetched
+        // through storage, possibly past the cache bound) and still reach it.
+        let dim = 8;
+        let rows = vectors(200, dim);
+        let mut index = index(dim).with_cache_capacity(16);
+        for (id, vector) in rows.iter().enumerate() {
+            index.insert(id as u64 + 1, vector).unwrap();
+        }
+        index.commit().unwrap();
+
+        for seed in 0..4 {
+            let query: Vec<f32> = (0..dim).map(|i| ((seed * dim + i) as f32).sin()).collect();
+            for target in (1..=200).step_by(25) {
+                let hits = index
+                    .search(&query, 10, Some(&|id| Ok(id == target)))
+                    .unwrap();
+                assert_eq!(
+                    hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+                    vec![target],
+                    "query {seed} did not reach admitted row {target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_filter_that_rejects_everything_returns_nothing_and_terminates() {
+        let dim = 8;
+        let rows = vectors(128, dim);
+        let mut index = index(dim);
+        for (id, vector) in rows.iter().enumerate() {
+            index.insert(id as u64 + 1, vector).unwrap();
+        }
+        index.commit().unwrap();
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32).sin()).collect();
+        let hits = index.search(&query, 10, Some(&|_| Ok(false))).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn filtered_recall_matches_the_brute_force_oracle() {
+        // The filtered walk, scored against the exhaustive filtered top-k, at
+        // a moderate (10%) and a selective (1%) filter.
+        let dim = 8;
+        let rows = vectors(400, dim);
+        let mut index = index(dim);
+        let mut brute = BruteForceVectorIndex::new(dim);
+        for (id, vector) in rows.iter().enumerate() {
+            index.insert(id as u64 + 1, vector).unwrap();
+            brute.insert(id as u64 + 1, vector).unwrap();
+        }
+        index.commit().unwrap();
+
+        for (label, filter) in [
+            (
+                "moderate",
+                &(move |id: RowId| id.is_multiple_of(10)) as &dyn Fn(RowId) -> bool,
+            ),
+            (
+                "selective",
+                &(move |id: RowId| id.is_multiple_of(100)) as &dyn Fn(RowId) -> bool,
+            ),
+        ] {
+            let mut total = 0.0;
+            for seed in 0..12 {
+                let query: Vec<f32> = (0..dim).map(|i| ((seed * dim + i) as f32).sin()).collect();
+                let truth: Vec<RowId> = brute
+                    .search(&query, 10, Some(&|id| Ok(filter(id))))
+                    .unwrap()
+                    .into_iter()
+                    .map(|h| h.id)
+                    .collect();
+                if truth.is_empty() {
+                    total += 1.0;
+                    continue;
+                }
+                let got = index
+                    .search(&query, 10, Some(&|id| Ok(filter(id))))
+                    .unwrap();
+                let hit = got.iter().filter(|s| truth.contains(&s.id)).count();
+                total += hit as f64 / truth.len() as f64;
+            }
+            let recall = total / 12.0;
+            assert!(recall >= 0.95, "{label} filter recall@10 was {recall:.3}");
+        }
     }
 
     /// The whole point of the module: a corpus far larger than the cache is
@@ -1293,7 +1444,7 @@ mod tests {
         // than the 32-node cache, so it provably did not all fit in memory.
         for seed in 0..8 {
             let query: Vec<f32> = (0..dim).map(|i| ((seed * dim + i) as f32).sin()).collect();
-            assert!(!index.search(&query, 5).unwrap().is_empty());
+            assert!(!index.search(&query, 5, None).unwrap().is_empty());
             assert!(
                 index.cache_len() <= capacity,
                 "cache grew to {} nodes, bound is {capacity}",
@@ -1319,7 +1470,7 @@ mod tests {
         let expected: Vec<Vec<RowId>> = (0..8)
             .map(|seed| {
                 original
-                    .search(&query(seed), 10)
+                    .search(&query(seed), 10, None)
                     .unwrap()
                     .into_iter()
                     .map(|h| h.id)
@@ -1331,7 +1482,7 @@ mod tests {
         let restored = PagedHnswIndex::open(storage, "hnsw", dim).unwrap();
         for (seed, expected) in expected.iter().enumerate() {
             let got: Vec<RowId> = restored
-                .search(&query(seed), 10)
+                .search(&query(seed), 10, None)
                 .unwrap()
                 .into_iter()
                 .map(|h| h.id)
@@ -1350,14 +1501,14 @@ mod tests {
             index.commit().unwrap();
             index.remove(1).unwrap();
             index.commit().unwrap();
-            let hits = index.search(&[1.0, 0.0, 0.0], 4).unwrap();
+            let hits = index.search(&[1.0, 0.0, 0.0], 4, None).unwrap();
             assert!(hits.iter().all(|hit| hit.id != 1));
         }
 
         // A fresh handle over the same storage still hides the deleted row.
         let restored = PagedHnswIndex::open(storage, "hnsw", 3).unwrap();
         assert!(restored
-            .search(&[1.0, 0.0, 0.0], 4)
+            .search(&[1.0, 0.0, 0.0], 4, None)
             .unwrap()
             .iter()
             .all(|hit| hit.id != 1));
@@ -1431,7 +1582,7 @@ mod tests {
         // throughout this module's other tests, extended to Q8.
         let query = &rows[rows.len() - 1];
         let before: Vec<RowId> = quantized
-            .search(query, 10)
+            .search(query, 10, None)
             .unwrap()
             .into_iter()
             .map(|h| h.id)
@@ -1440,7 +1591,7 @@ mod tests {
         let storage = quantized.into_storage();
         let restored = PagedHnswIndex::open_quantized(storage, "hnsw", dim).unwrap();
         let after: Vec<RowId> = restored
-            .search(query, 10)
+            .search(query, 10, None)
             .unwrap()
             .into_iter()
             .map(|h| h.id)
@@ -1477,19 +1628,19 @@ mod tests {
         for seed in 0..10 {
             let query: Vec<f32> = (0..dim).map(|i| ((seed * dim + i) as f32).sin()).collect();
             let truth: Vec<RowId> = brute
-                .search(&query, 10)
+                .search(&query, 10, None)
                 .unwrap()
                 .into_iter()
                 .map(|h| h.id)
                 .collect();
             let paged_found: Vec<RowId> = paged
-                .search(&query, 10)
+                .search(&query, 10, None)
                 .unwrap()
                 .into_iter()
                 .map(|h| h.id)
                 .collect();
             let in_memory_found: Vec<RowId> = in_memory
-                .search(&query, 10)
+                .search(&query, 10, None)
                 .unwrap()
                 .into_iter()
                 .map(|h| h.id)
@@ -1534,7 +1685,7 @@ mod tests {
             (0..dim).map(|i| ((seed * dim + i) as f32).sin()).collect()
         };
         let expected: Vec<RowId> = original
-            .search(&query(0), 10)
+            .search(&query(0), 10, None)
             .unwrap()
             .into_iter()
             .map(|h| h.id)
@@ -1552,7 +1703,7 @@ mod tests {
 
         let restored = PagedHnswIndex::open(storage, "hnsw", dim).unwrap();
         let got: Vec<RowId> = restored
-            .search(&query(0), 10)
+            .search(&query(0), 10, None)
             .unwrap()
             .into_iter()
             .map(|h| h.id)
@@ -1588,7 +1739,7 @@ mod tests {
             "an encoding mismatch must look exactly like \"nothing saved\", so the \
              caller's normal staleness check rebuilds it"
         );
-        assert!(mismatched.search(&[1.0; 6], 10).unwrap().is_empty());
+        assert!(mismatched.search(&[1.0; 6], 10, None).unwrap().is_empty());
 
         // And a rebuild — re-index every row, then commit, deliberately
         // *without* calling `reset()` first — must complete and answer
@@ -1608,7 +1759,7 @@ mod tests {
         assert_eq!(mismatched.len(), 32, "rebuild did not index every row");
 
         let query = rows.pop().unwrap();
-        let hits = mismatched.search(&query, 1).unwrap();
+        let hits = mismatched.search(&query, 1, None).unwrap();
         assert_eq!(
             hits[0].id, 32,
             "rebuilt quantised graph answered incorrectly"
@@ -1620,6 +1771,6 @@ mod tests {
         let storage = mismatched.into_storage();
         let reopened = PagedHnswIndex::open_quantized(storage, "hnsw", dim).unwrap();
         assert_eq!(reopened.len(), 32);
-        assert_eq!(reopened.search(&query, 1).unwrap()[0].id, 32);
+        assert_eq!(reopened.search(&query, 1, None).unwrap()[0].id, 32);
     }
 }

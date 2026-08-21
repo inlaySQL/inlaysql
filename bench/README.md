@@ -334,21 +334,36 @@ pgvector and DuckDB are not in this suite because neither links into the
 harness. They are in `./bench/compare.sh` instead, on a corpus generated once
 and shared by all four engines.
 
-### The filtered case
+### The filtered cases
 
-After the unfiltered comparison, the suite runs the same corpus again with
-`WHERE tenant = id % 100`, so each tenant owns ~1% of the rows, and scores the
-result against each tenant's own exhaustive top-k. This is the workload AHL-379
-existed for: a fixed candidate budget over-fetched for fusion contains
-essentially none of one tenant, so filtering *after* retrieval returns nothing
-at all. The engine now over-fetches adaptively until the filter admits `LIMIT`
-rows, and this case reports what that costs — both the recall it preserves and
-the extra latency of the wider probe.
+After the unfiltered comparison, the suite runs the same corpus three more
+times with a `WHERE` pushed into the probe, at three filter selectivities:
+`WHERE tenant % ? = ?` with each bucket owning ~10%, ~1% and ~0.1% of the
+rows. Each query is pinned to a bucket and scored against that bucket's own
+exhaustive top-k, so the recall column measures the filter, not the
+approximation.
 
-`sqlite-vec` is absent from this case on purpose. Its `vec0` tables take an
+This is the workload AHL-379 existed for: a fixed candidate budget
+over-fetched for fusion contains essentially none of one tenant, so filtering
+*after* retrieval returns nothing. The engine used to answer it by doubling
+the candidate budget each round and re-running the search from scratch until
+the filter admitted `LIMIT` rows — geometrically re-walking the graph. It now
+compiles the `WHERE` into a row predicate and pushes it into the index walk
+itself: a rejected row is traversed (so its neighbours stay reachable) but
+neither returned nor counted, and the walk keeps going until its candidate
+beam fills with matching rows or the graph is exhausted — one walk, where the
+old path paid one per doubling round. The ~0.1% bucket is the pathological
+end: it admits fewer rows than the `LIMIT`, so the walk drains the whole
+graph and answers exactly — the case where the old loop re-walked the graph
+several times before giving up. The unfiltered row above is the permissive
+end: a filter that admits everything costs one walk, and the engine-level
+test `a_permissive_filter_answers_like_the_unfiltered_query` pins
+filtered-everything to unfiltered exactly.
+
+`sqlite-vec` is absent from these cases on purpose. Its `vec0` tables take an
 optional `WHERE` on metadata columns, but wiring that into the harness would
-compare two different questions; the filtered case is about InlaySQL's own
-over-fetch cost, not a third-party comparison.
+compare two different questions; the filtered cases are about InlaySQL's own
+filtered-walk cost, not a third-party comparison.
 
 ### Incremental maintenance
 

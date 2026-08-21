@@ -30,6 +30,16 @@ use crate::row::RowBuf;
 /// this stage. Both index backends key their entries by row id.
 pub type RowId = u64;
 
+/// A predicate a filtered retrieval search pushes into the walk.
+///
+/// `Ok(true)` admits the row into the result set; `Ok(false)` excludes it
+/// from the results *without* excluding it from the walk — the search still
+/// traverses through a rejected row to reach its neighbours, which is what
+/// keeps a selective filter from severing the graph (see
+/// [`VectorIndex::search`]). The predicate runs on the engine's side and may
+/// decode a row, so it can fail; errors propagate out of the search.
+pub type RowFilter<'a> = dyn Fn(RowId) -> Result<bool> + 'a;
+
 /// A row id paired with a relevance score. Higher scores rank first.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Scored {
@@ -344,7 +354,14 @@ pub trait FullTextIndex {
     fn commit(&mut self) -> Result<()>;
 
     /// Return up to `k` documents ranked by BM25 relevance, best first.
-    fn search(&self, query: &str, k: usize) -> Result<Vec<Scored>>;
+    ///
+    /// `filter` restricts which documents may appear in the result. A document
+    /// it rejects is skipped without consuming a result slot, and the scan
+    /// continues past it — an inverted index has no graph to keep connected,
+    /// so filtered search is exactly "keep scanning until `k` documents pass
+    /// or the postings run out". Fewer than `k` results therefore means the
+    /// filter's answer over the whole index, never a partial probe.
+    fn search(&self, query: &str, k: usize, filter: Option<&RowFilter>) -> Result<Vec<Scored>>;
 
     /// Serialise the committed index, or `None` if this backend cannot be
     /// persisted. See the [module-level note](self#persisting-an-index).
@@ -371,7 +388,23 @@ pub trait VectorIndex {
     fn commit(&mut self) -> Result<()>;
 
     /// Return up to `k` neighbours ranked by similarity, closest first.
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<Scored>>;
+    ///
+    /// `filter` restricts which rows may appear in the result. A row it
+    /// rejects is excluded from the result set and does not count toward `k`,
+    /// but the walk still expands through it, so its neighbours stay
+    /// reachable: pruning rejected nodes themselves would break the graph's
+    /// connectivity and silently drop matches behind them.
+    ///
+    /// The walk stops when its candidate beam fills with matching rows —
+    /// which for a permissive filter is exactly the unfiltered walk, byte for
+    /// byte — or when the graph is exhausted. Exhaustion happens only when
+    /// the filter admits fewer rows than the beam, and then the returned set
+    /// is *complete* for that filter: a filter too selective for any bounded
+    /// probe degrades to correctness, never to a partial answer. One walk,
+    /// where the pre-pushdown engine re-walked the graph once per doubling
+    /// round of its over-fetch loop. Passing `None` searches unfiltered with
+    /// exactly the behaviour and cost of before.
+    fn search(&self, query: &[f32], k: usize, filter: Option<&RowFilter>) -> Result<Vec<Scored>>;
 
     /// Resident bytes occupied by vector payloads, when the backend can
     /// report them. Graph/container overhead is excluded.
