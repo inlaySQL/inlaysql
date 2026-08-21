@@ -6,13 +6,13 @@
 //! leaves the buffering/durability contract exactly as the core expects:
 //! writes are visible immediately and become durable on [`FileDevice::sync`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 
 use inlaysql_core::btree::Device;
 use inlaysql_core::{Error, Result};
@@ -114,6 +114,16 @@ struct CommitCoordinator {
     readers: Mutex<HashMap<u64, u64>>,
     /// Next token [`Device::register_reader`] hands out on this file.
     next_reader_token: AtomicU64,
+    /// Raw data-area page bytes shared by every handle on this file, so a
+    /// page is read from the device once per file rather than once per
+    /// handle. See [`ReadCache`] for why only data-area pages are cacheable
+    /// and how the reuse opt-in turns it off.
+    read_cache: RwLock<ReadCache>,
+    /// Set once, when any handle sharing this file opts into page reuse; from
+    /// then on the raw cache is bypassed and stays off. See
+    /// [`Device::note_page_reuse_enabled`] in the core for the contract this
+    /// satisfies.
+    reuse_enabled: AtomicBool,
 }
 
 /// The committed state and per-region append positions the reservation gate
@@ -140,6 +150,152 @@ struct FlushState {
     /// completion from a spurious wakeup and from a *second* round starting
     /// before it got scheduled.
     epoch: u64,
+}
+
+/// Raw page bytes shared by every read-write handle on one file.
+///
+/// This is the read-side counterpart of the commit machinery above: several
+/// `Database` handles on one file each keep their own decoded page cache, so
+/// every connection re-reads and re-decodes the same pages. This cache holds
+/// the *raw* bytes instead, keyed by data offset, so a decoded-cache miss in
+/// any handle pays a lookup here before it pays a `pread` — the device read is
+/// done once per file, not once per handle, and a freshly opened connection
+/// warms up from RAM instead of from the device.
+///
+/// # What is cacheable, and why this needs no invalidation
+///
+/// Only the data area is cacheable — the header, the state block and the WAL
+/// regions are rewritten in place at every checkpoint and commit, so caching
+/// them would serve stale bytes. The boundary is derived from the on-disk
+/// layout (page size + format version, learned from the header the tree reads
+/// or writes through this device) with the core's own
+/// [`inlaysql_core::btree::cache::data_area_page`] arithmetic, and an entry is
+/// only ever looked up at or beyond it.
+///
+/// Within the data area the same argument the decoded cache rests on applies:
+/// the tree is copy-on-write and, with page reuse off (the default, and the
+/// only configuration this file's server exposes), a page id names one
+/// immutable sequence of bytes for the lifetime of the file, so an entry can
+/// never go stale and there is nothing to invalidate — no version, no
+/// cross-handle protocol. This cache is therefore sound *only* while reuse is
+/// off, and [`CommitCoordinator::reuse_enabled`] is the gate that keeps it
+/// that way: the moment any handle opts in (a one-way trip), the cache is
+/// flushed and bypassed on every lookup. The gate is checked on the read path
+/// before any entry is trusted, and it is set before the first commit that
+/// could reissue an id, so there is no window in which a stale entry can be
+/// served.
+///
+/// # Cost
+///
+/// A hit is one shared read-lock acquisition, one map lookup and one
+/// `Arc::clone`, paid only where the caller would otherwise issue a `pread`
+/// syscall — the decoded cache in front of it means the hot, all-hits path of
+/// a warmed handle never reaches here. Eviction is FIFO on the byte budget,
+/// deliberately crude: recency ordering is the decoded cache's job, and this
+/// cache's only contract is to bound memory.
+struct ReadCache {
+    /// `(page size, format version)`, learned from the first header this
+    /// process's handles observe. `None` until then; nothing is cached before
+    /// the boundary is known.
+    layout: Option<(usize, u32)>,
+    /// Byte budget over raw pages. `0` disables the cache entirely.
+    budget: usize,
+    /// Bytes currently resident.
+    bytes: usize,
+    /// Offset → raw page bytes.
+    pages: HashMap<u64, Arc<[u8]>>,
+    /// Insertion order of resident pages, for FIFO eviction.
+    order: VecDeque<u64>,
+    /// Lookups that found the offset resident, and lookups that did not —
+    /// diagnostics, and how a test proves the cache is actually being used.
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl ReadCache {
+    fn new(budget: usize) -> Self {
+        Self {
+            layout: None,
+            budget,
+            bytes: 0,
+            pages: HashMap::new(),
+            order: VecDeque::new(),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+
+    /// The byte offset where the data area begins, or `None` until the layout
+    /// is known.
+    fn boundary(&self) -> Option<usize> {
+        let (page_size, version) = self.layout?;
+        Some(inlaysql_core::wal::all_regions_end(page_size, version))
+    }
+
+    /// Forget every entry and the layout they were read under.
+    fn clear(&mut self) {
+        self.layout = None;
+        self.bytes = 0;
+        self.pages.clear();
+        self.order.clear();
+    }
+
+    /// The resident page at `offset`, if one covers exactly `buf`'s length —
+    /// and if `offset` lies at or beyond the data area. The boundary is
+    /// enforced here, on every lookup, because a hit below it would serve
+    /// stale bytes for a region the tree rewrites in place; keeping the check
+    /// beside the data makes a caller that forgets it fail closed.
+    fn get(&self, offset: u64, buf: &[u8]) -> Option<Arc<[u8]>> {
+        let boundary = self.boundary()?;
+        if (offset as usize) < boundary {
+            return None;
+        }
+        let bytes = self.pages.get(&offset)?;
+        if bytes.len() != buf.len() {
+            return None;
+        }
+        Some(Arc::clone(bytes))
+    }
+
+    /// Make `page` resident at `offset`, evicting FIFO until the budget holds.
+    /// `false` (nothing cached) when the offset is below the data area, the
+    /// budget is zero, the page is larger than the whole budget, or it is
+    /// already resident.
+    fn insert(&mut self, offset: u64, page: &[u8]) -> bool {
+        if self.budget == 0 || page.is_empty() || page.len() > self.budget {
+            return false;
+        }
+        let Some(boundary) = self.boundary() else {
+            return false;
+        };
+        if (offset as usize) < boundary || self.pages.contains_key(&offset) {
+            return false;
+        }
+        while self.bytes + page.len() > self.budget {
+            let Some(evict) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(freed) = self.pages.remove(&evict) {
+                self.bytes = self.bytes.saturating_sub(freed.len());
+            }
+        }
+        if self.bytes + page.len() > self.budget {
+            return false;
+        }
+        self.pages.insert(offset, Arc::from(page.to_vec()));
+        self.order.push_back(offset);
+        self.bytes += page.len();
+        true
+    }
+
+    /// Record the layout observed in a header, forgetting resident pages if it
+    /// disagrees with the layout they were read under.
+    fn note_layout(&mut self, layout: (usize, u32)) {
+        if self.layout != Some(layout) {
+            self.clear();
+            self.layout = Some(layout);
+        }
+    }
 }
 
 impl CommitCoordinator {
@@ -351,13 +507,82 @@ impl FileDevice {
             self.path.display(),
         ))
     }
+
+    /// Serve `offset..offset+buf.len()` from the shared raw cache when it can
+    /// and may. `true` only when `buf` was filled from the cache; every other
+    /// outcome — disabled cache, unknown layout, an offset below the data
+    /// area, a miss — falls through to a real device read.
+    fn read_from_shared_cache(&self, offset: usize, buf: &mut [u8]) -> bool {
+        let Some(coordinator) = self.coordinator.as_ref() else {
+            return false;
+        };
+        if coordinator.reuse_enabled.load(Ordering::Acquire) || buf.is_empty() {
+            return false;
+        }
+        let cache = coordinator
+            .read_cache
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(boundary) = cache.boundary() else {
+            return false;
+        };
+        if offset < boundary {
+            return false;
+        }
+        let Some(bytes) = cache.get(offset as u64, buf) else {
+            cache.misses.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        cache.hits.fetch_add(1, Ordering::Relaxed);
+        drop(cache);
+        buf.copy_from_slice(&bytes);
+        true
+    }
+
+    /// Record a successful device read where it belongs: a header read teaches
+    /// the layout; a data-area read may become resident in the shared cache.
+    fn fill_shared_cache(&self, offset: usize, buf: &[u8]) {
+        let Some(coordinator) = self.coordinator.as_ref() else {
+            return;
+        };
+        if offset == inlaysql_core::wal::header_offset() {
+            if let Ok(layout) = inlaysql_core::btree::tree::parse_header(buf) {
+                self.note_layout(layout);
+            }
+            return;
+        }
+        if coordinator.reuse_enabled.load(Ordering::Acquire) || buf.is_empty() {
+            return;
+        }
+        coordinator
+            .read_cache
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(offset as u64, buf);
+    }
+
+    /// Teach the shared cache the on-disk layout just observed in a header.
+    fn note_layout(&self, layout: (usize, u32)) {
+        if let Some(coordinator) = &self.coordinator {
+            coordinator
+                .read_cache
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .note_layout(layout);
+        }
+    }
 }
 
 impl Device for FileDevice {
     fn read(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
+        if self.read_from_shared_cache(offset, buf) {
+            return Ok(());
+        }
         self.file
             .read_exact_at(buf, offset as u64)
-            .map_err(io_error)
+            .map_err(io_error)?;
+        self.fill_shared_cache(offset, buf);
+        Ok(())
     }
 
     fn write(&mut self, offset: usize, data: &[u8]) -> Result<()> {
@@ -366,7 +591,16 @@ impl Device for FileDevice {
         }
         self.file
             .write_all_at(data, offset as u64)
-            .map_err(io_error)
+            .map_err(io_error)?;
+        // Creating a fresh database writes the header, so this is where a
+        // handle first learns the layout of a file it just made — the read
+        // side never sees a header for one.
+        if offset == inlaysql_core::wal::header_offset() {
+            if let Ok(layout) = inlaysql_core::btree::tree::parse_header(data) {
+                self.note_layout(layout);
+            }
+        }
+        Ok(())
     }
 
     /// Make every write this handle has issued durable — batched with any
@@ -576,6 +810,22 @@ impl Device for FileDevice {
             .copied()
             .min()
     }
+
+    /// Flush the shared raw-page cache and gate it off — page ids may now be
+    /// reissued, so every resident entry may describe a page's previous
+    /// occupant. One-way: entries flushed here can never be trusted again,
+    /// and nothing this process later learns can change that.
+    fn note_page_reuse_enabled(&self) {
+        let Some(coordinator) = &self.coordinator else {
+            return;
+        };
+        coordinator.reuse_enabled.store(true, Ordering::Release);
+        coordinator
+            .read_cache
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
 }
 
 fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator>> {
@@ -654,9 +904,28 @@ fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator
         _lock: lock_file,
         readers: Mutex::new(HashMap::new()),
         next_reader_token: AtomicU64::new(1),
+        read_cache: RwLock::new(ReadCache::new(shared_read_cache_budget())),
+        reuse_enabled: AtomicBool::new(false),
     });
     registry.insert(file_id, Arc::downgrade(&coordinator));
     Ok(coordinator)
+}
+
+/// The shared raw-page cache budget for this process's handles on one file —
+/// [`inlaysql_core::btree::DEFAULT_PAGE_CACHE_BYTES`] unless the
+/// `INLAYSQL_DISABLE_SHARED_READ_CACHE` environment variable is set, which
+/// pins it to zero and restores the read-from-the-device-every-time behaviour.
+///
+/// The variable exists so the same benchmark binary can measure the cache on
+/// and off across two process runs; it is a diagnostic knob, not a supported
+/// configuration surface. Read once, when the first handle on a file is
+/// opened.
+fn shared_read_cache_budget() -> usize {
+    if std::env::var_os("INLAYSQL_DISABLE_SHARED_READ_CACHE").is_some() {
+        0
+    } else {
+        inlaysql_core::btree::DEFAULT_PAGE_CACHE_BYTES
+    }
 }
 
 fn io_error(error: io::Error) -> inlaysql_core::Error {
@@ -710,6 +979,8 @@ mod group_commit_tests {
             _lock: lock_file,
             readers: Mutex::new(HashMap::new()),
             next_reader_token: AtomicU64::new(1),
+            read_cache: RwLock::new(ReadCache::new(1 << 20)),
+            reuse_enabled: AtomicBool::new(false),
         }
     }
 
@@ -855,5 +1126,237 @@ mod group_commit_tests {
             "a commit after a failed flush must still be able to become leader \
              and fsync for itself"
         );
+    }
+}
+
+/// Tests of the shared raw-page read cache: `ReadCache` in isolation, then the
+/// whole `FileDevice` path — the boundary discipline that keeps the header,
+/// state block and WAL regions uncached, population through a real tree, and
+/// the page-reuse gate that flushes and disables it.
+#[cfg(test)]
+mod shared_read_cache_tests {
+    use super::*;
+    use inlaysql_core::btree::{CowBTree, DEFAULT_PAGE_SIZE, FORMAT_VERSION};
+
+    fn cache_with_budget(budget: usize) -> ReadCache {
+        let mut cache = ReadCache::new(budget);
+        cache.note_layout((DEFAULT_PAGE_SIZE, FORMAT_VERSION));
+        cache
+    }
+
+    fn boundary(cache: &ReadCache) -> usize {
+        cache.boundary().expect("layout must be set")
+    }
+
+    #[test]
+    fn a_resident_data_area_page_is_served_again() {
+        let mut cache = cache_with_budget(1 << 16);
+        let page = vec![0xabu8; DEFAULT_PAGE_SIZE];
+        let offset = boundary(&cache);
+        assert!(
+            cache.insert(offset as u64, &page),
+            "data-area page must cache"
+        );
+
+        let mut buf = vec![0u8; DEFAULT_PAGE_SIZE];
+        let served = cache
+            .get(offset as u64, &buf)
+            .expect("page must be resident");
+        buf.copy_from_slice(&served);
+        assert_eq!(buf, page);
+    }
+
+    #[test]
+    fn nothing_below_the_data_area_is_ever_cached_or_served() {
+        let mut cache = cache_with_budget(1 << 16);
+        let offset = boundary(&cache);
+        let page = vec![0u8; DEFAULT_PAGE_SIZE];
+        // The header, the state block and every WAL region live below the
+        // data area and are rewritten in place; serving them from a cache
+        // would be exactly the stale-read bug this boundary exists for.
+        for bad in [0usize, 1, offset - 1] {
+            assert!(
+                !cache.insert(bad as u64, &page),
+                "offset {bad} must not cache"
+            );
+            assert!(
+                cache.get(bad as u64, &page).is_none(),
+                "offset {bad} must never be served"
+            );
+        }
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.pages.is_empty());
+    }
+
+    #[test]
+    fn a_zero_budget_caches_nothing() {
+        let mut cache = cache_with_budget(0);
+        assert!(!cache.insert(boundary(&cache) as u64, &vec![0u8; DEFAULT_PAGE_SIZE]));
+        assert!(cache
+            .get(boundary(&cache) as u64, &vec![0u8; DEFAULT_PAGE_SIZE])
+            .is_none());
+    }
+
+    #[test]
+    fn a_page_larger_than_the_whole_budget_is_not_cached() {
+        let mut cache = cache_with_budget(128);
+        let page = vec![0u8; DEFAULT_PAGE_SIZE];
+        assert!(!cache.insert(boundary(&cache) as u64, &page));
+        assert!(cache.pages.is_empty());
+    }
+
+    #[test]
+    fn eviction_is_fifo_and_respects_the_budget() {
+        let mut cache = cache_with_budget(2 * DEFAULT_PAGE_SIZE);
+        let base = boundary(&cache) as u64;
+        for i in 0..3u64 {
+            let page = vec![i as u8; DEFAULT_PAGE_SIZE];
+            assert!(cache.insert(base + i * DEFAULT_PAGE_SIZE as u64, &page));
+        }
+        assert!(cache.bytes <= cache.budget);
+        // The oldest entry went first.
+        assert!(cache.get(base, &vec![0u8; DEFAULT_PAGE_SIZE]).is_none());
+        for i in 1..3u64 {
+            assert!(cache
+                .get(
+                    base + i * DEFAULT_PAGE_SIZE as u64,
+                    &vec![0u8; DEFAULT_PAGE_SIZE]
+                )
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn a_layout_change_forgets_everything_read_under_the_old_layout() {
+        let mut cache = cache_with_budget(1 << 16);
+        let offset = boundary(&cache) as u64;
+        assert!(cache.insert(offset, &vec![1u8; DEFAULT_PAGE_SIZE]));
+        // The file at this identity was replaced by one with a different page
+        // size: pages cached under the old layout must never be served.
+        cache.note_layout((DEFAULT_PAGE_SIZE * 2, FORMAT_VERSION));
+        assert!(cache.pages.is_empty());
+        assert_eq!(cache.bytes, 0);
+        assert!(cache.get(offset, &vec![0u8; DEFAULT_PAGE_SIZE]).is_none());
+    }
+
+    /// End to end: a tree populates the shared cache as it reads, and a
+    /// second device handle on the same file is served from it instead of
+    /// re-reading.
+    #[test]
+    fn the_tree_populates_the_shared_cache_and_a_second_handle_reads_from_it() {
+        let path = std::env::temp_dir().join(format!(
+            "inlaysql-shared-cache-populate-{}.inlay",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let device = FileDevice::open(&path).expect("open");
+            // Held for the whole test: the coordinator (and with it the OS
+            // lock and the shared cache) lives only as long as some handle
+            // references it — exactly the role `Server::run`'s keeper
+            // `Database` plays for the MySQL server.
+            let keeper = device.coordinator.clone().expect("rw handle");
+            let mut tree = CowBTree::open_or_create(device, DEFAULT_PAGE_SIZE).expect("create");
+            for key in 0..64 {
+                tree.put(format!("key-{key}").as_bytes(), b"value")
+                    .expect("put");
+            }
+            tree.commit().expect("commit");
+            tree.get(b"key-7").expect("read populates the cache");
+            drop(tree);
+            {
+                let cache = keeper.read_cache.read().unwrap();
+                assert!(
+                    cache.bytes > 0,
+                    "the first handle's reads must have populated the shared cache"
+                );
+            }
+        }
+
+        let device = FileDevice::open(&path).expect("reopen");
+        let mut header = [0u8; 24];
+        device.read(0, &mut header).expect("header");
+        let (page_size, version) =
+            inlaysql_core::btree::tree::parse_header(&header).expect("layout");
+        let coordinator = device.coordinator.as_ref().expect("rw handle");
+        let offset = inlaysql_core::wal::data_offset_for(page_size, version, 1);
+        let mut first = vec![0u8; page_size];
+        device.read(offset, &mut first).expect("read");
+        let cache = coordinator.read_cache.read().unwrap();
+        assert_eq!(
+            cache.hits.load(Ordering::Relaxed),
+            0,
+            "the first read of this offset by this handle is a miss"
+        );
+        drop(cache);
+
+        let mut second = vec![0u8; page_size];
+        device.read(offset, &mut second).expect("read");
+        assert_eq!(first, second);
+        let cache = coordinator.read_cache.read().unwrap();
+        assert_eq!(
+            cache.hits.load(Ordering::Relaxed),
+            1,
+            "the second read of the same offset must be served from the cache"
+        );
+        drop(cache);
+
+        drop(device);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The one event that invalidates the whole design — a handle opting into
+    /// page reuse — flushes the shared cache and gates it off, so a later
+    /// reissue of a page id can never be served its previous occupant.
+    #[test]
+    fn the_reuse_opt_in_flushes_and_gates_the_shared_cache() {
+        let path = std::env::temp_dir().join(format!(
+            "inlaysql-shared-cache-reuse-{}.inlay",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let device = FileDevice::open(&path).expect("open");
+        let coordinator = device.coordinator.clone().expect("rw handle");
+        let mut tree = CowBTree::open_or_create(device, DEFAULT_PAGE_SIZE).expect("create");
+        tree.put(b"key", b"value").expect("put");
+        tree.commit().expect("commit");
+        tree.get(b"key").expect("read populates the cache");
+        {
+            let cache = coordinator.read_cache.read().unwrap();
+            assert!(
+                cache.bytes > 0,
+                "the read above must have populated the cache"
+            );
+        }
+
+        tree.set_page_reuse(true);
+        assert!(coordinator.reuse_enabled.load(Ordering::Acquire));
+        {
+            let cache = coordinator.read_cache.read().unwrap();
+            assert_eq!(cache.bytes, 0, "the reuse opt-in must flush the cache");
+            assert!(cache.pages.is_empty());
+        }
+
+        // A later data-area read through another handle must not repopulate it.
+        let device2 = FileDevice::open(&path).expect("reopen");
+        let mut header = [0u8; 24];
+        device2.read(0, &mut header).expect("header");
+        let (page_size, version) =
+            inlaysql_core::btree::tree::parse_header(&header).expect("layout");
+        let offset = inlaysql_core::wal::data_offset_for(page_size, version, 1);
+        let mut buf = vec![0u8; page_size];
+        device2.read(offset, &mut buf).expect("read");
+        {
+            let cache = coordinator.read_cache.read().unwrap();
+            assert!(
+                cache.pages.is_empty(),
+                "once reuse is on, the cache must stay off"
+            );
+        }
+        drop(device2);
+        drop(tree);
+        let _ = std::fs::remove_file(&path);
     }
 }

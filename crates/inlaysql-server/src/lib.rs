@@ -26,9 +26,13 @@
 //! OS thread per connection, and each thread opens its own
 //! [`Database`](inlaysql::Database) on the same file. The engine is `!Send` by
 //! design, and several handles on one file already commit concurrently with
-//! first-committer-wins, so this needs no locking of its own. There is no async
-//! runtime anywhere in this crate, which is deliberate: the workspace has zero
-//! async dependencies and this is not the crate that changes that.
+//! first-committer-wins, so this needs no locking of its own. What the handles
+//! *share* is the file device's per-file raw-page read cache
+//! (`FileDevice`'s `CommitCoordinator`), so a page is read from the device
+//! once per file rather than once per connection — see `docs/server.md`, D2.
+//! There is no async runtime anywhere in this crate, which is deliberate: the
+//! workspace has zero async dependencies and this is not the crate that
+//! changes that.
 //!
 //! # Security
 //!

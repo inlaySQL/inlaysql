@@ -434,6 +434,17 @@ impl<D: Device> CowBTree<D> {
     /// on.** That is a real, load-bearing constraint, not a caveat: it is
     /// the reason this is a handle-level opt-in instead of the default.
     pub fn set_page_reuse(&mut self, enabled: bool) {
+        if enabled {
+            // Page ids may now be reissued with new content, which breaks the
+            // immutability assumption every cache keyed by page id or data
+            // offset rests on (`super::cache`, D4). This handle's own decoded
+            // cache and read cursor are handled by `invalidate_for_reuse` at
+            // every root change; the device gets told here, once, so a
+            // device-level cache shared by several handles — `FileDevice`'s
+            // raw-page cache, in the `inlaysql` crate — can flush itself and
+            // stay off. See [`Device::note_page_reuse_enabled`].
+            self.device.note_page_reuse_enabled();
+        }
         self.reuse_enabled = enabled;
     }
 
@@ -2566,7 +2577,17 @@ fn encode_header_with_version(page_size: usize, version: u32) -> Vec<u8> {
     buf
 }
 
-fn parse_header(bytes: &[u8]) -> Result<(usize, u32)> {
+/// Parse and validate the fixed-size file header, returning the page size and
+/// format version it declares.
+///
+/// This is how a device learns the on-disk layout: `FileDevice` (in the
+/// `inlaysql` crate) observes the header the tree reads or writes and uses
+/// this to derive where the immutable data area begins, so it can cache raw
+/// data pages without ever caching the header, the state block or a WAL
+/// region, all of which are rewritten in place. See
+/// [`crate::btree::cache::data_area_page`] for the same boundary in decoded
+/// form.
+pub fn parse_header(bytes: &[u8]) -> Result<(usize, u32)> {
     if bytes.len() < HEADER_LEN {
         return Err(Error::Corrupt("header is truncated".to_string()));
     }
