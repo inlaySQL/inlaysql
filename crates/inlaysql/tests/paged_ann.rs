@@ -246,10 +246,13 @@ fn the_index_does_not_hold_the_corpus_in_memory() {
     }
     assert_eq!(nearest(&mut db, 250, 1), vec![250]);
 
-    // The in-RAM backend reports the embedding bytes it is holding. The paged
-    // one holds a bounded cache instead of the corpus, so it reports nothing to
-    // measure — which is the point of it.
-    assert_eq!(db.vector_index_resident_bytes("docs", "embedding"), None);
+    // The paged backend reports its bounded *cache*, not the corpus: querying
+    // 500 rows fills a cache far short of `DEFAULT_CACHE_NODES` (4096), so its
+    // number stays well under what the in-RAM index — which holds every
+    // embedding — reports for the identical corpus.
+    let paged_resident = db
+        .vector_index_resident_bytes("docs", "embedding")
+        .expect("the paged index measures its cache");
 
     let mut in_ram = Database::open(workspace.path("in-ram.inlay")).unwrap();
     create(&mut in_ram);
@@ -263,6 +266,11 @@ fn the_index_does_not_hold_the_corpus_in_memory() {
     assert!(
         resident >= 500 * DIM * 4,
         "expected the in-RAM index to hold the whole corpus, got {resident} bytes"
+    );
+    assert!(
+        paged_resident <= resident,
+        "paged cache ({paged_resident} bytes) exceeded the in-RAM index's own corpus \
+         ({resident} bytes)"
     );
 }
 
@@ -292,7 +300,12 @@ fn the_options_constructor_reaches_the_same_place() {
         insert(&mut db, id);
     }
     assert_eq!(nearest(&mut db, 11, 1), vec![11]);
-    assert_eq!(db.vector_index_resident_bytes("docs", "embedding"), None);
+    // The paged backend built here reports its cache, same as when it is
+    // reached via `Database::open_paged` — the options constructor lands on
+    // the same backend, not a different one that happens to skip this.
+    assert!(db
+        .vector_index_resident_bytes("docs", "embedding")
+        .is_some());
 }
 
 #[test]
@@ -313,4 +326,97 @@ fn a_dimension_mismatch_is_still_an_error() {
         )
         .unwrap_err();
     assert!(matches!(err, Error::Type(_)), "unexpected error: {err:?}");
+}
+
+/// A `VECTOR(n, INT8)` column indexed through the paged backend must actually
+/// store int8 nodes, not the exact `f32` every paged index used to store
+/// regardless of the column's declared type. This is the gap PLAN.md's
+/// "Retrieval — extend the moat" section named: the paged path never got the
+/// ~4x storage/memory win quantisation already buys the in-memory index. A
+/// real file on disk, not a synthetic byte count, is what proves it landed.
+#[test]
+fn a_quantised_column_gets_a_quantised_paged_graph_not_a_silently_exact_one() {
+    const QDIM: usize = 384;
+
+    fn qvector(seed: u64) -> Vec<f32> {
+        let mut values = vec![0.0f32; QDIM];
+        for (i, value) in values.iter_mut().enumerate() {
+            *value = (((seed.wrapping_mul(2_654_435_761).wrapping_add(i as u64 * 97)) % 1000)
+                as f32)
+                / 1000.0;
+        }
+        values[(seed as usize) % QDIM] += 4.0;
+        values
+    }
+
+    fn build(path: &std::path::Path, quantized: bool, rows: u64) {
+        let mut db = Database::open_paged(path).unwrap();
+        let ty = if quantized {
+            format!("VECTOR({QDIM}, INT8)")
+        } else {
+            format!("VECTOR({QDIM})")
+        };
+        db.execute(
+            &format!("CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding {ty})"),
+            &[],
+        )
+        .unwrap();
+        db.execute("CREATE INDEX docs_embedding ON docs (embedding)", &[])
+            .unwrap();
+        for id in 1..=rows {
+            db.execute(
+                "INSERT INTO docs VALUES (?, ?)",
+                &[Value::Integer(id as i64), Value::Vector(qvector(id))],
+            )
+            .unwrap();
+        }
+        db.checkpoint().unwrap();
+    }
+
+    let workspace = Workspace::new("quantised");
+    let exact_path = workspace.path("exact.inlay");
+    let quantized_path = workspace.path("quantized.inlay");
+    const ROWS: u64 = 300;
+    build(&exact_path, false, ROWS);
+    build(&quantized_path, true, ROWS);
+
+    let exact_bytes = fs::metadata(&exact_path).unwrap().len();
+    let quantized_bytes = fs::metadata(&quantized_path).unwrap().len();
+    assert!(
+        quantized_bytes < exact_bytes,
+        "quantised paged file ({quantized_bytes} bytes) was not smaller than the exact one \
+         ({exact_bytes} bytes) — the paged path may still be storing f32 for an INT8 column"
+    );
+
+    // And the graph still answers correctly, quantisation noise notwithstanding.
+    let mut db = Database::open_paged(&quantized_path).unwrap();
+    let rows = db
+        .query(
+            "SELECT id, vector_score(embedding, ?) AS score FROM docs \
+             ORDER BY score DESC LIMIT 1",
+            &[Value::Vector(qvector(42))],
+        )
+        .unwrap();
+    assert_eq!(rows.rows[0][0], Value::Integer(42));
+
+    // The cache reports less, too: same corpus, same cache bound, fewer
+    // resident bytes per node.
+    let mut exact_db = Database::open_paged(&exact_path).unwrap();
+    let exact_rows = exact_db
+        .query(
+            "SELECT id, vector_score(embedding, ?) AS score FROM docs \
+             ORDER BY score DESC LIMIT 1",
+            &[Value::Vector(qvector(1))],
+        )
+        .unwrap();
+    assert_eq!(exact_rows.rows[0][0], Value::Integer(1));
+    let exact_resident = exact_db
+        .vector_index_resident_bytes("docs", "embedding")
+        .unwrap();
+    let quantized_resident = db.vector_index_resident_bytes("docs", "embedding").unwrap();
+    assert!(
+        quantized_resident < exact_resident,
+        "quantised cache ({quantized_resident} bytes) was not smaller than exact \
+         ({exact_resident} bytes)"
+    );
 }

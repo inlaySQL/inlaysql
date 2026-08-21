@@ -146,39 +146,49 @@ impl Default for HnswParams {
     }
 }
 
+/// Which representation a vector column's index stores its embeddings in.
+///
+/// `pub(crate)` rather than private: [`crate::hnsw_paged::PagedHnswIndex`] is
+/// the same algorithm over the same [`StoredVector`] shape, just with the
+/// nodes living in a [`crate::traits::Storage`] backend instead of in memory,
+/// and needs the same encoding to choose the same wire format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VectorEncoding {
+pub(crate) enum VectorEncoding {
+    /// Full-precision `f32` per component.
     Exact,
+    /// Symmetric int8 quantisation — see [`crate::quantize::Q8Vector`].
     Q8,
 }
 
 /// A vector in the representation selected by the SQL column.
 #[derive(Debug, Clone, PartialEq)]
-enum StoredVector {
+pub(crate) enum StoredVector {
+    /// Full-precision `f32` per component.
     Exact(Vec<f32>),
+    /// Symmetric int8 quantisation — see [`crate::quantize::Q8Vector`].
     Q8(Q8Vector),
 }
 
 impl StoredVector {
-    fn from_f32(values: &[f32], encoding: VectorEncoding) -> Self {
+    pub(crate) fn from_f32(values: &[f32], encoding: VectorEncoding) -> Self {
         match encoding {
             VectorEncoding::Exact => Self::Exact(values.to_vec()),
             VectorEncoding::Q8 => Self::Q8(Q8Vector::from_f32(values)),
         }
     }
 
-    fn to_f32(&self) -> Vec<f32> {
+    pub(crate) fn to_f32(&self) -> Vec<f32> {
         match self {
             Self::Exact(values) => values.clone(),
             Self::Q8(values) => values.to_f32(),
         }
     }
 
-    fn normalised(&self, encoding: VectorEncoding) -> Self {
+    pub(crate) fn normalised(&self, encoding: VectorEncoding) -> Self {
         Self::from_f32(&normalise(&self.to_f32()), encoding)
     }
 
-    fn payload_bytes(&self) -> usize {
+    pub(crate) fn payload_bytes(&self) -> usize {
         match self {
             Self::Exact(values) => values.len() * core::mem::size_of::<f32>(),
             Self::Q8(values) => values.payload_bytes(),
@@ -1052,7 +1062,9 @@ pub(crate) fn max_level_for(count: usize, m: usize) -> usize {
     level
 }
 
-fn encode_stored_vector(out: &mut Vec<u8>, vector: &StoredVector) {
+/// Append a vector's payload in its own encoding's wire format. Shared with
+/// [`crate::hnsw_paged`], whose node records carry the same payload shape.
+pub(crate) fn encode_stored_vector(out: &mut Vec<u8>, vector: &StoredVector) {
     match vector {
         StoredVector::Exact(values) => {
             for value in values {
@@ -1066,7 +1078,9 @@ fn encode_stored_vector(out: &mut Vec<u8>, vector: &StoredVector) {
     }
 }
 
-fn decode_stored_vector(
+/// Parse a vector payload produced by [`encode_stored_vector`]. Shared with
+/// [`crate::hnsw_paged`].
+pub(crate) fn decode_stored_vector(
     cursor: &mut Cursor<'_>,
     dim: usize,
     encoding: VectorEncoding,
@@ -1147,7 +1161,9 @@ pub(crate) fn distance(counter: &Cell<u64>, a: &[f32], b: &[f32]) -> f32 {
     1.0 - dot
 }
 
-fn stored_distance(counter: &Cell<u64>, a: &StoredVector, b: &StoredVector) -> f32 {
+/// Distance between two vectors, dispatching on which side (if either) is
+/// quantised. Shared with [`crate::hnsw_paged`].
+pub(crate) fn stored_distance(counter: &Cell<u64>, a: &StoredVector, b: &StoredVector) -> f32 {
     match (a, b) {
         (StoredVector::Exact(left), StoredVector::Exact(right)) => distance(counter, left, right),
         (StoredVector::Q8(left), StoredVector::Exact(right)) => {

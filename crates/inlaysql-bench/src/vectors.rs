@@ -236,6 +236,7 @@ fn run_shape(
     if auxiliary {
         incremental_maintenance(&corpus);
         paged_memory(&corpus, shape);
+        paged_quantization(dir, &corpus, shape)?;
     }
     Ok(())
 }
@@ -305,6 +306,95 @@ fn paged_memory(corpus: &[Vector], shape: Shape) {
         recall_sum / 25.0,
         shape.label()
     );
+}
+
+/// The paged backend's own quantisation payoff: real files on disk, exact
+/// against int8, over `Database::open_paged`.
+///
+/// This is the paged-index counterpart to the "file bytes" / "resident vector
+/// payload" numbers `run_shape` already prints for the in-memory `HnswIndex`
+/// (see [`inlaysql_vectors`]) — the number PLAN.md's "Retrieval — extend the
+/// moat" section and BENCHMARK.md's quantisation section want for the paged
+/// path, measured the same way: a real `.inlay` file, not a synthetic byte
+/// count.
+fn paged_quantization(
+    dir: &Path,
+    corpus: &[Vector],
+    shape: Shape,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dim = corpus[0].1.len();
+    let exact_path = dir.join("paged-exact.inlay");
+    let quantized_path = dir.join("paged-int8.inlay");
+
+    let (exact_file_bytes, exact_resident) = paged_build(&exact_path, corpus, dim, false)?;
+    let (quantized_file_bytes, quantized_resident) =
+        paged_build(&quantized_path, corpus, dim, true)?;
+
+    println!(
+        "\n=== paged HNSW quantisation: exact vs int8 ({}) ===",
+        shape.label()
+    );
+    println!(
+        "file bytes: exact={exact_file_bytes} int8={quantized_file_bytes} ({:.2}x smaller)",
+        exact_file_bytes as f64 / quantized_file_bytes.max(1) as f64
+    );
+    if let (Some(exact), Some(int8)) = (exact_resident, quantized_resident) {
+        println!(
+            "resident cache payload: exact={:.1} MiB int8={:.1} MiB ({:.2}x smaller)",
+            exact as f64 / 1_048_576.0,
+            int8 as f64 / 1_048_576.0,
+            exact as f64 / int8.max(1) as f64
+        );
+    }
+    Ok(())
+}
+
+/// Build a paged index over `corpus` at `path`, query it once so the cache is
+/// warm, and report the file's size on disk plus its resident cache bytes.
+fn paged_build(
+    path: &Path,
+    corpus: &[Vector],
+    dim: usize,
+    quantized: bool,
+) -> Result<(u64, Option<usize>), Box<dyn std::error::Error>> {
+    let _ = std::fs::remove_file(path);
+    let mut db = Database::open_paged(path)?;
+    let vector_type = if quantized {
+        format!("VECTOR({dim}, INT8)")
+    } else {
+        format!("VECTOR({dim})")
+    };
+    db.execute(
+        &format!("CREATE TABLE vecs (id INTEGER PRIMARY KEY, embedding {vector_type})"),
+        &[],
+    )?;
+    db.execute("CREATE INDEX vecs_embedding ON vecs (embedding)", &[])?;
+
+    crate::batched(&mut db, corpus.len(), |db, index| {
+        let (id, embedding) = &corpus[index];
+        db.execute(
+            "INSERT INTO vecs (id, embedding) VALUES (?, ?)",
+            &[Value::Integer(*id as i64), Value::Vector(embedding.clone())],
+        )?;
+        Ok(())
+    })?;
+
+    // A node's cache entry is written when it is inserted, not only when a
+    // query later touches it (see `PagedHnswIndex::store_node`), so a corpus
+    // that fits under `DEFAULT_CACHE_NODES` is already fully resident here —
+    // no warm-up queries needed. One query all the same, so the number
+    // reported is "what a caller sees after using the index", and so both
+    // configurations go through the identical procedure.
+    let sql =
+        "SELECT id, vector_score(embedding, ?) AS score FROM vecs ORDER BY score DESC LIMIT 1";
+    db.query(sql, &[Value::Vector(corpus[0].1.clone())])?;
+
+    let resident_vector_bytes = db.vector_index_resident_bytes("vecs", "embedding");
+    db.checkpoint()?;
+    let file_bytes = std::fs::metadata(path)?.len();
+    drop(db);
+    let _ = std::fs::remove_file(path);
+    Ok((file_bytes, resident_vector_bytes))
 }
 
 /// Incremental ANN maintenance, measured directly against [`HnswIndex`].
