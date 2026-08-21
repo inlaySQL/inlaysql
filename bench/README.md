@@ -769,6 +769,18 @@ concurrent phase, matching how `write_oltp_result`'s ops/s is computed above.
 Default levels are **1 and 8**; override with `SERVER_CONCURRENCY_LEVELS`
 (comma-separated).
 
+**Known confound: `mysql.connector`'s threaded concurrency is GIL-bound, and
+this driver uses threads.** A published read comparing 1 against 8
+connections (AHL-495) was read as evidence of server-side per-connection
+cache duplication; a later investigation could not reproduce the drop on a
+quiet machine and instead independently reproduced, twice, that this same
+client library's threaded concurrency regresses on its own — 8 threads
+measurably slower than 1 connection, where 8 *processes* of the identical
+client scale up several times over. See `BENCHMARK.md`'s "Server-to-server"
+section for the correction. This driver has not been changed to use
+processes yet; a number from it at more than one connection should be read
+with that confound in mind until it is.
+
 **The workload size here is deliberately smaller than the OLTP section's own
 `ROWS`/`LOOKUPS`, and is its own separate knob** (`SERVER_ROWS`/
 `SERVER_LOOKUPS`, defaulting to 2,000 rows and 1,000 lookups against the OLTP

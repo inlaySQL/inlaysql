@@ -144,11 +144,26 @@ copy-on-write and a data-area page is immutable for the file's lifetime
 (`crates/inlaysql-core/src/btree/cache.rs`, decision D4). It therefore caches
 only data-area pages — the header, the state block and the WAL regions are
 rewritten in place and are never served from it — and it is gated off the
-moment any handle opts into page reuse (`EngineOptions` has no such option
-today, and this server never opts in): `CowBTree::set_page_reuse` tells the
+moment any handle opts into page reuse: `CowBTree::set_page_reuse` tells the
 device, the device flushes the cache and bypasses it from then on, one-way.
-If page reuse is ever wired through the server's open path, that gate is what
+`EngineOptions::page_reuse` now reaches `set_page_reuse` publicly (Phase 2
+item 6), and this server does not opt into it — `serve_connection` still
+opens with `Database::open`, which defaults it off — so the gate has never
+fired in production here, but it is real and tested
+(`the_reuse_opt_in_flushes_and_gates_the_shared_cache`), not aspirational: if
+`page_reuse` is ever wired through the server's own open path, this is what
 keeps a reissued page id from being served its previous occupant's bytes.
+
+**What this cache does and does not explain.** It was built while
+investigating AHL-495's published claim that per-connection cache duplication
+explains a measured 1-to-8-connection read drop — see `BENCHMARK.md`'s
+"Server-to-server" section for the correction: that claim did not hold up
+once tested, and the evidence points at the benchmark driver's own
+GIL-bound threaded concurrency instead. This cache is real and helps the
+page-miss path specifically (~18%, measured with the per-handle decoded
+cache budget forced to zero), but it does not change the cited number, whose
+own benchmark table already fits inside one connection's warm per-handle
+cache.
 
 The page cache budget is the default `DEFAULT_PAGE_CACHE_BYTES` (8 MiB) per
 file, not per connection; `INLAYSQL_DISABLE_SHARED_READ_CACHE=1` pins it to

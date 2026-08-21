@@ -218,16 +218,35 @@ At one connection InlaySQL loses on writes (0.70x) and **wins on reads
 (1.52x)**. At eight it still edges reads (19,874 against 18,029, 1.10x) and
 loses writes badly — **4.76x**.
 
-The number that matters most here is not against MySQL, it is against
-ourselves: **our own read throughput nearly halves as connections rise**,
-37,158 to 19,874, where MySQL gives up 26%. Each connection gets its own
-`Database` handle and therefore its own page cache, so eight connections warm
-eight caches over the same pages instead of sharing one. That is a consequence
-of decision D2 (thread-per-connection, `!Send` engine) and it is a structural
-concurrency difference rather than a tuning gap — but the cache duplication
-specifically is the part worth attacking, and nothing has tried yet. Both
-sides use disjoint id ranges per connection to avoid conflicts; retries are
-zero on both. See "Server-to-server" in `bench/README.md` for the detailed
+**Correction, on purpose: the paragraph that used to be here read the
+1-to-8-connection drop (37,158 to 19,874 reads/s) as evidence that eight
+connections warm eight per-handle page caches over the same pages, and named
+that as the thing worth attacking.** A later investigation looked, and the
+evidence does not support it. `inlaysql serve --mysql`'s read phase was
+rebuilt on a quiet machine with the same client, same driver, same shape;
+the aggregate 1-to-8 drop did not reproduce. What did reproduce, independently
+in two separate runs against a live server: `mysql.connector`'s *threaded*
+concurrency is GIL-bound in the Python process making the calls — eight
+threads of that client measurably regress against one connection, where eight
+*processes* of the identical client scale up several times over. The server
+was never saturated during any of this: sampled mid-run, its threads sit in
+`recvfrom`, and in-process this engine reads 2.82M points/s warm. MySQL losing
+26% under the same benchmark's load is very likely the same client-side effect
+landing on both engines, not a smaller version of a real server-side one.
+
+None of this means the numbers above are wrong — they are what that run
+measured, on that machine, with that driver, and the table stays. It means
+the *explanation* attached to them was not tested before it was published,
+and once tested, did not hold. A shared raw-page cache across connections on
+one file was built anyway during the investigation (`docs/server.md`, "D2 —
+thread-per-connection, one handle each") — real, and worth roughly 18% on the
+page-miss path specifically — but it changes nothing about the 37,158-to-19,874
+gap, because the per-handle cache in this benchmark's own table already holds
+the whole working set warm, so nothing shared below it is ever asked. The
+honest next step is a re-run with a process-based driver on a quiet machine,
+not more server-side work aimed at a gap that may not be where this pointed.
+Both sides use disjoint id ranges per connection to avoid conflicts; retries
+are zero on both. See "Server-to-server" in `bench/README.md` for the detailed
 methodology, the concurrency-model/credential/TLS asymmetries that remain, and
 why PostgreSQL has no row here.
 
@@ -239,12 +258,14 @@ engines. "Comparable" is not "hardware-durable".
 
 ## What is not measured here
 
-- **No server-to-server numbers on a quiet machine.** The server-to-server
-  table above (AHL-495) is the first such run this project has had, and it was
-  measured under the same load average of 5.4 as everything else on this page.
-  It is enough to retire the older "we win reads only by being in-process"
-  caveat — those rows pay a socket round trip on both sides — but a repeat on
-  an idle machine is still what a stronger claim would need.
+- **No server-to-server numbers with a trustworthy driver.** The server-to-server
+  table above (AHL-495) is the first such run this project has had. It is
+  enough to retire the older "we win reads only by being in-process" caveat —
+  those rows pay a socket round trip on both sides — but the 1-to-8-connection
+  read comparison specifically has since turned out to depend on the driver's
+  own concurrency shape (see the correction above): a repeat needs a
+  process-based client, not just a quieter machine, before that comparison
+  means what it was first read to mean.
 - **No server-to-server PostgreSQL row.** `inlaysql serve` speaks the MySQL
   wire protocol and nothing else, so there is no like-for-like transport to
   measure PostgreSQL over; `bench/README.md` says so under

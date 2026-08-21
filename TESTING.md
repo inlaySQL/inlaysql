@@ -94,12 +94,20 @@ written down here rather than left to look automatic.
 the property that motivates it directly rather than under fault injection: a
 sustained write/delete/write/checkpoint workload stops growing the file once
 `CowBTree::set_page_reuse(true)` is on, where the same workload with reuse
-off — today's default, and the only behaviour reachable from `Database` —
-grows it without bound. See
+off — still the default — grows it without bound. The same file also proves
+this through the public surface now, not just the storage layer directly:
+`EngineOptions::page_reuse` reaches `CowBTree::set_page_reuse` through
+`Database::open_on_with_options`, and a second test drives the identical
+churn shape through ordinary `CREATE TABLE`/`INSERT ... ON CONFLICT DO UPDATE`/`DELETE`
+rather than `CowBTree::put`/`delete`. `crates/inlaysql/tests/vacuum.rs` covers
+whole-file compaction (`inlaysql vacuum <path>`) the same way: a real schema
+covering every reconstruction shape survives with its data, its constraints
+and its query behaviour intact, and the file measurably shrinks. See
 [the free list in `docs/recovery.md`](docs/recovery.md#the-free-list-and-page-reuse-phase-2-item-6-ahl-481)
-for the design these two files hold to; both are opt-in and storage-engine
-only, reachable through `CowBTree::set_page_reuse` directly rather than
-through any SQL statement or public `Database`/`EngineOptions` surface.
+for the design these hold to, and what remains true even now that the option
+is public: reclamation can only prove liveness for readers this process's
+reservation gate can see, so it is still unsound to enable beside a
+concurrent `FileDevice::open_read_only` on the same file.
 
 The assertion is **not** "everything we wrote is still there" — a crash is
 supposed to lose the last commit. It is:

@@ -700,12 +700,17 @@ the same transport:
 
 Reads win at one connection (1.52x) and still edge it at eight (1.10x);
 writes lose at one (0.70x) and badly at eight (4.76x), which is
-thread-per-connection against a worker pool. The finding that matters most is
-against ourselves: **our read throughput nearly halves from one connection to
-eight** where MySQL gives up 26%, because each connection gets its own handle
-and therefore its own page cache. `BENCHMARK.md` and `bench/README.md` have
-the methodology and the remaining asymmetries; PostgreSQL has no row because
-this server speaks only the MySQL wire protocol.
+thread-per-connection against a worker pool. The 1-to-8 read drop shown here
+was published with a specific explanation — each connection warming its own
+page cache — that a later investigation could not reproduce or support; see
+`BENCHMARK.md`'s "Server-to-server" section for the correction, the client-side
+GIL-threading confound that most likely explains it instead, and what a shared
+raw-page cache across connections (built during that investigation, real, and
+worth ~18% on the page-miss path) does and does not change about it. The
+numbers in the table are what that run measured and stay; the causal story
+attached to them does not. `bench/README.md` has the full methodology and the
+remaining asymmetries; PostgreSQL has no row because this server speaks only
+the MySQL wire protocol.
 
 What none of this proves: Docker Desktop's virtual disk was never
 independently verified to honour `fsync` as a barrier for any of the engines
@@ -722,50 +727,76 @@ Roughly in order of value. Every line here is a gap already named in
 below is a surprise to the project, it is the honest state of it:
 
 1. **The join and range miss path** — the last measured read loss to
-   SQLite. AHL-479 found the entry-range walk itself was not the
-   bottleneck — reading admitted entries without cloning their keys moved
-   the indexed-range case +15–18%, but a full join barely moved (~4.5%),
-   because the join workload's table plus index (~18 MiB) exceeds the
-   default 8 MiB page cache: the same "our miss path is dearer than
-   SQLite's" story the point read had, now showing up in a workload big
-   enough to miss. [`PERF.md`](PERF.md) has the profile and the
-   cache-budget arithmetic that settled it.
-2. **The sequential-commit gap to MySQL**, and the server's per-connection
-   page cache. As a library the write gap is now 1.08x containerised (780.7
-   vs 723.1); over the wire it is 1.43x at one connection and 4.76x at eight.
-   Group commit cannot fire on a single connection, so what is left there is
-   per-commit cost against InnoDB's own redo write — but the read side is the
-   sharper item: eight connections warm eight page caches over the same pages,
-   which is why server-to-server reads fall from 37,158 to 19,874. A shared
-   read-only cache under several handles is the thing nothing has tried yet.
-3. ~~**Wiring the free list into the public API.**~~ — **done.** The free
+   SQLite, and still the biggest one. AHL-479 found the entry-range walk
+   itself was not the bottleneck — reading admitted entries without cloning
+   their keys moved the indexed-range case +15–18%, but a full join barely
+   moved (~4.5%), because the join workload's table plus index (~18 MiB)
+   exceeds the default 8 MiB page cache. [`PERF.md`](PERF.md) has the
+   profile and the cache-budget arithmetic that settled it, plus two
+   rejected attempts at the obvious fix (page/cell representation, AHL-493)
+   and why each traded the point-read win or a small-join regression for a
+   cold-path gain nobody asked for. A later, narrower fix — a probed join's
+   inner row was being cloned twice, once by the probe and again by the
+   pairing loop — landed a small, safe (zero risk to the point-read path by
+   construction), consistent-but-modest ~3–5% win on both full-join shapes,
+   measured on a quiet machine; it is not what closes this gap. The
+   remaining, still-untried angle: a cheaper key comparison (`memcmp` is
+   12–21% of the miss path's self-time).
+2. ~~**The server's per-connection page cache.**~~ — **investigated, and
+   the diagnosis behind it did not hold up.** The 1-to-8-connection read
+   drop this item used to cite (37,158 → 19,874, "each connection warms its
+   own page cache") could not be reproduced on a quiet machine with the same
+   client and driver; what did reproduce, independently, twice: the Python
+   MySQL client's *threaded* concurrency is GIL-bound, and that alone
+   explains a comparable-looking drop with nothing server-side involved. See
+   `BENCHMARK.md`'s "Server-to-server" section for the full correction. A
+   shared raw-page cache across connections was built anyway — real, gated
+   safely against `EngineOptions::page_reuse`, and worth ~18% on the
+   page-miss path specifically — but it does not touch the cited gap,
+   because that gap's own benchmark table already fits in one connection's
+   warm cache. The open item now is a corrected server-to-server number: the
+   benchmark driver needs to measure with processes, not threads, before
+   this line item can be re-scoped honestly.
+3. ~~**The sequential-commit gap to MySQL.**~~ — as a library the write gap
+   is 1.08x containerised (780.7 vs 723.1); over the wire it is 1.43x at one
+   connection and 4.76x at eight, thread-per-connection against a worker
+   pool, and group commit cannot fire on a single connection by design. This
+   remains open; nothing above changes it.
+4. ~~**Wiring the free list into the public API.**~~ — **done.** The free
    list and page reuse landed inside the engine (AHL-481); `EngineOptions::page_reuse`
    now reaches it, and `inlaysql vacuum <path>` does whole-file compaction —
    a copy into a fresh file and an atomic rename, the same algorithm real
    SQLite's own `VACUUM` uses, so it never touches the copy-on-write tree's
    crash-recovery path at all. See `docs/recovery.md` for what is and is not
    done at the storage layer underneath it.
-4. **A cost-based join planner.** Joins run nested-loop in the order they are
+5. **A cost-based join planner.** Joins run nested-loop in the order they are
    written; index selection is the narrow rule in
    [Scalar indexes and joins that use them](#scalar-indexes-and-joins-that-use-them).
    This is what the join losses in [Performance](#performance) are waiting
    on.
-5. **A server-to-server benchmark on a quiet machine.** The first one exists
-   now (AHL-495, in [Performance](#performance)), measured under the same load
-   as everything else on the page; a repeat on an idle machine is what a
-   stronger claim would rest on.
-6. **Multi-column and composite retrieval indexes.** `CREATE INDEX` for
+6. **A server-to-server benchmark with a corrected driver, on a quiet
+   machine.** The first server-to-server table exists (AHL-495, in
+   [Performance](#performance)), but item 2 above found its own driver
+   (threaded Python client concurrency) is a confound serious enough that a
+   repeat needs a process-based driver before the number can be trusted,
+   not just a quieter machine.
+7. **Multi-column and composite retrieval indexes.** `CREATE INDEX` for
    BM25/ANN is single-column only — the scalar B-tree index already supports
    composite keys.
-7. **Filter-aware graph walks and per-value sub-indexes.** A restrictive
+8. **Filter-aware graph walks and per-value sub-indexes.** A restrictive
    `WHERE` on a retrieval query over-fetches from the index rather than
    pre-filtering it.
-8. **Quantised paged index nodes.** `PagedHnswIndex` stores exact `f32` even
-   for an `INT8` column, so the paged path does not yet get the 4x that
-   quantisation buys the in-memory index.
-9. **Deeper SQL Logic Test coverage, real SQLancer runs and continuous
-   fuzzing** beyond what `trust.yml` runs today (see
-   [`docs/sqlancer.md`](docs/sqlancer.md)).
+9. ~~**Quantised paged index nodes.**~~ — **done.** `PagedHnswIndex` stored
+   exact `f32` even for an `INT8` column; it now shares the same
+   `Q8Vector`/`VectorEncoding` quantisation the in-memory index already had.
+   Measured: 2.14–2.16x smaller file, 3.96x smaller resident cache payload
+   (the same ratio the in-memory index publishes) — the file-size win is
+   larger than the in-memory index's 1.65x because every paged node stores
+   its vector inline, where the in-memory index recomputes a live node's
+   vector from its own embeddings map instead.
+10. **Deeper SQL Logic Test coverage, real SQLancer runs and continuous
+    fuzzing** beyond what `trust.yml` runs today (see
+    [`docs/sqlancer.md`](docs/sqlancer.md)).
 
 Full Postgres parity is deliberately not on this list — see the last point in
 [What this is not](#what-this-is-not). Neither is `WITH RECURSIVE`: nothing in
