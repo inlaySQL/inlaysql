@@ -234,7 +234,7 @@ fn relevance_matches_a_hand_built_bm25_index_over_the_concatenated_text() {
         let engine_hits = ids_and_scores(&hits);
 
         let oracle_hits: Vec<(i64, f32)> = oracle
-            .search(term, 10)
+            .search(term, 10, None)
             .unwrap()
             .into_iter()
             .map(|scored| (scored.id as i64, scored.score))
