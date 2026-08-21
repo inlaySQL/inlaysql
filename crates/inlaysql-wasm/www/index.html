@@ -288,6 +288,16 @@
 </header>
 
 <div class="wrap">
+  <p class="warn">
+    <strong>Still in development, and under heavy testing right now.</strong>
+    The on-disk format is pre-1.0 (recreate, not migrate) and the MySQL server
+    is plaintext and localhost-first — see
+    <a href="https://github.com/inlaySQL/inlaysql#what-this-is-not">What this is not</a>
+    below before you rely on it for anything real. If the idea here is one you'd
+    use, tell us in
+    <a href="https://github.com/inlaySQL/inlaysql/issues">Issues</a> — what
+    you'd need first is exactly what decides what gets built next.
+  </p>
   <div class="figures">
     <div class="figure">
       <b>1.36M</b>
@@ -566,9 +576,9 @@ cargo run -p inlaysql-mcp --bin inlaysql -- serve --mysql app.inlay</pre>
       <a href="https://github.com/inlaySQL/inlaysql#readme">README</a> for the
       pitch and the architecture,
       <a href="https://github.com/inlaySQL/inlaysql/blob/main/TESTING.md">TESTING.md</a>
-      for what is covered and what is not, and
-      <a href="https://github.com/inlaySQL/inlaysql/blob/main/PLAN.md">PLAN.md</a>
-      for what is being built next and why.
+      for what is covered and what is not, and the README's own
+      <a href="https://github.com/inlaySQL/inlaysql#next">Next</a> section for
+      what is being built and why.
     </p>
   </div>
 </section>
