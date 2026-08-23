@@ -1336,6 +1336,53 @@ impl<D: Device> CowBTree<D> {
         Ok(out)
     }
 
+    /// At most `limit` `(row id, value)` pairs whose key starts with `prefix`
+    /// and is strictly greater than `after`, in row-id order.
+    ///
+    /// The table-scan sibling of [`CowBTree::scan_prefix_from`]: a table row's
+    /// key is its prefix followed by a big-endian row id, so a scan of one
+    /// table wants the row id and the value, and never the key bytes it would
+    /// decode the row id out of and throw away. This walk reads the row id
+    /// straight out of the borrowed entry — the same shape argument
+    /// [`CowBTree::scan_range_row_ids_from`] relies on — and resolves the
+    /// value, without cloning the key.
+    pub fn scan_prefix_row_values_from(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(RowId, RowBuf)>> {
+        let upper = prefix_upper_bound(prefix);
+        self.scan_range_row_values_from(prefix, upper.as_deref(), after, limit)
+    }
+
+    /// At most `limit` `(row id, value)` pairs whose key is in `[start, end)`
+    /// and is strictly greater than `after`, in the order the walk visits them.
+    ///
+    /// The row-id-and-value form of [`CowBTree::scan_range_from`]: same pruning,
+    /// same order, same `WalkBounds` semantics — only the leaf branch differs
+    /// (row id out of the borrowed key, value resolved, no key clone).
+    pub fn scan_range_row_values_from(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(RowId, RowBuf)>> {
+        let mut out = Vec::new();
+        if limit == 0 || end.is_some_and(|end| end <= start) {
+            return Ok(out);
+        }
+        let bounds = WalkBounds {
+            start,
+            end,
+            after,
+            limit,
+        };
+        self.walk_row_values(self.read_root(), &bounds, self.has_pending, &mut out)?;
+        Ok(out)
+    }
+
     // -------------------------------------------------------------- internals
 
     fn write_state(&mut self) -> Result<()> {
@@ -2226,6 +2273,65 @@ impl<D: Device> CowBTree<D> {
                     };
                     if below_upper && above_lower {
                         self.walk_row_ids(separator.child, bounds, pending, out)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [`CowBTree::walk`]'s row-id-and-value sibling, for the table scan.
+    ///
+    /// The internal-node branch is [`CowBTree::walk`]'s, unchanged: pruning is
+    /// entirely [`WalkBounds`]'s, so the two walks visit exactly the same
+    /// entries by construction. The leaf branch differs twice: the key is read
+    /// for its row id (`trailing_row_id`, the same eight bytes
+    /// [`CowBTree::walk_row_ids`] reads) instead of being cloned into an owned
+    /// `Vec<u8>`, and the value is resolved exactly as [`CowBTree::walk`]
+    /// resolves it. A table scan decodes the row id out of the key and throws
+    /// the rest away, so this walk skips that clone-and-discard.
+    fn walk_row_values(
+        &self,
+        id: PageId,
+        bounds: &WalkBounds<'_>,
+        pending: bool,
+        out: &mut Vec<(RowId, RowBuf)>,
+    ) -> Result<()> {
+        if id == 0 || out.len() >= bounds.limit {
+            return Ok(());
+        }
+        let node = self.node_at(id, pending)?;
+        match &*node {
+            Node::Leaf(entries) => {
+                for entry in entries {
+                    if out.len() >= bounds.limit {
+                        return Ok(());
+                    }
+                    if !bounds.admits(&entry.key) {
+                        continue;
+                    }
+                    let value = self.resolve_value_at(&entry.value, pending)?;
+                    out.push((trailing_row_id(&entry.key)?, value));
+                }
+            }
+            Node::Internal { leftmost, cells } => {
+                if cells.is_empty() || bounds.starts_below(&cells[0].key) {
+                    self.walk_row_values(*leftmost, bounds, pending, out)?;
+                }
+                for (i, separator) in cells.iter().enumerate() {
+                    if out.len() >= bounds.limit {
+                        return Ok(());
+                    }
+                    let below_upper = match bounds.end {
+                        Some(end) => separator.key.as_slice() < end,
+                        None => true,
+                    };
+                    let above_lower = match cells.get(i + 1) {
+                        Some(next) => bounds.starts_below(&next.key),
+                        None => true,
+                    };
+                    if below_upper && above_lower {
+                        self.walk_row_values(separator.child, bounds, pending, out)?;
                     }
                 }
             }
@@ -3424,6 +3530,73 @@ mod tests {
             .scan_range_row_ids_from(&start, Some(&end), None, 0)
             .unwrap()
             .is_empty());
+    }
+
+    /// The row-id-and-value walk is the table scan's fast path, so it has to
+    /// agree with the general `(key, value)` walk row for row: same row ids
+    /// (decoded out of the key), same values, same order.
+    #[test]
+    fn a_row_values_walk_agrees_with_the_general_walk() {
+        let row_key = |id: u64| {
+            let mut key = b"\x01tbl\0".to_vec();
+            key.extend_from_slice(&id.to_be_bytes());
+            key
+        };
+        let mut db = CowBTree::create(disk(), PAGE).unwrap();
+        // Enough rows to span several leaves, with adjacent-key noise so a walk
+        // that leaked past its bounds would be wrong, not merely slow.
+        for id in 1..=900u64 {
+            db.put(&row_key(id), format!("row-{id}").as_bytes())
+                .unwrap();
+            db.put(
+                &[b"\x01tblz\0".to_vec(), id.to_be_bytes().to_vec()].concat(),
+                b"noise",
+            )
+            .unwrap();
+            db.commit().unwrap();
+        }
+
+        let by_row_values = db
+            .scan_prefix_row_values_from(b"\x01tbl\0", None, usize::MAX)
+            .unwrap();
+        let by_general_walk = db.scan_prefix(b"\x01tbl\0").unwrap();
+        assert_eq!(by_row_values.len(), by_general_walk.len());
+        assert_eq!(by_row_values.len(), 900);
+        for ((row_id, value), (key, general_value)) in
+            by_row_values.iter().zip(by_general_walk.iter())
+        {
+            assert_eq!(
+                *row_id,
+                crate::storage::row_id_from_key(key).unwrap(),
+                "row-value walk disagreed with the general walk's row id"
+            );
+            assert_eq!(value.as_slice(), general_value.as_slice());
+        }
+
+        // A resumed, batched read reassembles to the whole-range answer.
+        let expected = by_row_values;
+        let mut resumed = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let batch = db
+                .scan_prefix_row_values_from(b"\x01tbl\0", after.as_deref(), 5)
+                .unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            assert!(batch.len() <= 5);
+            // `after` compares against whole keys, so resume from the last
+            // batch's row key, not its row id alone.
+            after = Some(row_key(batch.last().unwrap().0));
+            resumed.extend(batch);
+        }
+        assert_eq!(resumed.len(), expected.len());
+        for ((row_id, value), (expected_id, expected_value)) in
+            resumed.iter().zip(expected.iter())
+        {
+            assert_eq!(row_id, expected_id);
+            assert_eq!(value.as_slice(), expected_value.as_slice());
+        }
     }
 
     /// A too-short key is corruption, not a panic — the row-id walk has to
