@@ -80,8 +80,8 @@ pub const KIND_OVERFLOW: u8 = 2;
 /// length u64`).
 ///
 /// The inline case is a *borrowed byte range* into the page's shared buffer
-/// when it came from a [`decode`], and an owned `Rc<[u8]>` when the write path
-/// or the raw-leaf scan materialised it. A decoded `Node` is cached behind its
+/// when it came from a [`decode`] or the raw-leaf scan, and an owned `Rc<[u8]>`
+/// when the write path materialised it. A decoded `Node` is cached behind its
 /// own `Rc` (`btree::cache::PageCache`), and every read that hits the cache
 /// used to clone these bytes byte-for-byte to hand a caller an owned `Vec<u8>`
 /// — `CowBTree::resolve_value_at`, the specific site `PERF.md` names as
@@ -93,8 +93,8 @@ pub enum ValueRef {
     /// The value bytes, stored in the leaf cell itself, as a byte range into
     /// the page's shared buffer.
     Inline(Range<usize>),
-    /// The value bytes, owned because the write path or the raw-leaf scan had
-    /// to copy them out of a transient buffer (see [`ValueRef::Inline`]).
+    /// The value bytes, owned because the write path had to copy them out of a
+    /// transient buffer (see [`ValueRef::Inline`]).
     Owned(Rc<[u8]>),
     /// The value lives in a chain of overflow pages starting at `first`, and is
     /// `len` bytes long in total.
@@ -577,9 +577,15 @@ pub fn decode_leaf_cell_ref<'a>(
                     "leaf value runs past end of page".to_string(),
                 ));
             }
+            // Borrow the value's byte range rather than copying it into a fresh
+            // `Rc<[u8]>` per cell. The caller keeps the page's shared buffer
+            // alive for the whole scan (see `CowBTree::walk_raw_row_values`),
+            // and `resolve_value_at` turns the range into a `RowBuf::Shared`
+            // with a single refcount bump — the AHL-455 pattern this scan was
+            // the last path not yet converted to.
             Ok(LeafCellRef {
                 key,
-                value: ValueRef::Owned(Rc::from(&bytes[key_end + 5..value_end])),
+                value: ValueRef::Inline(key_end + 5..value_end),
             })
         }
         VALUE_OVERFLOW => {

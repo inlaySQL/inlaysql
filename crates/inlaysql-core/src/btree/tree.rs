@@ -2227,9 +2227,10 @@ impl<D: Device> CowBTree<D> {
     ) -> Result<RowBuf> {
         match value {
             ValueRef::Inline(range) => {
-                // `None` is only ever passed by the raw-leaf scan, whose values
-                // are always `Owned` — a borrowed inline value there would be a
-                // bug in that path, not a corrupt file.
+                // The decoded-node path passes the node's shared buffer; the
+                // raw-leaf scan passes the shared buffer it reads the page
+                // into. `None` means a borrowed range reached here without its
+                // buffer, which is a bug in that path, not a corrupt file.
                 let Some(bytes) = node_bytes else {
                     return Err(Error::Corrupt(
                         "borrowed inline value outside a decoded page".to_string(),
@@ -2490,9 +2491,12 @@ impl<D: Device> CowBTree<D> {
     /// Internal nodes are decoded and navigated exactly as the general walk
     /// does — they are few, and their separators have to be read to descend.
     /// Leaf pages are *not* decoded into a cached [`Node`]: their cells are
-    /// parsed with the key borrowed straight off the page bytes
-    /// ([`page::scan_leaf_cells`]), so a scan of a leaf allocates no `Rc<Node>`,
-    /// no `Vec<Entry>` and no per-cell key `Vec`.
+    /// parsed with the key and the value borrowed straight off the page bytes
+    /// ([`page::scan_leaf_cells`]), behind one shared `Rc<[u8]>` per leaf, so a
+    /// scan of a leaf allocates no `Rc<Node>`, no `Vec<Entry>` and no per-cell
+    /// key `Vec` or value `Rc` — each row's value becomes a [`RowBuf::Shared`]
+    /// by a refcount bump (the AHL-455 pattern this scan was the last path not
+    /// yet converted to).
     ///
     /// That is a scan-only win and deliberately not the universal read path: a
     /// point lookup / `get` still decodes once and serves from the cache, where
@@ -2513,14 +2517,23 @@ impl<D: Device> CowBTree<D> {
         let internal = self.with_raw_page(id, pending, |page_size, bytes| {
             match bytes[page::OFF_KIND] {
                 page::KIND_LEAF => {
-                    page::scan_leaf_cells(bytes, page_size, |key, value| {
+                    // Keep the page bytes behind one shared `Rc<[u8]>` for the
+                    // whole leaf: `scan_leaf_cells` now yields `ValueRef::Inline`
+                    // ranges into it (AHL-455's pattern), so each row's value
+                    // becomes a `RowBuf::Shared` via a refcount bump rather than
+                    // a per-cell `Rc::from` copy. The page's `Rc` — not the
+                    // transient scratch `bytes` — is what the cells borrow from,
+                    // and it is kept alive by every `RowBuf::Shared` that clones
+                    // it, so the rows can safely outlive this callback.
+                    let shared: Rc<[u8]> = Rc::from(bytes);
+                    page::scan_leaf_cells(&shared, page_size, |key, value| {
                         if out.len() >= bounds.limit {
                             return Ok(());
                         }
                         if !bounds.admits(key) {
                             return Ok(());
                         }
-                        let value = self.resolve_value_at(None, &value, pending)?;
+                        let value = self.resolve_value_at(Some(&shared), &value, pending)?;
                         out.push((trailing_row_id(key)?, value));
                         Ok(())
                     })?;
