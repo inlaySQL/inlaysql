@@ -612,19 +612,22 @@ impl<'a> IndexProbe<'a> {
 /// "equal ⇒ same bucket" hold without any cross-class or case-folding
 /// normalisation here.
 pub(crate) struct HashJoin {
-    /// The inner rows, bucketed by the hash of their key. Rows are inserted in
-    /// scan order and the scan is row-id ascending, so each bucket is row-id
-    /// ascending — the order the materialising path would have replayed them
-    /// in, so the pairs come out in the same order.
-    buckets: Vec<Vec<Vec<Value>>>,
-    /// `buckets.len() - 1`, a power of two, so a hash indexes a bucket with a
+    /// Every inner row, contiguous and grouped by bucket, so a probe reads one
+    /// cache-friendly run instead of chasing a bucket header per lookup. Rows
+    /// are placed in scan order and the scan is row-id ascending, so each
+    /// bucket's run stays row-id ascending — the order the materialising path
+    /// would have replayed them in, so the pairs come out in the same order.
+    rows: Vec<Vec<Value>>,
+    /// `offsets[b]..offsets[b + 1]` is the run of `rows` bucket `b` holds; it
+    /// has `mask + 2` entries so `offsets[b + 1]` is always in bounds.
+    offsets: Vec<usize>,
+    /// `offsets.len() - 2`, a power of two, so a hash indexes a bucket with a
     /// mask instead of a modulo.
     mask: usize,
     /// The joined-row ordinal the outer key is read from.
     key: usize,
     /// The bucket the last [`HashJoin::prepare`] selected; `usize::MAX` is the
-    /// empty sentinel (a `NULL` or missing key), which indexes past the end of
-    /// `buckets` and reads as no rows.
+    /// empty sentinel (a `NULL` or missing key), which reads as an empty range.
     current: usize,
     /// The inner table's declared width, what a `LEFT JOIN` pads with.
     width: usize,
@@ -634,6 +637,13 @@ impl HashJoin {
     /// Build the hash table by scanning `table` once, keying each decoded row
     /// on its `inner_key` column and remembering where the outer key is read
     /// from.
+    ///
+    /// The rows are laid out with a counting-sort (two passes: count each
+    /// bucket, prefix-sum into `offsets`, then place every row at its bucket's
+    /// next free slot) rather than as a `Vec` of bucket `Vec`s. That keeps the
+    /// whole inner side in one contiguous allocation and groups each bucket's
+    /// rows adjacently, so a probe walks a single run instead of a chain of
+    /// small allocations.
     pub fn build(
         storage: &dyn Storage,
         table: &str,
@@ -648,13 +658,36 @@ impl HashJoin {
         }
         let buckets_len = rows.len().next_power_of_two().max(16);
         let mask_bits = buckets_len - 1;
-        let mut buckets: Vec<Vec<Vec<Value>>> = (0..buckets_len).map(|_| Vec::new()).collect();
+
+        // Counting sort into bucket-contiguous order. The placement pass walks
+        // the rows in scan order, so each bucket's run stays row-id ascending.
+        let mut counts = alloc::vec![0usize; buckets_len];
+        for row in &rows {
+            counts[(hash_value(&row[inner_key]) as usize) & mask_bits] += 1;
+        }
+        let mut offsets = Vec::with_capacity(buckets_len + 1);
+        let mut running = 0usize;
+        offsets.push(0);
+        for &count in &counts {
+            running += count;
+            offsets.push(running);
+        }
+        // `counts` is repurposed as the per-bucket write cursor, seeded with
+        // each bucket's start.
+        for (cursor, start) in counts.iter_mut().zip(offsets.iter()) {
+            *cursor = *start;
+        }
+        let mut placed: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+        placed.resize_with(rows.len(), Vec::new);
         for row in rows {
             let bucket = (hash_value(&row[inner_key]) as usize) & mask_bits;
-            buckets[bucket].push(row);
+            let slot = counts[bucket];
+            placed[slot] = row;
+            counts[bucket] = slot + 1;
         }
         Ok(Self {
-            buckets,
+            rows: placed,
+            offsets,
             mask: mask_bits,
             key,
             current: usize::MAX,
@@ -672,10 +705,12 @@ impl HashJoin {
 
     /// The bucket [`HashJoin::prepare`] selected.
     fn rows(&self) -> &[Vec<Value>] {
-        match self.buckets.get(self.current) {
-            Some(bucket) => bucket,
-            None => &[],
+        if self.current == usize::MAX {
+            return &[];
         }
+        let start = self.offsets[self.current];
+        let end = self.offsets[self.current + 1];
+        &self.rows[start..end]
     }
 }
 
