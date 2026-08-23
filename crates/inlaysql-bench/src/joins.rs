@@ -70,6 +70,9 @@ const POSTS_PER_USER: usize = 8;
 struct Timing {
     label: String,
     elapsed: Duration,
+    /// The first execution alone — for InlaySQL this is the cold build (the
+    /// reusable hash table is built here), for SQLite the cold page cache.
+    cold: Duration,
     samples: Vec<Duration>,
 }
 
@@ -174,15 +177,16 @@ pub fn run(config: &Config, dir: &Path) -> Result<(), Box<dyn std::error::Error>
 fn report(workload: &str, operations: usize, timings: &[&Timing]) {
     println!("\n{workload}");
     println!(
-        "{:<46} {:>12} {:>10} {:>10} {:>10}",
-        "engine", "joins/s", "p50", "p95", "max"
+        "{:<46} {:>12} {:>10} {:>10} {:>10} {:>10}",
+        "engine", "joins/s", "cold", "p50", "p95", "max"
     );
     for timing in timings {
         let (p50, p95, max) = percentiles(&timing.samples);
         println!(
-            "{:<46} {:>12.0} {:>10} {:>10} {:>10}",
+            "{:<46} {:>12.0} {:>10} {:>10} {:>10} {:>10}",
             timing.label,
             timing.per_second(operations),
+            format!("{:?}", timing.cold),
             format!("{p50:.2?}"),
             format!("{p95:.2?}"),
             format!("{max:.2?}")
@@ -292,6 +296,7 @@ fn inlaysql_joins(
         Ok(Timing {
             label: label.to_string(),
             elapsed: started.elapsed(),
+            cold: samples.first().copied().unwrap_or_default(),
             samples,
         })
     };
@@ -380,6 +385,7 @@ fn sqlite_joins(
         Ok(Timing {
             label: format!("{label} (index)"),
             elapsed: started.elapsed(),
+            cold: samples.first().copied().unwrap_or_default(),
             samples,
         })
     };
