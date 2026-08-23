@@ -3321,6 +3321,31 @@ impl Engine {
         if let Some(stop) = stop_after {
             stream = Box::new(stream.take(stop));
         }
+
+        // A query with none of the blocking operators — aggregate, window,
+        // `DISTINCT`, `ORDER BY` — can be projected straight out of the stream,
+        // skipping the intermediate `Vec<ExecRow>` the blocking path needs in
+        // order to sort and fold. The stream already yields rows in row-id
+        // order, so `sort_rows` with an empty `ORDER BY` (a stable re-sort of
+        // that same order) is a no-op: skipping it changes only the
+        // allocations, not the answer.
+        let non_blocking = !is_aggregate
+            && plan.windows.is_empty()
+            && !plan.distinct
+            && plan.order.is_empty()
+            && plan.score.is_none();
+        if non_blocking {
+            // `stop_after` already bounded the scan to `limit + offset`; skip
+            // the offset and take the limit to finish the page.
+            if offset > 0 {
+                stream = Box::new(stream.skip(offset));
+            }
+            if let Some(limit) = limit {
+                stream = Box::new(stream.take(limit));
+            }
+            return project_stream(&plan.items, stream, env);
+        }
+
         let mut rows: Vec<ExecRow> = stream.collect::<Result<Vec<_>>>()?;
 
         if is_aggregate {
@@ -5671,6 +5696,48 @@ fn project(items: &[SelectItem], rows: Vec<ExecRow>, env: &Env<'_>) -> Result<Re
         None => {
             for row in &rows {
                 out_rows.push(project_row(items, row, env)?);
+            }
+        }
+    }
+    Ok(ResultSet {
+        columns,
+        rows: out_rows,
+    })
+}
+
+/// [`project`] for a query whose rows stream straight out of the pipeline:
+/// the same projection, but consuming a [`RowStream`] rather than an already
+/// collected `Vec<ExecRow>`, so a non-blocking query never materialises the
+/// intermediate `ExecRow`s. The answer is identical — see [`Engine::run_select`]
+/// for why skipping the empty-`ORDER BY` re-sort is safe.
+fn project_stream(items: &[SelectItem], stream: RowStream<'_>, env: &Env<'_>) -> Result<ResultSet> {
+    let columns = items.iter().map(|item| item.label().to_string()).collect();
+    let mut out_rows = Vec::new();
+    match moving_projection(items) {
+        Some(moves) => {
+            for row in stream {
+                let mut row = row?;
+                let mut values = Vec::with_capacity(moves.len());
+                for taken in &moves {
+                    values.push(match taken {
+                        Moved::Column(index) => row
+                            .values
+                            .get_mut(*index)
+                            .map(|slot| core::mem::replace(slot, Value::Null))
+                            .unwrap_or(Value::Null),
+                        Moved::Score => match row.score {
+                            Some(score) => Value::Real(f64::from(score)),
+                            None => Value::Null,
+                        },
+                    });
+                }
+                out_rows.push(values);
+            }
+        }
+        None => {
+            for row in stream {
+                let row = row?;
+                out_rows.push(project_row(items, &row, env)?);
             }
         }
     }

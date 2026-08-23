@@ -353,8 +353,8 @@ impl<'a> JoinInner<'a> {
         }
     }
 
-    /// Take ownership of one candidate, cloning only when the row has to
-    /// survive to be paired again.
+    /// Append one candidate's values into `out`, cloning only when the row has
+    /// to survive to be paired again.
     ///
     /// A materialised side (and a probe's table-scan fallback) is replayed
     /// once per outer row, so this clones, exactly as reading through
@@ -362,15 +362,20 @@ impl<'a> JoinInner<'a> {
     /// rebuilt fresh by [`JoinInner::prepare`] for every outer row and never
     /// read again after this outer row's pairing loop moves past them — they
     /// were already decoded once, by `IndexProbe::fetch`, so cloning them a
-    /// second time into the pairing buffer was pure waste. This takes instead:
-    /// one decode per row, not one decode plus one clone. A hash join's rows
-    /// are shared across every outer row that reaches their bucket, so they
-    /// clone, the same as the materialised side.
-    fn take_row(&mut self, index: usize) -> Vec<Value> {
+    /// second time into the pairing buffer was pure waste. Those are moved
+    /// instead. A hash join's rows are shared across every outer row that
+    /// reaches their bucket, so they clone, the same as the materialised side.
+    ///
+    /// Appending straight into the caller's buffer — rather than handing back a
+    /// temporary `Vec<Value>` — is what saves one heap allocation per
+    /// candidate: the caller's scratch is already sized for the outer plus
+    /// inner width, and the temporary `Vec` this used to return was allocated
+    /// only to be drained into that scratch.
+    fn append_row_into(&mut self, index: usize, out: &mut Vec<Value>) {
         match self {
-            JoinInner::Materialised { rows, .. } => rows[index].clone(),
-            JoinInner::Probe(probe) => probe.take_row(index),
-            JoinInner::Hash(hash) => hash.rows()[index].clone(),
+            JoinInner::Materialised { rows, .. } => out.extend(rows[index].iter().cloned()),
+            JoinInner::Probe(probe) => out.extend(probe.take_row(index)),
+            JoinInner::Hash(hash) => out.extend(hash.rows()[index].iter().cloned()),
         }
     }
 
@@ -829,11 +834,10 @@ impl Iterator for NestedLoopJoin<'_> {
                 outer.next += 1;
                 // Truncate rather than reallocate: the outer half is already
                 // there and only the inner half changes per pair. The inner
-                // half is taken, not cloned — see `JoinInner::take_row` for
-                // why that is sound here.
+                // values are appended straight into the scratch, not cloned
+                // into a temporary row first — see `JoinInner::append_row_into`.
                 outer.joined.truncate(outer.values.len());
-                let inner = self.inner.take_row(index);
-                outer.joined.extend(inner);
+                self.inner.append_row_into(index, &mut outer.joined);
                 let keep = match self.on {
                     Some(on) => match eval::evaluate(on, &outer.joined, Computed::NONE, self.env) {
                         Ok(value) => eval::is_truthy(&value),
