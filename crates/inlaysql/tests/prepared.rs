@@ -93,6 +93,131 @@ fn a_prepared_statement_reports_what_it_is() {
 }
 
 #[test]
+fn the_row_callback_matches_materialised_results_for_streaming_and_blocking_queries() {
+    let mut db = Database::open_in_memory().expect("open");
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT)",
+        &[],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO users VALUES (1, 'one'), (17, 'seventeen'), (3, 'three')",
+        &[],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO posts VALUES (1, 17, 'b'), (2, 1, 'a'), (3, 17, 'c')",
+        &[],
+    )
+    .unwrap();
+
+    for sql in [
+        "SELECT users.name, posts.title \
+         FROM users JOIN posts ON posts.user_id = users.id",
+        "SELECT users.name, posts.title \
+         FROM users LEFT JOIN posts ON posts.user_id = users.id",
+        "SELECT users.name || ':' || posts.title \
+         FROM users JOIN posts ON posts.user_id = users.id \
+         LIMIT 2 OFFSET 1",
+        "SELECT users.name, posts.title \
+         FROM users JOIN posts ON posts.user_id = users.id AND posts.title != 'b'",
+        "SELECT users.name, posts.title \
+         FROM users JOIN posts ON posts.user_id = users.id \
+         ORDER BY posts.title DESC",
+    ] {
+        let statement = db.prepare(sql).unwrap();
+        let expected = db.query_prepared(&statement, &[]).unwrap().rows;
+        let mut streamed = Vec::new();
+        let count = db
+            .query_prepared_each(&statement, &[], |row| {
+                streamed.push(row.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(count, expected.len());
+        assert_eq!(streamed, expected);
+    }
+}
+
+#[test]
+fn a_row_callback_error_stops_and_is_returned() {
+    let mut db = Database::open_in_memory().expect("open");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &[])
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3)", &[])
+        .unwrap();
+    let statement = db.prepare("SELECT id FROM t").unwrap();
+    let mut seen = 0;
+    let error = db
+        .query_prepared_each(&statement, &[], |_| {
+            seen += 1;
+            if seen == 2 {
+                return Err(Error::Unsupported("consumer stopped".into()));
+            }
+            Ok(())
+        })
+        .expect_err("consumer error was swallowed");
+    assert_eq!(seen, 2);
+    assert!(matches!(error, Error::Unsupported(message) if message == "consumer stopped"));
+}
+
+#[test]
+fn a_row_callback_refuses_writes_before_they_run() {
+    let mut db = Database::open_in_memory().expect("open");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &[])
+        .unwrap();
+    let insert = db.prepare("INSERT INTO t VALUES (1) RETURNING id").unwrap();
+    let error = db
+        .query_prepared_each(&insert, &[], |_| Ok(()))
+        .expect_err("write reached the callback API");
+    assert!(matches!(error, Error::Unsupported(_)));
+    assert!(db.query("SELECT id FROM t", &[]).unwrap().rows.is_empty());
+}
+
+#[test]
+fn a_cached_hash_build_refreshes_after_another_handle_commits() {
+    let workspace = Workspace::new("hash-refresh");
+    let path = workspace.db_path();
+    let mut reader = Database::open(&path).expect("reader");
+    reader
+        .execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", &[])
+        .unwrap();
+    reader
+        .execute(
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER)",
+            &[],
+        )
+        .unwrap();
+    reader.execute("INSERT INTO users VALUES (1)", &[]).unwrap();
+    reader
+        .execute("INSERT INTO posts VALUES (1, 1)", &[])
+        .unwrap();
+    let join = reader
+        .prepare("SELECT posts.id FROM users JOIN posts ON posts.user_id = users.id")
+        .unwrap();
+    assert_eq!(reader.query_prepared(&join, &[]).unwrap().rows.len(), 1);
+
+    let mut writer = Database::open(&path).expect("writer");
+    writer
+        .execute("INSERT INTO posts VALUES (2, 1)", &[])
+        .unwrap();
+
+    let mut rows = Vec::new();
+    reader
+        .query_prepared_each(&join, &[], |row| {
+            rows.push(row.to_vec());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]);
+}
+
+#[test]
 fn a_statement_outliving_its_schema_fails_loudly_rather_than_returning_wrong_rows() {
     let workspace = Workspace::new("stale");
     let path = workspace.db_path();

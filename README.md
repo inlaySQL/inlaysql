@@ -147,6 +147,20 @@ for id in ids {
 }
 ```
 
+For a large result that is consumed one row at a time, avoid retaining the
+whole `ResultSet`:
+
+```rust
+let scan = db.prepare("SELECT id, body FROM docs")?;
+let count = db.query_prepared_each(&scan, &[], |row| {
+    send_row(row)?;
+    Ok(())
+})?;
+```
+
+The callback's slice is borrowed for that call only. Copy values you need to
+keep; otherwise the engine reuses its projected-row allocation as it streams.
+
 The same statement works on `AsyncDatabase` (`prepare(...).await`,
 `execute_prepared`, `query_prepared`); the handle is reference-counted, so
 holding one and sharing clones between tasks is free.

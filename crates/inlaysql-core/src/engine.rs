@@ -30,8 +30,8 @@ use crate::collation::Collation;
 use crate::error::{Error, Result};
 use crate::eval::{self, Computed, Env, SharedRng, SubqueryRunner};
 use crate::exec::{
-    Decode, DecodeFilter, ExecRow, Filter, HashJoin, IndexProbe, JoinInner, NestedLoopJoin,
-    ProbeKind, RowBytes, RowStream,
+    Decode, DecodeFilter, ExecRow, Filter, HashJoin, HashJoinTable, IndexProbe, JoinInner,
+    NestedLoopJoin, ProbeKind, RowBytes, RowStream,
 };
 use crate::fusion::{reciprocal_rank_fusion, sort_by_score_desc};
 use crate::hnsw_paged::PagedHnswIndex;
@@ -49,6 +49,9 @@ use crate::traits::{
     scan_all, Clock, FullTextIndex, IndexFactory, Rng, RowId, RowScan, Scored, Storage, VectorIndex,
 };
 use crate::value::{DataType, Value};
+
+/// A borrowed projected-row consumer used by the internal push pipeline.
+type RowSink<'a> = dyn FnMut(&[Value]) -> Result<()> + 'a;
 
 /// Metadata key holding the next row id to hand out.
 const NEXT_ROW_ID_KEY: &str = "next_row_id";
@@ -95,6 +98,13 @@ const INDEX_COMMIT_BYTES: usize = 64 * 1024;
 
 /// How many candidates each retriever returns when the query has no `LIMIT`.
 const DEFAULT_CANDIDATES: usize = 64;
+
+/// Default ceiling for one retained prepared hash-join build.
+///
+/// The cache holds at most one build per engine, so this bounds its accounted
+/// payload rather than multiplying per entry. Set
+/// [`EngineOptions::hash_join_cache_bytes`] to zero to disable it.
+const DEFAULT_HASH_JOIN_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Multiplier applied to `LIMIT` when sizing each retriever's candidate list.
 ///
@@ -175,6 +185,16 @@ pub struct EngineOptions {
     /// Ignored by backends that are already in memory, such as
     /// [`crate::mem::MemStorage`].
     pub page_cache_bytes: usize,
+    /// Maximum resident bytes for one hash-join build retained across
+    /// executions on the same committed snapshot.
+    ///
+    /// A prepared full-scan equi-join otherwise rescans and decodes its inner
+    /// table every time it runs, even when no row has changed. The retained
+    /// build is immutable and is reused only while `write_version` agrees;
+    /// schema changes clear it, and reads after writes in an open transaction
+    /// bypass it. At most one build is held, and a build larger than this
+    /// ceiling runs normally without being retained. Set to `0` to disable.
+    pub hash_join_cache_bytes: usize,
     /// Let this handle draw on the free list instead of always growing the
     /// file (Phase 2 item 6, `CowBTree::set_page_reuse`).
     ///
@@ -205,8 +225,36 @@ impl Default for EngineOptions {
             implicit_indexes: false,
             paged_vector_indexes: false,
             page_cache_bytes: crate::btree::DEFAULT_PAGE_CACHE_BYTES,
+            hash_join_cache_bytes: DEFAULT_HASH_JOIN_CACHE_BYTES,
             page_reuse: false,
         }
+    }
+}
+
+/// Identity and immutable payload of the one retained hash-join build.
+struct CachedHashJoin {
+    write_version: u64,
+    table_name: String,
+    mask: ColumnMask,
+    inner_key: usize,
+    width: usize,
+    table: Rc<HashJoinTable>,
+}
+
+impl CachedHashJoin {
+    fn matches(
+        &self,
+        write_version: u64,
+        table_name: &str,
+        mask: &ColumnMask,
+        inner_key: usize,
+        width: usize,
+    ) -> bool {
+        self.write_version == write_version
+            && self.table_name == table_name
+            && self.mask == *mask
+            && self.inner_key == inner_key
+            && self.width == width
     }
 }
 
@@ -244,6 +292,14 @@ pub struct Engine {
     /// by every path that replaces the catalog — which is the only way it can
     /// be wrong, and the only reason it is safe to hold at all.
     rules: BTreeMap<String, Rc<TableRules>>,
+    /// The last full-scan hash build, retained across prepared executions.
+    ///
+    /// One entry is deliberate: it gives the common repeated-statement case
+    /// reuse without turning every distinct join an application has ever run
+    /// into resident memory. The entry carries the committed row version and
+    /// the exact physical build shape; [`Engine::hash_join_table`] owns the
+    /// validity and budget checks.
+    hash_join_cache: RefCell<Option<CachedHashJoin>>,
     /// Keyed by table name and the index's *full* column list, in the order
     /// the index declared it — not by a single column. A single-column index
     /// (still, by far, the common case) keys under a one-element list, which
@@ -364,6 +420,7 @@ impl Engine {
             clock,
             catalog,
             rules: BTreeMap::new(),
+            hash_join_cache: RefCell::new(None),
             text_indexes: BTreeMap::new(),
             vector_indexes: BTreeMap::new(),
             indexes_dirty: false,
@@ -565,6 +622,51 @@ impl Engine {
     /// Run a prepared statement that must return rows.
     pub fn run_query(&mut self, statement: &Statement, params: &[Value]) -> Result<ResultSet> {
         self.run(statement, params)?.into_rows()
+    }
+
+    /// Run a prepared query and visit each final row without retaining a
+    /// [`ResultSet`]. Returns the number of rows delivered.
+    ///
+    /// The callback's slice is valid only for that call. Non-blocking queries
+    /// reuse its backing allocation for the next row, which is the point of
+    /// this API: a caller that serialises or counts rows should not pay for a
+    /// `Vec<Vec<Value>>` containing the whole answer. Sorting, aggregation,
+    /// windows and `DISTINCT` still materialise internally because their SQL
+    /// semantics require seeing the complete input before emitting a row.
+    pub fn run_query_each(
+        &mut self,
+        statement: &Statement,
+        params: &[Value],
+        mut each: impl FnMut(&[Value]) -> Result<()>,
+    ) -> Result<usize> {
+        if !statement.is_read_only() {
+            return Err(Error::Unsupported(
+                "row callbacks require a read-only statement".to_string(),
+            ));
+        }
+        self.refresh_snapshot()?;
+        statement.validate(&self.catalog, params)?;
+        self.statement_now.set(self.clock.now_micros());
+
+        let Plan::Select(select) = statement.plan() else {
+            let result = self.run_refreshed(statement, params)?.into_rows()?;
+            let count = result.rows.len();
+            for row in &result.rows {
+                each(row)?;
+            }
+            return Ok(count);
+        };
+
+        self.refresh_indexes()?;
+        let env = self.read_env(params);
+        let mut count = 0usize;
+        let mut counted = |row: &[Value]| {
+            each(row)?;
+            count += 1;
+            Ok(())
+        };
+        self.run_select_to(select, &env, None, Some(&mut counted))?;
+        Ok(count)
     }
 
     /// Plan and run one SQL statement.
@@ -1199,6 +1301,11 @@ impl Engine {
     /// Throw away every resolved constraint, because the catalog moved.
     fn invalidate_rules(&mut self) {
         self.rules.clear();
+        // A hash build's mask and column ordinals were resolved against this
+        // same catalog. Even when DDL changed no row and therefore did not
+        // advance `write_version`, a build from the old shape is not valid for
+        // a freshly prepared plan over the new one.
+        self.hash_join_cache.get_mut().take();
     }
 
     /// Create the index backends this table's catalog declares, if they are not
@@ -3161,6 +3268,23 @@ impl Engine {
         env: &Env<'_>,
         cap: Option<usize>,
     ) -> Result<ResultSet> {
+        self.run_select_to(plan, env, cap, None)
+    }
+
+    /// [`Engine::run_select`] with an optional row consumer.
+    ///
+    /// A consumer changes ownership, not SQL semantics: non-blocking queries
+    /// project each row into one reusable scratch buffer, while blocking
+    /// queries still materialise for their sort/aggregate and then visit the
+    /// final rows. The empty `rows` in the returned set are an internal signal
+    /// only; public callback APIs return the counted rows instead.
+    fn run_select_to(
+        &self,
+        plan: &SelectPlan,
+        env: &Env<'_>,
+        cap: Option<usize>,
+        mut sink: Option<&mut RowSink<'_>>,
+    ) -> Result<ResultSet> {
         let driving = &plan.from[0];
         let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
 
@@ -3199,6 +3323,11 @@ impl Engine {
             (true, Some(fetch)) => Some(fetch),
             _ => None,
         };
+        let non_blocking = !is_aggregate
+            && plan.windows.is_empty()
+            && !plan.distinct
+            && plan.order.is_empty()
+            && plan.score.is_none();
 
         // Which rows we even look at: retrieval when the query asked for it,
         // otherwise a point lookup or a scan depending on what the filter pins
@@ -3219,6 +3348,33 @@ impl Engine {
         let driving_is_a_point_lookup =
             pinned_rowid(&driving.table, plan.filter.as_ref(), params).is_some();
         let full_scan = fetch.is_none() && plan.score.is_none() && !driving_is_a_point_lookup;
+
+        // One ordinary join can stay borrowed all the way into a row callback:
+        // no iterator item ever has to own the joined row, and one projection
+        // buffer serves the complete result. Multi-join and residual-filter
+        // shapes keep the general iterator pipeline until their state machines
+        // can make the same ownership guarantee.
+        if non_blocking
+            && plan.joins.len() == 1
+            && plan.from.len() == 2
+            && plan.filter.is_none()
+            && driving.derived.is_none()
+            && plan.from[1].derived.is_none()
+        {
+            if let Some(sink) = sink.take() {
+                return self.run_single_join_to(
+                    plan,
+                    env,
+                    &mask,
+                    &driving_mask,
+                    full_scan,
+                    offset,
+                    limit,
+                    sink,
+                );
+            }
+        }
+
         let mut stream: RowStream<'_> = if plan.joins.is_empty() {
             match (&driving.derived, &plan.score, &plan.filter) {
                 // A derived table has no storage to stream from, so it
@@ -3329,11 +3485,6 @@ impl Engine {
         // order, so `sort_rows` with an empty `ORDER BY` (a stable re-sort of
         // that same order) is a no-op: skipping it changes only the
         // allocations, not the answer.
-        let non_blocking = !is_aggregate
-            && plan.windows.is_empty()
-            && !plan.distinct
-            && plan.order.is_empty()
-            && plan.score.is_none();
         if non_blocking {
             // `stop_after` already bounded the scan to `limit + offset`; skip
             // the offset and take the limit to finish the page.
@@ -3343,7 +3494,20 @@ impl Engine {
             if let Some(limit) = limit {
                 stream = Box::new(stream.take(limit));
             }
-            return project_stream(&plan.items, stream, env);
+            return match sink.as_mut() {
+                Some(sink) => {
+                    project_stream_to(&plan.items, stream, env, *sink)?;
+                    Ok(ResultSet {
+                        columns: plan
+                            .items
+                            .iter()
+                            .map(|item| item.label().to_string())
+                            .collect(),
+                        rows: Vec::new(),
+                    })
+                }
+                None => project_stream(&plan.items, stream, env),
+            };
         }
 
         let mut rows: Vec<ExecRow> = stream.collect::<Result<Vec<_>>>()?;
@@ -3378,7 +3542,94 @@ impl Engine {
             rows.truncate(limit);
         }
 
-        project(&plan.items, rows, env)
+        let result = project(&plan.items, rows, env)?;
+        if let Some(sink) = sink.as_mut() {
+            for row in &result.rows {
+                (*sink)(row)?;
+            }
+            return Ok(ResultSet {
+                columns: result.columns,
+                rows: Vec::new(),
+            });
+        }
+        Ok(result)
+    }
+
+    /// Push one non-blocking stored-table join into a borrowed-row consumer.
+    #[allow(clippy::too_many_arguments)]
+    fn run_single_join_to(
+        &self,
+        plan: &SelectPlan,
+        env: &Env<'_>,
+        mask: &ColumnMask,
+        driving_mask: &ColumnMask,
+        full_scan: bool,
+        offset: usize,
+        limit: Option<usize>,
+        sink: &mut dyn FnMut(&[Value]) -> Result<()>,
+    ) -> Result<ResultSet> {
+        let columns = plan
+            .items
+            .iter()
+            .map(|item| item.label().to_string())
+            .collect();
+        if limit == Some(0) {
+            return Ok(ResultSet {
+                columns,
+                rows: Vec::new(),
+            });
+        }
+
+        let driving = &plan.from[0];
+        let join = &plan.joins[0];
+        let outer: RowStream<'_> = Box::new(Decode::new(
+            self.candidate_bytes(&driving.table, &None, env.params())?,
+            driving_mask,
+        ));
+        let side = self.join_inner(
+            &plan.from,
+            1,
+            driving.table.columns.len(),
+            join.on.as_ref(),
+            mask,
+            full_scan,
+        )?;
+        let hash_key_is_full_on = side.is_hash() && is_single_equality(join.on.as_ref());
+        let mut skipped = 0usize;
+        let mut emitted = 0usize;
+        let mut projected = Vec::with_capacity(plan.items.len());
+        let joiner = NestedLoopJoin::new(outer, side, join.kind, join.on.as_ref(), env);
+        let direct_projection = plan
+            .items
+            .iter()
+            .all(|item| !matches!(item, SelectItem::Expr { .. }));
+        if hash_key_is_full_on && direct_projection {
+            joiner.try_for_each_hash_pair(|_, score, outer, inner| {
+                if skipped < offset {
+                    skipped += 1;
+                    return Ok(true);
+                }
+                project_split_row(&plan.items, outer, inner, score, &mut projected)?;
+                sink(&projected)?;
+                emitted += 1;
+                Ok(limit.is_none_or(|limit| emitted < limit))
+            })?;
+        } else {
+            joiner.try_for_each_borrowed(hash_key_is_full_on, |_, score, values| {
+                if skipped < offset {
+                    skipped += 1;
+                    return Ok(true);
+                }
+                project_borrowed_row(&plan.items, values, score, env, &mut projected)?;
+                sink(&projected)?;
+                emitted += 1;
+                Ok(limit.is_none_or(|limit| emitted < limit))
+            })?;
+        }
+        Ok(ResultSet {
+            columns,
+            rows: Vec::new(),
+        })
     }
 
     /// Run the query inside a subquery or a derived table, returning its rows.
@@ -3479,15 +3730,9 @@ impl Engine {
 
         if full_scan {
             if let Some((key, _ty)) = hash_join_key(from, inner_index, offset_of, on) {
-                let hash = HashJoin::build(
-                    &self.storage,
-                    &inner.name,
-                    inner_mask,
-                    key.outer,
-                    key.inner,
-                    inner.columns.len(),
-                )?;
-                return Ok(JoinInner::Hash(hash));
+                let table =
+                    self.hash_join_table(&inner.name, inner_mask, key.inner, inner.columns.len())?;
+                return Ok(JoinInner::Hash(HashJoin::from_table(table, key.outer)));
             }
         }
 
@@ -3504,6 +3749,51 @@ impl Engine {
             ))),
             None => self.materialise_inner(inner, &inner_mask),
         }
+    }
+
+    /// Reuse the immutable build half of a full-scan hash join when the same
+    /// physical shape runs again on the same committed rows.
+    ///
+    /// `write_version` is the row currency used by every persisted retrieval
+    /// index too: it advances in the same commit as a row mutation. A catalog
+    /// change clears the entry in [`Engine::invalidate_rules`]. An explicit
+    /// transaction that has buffered a row change cannot use the committed
+    /// version as its identity yet, so it bypasses both lookup and insertion.
+    /// This keeps read-your-writes exact without inventing an uncommitted
+    /// snapshot number.
+    fn hash_join_table(
+        &self,
+        table_name: &str,
+        mask: ColumnMask,
+        inner_key: usize,
+        width: usize,
+    ) -> Result<Rc<HashJoinTable>> {
+        let transaction_has_writes = self.in_transaction && !self.pending_changes.is_empty();
+        if !transaction_has_writes {
+            let cache = self.hash_join_cache.borrow();
+            if let Some(cached) = cache.as_ref() {
+                if cached.matches(self.write_version, table_name, &mask, inner_key, width) {
+                    return Ok(Rc::clone(&cached.table));
+                }
+            }
+        }
+
+        let table =
+            HashJoin::build_table(&self.storage, table_name, mask.clone(), inner_key, width)?;
+        if !transaction_has_writes
+            && self.options.hash_join_cache_bytes > 0
+            && table.resident_bytes() <= self.options.hash_join_cache_bytes
+        {
+            self.hash_join_cache.replace(Some(CachedHashJoin {
+                write_version: self.write_version,
+                table_name: table_name.to_string(),
+                mask,
+                inner_key,
+                width,
+                table: Rc::clone(&table),
+            }));
+        }
+        Ok(table)
     }
 
     /// The index probe a join's `ON` justifies for its inner side, or `None`
@@ -4346,9 +4636,10 @@ struct JoinKey {
 /// values are the same [`Value`] class and hash alike — an `INTEGER` next to a
 /// `REAL` compares as `f64` and would need normalisation the hash does not do)
 /// and the collation has to be binary (a `NOCASE` text key would fold two
-/// byte-unequal texts into one match). [`HashJoin`] re-evaluates the `ON` over
-/// its candidates, so a hash that *over*-groups is slow, but one that splits
-/// equal keys apart is wrong — which is what both conditions rule out.
+/// byte-unequal texts into one match). A hash that *over*-groups is safe because
+/// candidates still compare their keys (and residual predicates still run),
+/// but one that splits equal keys apart is wrong — which is what both
+/// conditions rule out.
 fn hash_join_key(
     from: &[FromItem],
     inner_index: usize,
@@ -4374,6 +4665,18 @@ fn hash_join_key(
         }
     }
     None
+}
+
+/// Whether `ON` is exactly one equality, with no residual conjunct to run
+/// after a hash candidate's key has been compared directly.
+fn is_single_equality(on: Option<&crate::plan::Expr>) -> bool {
+    matches!(
+        on,
+        Some(crate::plan::Expr::Binary {
+            op: crate::plan::BinaryOp::Eq,
+            ..
+        })
+    )
 }
 
 /// The declared type of a joined-row column that belongs to one of the tables
@@ -5744,6 +6047,125 @@ fn project_stream(items: &[SelectItem], stream: RowStream<'_>, env: &Env<'_>) ->
     Ok(ResultSet {
         columns,
         rows: out_rows,
+    })
+}
+
+/// Project a non-blocking stream into one reusable output row.
+///
+/// Unlike [`project_stream`], this does not transfer each row into a retained
+/// outer `Vec`: the consumer must finish with the slice before it returns, and
+/// the allocation is cleared and reused for the next row.
+fn project_stream_to(
+    items: &[SelectItem],
+    stream: RowStream<'_>,
+    env: &Env<'_>,
+    sink: &mut dyn FnMut(&[Value]) -> Result<()>,
+) -> Result<()> {
+    let mut values = Vec::with_capacity(items.len());
+    match moving_projection(items) {
+        Some(moves) => {
+            for row in stream {
+                let mut row = row?;
+                values.clear();
+                for taken in &moves {
+                    values.push(match taken {
+                        Moved::Column(index) => row
+                            .values
+                            .get_mut(*index)
+                            .map(|slot| core::mem::replace(slot, Value::Null))
+                            .unwrap_or(Value::Null),
+                        Moved::Score => match row.score {
+                            Some(score) => Value::Real(f64::from(score)),
+                            None => Value::Null,
+                        },
+                    });
+                }
+                sink(&values)?;
+            }
+        }
+        None => {
+            for row in stream {
+                let row = row?;
+                values.clear();
+                for item in items {
+                    values.push(project_one(item, &row, env)?);
+                }
+                sink(&values)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Project a joined row borrowed from [`NestedLoopJoin`]'s reusable buffer.
+fn project_borrowed_row(
+    items: &[SelectItem],
+    values: &[Value],
+    score: Option<f32>,
+    env: &Env<'_>,
+    out: &mut Vec<Value>,
+) -> Result<()> {
+    out.clear();
+    for item in items {
+        out.push(match item {
+            SelectItem::Column { index, .. } => values.get(*index).cloned().unwrap_or(Value::Null),
+            SelectItem::Expr { expr, .. } => eval::evaluate(expr, values, Computed::NONE, env)?,
+            SelectItem::Score { .. } => score
+                .map(|score| Value::Real(f64::from(score)))
+                .unwrap_or(Value::Null),
+        });
+    }
+    Ok(())
+}
+
+/// Project direct columns from a hash pair without first concatenating it.
+fn project_split_row(
+    items: &[SelectItem],
+    outer: &[Value],
+    inner: Option<&[Value]>,
+    score: Option<f32>,
+    out: &mut Vec<Value>,
+) -> Result<()> {
+    out.clear();
+    for item in items {
+        out.push(match item {
+            SelectItem::Column { index, .. } if *index < outer.len() => outer[*index].clone(),
+            SelectItem::Column { index, .. } => inner
+                .and_then(|inner| inner.get(*index - outer.len()))
+                .cloned()
+                .unwrap_or(Value::Null),
+            SelectItem::Score { .. } => score
+                .map(|score| Value::Real(f64::from(score)))
+                .unwrap_or(Value::Null),
+            // The caller admits only direct projections. Fail loudly if that
+            // guard ever drifts instead of manufacturing a `NULL` result.
+            SelectItem::Expr { .. } => {
+                return Err(Error::Unsupported(
+                    "internal split-row projection received an expression".to_string(),
+                ))
+            }
+        });
+    }
+    Ok(())
+}
+
+/// One projected value, shared by the reusable-row callback path.
+fn project_one(item: &SelectItem, row: &ExecRow, env: &Env<'_>) -> Result<Value> {
+    Ok(match item {
+        SelectItem::Column { index, .. } => row.values.get(*index).cloned().unwrap_or(Value::Null),
+        SelectItem::Expr { expr, .. } => eval::evaluate(
+            expr,
+            &row.values,
+            Computed {
+                aggregates: &row.aggregates,
+                windows: &row.windows,
+            },
+            env,
+        )?,
+        SelectItem::Score { .. } => row
+            .score
+            .map(|score| Value::Real(f64::from(score)))
+            .unwrap_or(Value::Null),
     })
 }
 

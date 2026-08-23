@@ -313,6 +313,47 @@ impl Database {
         self.engine.run_query(statement.as_core(), params)
     }
 
+    /// Run a prepared query and visit each final row without retaining the
+    /// whole result set. Returns the number of rows delivered.
+    ///
+    /// The slice is borrowed only for the callback invocation; copy values you
+    /// need to keep. For a non-blocking query (`SELECT` without sorting,
+    /// aggregation, windows or `DISTINCT`) the engine reuses one projected-row
+    /// allocation from beginning to end. This is the appropriate API for wire
+    /// protocols, exports and scans that serialise or count rows as they arrive
+    /// rather than needing random access to every row afterwards.
+    ///
+    /// Only read-only statements are accepted. A callback can fail after some
+    /// rows have been delivered; refusing writes prevents that consumer error
+    /// from looking like a failed statement after a mutation already committed.
+    ///
+    /// ```
+    /// use inlaysql::{Database, Value};
+    ///
+    /// let mut db = Database::open_in_memory()?;
+    /// db.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)", &[])?;
+    /// db.execute("INSERT INTO kv VALUES (1, 'one'), (2, 'two')", &[])?;
+    /// let query = db.prepare("SELECT body FROM kv")?;
+    /// let mut bodies = Vec::new();
+    /// let count = db.query_prepared_each(&query, &[], |row| {
+    ///     bodies.push(row[0].clone());
+    ///     Ok(())
+    /// })?;
+    /// assert_eq!(count, 2);
+    /// assert_eq!(bodies[0], Value::Text("one".into()));
+    /// # Ok::<(), inlaysql::Error>(())
+    /// ```
+    pub fn query_prepared_each(
+        &mut self,
+        statement: &Statement,
+        params: &[Value],
+        each: impl FnMut(&[Value]) -> Result<()>,
+    ) -> Result<usize> {
+        self.check_writable_statement(statement)?;
+        self.engine
+            .run_query_each(statement.as_core(), params, each)
+    }
+
     /// How many statements this handle has parsed since it was opened.
     ///
     /// Diagnostic: it is how a caller (or a test) confirms that a prepared

@@ -1196,19 +1196,25 @@ fn a_full_scan_join_builds_a_hash_table_instead_of_probing() {
         run(&mut indexed, sql);
     }
 
-    for sql in [
-        "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k",
-        "SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k",
-        "SELECT a.id, b.id FROM a JOIN b ON a.s = b.s",
-        "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND a.s = b.s",
+    for (sql, builds) in [
+        ("SELECT a.id, b.id FROM a JOIN b ON a.k = b.k", true),
+        // Same inner table, key, mask and committed version as the first
+        // query: `LEFT` changes output handling, not the immutable hash build.
+        ("SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k", false),
+        ("SELECT a.id, b.id FROM a JOIN b ON a.s = b.s", true),
+        (
+            "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND a.s = b.s",
+            true,
+        ),
     ] {
         probe.reset();
         let indexed_rows = rows(&mut indexed, sql, &[]);
         // The hash join scans the inner table once to build, and never does a
         // point read by row id.
-        assert!(
+        assert_eq!(
             probe.scans_of("b") > 0,
-            "`{sql}` did not scan the inner table to build the hash"
+            builds,
+            "`{sql}` hash-build reuse disagreed with its physical shape"
         );
         assert_eq!(probe.reads.get(), 0, "`{sql}` probed by row id instead");
         // And it answers exactly as the unindexed scan does.

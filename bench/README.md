@@ -141,16 +141,20 @@ wrong. Nothing here measures `ORDER BY` pushdown through the index (open per
 SUITE=joins ROWS=20000 QUERIES=100 LIMIT=20 ./bench/run.sh
 ```
 
-`users` x `posts`, the AHL-464 index nested-loop join shape, in both
-directions the planner rule (`Engine::join_probe`) actually takes:
+`users` x `posts`, in both directions the planner can drive it:
 
 - **PK inner** — `FROM posts JOIN users ON posts.user_id = users.id`. The
-  inner table's join key is its `INTEGER PRIMARY KEY`, so each outer row costs
-  one tree descent.
+  inner table's join key is its `INTEGER PRIMARY KEY`.
 - **Secondary-index inner** — `FROM users JOIN posts ON posts.user_id =
   users.id`. The inner table's join key is `posts.user_id`, a scalar B-tree
-  index, so each outer row costs an index entry-range read plus one descent
-  per matched post. This is the exact shape `PERF.md` names.
+  index. This is the exact shape `PERF.md` names.
+
+Without `LIMIT`, both are full scans and use the hash join; a repeated prepared
+execution may reuse its immutable inner build while the committed row version
+is unchanged. With `LIMIT`, the planner keeps the index-probe path so it can
+stop before paying a full build. Both engines consume and discard one projected
+row at a time (`query_prepared_each` and `query_map`, respectively); neither
+retains an answer-sized result container merely to count it.
 
 Each direction runs with and without a `LIMIT` (`--limit`, default 10),
 because the probe is a stage of the streaming pipeline and a `LIMIT` on an
@@ -162,17 +166,17 @@ assignment), so neither direction gets a luckier key distribution, and both
 engines run against the identical schema and the identical
 `CREATE INDEX posts_user_id ON posts (user_id)`. Both engines prepare each
 query once, outside the timed loop; neither query takes a bound parameter, so
-this measures execution, not the parser or a lookup key.
+this measures repeated prepared execution, including cache validation but not
+the parser or a lookup key.
 
 **What this deliberately does not claim:** there is no unindexed/materialising
-row. The fallback the AHL-464 rule declines — an equality that is not on the
-inner table's key or a leading index column — is exercised by
+row. The fallback the join-key rules decline — an equality the hash or probe
+cannot reproduce — is exercised by
 `crates/inlaysql-core/tests/btree_index.rs` and `tests/streaming.rs`, not by
 this harness, and `PERF.md` already states plainly that a join the rule
 declines is still O(n×m) and would still lose. This suite measures the access
-path the rule was built for, nothing about join reordering or a hash join
-(neither exists), and nothing about a join with an `OR` or a composite `ON`
-whose leading conjunct is not the probe key.
+paths the rules were built for, not join reordering, and says nothing about a
+join with an `OR` or a composite `ON` whose equality is not usable as a key.
 
 ## Suite: vectors — InlaySQL vs sqlite-vec
 

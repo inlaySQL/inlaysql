@@ -13,7 +13,7 @@ use std::rc::Rc;
 use inlaysql_core::mem::{LogicalClock, MemIndexFactory, MemStorage};
 use inlaysql_core::row::RowBuf;
 use inlaysql_core::traits::{RowId, Storage};
-use inlaysql_core::{Engine, Error, Result, Value};
+use inlaysql_core::{Engine, EngineOptions, Error, Result, Value};
 
 /// `MemStorage` that counts how often the engine falls back to a full scan.
 struct CountingStorage {
@@ -74,16 +74,62 @@ impl Storage for CountingStorage {
 }
 
 fn counting_engine() -> (Engine, Rc<Cell<usize>>) {
+    counting_engine_with_options(EngineOptions::default())
+}
+
+fn counting_engine_with_options(options: EngineOptions) -> (Engine, Rc<Cell<usize>>) {
     let scans = Rc::new(Cell::new(0));
-    let engine = Engine::open(
+    let engine = Engine::open_with_options(
         Box::new(CountingStorage {
             inner: MemStorage::new(),
             scans: scans.clone(),
         }),
         Box::new(MemIndexFactory),
         Box::new(LogicalClock::new()),
+        options,
     )
     .expect("open");
+    (engine, scans)
+}
+
+fn seeded_join(cache_bytes: usize) -> (Engine, Rc<Cell<usize>>) {
+    let (mut engine, scans) = counting_engine_with_options(EngineOptions {
+        hash_join_cache_bytes: cache_bytes,
+        ..EngineOptions::default()
+    });
+    engine
+        .execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+            &[],
+        )
+        .unwrap();
+    engine
+        .execute(
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT)",
+            &[],
+        )
+        .unwrap();
+    for id in 1..=2 {
+        engine
+            .execute(
+                "INSERT INTO users VALUES (?, ?)",
+                &[Value::Integer(id), Value::Text(format!("user-{id}").into())],
+            )
+            .unwrap();
+    }
+    for id in 1..=4 {
+        engine
+            .execute(
+                "INSERT INTO posts VALUES (?, ?, ?)",
+                &[
+                    Value::Integer(id),
+                    Value::Integer(1 + (id - 1) % 2),
+                    Value::Text(format!("post-{id}").into()),
+                ],
+            )
+            .unwrap();
+    }
+    scans.set(0);
     (engine, scans)
 }
 
@@ -123,6 +169,97 @@ fn a_prepared_statement_is_parsed_once_however_often_it_runs() {
         engine.statements_parsed() - before,
         1,
         "twenty executions of one prepared statement must parse exactly once"
+    );
+}
+
+#[test]
+fn a_prepared_hash_join_reuses_its_inner_build_on_the_same_snapshot() {
+    let (mut engine, scans) = seeded_join(1024 * 1024);
+    let join = engine
+        .prepare(
+            "SELECT users.name, posts.title \
+             FROM users JOIN posts ON posts.user_id = users.id",
+        )
+        .unwrap();
+
+    let before = scans.get();
+    assert_eq!(engine.run_query(&join, &[]).unwrap().rows.len(), 4);
+    let first = scans.get();
+    assert_eq!(first - before, 2, "first run scans outer and inner");
+
+    assert_eq!(engine.run_query(&join, &[]).unwrap().rows.len(), 4);
+    assert_eq!(
+        scans.get() - first,
+        1,
+        "same-snapshot rerun scans only the outer table"
+    );
+}
+
+#[test]
+fn a_committed_row_change_invalidates_the_prepared_hash_build() {
+    let (mut engine, scans) = seeded_join(1024 * 1024);
+    let join = engine
+        .prepare(
+            "SELECT users.name, posts.title \
+             FROM users JOIN posts ON posts.user_id = users.id",
+        )
+        .unwrap();
+    assert_eq!(engine.run_query(&join, &[]).unwrap().rows.len(), 4);
+
+    engine
+        .execute("INSERT INTO posts VALUES (5, 1, 'post-5')", &[])
+        .unwrap();
+    let before = scans.get();
+    assert_eq!(engine.run_query(&join, &[]).unwrap().rows.len(), 5);
+    assert_eq!(
+        scans.get() - before,
+        2,
+        "a newer write version rebuilds the inner before returning rows"
+    );
+}
+
+#[test]
+fn an_open_transaction_with_writes_bypasses_the_committed_hash_build() {
+    let (mut engine, scans) = seeded_join(1024 * 1024);
+    let join = engine
+        .prepare(
+            "SELECT users.name, posts.title \
+             FROM users JOIN posts ON posts.user_id = users.id",
+        )
+        .unwrap();
+    assert_eq!(engine.run_query(&join, &[]).unwrap().rows.len(), 4);
+
+    engine.begin().unwrap();
+    engine
+        .execute("INSERT INTO posts VALUES (5, 1, 'pending')", &[])
+        .unwrap();
+    let before = scans.get();
+    assert_eq!(engine.run_query(&join, &[]).unwrap().rows.len(), 5);
+    assert_eq!(
+        scans.get() - before,
+        2,
+        "read-your-writes cannot reuse a build from the committed snapshot"
+    );
+    engine.rollback().unwrap();
+}
+
+#[test]
+fn a_zero_hash_cache_budget_rebuilds_normally() {
+    let (mut engine, scans) = seeded_join(0);
+    let join = engine
+        .prepare(
+            "SELECT users.name, posts.title \
+             FROM users JOIN posts ON posts.user_id = users.id",
+        )
+        .unwrap();
+
+    assert_eq!(engine.run_query(&join, &[]).unwrap().rows.len(), 4);
+    let after_first = scans.get();
+    assert_eq!(engine.run_query(&join, &[]).unwrap().rows.len(), 4);
+    assert_eq!(
+        scans.get() - after_first,
+        2,
+        "disabled cache retains no inner build"
     );
 }
 
