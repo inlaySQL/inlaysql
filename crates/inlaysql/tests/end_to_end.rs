@@ -77,7 +77,7 @@ fn seed(db: &mut Database) {
             "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
             &[
                 Value::Integer(*id),
-                Value::Text(body.to_string()),
+                Value::Text(body.to_string().into()),
                 Value::Vector(hashed_embedding(body, DIM)),
             ],
         )
@@ -101,7 +101,7 @@ fn hybrid(db: &mut Database, limit: usize) -> ResultSet {
         ),
         &[
             Value::Vector(hashed_embedding(QUERY_SUBJECT, DIM)),
-            Value::Text(QUERY_TEXT.to_string()),
+            Value::Text(QUERY_TEXT.to_string().into()),
         ],
     )
     .expect("hybrid query")
@@ -174,7 +174,7 @@ fn the_fused_order_is_rank_fusion_of_the_two_retrievers() {
     let text = ids(&db
         .query(
             "SELECT id, bm25_score(body, ?) AS score FROM docs LIMIT 6",
-            &[Value::Text(QUERY_TEXT.to_string())],
+            &[Value::Text(QUERY_TEXT.to_string().into())],
         )
         .expect("text query"));
 
@@ -230,7 +230,7 @@ fn inserts_after_a_reopen_are_immediately_searchable() {
         "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
         &[
             Value::Integer(7),
-            Value::Text(body.to_string()),
+            Value::Text(body.to_string().into()),
             Value::Vector(hashed_embedding(body, DIM)),
         ],
     )
@@ -264,7 +264,7 @@ fn a_dimension_mismatch_is_rejected_at_insert() {
             "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
             &[
                 Value::Integer(99),
-                Value::Text("wrong width".to_string()),
+                Value::Text("wrong width".to_string().into()),
                 Value::Vector(vec![0.0; 8]),
             ],
         )

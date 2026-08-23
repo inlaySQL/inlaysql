@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
             &[
                 Value::Integer(*id),
-                Value::Text(body.clone()),
+                Value::Text(body.clone().into()),
                 Value::Vector(hashed_embedding(body, dim)),
             ],
         )?;

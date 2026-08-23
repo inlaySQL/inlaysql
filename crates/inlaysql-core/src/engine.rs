@@ -5786,7 +5786,7 @@ mod tests {
     use core::cmp::Ordering;
 
     fn text(s: &str) -> Value {
-        Value::Text(s.to_string())
+        Value::Text(s.to_string().into())
     }
     fn blob(bytes: &[u8]) -> Value {
         Value::Blob(bytes.to_vec())

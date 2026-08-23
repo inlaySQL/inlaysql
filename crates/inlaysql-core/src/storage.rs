@@ -395,7 +395,7 @@ mod tests {
         let entries = [
             entry_key("i", &[&Value::Null], &[], 0).unwrap(),
             entry_key("idx", &[&Value::Integer(0)], &[], 1).unwrap(),
-            entry_key("ann:t.c", &[&Value::Text("x".to_string())], &[], 2).unwrap(),
+            entry_key("ann:t.c", &[&Value::Text("x".to_string().into())], &[], 2).unwrap(),
             entry_key("", &[&Value::Blob(alloc::vec![0, 1, 2])], &[], RowId::MAX).unwrap(),
         ];
         // Every index key begins with the one byte no identifier and no

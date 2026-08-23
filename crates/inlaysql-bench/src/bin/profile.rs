@@ -221,12 +221,16 @@ fn run_points(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Er
 
     db.begin()?;
     for id in 1..=config.rows as i64 {
-        if let Err(inlaysql::Error::Transaction(_)) =
-            db.execute_prepared(&insert, &[Value::Integer(id), Value::Text(payload.clone())])
-        {
+        if let Err(inlaysql::Error::Transaction(_)) = db.execute_prepared(
+            &insert,
+            &[Value::Integer(id), Value::Text(payload.clone().into())],
+        ) {
             db.commit()?;
             db.begin()?;
-            db.execute_prepared(&insert, &[Value::Integer(id), Value::Text(payload.clone())])?;
+            db.execute_prepared(
+                &insert,
+                &[Value::Integer(id), Value::Text(payload.clone().into())],
+            )?;
         }
     }
     db.commit()?;
@@ -262,8 +266,8 @@ fn run_indexed(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::E
     for id in 1..=config.rows as i64 {
         let bound = [
             Value::Integer(id),
-            Value::Text(email(id)),
-            Value::Text(payload.clone()),
+            Value::Text(email(id).into()),
+            Value::Text(payload.clone().into()),
         ];
         if let Err(inlaysql::Error::Transaction(_)) = db.execute_prepared(&insert, &bound) {
             db.commit()?;
@@ -281,7 +285,7 @@ fn run_indexed(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::E
     announce_query_phase();
     let (iterations, elapsed) = run_for(config.seconds, || {
         let id = 1 + (rng.next_u64() % rows as u64) as i64;
-        let result = db.query_prepared(&lookup, &[Value::Text(email(id))])?;
+        let result = db.query_prepared(&lookup, &[Value::Text(email(id).into())])?;
         debug_assert_eq!(result.rows.len(), 1);
         Ok(())
     })?;
@@ -315,8 +319,8 @@ fn run_indexed_range(config: &Config, path: &Path) -> Result<(), Box<dyn std::er
     for id in 1..=config.rows as i64 {
         let bound = [
             Value::Integer(id),
-            Value::Text(email(id)),
-            Value::Text(payload.clone()),
+            Value::Text(email(id).into()),
+            Value::Text(payload.clone().into()),
         ];
         if let Err(inlaysql::Error::Transaction(_)) = db.execute_prepared(&insert, &bound) {
             db.commit()?;
@@ -337,8 +341,8 @@ fn run_indexed_range(config: &Config, path: &Path) -> Result<(), Box<dyn std::er
         let result = db.query_prepared(
             &range,
             &[
-                Value::Text(email(start)),
-                Value::Text(email(start + RANGE_SIZE as i64)),
+                Value::Text(email(start).into()),
+                Value::Text(email(start + RANGE_SIZE as i64).into()),
             ],
         )?;
         debug_assert_eq!(result.rows.len(), RANGE_SIZE);
@@ -369,7 +373,7 @@ fn run_joins(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Err
     let insert_post = db.prepare("INSERT INTO posts (id, user_id, title) VALUES (?, ?, ?)")?;
     db.begin()?;
     for id in 1..=config.rows as i64 {
-        let bound = [Value::Integer(id), Value::Text(format!("user{id}"))];
+        let bound = [Value::Integer(id), Value::Text(format!("user{id}").into())];
         if let Err(inlaysql::Error::Transaction(_)) = db.execute_prepared(&insert_user, &bound) {
             db.commit()?;
             db.begin()?;
@@ -382,7 +386,7 @@ fn run_joins(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Err
         let bound = [
             Value::Integer(post_id),
             Value::Integer(user_id),
-            Value::Text(payload.clone()),
+            Value::Text(payload.clone().into()),
         ];
         if let Err(inlaysql::Error::Transaction(_)) = db.execute_prepared(&insert_post, &bound) {
             db.commit()?;
@@ -466,7 +470,7 @@ fn run_writes(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Er
     let warmup = CDC_WARMUP_ROWS.max(1);
     db.begin()?;
     for id in 1..=warmup as i64 {
-        let bound = [Value::Integer(id), Value::Text(payload.clone())];
+        let bound = [Value::Integer(id), Value::Text(payload.clone().into())];
         if let Err(inlaysql::Error::Transaction(_)) = db.execute_prepared(&insert, &bound) {
             db.commit()?;
             db.begin()?;
@@ -480,7 +484,7 @@ fn run_writes(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Er
     let (iterations, elapsed) = run_for(config.seconds, || {
         db.execute_prepared(
             &insert,
-            &[Value::Integer(next_id), Value::Text(payload.clone())],
+            &[Value::Integer(next_id), Value::Text(payload.clone().into())],
         )?;
         next_id += 1;
         Ok(())
@@ -584,7 +588,7 @@ mod tests {
             for id in 1..=200i64 {
                 db.execute_prepared(
                     &insert,
-                    &[Value::Integer(id), Value::Text(format!("row-{id}"))],
+                    &[Value::Integer(id), Value::Text(format!("row-{id}").into())],
                 )
                 .unwrap();
             }
@@ -602,7 +606,7 @@ mod tests {
                 );
                 assert_eq!(
                     result.rows[0][0],
-                    Value::Text(format!("row-{id}")),
+                    Value::Text(format!("row-{id}").into()),
                     "page_cache_bytes={page_cache_bytes}: row {id} wrong"
                 );
             }

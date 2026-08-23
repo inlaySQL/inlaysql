@@ -1,6 +1,7 @@
 //! Column types and runtime values.
 
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -70,6 +71,81 @@ impl fmt::Display for DataType {
     }
 }
 
+/// An owned text value that is cheap to clone.
+///
+/// `Value::Text` used to hold a `String`, so every clone — and the join
+/// pipeline clones each inner row once per matching outer row — reallocated
+/// and recopied the bytes. `Arc<str>` keeps exactly `String`'s semantics —
+/// equality, ordering, hashing and formatting are all defined over the `str` —
+/// while a clone is a refcount bump with no allocation. That is what
+/// `PERF.md`'s "a projected row allocates once at the boundary" means in
+/// practice: a decoded text is allocated once and shared everywhere it is
+/// copied.
+///
+/// `Arc`, not `Rc`, because `Value` is held in a `static` (it must be `Sync`)
+/// and the `inlaysql` crate may hand a value across its dedicated I/O thread.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Text(Arc<str>);
+
+impl Text {
+    /// Borrow the text as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for Text {
+    fn from(value: String) -> Self {
+        Text(Arc::from(value.as_str()))
+    }
+}
+
+impl From<&str> for Text {
+    fn from(value: &str) -> Self {
+        Text(Arc::from(value))
+    }
+}
+
+impl From<Text> for String {
+    fn from(value: Text) -> Self {
+        value.0.as_ref().to_string()
+    }
+}
+
+impl core::ops::Deref for Text {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for Text {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl core::borrow::Borrow<str> for Text {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Text {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Debug as the `str`, exactly as `String`'s `Debug` does, so `Value`'s derived
+/// `Debug` output is unchanged.
+impl fmt::Debug for Text {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
 /// A runtime value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -80,7 +156,7 @@ pub enum Value {
     /// Floating point value.
     Real(f64),
     /// Text value.
-    Text(String),
+    Text(Text),
     /// Binary value.
     Blob(Vec<u8>),
     /// Embedding value.
@@ -103,7 +179,7 @@ impl Value {
     /// Borrow the value as text, if it is text.
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Value::Text(s) => Some(s),
+            Value::Text(s) => Some(s.as_str()),
             _ => None,
         }
     }
@@ -161,13 +237,13 @@ impl From<f64> for Value {
 
 impl From<&str> for Value {
     fn from(v: &str) -> Self {
-        Value::Text(v.to_string())
+        Value::Text(Text::from(v))
     }
 }
 
 impl From<String> for Value {
     fn from(v: String) -> Self {
-        Value::Text(v)
+        Value::Text(Text::from(v))
     }
 }
 
@@ -282,7 +358,7 @@ impl<'a> ValueRef<'a> {
             ValueRef::Null => Value::Null,
             ValueRef::Integer(i) => Value::Integer(*i),
             ValueRef::Real(r) => Value::Real(*r),
-            ValueRef::Text(s) => Value::Text(String::from(*s)),
+            ValueRef::Text(s) => Value::Text(Text::from(*s)),
             ValueRef::Blob(b) => Value::Blob(b.to_vec()),
             ValueRef::Vector(v) => Value::Vector(v.clone()),
         }

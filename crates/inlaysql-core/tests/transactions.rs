@@ -99,7 +99,7 @@ fn insert(engine: &mut Engine, id: i64) {
     engine
         .execute(
             "INSERT INTO t (id, body) VALUES (?, ?)",
-            &[Value::Integer(id), Value::Text("row".to_string())],
+            &[Value::Integer(id), Value::Text("row".to_string().into())],
         )
         .unwrap();
 }
@@ -367,7 +367,7 @@ fn a_transaction_that_outgrows_the_log_is_rejected_clearly() {
     for id in 1..=2000 {
         match engine.execute(
             "INSERT INTO t (id, body) VALUES (?, ?)",
-            &[Value::Integer(id), Value::Text(body.clone())],
+            &[Value::Integer(id), Value::Text(body.clone().into())],
         ) {
             Ok(_) => accepted += 1,
             Err(Error::Transaction(message)) => {
@@ -391,7 +391,7 @@ fn a_transaction_that_outgrows_the_log_is_rejected_clearly() {
     engine
         .execute(
             "INSERT INTO t (id, body) VALUES (?, ?)",
-            &[Value::Integer(10_000), Value::Text(body.clone())],
+            &[Value::Integer(10_000), Value::Text(body.clone().into())],
         )
         .unwrap();
     engine.commit().unwrap();
@@ -445,7 +445,10 @@ fn crash_sweep(seed: u64) {
         if engine
             .execute(
                 "INSERT INTO t (id, body) VALUES (?, ?)",
-                &[Value::Integer(id as i64), Value::Text("x".to_string())],
+                &[
+                    Value::Integer(id as i64),
+                    Value::Text("x".to_string().into()),
+                ],
             )
             .is_err()
         {

@@ -55,13 +55,16 @@ fn a_prepared_statement_parses_once_against_a_real_file() {
     for id in 1..=50 {
         db.execute_prepared(
             &insert,
-            &[Value::Integer(id), Value::Text(format!("row-{id}"))],
+            &[Value::Integer(id), Value::Text(format!("row-{id}").into())],
         )
         .unwrap();
     }
     for id in 1..=50 {
         let rows = db.query_prepared(&lookup, &[Value::Integer(id)]).unwrap();
-        assert_eq!(rows.rows, vec![vec![Value::Text(format!("row-{id}"))]]);
+        assert_eq!(
+            rows.rows,
+            vec![vec![Value::Text(format!("row-{id}").into())]]
+        );
     }
 
     assert_eq!(
@@ -191,7 +194,7 @@ fn a_prepared_statement_crosses_onto_the_async_io_thread() {
         for id in 1..=10 {
             db.execute_prepared(
                 &insert,
-                &[Value::Integer(id), Value::Text(format!("row-{id}"))],
+                &[Value::Integer(id), Value::Text(format!("row-{id}").into())],
             )
             .await
             .unwrap();
@@ -231,7 +234,7 @@ fn queued_prepared_statements_keep_their_arrival_order() {
             .map(|id| {
                 db.execute_prepared(
                     &insert,
-                    &[Value::Integer(id), Value::Text(format!("row-{id}"))],
+                    &[Value::Integer(id), Value::Text(format!("row-{id}").into())],
                 )
             })
             .collect();

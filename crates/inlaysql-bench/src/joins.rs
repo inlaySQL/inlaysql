@@ -230,7 +230,7 @@ fn inlaysql_joins(
     let insert_post = db.prepare("INSERT INTO posts (id, user_id, title) VALUES (?, ?, ?)")?;
     db.begin()?;
     for id in 1..=users as i64 {
-        let bound = [Value::Integer(id), Value::Text(format!("user{id}"))];
+        let bound = [Value::Integer(id), Value::Text(format!("user{id}").into())];
         if let Err(inlaysql::Error::Transaction(_)) = db.execute_prepared(&insert_user, &bound) {
             db.commit()?;
             db.begin()?;
@@ -245,7 +245,7 @@ fn inlaysql_joins(
         let bound = [
             Value::Integer(post_id),
             Value::Integer(user_id),
-            Value::Text(payload.to_string()),
+            Value::Text(payload.to_string().into()),
         ];
         if let Err(inlaysql::Error::Transaction(_)) = db.execute_prepared(&insert_post, &bound) {
             db.commit()?;

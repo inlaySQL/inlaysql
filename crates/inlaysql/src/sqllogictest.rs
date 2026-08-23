@@ -312,7 +312,7 @@ fn format_value(value: &Value, ty: char) -> Result<String, String> {
         Value::Integer(_) => wrong_type("integer"),
         Value::Real(r) if ty == 'R' => Ok(crate::sqllogictest::format_real(*r)),
         Value::Real(_) => wrong_type("real"),
-        Value::Text(s) if ty == 'T' => Ok(s.clone()),
+        Value::Text(s) if ty == 'T' => Ok(s.to_string()),
         Value::Text(_) => wrong_type("text"),
         Value::Blob(_) => Ok("<blob>".to_string()),
         Value::Vector(_) => Ok("<vector>".to_string()),

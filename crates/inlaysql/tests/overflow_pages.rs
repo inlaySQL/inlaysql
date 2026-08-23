@@ -40,7 +40,7 @@ const TEXT_BYTES: usize = 64 * 1024;
 fn row() -> (Value, Value) {
     let embedding: Vec<f32> = (0..DIM).map(|i| (i as f32) * 0.5).collect();
     let text: String = "x".repeat(TEXT_BYTES);
-    (Value::Vector(embedding), Value::Text(text))
+    (Value::Vector(embedding), Value::Text(text.into()))
 }
 
 fn create_table(db: &mut Database) {
@@ -102,7 +102,7 @@ fn a_small_and_a_large_row_coexist_in_one_table() {
             &[
                 Value::Integer(2),
                 Value::Vector(vec![0.0; DIM]),
-                Value::Text("small".to_string()),
+                Value::Text("small".to_string().into()),
             ],
         )
         .expect("insert small");
@@ -110,7 +110,10 @@ fn a_small_and_a_large_row_coexist_in_one_table() {
 
     let mut db = Database::open(workspace.db_path()).expect("reopen");
     assert_eq!(read_row(&mut db, 1)[2], text);
-    assert_eq!(read_row(&mut db, 2)[2], Value::Text("small".to_string()));
+    assert_eq!(
+        read_row(&mut db, 2)[2],
+        Value::Text("small".to_string().into())
+    );
 }
 
 #[test]
@@ -126,10 +129,10 @@ fn a_large_row_is_updated_and_deleted_in_place() {
         let replacement = "y".repeat(TEXT_BYTES + 1);
         db.execute(
             "UPDATE docs SET body = ? WHERE id = 1",
-            &[Value::Text(replacement.clone())],
+            &[Value::Text(replacement.clone().into())],
         )
         .expect("update");
-        assert_eq!(read_row(&mut db, 1)[2], Value::Text(replacement));
+        assert_eq!(read_row(&mut db, 1)[2], Value::Text(replacement.into()));
 
         db.execute("DELETE FROM docs WHERE id = 1", &[])
             .expect("delete");

@@ -199,11 +199,11 @@ fn sweep(seed: u64, shape: Shape) {
                  VALUES (?, ?, ?, ?, ?, ?)",
                 &[
                     Value::Integer(id as i64),
-                    Value::Text(body(id)),
+                    Value::Text(body(id).into()),
                     Value::Vector(embedding(id)),
                     Value::Integer(bucket(id)),
-                    Value::Text(label(id)),
-                    Value::Text(name(id)),
+                    Value::Text(label(id).into()),
+                    Value::Text(name(id).into()),
                 ],
             )
             .is_err()
@@ -262,7 +262,7 @@ fn sweep(seed: u64, shape: Shape) {
             let hits = recovered
                 .query(
                     "SELECT id, bm25_score(body, ?) AS score FROM docs ORDER BY score DESC LIMIT 1",
-                    &[Value::Text(format!("uniquetoken{id}"))],
+                    &[Value::Text(format!("uniquetoken{id}").into())],
                 )
                 .unwrap_or_else(|e| panic!("seed {seed}: full-text search failed: {e}"));
             assert_eq!(
@@ -295,7 +295,7 @@ fn sweep(seed: u64, shape: Shape) {
         let all = recovered
             .query(
                 "SELECT id, bm25_score(body, ?) AS score FROM docs ORDER BY score DESC LIMIT 1000",
-                &[Value::Text("document embedded storage".to_string())],
+                &[Value::Text("document embedded storage".to_string().into())],
             )
             .unwrap_or_else(|e| panic!("seed {seed}: full-text sweep failed: {e}"));
         assert_surviving(&all, &surviving, seed);
@@ -393,7 +393,7 @@ fn assert_btree_indexes_agree(
         .iter()
         .map(|row| match (&row[0], &row[1], &row[2], &row[3]) {
             (Value::Integer(id), Value::Integer(bucket), Value::Text(label), Value::Text(name)) => {
-                (*id as u64, *bucket, label.clone(), name.clone())
+                (*id as u64, *bucket, label.to_string(), name.to_string())
             }
             other => panic!("seed {seed}: unexpected row {other:?}"),
         })
@@ -417,7 +417,7 @@ fn assert_btree_indexes_agree(
         let found = ids(recovered
             .query(
                 "SELECT id FROM docs WHERE label = ?",
-                &[Value::Text(label.clone())],
+                &[Value::Text(label.clone().into())],
             )
             .unwrap_or_else(|e| panic!("seed {seed}: label probe failed: {e}")));
         assert_eq!(
@@ -450,7 +450,7 @@ fn assert_btree_indexes_agree(
         let found = ids(recovered
             .query(
                 "SELECT id FROM docs WHERE bucket = ? AND label = ?",
-                &[Value::Integer(*bucket), Value::Text(label.clone())],
+                &[Value::Integer(*bucket), Value::Text(label.clone().into())],
             )
             .unwrap_or_else(|e| panic!("seed {seed}: composite probe failed: {e}")));
         assert_eq!(
@@ -472,7 +472,7 @@ fn assert_btree_indexes_agree(
         let found = ids(recovered
             .query(
                 "SELECT id FROM docs WHERE name = ?",
-                &[Value::Text(name.to_ascii_uppercase())],
+                &[Value::Text(name.to_ascii_uppercase().into())],
             )
             .unwrap_or_else(|e| panic!("seed {seed}: collated probe failed: {e}")));
         assert_eq!(
@@ -485,7 +485,7 @@ fn assert_btree_indexes_agree(
         let found = ids(recovered
             .query(
                 "SELECT id FROM docs WHERE label = ? COLLATE NOCASE",
-                &[Value::Text(label.to_ascii_uppercase())],
+                &[Value::Text(label.to_ascii_uppercase().into())],
             )
             .unwrap_or_else(|e| panic!("seed {seed}: second collated probe failed: {e}")));
         assert_eq!(
@@ -597,7 +597,7 @@ fn the_same_seed_replays_identically() {
                 "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
                 &[
                     Value::Integer(id as i64),
-                    Value::Text(body(id)),
+                    Value::Text(body(id).into()),
                     Value::Vector(embedding(id)),
                 ],
             );

@@ -96,9 +96,9 @@ fn build(path: &Path) {
             "INSERT INTO authors (id, name, handle, bio) VALUES (?, ?, ?, ?)",
             &[
                 Value::Integer(i),
-                Value::Text(format!("Author {i}")),
-                Value::Text(format!("author{i}")),
-                Value::Text(format!("bio {i}")),
+                Value::Text(format!("Author {i}").into()),
+                Value::Text(format!("author{i}").into()),
+                Value::Text(format!("bio {i}").into()),
             ],
         )
         .expect("insert author");
@@ -114,7 +114,7 @@ fn build(path: &Path) {
             &[
                 Value::Integer(i),
                 Value::Integer(i % 5),
-                Value::Text(format!("Document number {i} about rust and databases")),
+                Value::Text(format!("Document number {i} about rust and databases").into()),
                 Value::Integer((i % 5) + 1),
                 Value::Vector(vector(i as u64)),
             ],
@@ -153,7 +153,7 @@ fn snapshot(path: &Path) -> Snapshot {
         .rows
         .into_iter()
         .map(|row| match &row[0] {
-            Value::Text(t) => t.clone(),
+            Value::Text(t) => t.to_string(),
             other => panic!("expected text title, got {other:?}"),
         })
         .collect();
@@ -269,7 +269,7 @@ fn schema_data_and_constraints_all_survive_a_vacuum() {
         .expect("insert with default");
     assert_eq!(
         default_bio.rows[0][0],
-        Value::Text("unknown".to_string()),
+        Value::Text("unknown".to_string().into()),
         "DEFAULT ('unknown') should still apply"
     );
 }
@@ -291,7 +291,7 @@ fn a_vacuum_with_nothing_to_reclaim_still_reproduces_the_database_exactly() {
     for i in 0..20 {
         db.execute(
             "INSERT INTO t (id, v) VALUES (?, ?)",
-            &[Value::Integer(i), Value::Text(format!("row {i}"))],
+            &[Value::Integer(i), Value::Text(format!("row {i}").into())],
         )
         .expect("insert");
     }
@@ -317,7 +317,7 @@ fn snapshot_simple(path: &Path) -> Vec<(i64, String)> {
                 other => panic!("expected integer, got {other:?}"),
             };
             let v = match &row[1] {
-                Value::Text(t) => t.clone(),
+                Value::Text(t) => t.to_string(),
                 other => panic!("expected text, got {other:?}"),
             };
             (id, v)

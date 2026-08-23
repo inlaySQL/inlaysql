@@ -58,7 +58,7 @@ fn build(docs: usize, tenants: usize, seed: u64) -> (Engine, Vec<Row>, Vec<f32>)
                 &[
                     Value::Integer(id),
                     Value::Integer(tenant),
-                    Value::Text(body),
+                    Value::Text(body.into()),
                     Value::Vector(embedding.clone()),
                 ],
             )
@@ -154,7 +154,7 @@ fn a_filtered_fuse_query_returns_limit_rows() {
             "SELECT id, fuse(vector_score(embedding, ?), bm25_score(body, ?)) AS score FROM docs WHERE tenant = ? ORDER BY score DESC LIMIT 10",
             &[
                 Value::Vector(query),
-                Value::Text("document word1".to_string()),
+                Value::Text("document word1".to_string().into()),
                 Value::Integer(7),
             ],
         )
@@ -264,7 +264,7 @@ fn filtered_bm25_ranking_matches_the_oracle() {
         .query(
             "SELECT id, bm25_score(body, ?) AS score FROM docs WHERE tenant = ? ORDER BY score DESC LIMIT 10",
             &[
-                Value::Text(query_text.to_string()),
+                Value::Text(query_text.to_string().into()),
                 Value::Integer(tenant),
             ],
         )
@@ -319,7 +319,7 @@ fn filtered_fusion_matches_the_rrf_over_exact_filtered_lists() {
             "SELECT id, fuse(vector_score(embedding, ?), bm25_score(body, ?)) AS score FROM docs WHERE tenant = ? ORDER BY score DESC LIMIT 10",
             &[
                 Value::Vector(query),
-                Value::Text(query_text.to_string()),
+                Value::Text(query_text.to_string().into()),
                 Value::Integer(tenant),
             ],
         )

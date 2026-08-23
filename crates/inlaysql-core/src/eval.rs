@@ -854,7 +854,7 @@ fn affinity_conversion<C: Cell>(cell: &C, affinity: CompareAffinity) -> Option<V
                 Some(integer) => integer.to_string(),
                 None => real_to_text(cell.as_f64_cell()?),
             };
-            Some(Value::Text(rendered))
+            Some(Value::Text(rendered.into()))
         }
     }
 }
@@ -1193,7 +1193,11 @@ pub fn evaluate_aggregate(
                 out.push_str(&as_text(&value)?);
                 any = true;
             }
-            Ok(if any { Value::Text(out) } else { Value::Null })
+            Ok(if any {
+                Value::Text(out.into())
+            } else {
+                Value::Null
+            })
         }
     }
 }
@@ -1465,7 +1469,7 @@ fn concat(left: Value, right: Value) -> Result<Value> {
     }
     let mut text = as_text(&left)?;
     text.push_str(&as_text(&right)?);
-    Ok(Value::Text(text))
+    Ok(Value::Text(text.into()))
 }
 
 /// SQLite's text rendering of a non-`NULL` value.
@@ -1482,7 +1486,7 @@ fn as_text(value: &Value) -> Result<String> {
         )),
         Value::Integer(i) => Ok(i.to_string()),
         Value::Real(r) => Ok(real_to_text(*r)),
-        Value::Text(s) => Ok(s.clone()),
+        Value::Text(s) => Ok(s.to_string()),
         // SQLite reads a blob's bytes as text without validating them.
         Value::Blob(bytes) => Ok(String::from_utf8_lossy(bytes).into_owned()),
         Value::Vector(_) => Err(Error::Type("a VECTOR value has no text form".to_string())),
@@ -1714,7 +1718,7 @@ fn cast(value: Value, to: CastType) -> Result<Value> {
     }
 
     Ok(match to {
-        CastType::Text => Value::Text(as_text(&value)?),
+        CastType::Text => Value::Text(as_text(&value)?.into()),
         CastType::Blob => match value {
             Value::Blob(bytes) => Value::Blob(bytes),
             other => Value::Blob(as_text(&other)?.into_bytes()),
@@ -1917,11 +1921,14 @@ fn call(
             Value::Null => Value::Null,
             other => {
                 let text = as_text(other)?;
-                Value::Text(if func == ScalarFunc::Upper {
-                    text.to_ascii_uppercase()
-                } else {
-                    text.to_ascii_lowercase()
-                })
+                Value::Text(
+                    if func == ScalarFunc::Upper {
+                        text.to_ascii_uppercase()
+                    } else {
+                        text.to_ascii_lowercase()
+                    }
+                    .into(),
+                )
             }
         }),
         ScalarFunc::Substr => substr(&values),
@@ -1977,7 +1984,7 @@ fn call(
             }
             Ok(values[best].clone())
         }
-        ScalarFunc::Hex => Ok(Value::Text(hex_of(&values[0])?)),
+        ScalarFunc::Hex => Ok(Value::Text(hex_of(&values[0])?.into())),
         ScalarFunc::OctetLength => Ok(match &values[0] {
             Value::Null => Value::Null,
             Value::Text(s) => Value::Integer(s.len() as i64),
@@ -2011,7 +2018,7 @@ fn call(
         ScalarFunc::Json => json_fn(&values[0]),
         ScalarFunc::JsonValid => Ok(json_valid_fn(&values[0])),
         ScalarFunc::JsonType => json_type_fn(&values),
-        ScalarFunc::JsonQuote => Ok(Value::Text(json::write(&json_leaf(&values[0])?))),
+        ScalarFunc::JsonQuote => Ok(Value::Text(json::write(&json_leaf(&values[0])?).into())),
         ScalarFunc::JsonArrayLength => json_array_length_fn(&values),
         ScalarFunc::JsonExtract => json_extract_fn(&values),
         ScalarFunc::JsonRemove => json_remove_fn(&values),
@@ -2116,7 +2123,7 @@ fn substr(values: &[Value]) -> Result<Value> {
     Ok(if is_blob {
         Value::Blob(bytes[start..end].to_vec())
     } else {
-        Value::Text(units[start..end].iter().collect())
+        Value::Text(units[start..end].iter().collect::<String>().into())
     })
 }
 
@@ -2142,7 +2149,9 @@ fn trim(func: ScalarFunc, values: &[Value]) -> Result<Value> {
             end -= 1;
         }
     }
-    Ok(Value::Text(text[start..end].iter().collect()))
+    Ok(Value::Text(
+        text[start..end].iter().collect::<String>().into(),
+    ))
 }
 
 fn replace(values: &[Value]) -> Result<Value> {
@@ -2156,7 +2165,7 @@ fn replace(values: &[Value]) -> Result<Value> {
     }
     let subject = as_text(&values[0])?;
     let replacement = as_text(&values[2])?;
-    Ok(Value::Text(subject.replace(&pattern, &replacement)))
+    Ok(Value::Text(subject.replace(&pattern, &replacement).into()))
 }
 
 fn instr(values: &[Value]) -> Result<Value> {
@@ -2308,7 +2317,7 @@ fn mysql_substr(values: &[Value]) -> Result<Value> {
         if is_blob {
             Value::Blob(Vec::new())
         } else {
-            Value::Text(String::new())
+            Value::Text(String::new().into())
         }
     };
 
@@ -2344,7 +2353,7 @@ fn mysql_substr(values: &[Value]) -> Result<Value> {
     Ok(if is_blob {
         Value::Blob(bytes[start..end].to_vec())
     } else {
-        Value::Text(units[start..end].iter().collect())
+        Value::Text(units[start..end].iter().collect::<String>().into())
     })
 }
 
@@ -2360,12 +2369,12 @@ fn mysql_substr(values: &[Value]) -> Result<Value> {
 fn mysql_hex(value: &Value) -> Result<Value> {
     match value {
         Value::Null => Ok(Value::Null),
-        Value::Integer(i) => Ok(Value::Text(alloc::format!("{:X}", *i as u64))),
+        Value::Integer(i) => Ok(Value::Text(alloc::format!("{:X}", *i as u64).into())),
         Value::Real(r) => {
             let i = if r.is_finite() { *r as i64 } else { 0 };
-            Ok(Value::Text(alloc::format!("{:X}", i as u64)))
+            Ok(Value::Text(alloc::format!("{:X}", i as u64).into()))
         }
-        other => Ok(Value::Text(hex_of(other)?)),
+        other => Ok(Value::Text(hex_of(other)?.into())),
     }
 }
 
@@ -2528,7 +2537,7 @@ fn json_leaf(value: &Value) -> Result<Json> {
         Value::Null => Ok(Json::Null),
         Value::Integer(i) => Ok(Json::Int(*i)),
         Value::Real(r) => Ok(Json::Real(*r, real_to_text(*r))),
-        Value::Text(s) => Ok(Json::Text(s.clone())),
+        Value::Text(s) => Ok(Json::Text(s.to_string())),
         Value::Blob(_) => Err(Error::Type("JSON cannot hold BLOB values".to_string())),
         Value::Vector(_) => Err(Error::Type("JSON cannot hold VECTOR values".to_string())),
     }
@@ -2545,8 +2554,8 @@ fn json_to_value(node: &Json) -> Value {
         Json::Bool(b) => Value::Integer(i64::from(*b)),
         Json::Int(i) => Value::Integer(*i),
         Json::Real(r, _) => Value::Real(*r),
-        Json::Text(s) => Value::Text(s.clone()),
-        Json::Array(_) | Json::Object(_) => Value::Text(json::write(node)),
+        Json::Text(s) => Value::Text(s.clone().into()),
+        Json::Array(_) | Json::Object(_) => Value::Text(json::write(node).into()),
     }
 }
 
@@ -2586,7 +2595,7 @@ fn is_json_producing(expr: &Expr) -> bool {
 /// That generic pass would unwrap a single-path `json_extract` straight to
 /// its native SQL value, which loses exactly the distinction composition
 /// needs: a JSON string `"str"` and the SQL text `str` are both
-/// `Value::Text("str")`, and only evaluating `expr` here, rather than
+/// `Value::Text("str".into())`, and only evaluating `expr` here, rather than
 /// reading back its already-unwrapped `Value`, still knows which one it was.
 /// Checked against sqlite3:
 /// `json_set('{"z":1}','$.z', json_extract('{"a":"str"}','$.a'))` is
@@ -2631,7 +2640,7 @@ fn json_composed_value(
 /// `json(X)`.
 fn json_fn(value: &Value) -> Result<Value> {
     Ok(match json_doc(value)? {
-        Some(doc) => Value::Text(json::write(&doc)),
+        Some(doc) => Value::Text(json::write(&doc).into()),
         None => Value::Null,
     })
 }
@@ -2672,7 +2681,7 @@ fn json_type_fn(values: &[Value]) -> Result<Value> {
         return Ok(Value::Null);
     };
     Ok(match json_node_at(values, &doc)? {
-        Some(Some(node)) => Value::Text(node.type_name().to_string()),
+        Some(Some(node)) => Value::Text(node.type_name().to_string().into()),
         _ => Value::Null,
     })
 }
@@ -2715,7 +2724,7 @@ fn json_extract_fn(values: &[Value]) -> Result<Value> {
             .iter()
             .map(|path| json::get(&doc, path).cloned().unwrap_or(Json::Null))
             .collect();
-        Ok(Value::Text(json::write(&Json::Array(items))))
+        Ok(Value::Text(json::write(&Json::Array(items)).into()))
     }
 }
 
@@ -2739,7 +2748,7 @@ fn json_remove_fn(values: &[Value]) -> Result<Value> {
             doc = next;
         }
     }
-    Ok(Value::Text(json::write(&doc)))
+    Ok(Value::Text(json::write(&doc).into()))
 }
 
 /// `json_set`/`json_insert`/`json_replace` — one implementation, since the
@@ -2772,7 +2781,7 @@ fn json_put_fn(
         let value = json_composed_value(&pair[1], row, computed, env)?;
         doc = json::put(&doc, &path, &value, mode);
     }
-    Ok(Value::Text(json::write(&doc)))
+    Ok(Value::Text(json::write(&doc).into()))
 }
 
 /// `json_array(X, ...)`.
@@ -2786,7 +2795,7 @@ fn json_array_fn(
     for arg in args {
         items.push(json_composed_value(arg, row, computed, env)?);
     }
-    Ok(Value::Text(json::write(&Json::Array(items))))
+    Ok(Value::Text(json::write(&Json::Array(items)).into()))
 }
 
 /// `json_object(K, V, ...)` — every `K` must be `TEXT`, checked against
@@ -2805,9 +2814,9 @@ fn json_object_fn(
             return Err(Error::Type("json_object() labels must be TEXT".to_string()));
         };
         let value = json_composed_value(&pair[1], row, computed, env)?;
-        members.push((key, value));
+        members.push((key.to_string(), value));
     }
-    Ok(Value::Text(json::write(&Json::Object(members))))
+    Ok(Value::Text(json::write(&Json::Object(members)).into()))
 }
 
 /// `->`/`->>`.
@@ -2822,7 +2831,7 @@ fn json_arrow(op: BinaryOp, left: &Value, right: &Value) -> Result<Value> {
         return Ok(Value::Null);
     };
     Ok(match op {
-        BinaryOp::JsonExtractJson => Value::Text(json::write(node)),
+        BinaryOp::JsonExtractJson => Value::Text(json::write(node).into()),
         BinaryOp::JsonExtractText => json_to_value(node),
         _ => unreachable!("json_arrow only serves the -> and ->> operators"),
     })
@@ -3659,7 +3668,7 @@ mod datetime {
                 return Ok(Value::Null);
             }
             return Ok(match strftime(&format, &moment) {
-                Some(text) => Value::Text(text),
+                Some(text) => Value::Text(text.into()),
                 None => Value::Null,
             });
         }
@@ -3673,39 +3682,37 @@ mod datetime {
                 if moment.error {
                     return Ok(Value::Null);
                 }
-                Value::Text(alloc::format!(
-                    "{}-{:02}-{:02}",
-                    year(moment.y),
-                    moment.mo,
-                    moment.d
-                ))
+                Value::Text(
+                    alloc::format!("{}-{:02}-{:02}", year(moment.y), moment.mo, moment.d).into(),
+                )
             }
             ScalarFunc::Time => {
                 moment.compute_hms();
                 if moment.error {
                     return Ok(Value::Null);
                 }
-                Value::Text(alloc::format!(
-                    "{:02}:{:02}:{}",
-                    moment.h,
-                    moment.mi,
-                    seconds_text(&moment)
-                ))
+                Value::Text(
+                    alloc::format!("{:02}:{:02}:{}", moment.h, moment.mi, seconds_text(&moment))
+                        .into(),
+                )
             }
             ScalarFunc::DateTime => {
                 moment.compute_ymd_hms();
                 if moment.error {
                     return Ok(Value::Null);
                 }
-                Value::Text(alloc::format!(
-                    "{}-{:02}-{:02} {:02}:{:02}:{}",
-                    year(moment.y),
-                    moment.mo,
-                    moment.d,
-                    moment.h,
-                    moment.mi,
-                    seconds_text(&moment)
-                ))
+                Value::Text(
+                    alloc::format!(
+                        "{}-{:02}-{:02} {:02}:{:02}:{}",
+                        year(moment.y),
+                        moment.mo,
+                        moment.d,
+                        moment.h,
+                        moment.mi,
+                        seconds_text(&moment)
+                    )
+                    .into(),
+                )
             }
             ScalarFunc::UnixEpoch => {
                 if moment.subsec {
@@ -3922,8 +3929,8 @@ mod tests {
         assert_eq!(
             eval(&bin(
                 Op::NotEq,
-                lit(Value::Text("a".to_string())),
-                lit(Value::Text("b".to_string()))
+                lit(Value::Text("a".to_string().into())),
+                lit(Value::Text("b".to_string().into()))
             )),
             int(1)
         );
@@ -3932,7 +3939,7 @@ mod tests {
     /// A collating sequence decides `TEXT` against `TEXT` and nothing else.
     #[test]
     fn a_collation_decides_a_text_comparison_and_no_other() {
-        let t = |s: &str| lit(Value::Text(s.to_string()));
+        let t = |s: &str| lit(Value::Text(s.to_string().into()));
 
         // Case-insensitive under NOCASE, and not under BINARY.
         assert_eq!(
@@ -4064,21 +4071,21 @@ mod tests {
     #[test]
     fn a_column_reads_from_the_row() {
         let env = Env::new(&[], 0, generator());
-        let row = [int(41), Value::Text("x".to_string())];
+        let row = [int(41), Value::Text("x".to_string().into())];
         assert_eq!(
             evaluate(&Expr::Column(0), &row, Computed::NONE, &env).unwrap(),
             int(41)
         );
         assert_eq!(
             evaluate(&Expr::Column(1), &row, Computed::NONE, &env).unwrap(),
-            Value::Text("x".to_string())
+            Value::Text("x".to_string().into())
         );
         assert!(evaluate(&Expr::Column(2), &row, Computed::NONE, &env).is_err());
     }
 
     #[test]
     fn a_placeholder_reads_from_the_parameters() {
-        let params = [int(7), Value::Text("y".to_string())];
+        let params = [int(7), Value::Text("y".to_string().into())];
         let env = Env::new(&params, 0, generator());
         assert_eq!(
             evaluate(&Expr::Param(0), &[], Computed::NONE, &env).unwrap(),
@@ -4086,7 +4093,7 @@ mod tests {
         );
         assert_eq!(
             evaluate(&Expr::Param(1), &[], Computed::NONE, &env).unwrap(),
-            Value::Text("y".to_string())
+            Value::Text("y".to_string().into())
         );
         // The same plan, two bindings: the point of keeping `?` unresolved.
         let other = [int(9)];
@@ -4206,7 +4213,7 @@ mod tests {
             vec![real(1.0)],
             vec![int(2)],
             vec![Value::Null],
-            vec![Value::Text("1".to_string())],
+            vec![Value::Text("1".to_string().into())],
         ];
         let env = Env::new(&[], 0, generator());
         let distinct = Aggregate {
@@ -4228,13 +4235,13 @@ mod tests {
     #[test]
     fn group_concat_joins_non_null_values() {
         let group = vec![
-            vec![Value::Text("a".to_string())],
+            vec![Value::Text("a".to_string().into())],
             vec![Value::Null],
-            vec![Value::Text("b".to_string())],
+            vec![Value::Text("b".to_string().into())],
         ];
         assert_eq!(
             agg(AggFunc::GroupConcat, Some(Expr::Column(0)), &group),
-            Value::Text("a,b".to_string())
+            Value::Text("a,b".to_string().into())
         );
         assert_eq!(
             agg(AggFunc::GroupConcat, Some(Expr::Column(0)), &[]),
@@ -4275,7 +4282,7 @@ mod tests {
             evaluate(
                 &Expr::Func {
                     func,
-                    args: alloc::vec![Expr::Literal(Value::Text("now".to_string()))],
+                    args: alloc::vec![Expr::Literal(Value::Text("now".to_string().into()))],
                     collation: Collation::Binary,
                 },
                 &[],
@@ -4286,11 +4293,11 @@ mod tests {
         };
         assert_eq!(
             call(ScalarFunc::DateTime),
-            Value::Text("2001-09-09 01:46:40".to_string())
+            Value::Text("2001-09-09 01:46:40".to_string().into())
         );
         assert_eq!(
             call(ScalarFunc::Date),
-            Value::Text("2001-09-09".to_string())
+            Value::Text("2001-09-09".to_string().into())
         );
         assert_eq!(call(ScalarFunc::UnixEpoch), int(1_000_000_000));
     }
@@ -4314,7 +4321,7 @@ mod tests {
     }
 
     fn text(s: &str) -> Value {
-        Value::Text(s.to_string())
+        Value::Text(s.to_string().into())
     }
     fn blob(bytes: &[u8]) -> Value {
         Value::Blob(bytes.to_vec())
@@ -4356,7 +4363,7 @@ mod tests {
         assert_eq!(
             func(
                 ScalarFunc::Unhex,
-                vec![Value::Text(hex_of(&blob(b"round-trip")).unwrap())]
+                vec![Value::Text(hex_of(&blob(b"round-trip")).unwrap().into())]
             ),
             blob(b"round-trip")
         );

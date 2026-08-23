@@ -99,7 +99,7 @@ fn seeded() -> (Engine, Rc<Cell<usize>>) {
         engine
             .execute(
                 "INSERT INTO t (id, body) VALUES (?, ?)",
-                &[Value::Integer(id), Value::Text(body.to_string())],
+                &[Value::Integer(id), Value::Text(body.to_string().into())],
             )
             .unwrap();
     }

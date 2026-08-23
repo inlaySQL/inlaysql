@@ -194,7 +194,7 @@ fn inlaysql_ids(rows: &[Row], where_clause: &str) -> Result<Vec<i64>, inlaysql::
                 Value::Integer(index as i64 + 1),
                 row.a.map(Value::Integer).unwrap_or(Value::Null),
                 row.b
-                    .map(|text| Value::Text(text.to_string()))
+                    .map(|text| Value::Text(text.to_string().into()))
                     .unwrap_or(Value::Null),
             ],
         )?;
@@ -1026,14 +1026,14 @@ fn inlaysql_scalar(rows: &[ScalarRow], expr: &str) -> Result<Vec<Vec<String>>, i
                 Value::Integer(index as i64 + 1),
                 row.a.map(Value::Integer).unwrap_or(Value::Null),
                 row.b
-                    .map(|text| Value::Text(text.to_string()))
+                    .map(|text| Value::Text(text.to_string().into()))
                     .unwrap_or(Value::Null),
                 row.r.map(Value::Real).unwrap_or(Value::Null),
                 row.d
-                    .map(|text| Value::Text(text.to_string()))
+                    .map(|text| Value::Text(text.to_string().into()))
                     .unwrap_or(Value::Null),
                 row.j
-                    .map(|text| Value::Text(text.to_string()))
+                    .map(|text| Value::Text(text.to_string().into()))
                     .unwrap_or(Value::Null),
             ],
         )?;
@@ -1487,7 +1487,7 @@ fn shape_db(rows: &[ShapeRow]) -> Result<Database, inlaysql::Error> {
                 row.g.map(Value::Integer).unwrap_or(Value::Null),
                 row.a.map(Value::Integer).unwrap_or(Value::Null),
                 row.b
-                    .map(|text| Value::Text(text.to_string()))
+                    .map(|text| Value::Text(text.to_string().into()))
                     .unwrap_or(Value::Null),
             ],
         )?;
@@ -1962,7 +1962,7 @@ fn inlaysql_indexed_ids(rows: &[Row], where_clause: &str) -> Result<Vec<i64>, in
                 Value::Integer(index as i64 + 1),
                 row.a.map(Value::Integer).unwrap_or(Value::Null),
                 row.b
-                    .map(|text| Value::Text(text.to_string()))
+                    .map(|text| Value::Text(text.to_string().into()))
                     .unwrap_or(Value::Null),
             ],
         )?;
@@ -2099,7 +2099,7 @@ fn building_an_index_over_existing_rows_changes_no_answer() {
                     Value::Integer(index as i64 + 1),
                     row.a.map(Value::Integer).unwrap_or(Value::Null),
                     row.b
-                        .map(|text| Value::Text(text.to_string()))
+                        .map(|text| Value::Text(text.to_string().into()))
                         .unwrap_or(Value::Null),
                 ],
             )
@@ -2317,7 +2317,7 @@ fn subquery_db(rows: &[Row], sub: &[SubRow]) -> Result<Database, inlaysql::Error
                 Value::Integer(index as i64 + 1),
                 row.a.map(Value::Integer).unwrap_or(Value::Null),
                 row.b
-                    .map(|text| Value::Text(text.to_string()))
+                    .map(|text| Value::Text(text.to_string().into()))
                     .unwrap_or(Value::Null),
             ],
         )?;
@@ -2330,7 +2330,7 @@ fn subquery_db(rows: &[Row], sub: &[SubRow]) -> Result<Database, inlaysql::Error
                 row.a.map(Value::Integer).unwrap_or(Value::Null),
                 row.k.map(Value::Integer).unwrap_or(Value::Null),
                 row.b
-                    .map(|text| Value::Text(text.to_string()))
+                    .map(|text| Value::Text(text.to_string().into()))
                     .unwrap_or(Value::Null),
             ],
         )?;
@@ -2452,7 +2452,7 @@ fn unique_index_collisions_agree_with_sqlite() {
                         Value::Integer(id),
                         row.a.map(Value::Integer).unwrap_or(Value::Null),
                         row.b
-                            .map(|text| Value::Text(text.to_string()))
+                            .map(|text| Value::Text(text.to_string().into()))
                             .unwrap_or(Value::Null),
                     ],
                 )
@@ -2823,7 +2823,7 @@ fn collated_db(rows: &[CollatedRow], indexes: &[&str]) -> Result<Database, inlay
     }
     let cell = |value: Option<&'static str>| {
         value
-            .map(|text| Value::Text(text.to_string()))
+            .map(|text| Value::Text(text.to_string().into()))
             .unwrap_or(Value::Null)
     };
     for (index, row) in rows.iter().enumerate() {

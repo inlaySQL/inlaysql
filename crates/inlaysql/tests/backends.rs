@@ -78,7 +78,7 @@ fn hybrid_query(db: &mut Database, backend: &str) {
             "INSERT INTO hybrid (id, body, embedding) VALUES (?, ?, ?)",
             &[
                 Value::Integer(id),
-                Value::Text(body.to_string()),
+                Value::Text(body.to_string().into()),
                 Value::Vector(embedding.to_vec()),
             ],
         )
@@ -91,7 +91,7 @@ fn hybrid_query(db: &mut Database, backend: &str) {
              FROM hybrid ORDER BY score DESC LIMIT 3",
             &[
                 Value::Vector(vec![1.0, 0.2, 0.0, 0.0]),
-                Value::Text("embedded database".to_string()),
+                Value::Text("embedded database".to_string().into()),
             ],
         )
         .unwrap();

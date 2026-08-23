@@ -279,7 +279,7 @@ fn hybrid_search(db: &mut Database, arguments: &Json, limits: &Limits) -> ToolRe
                     "SELECT *, fuse(vector_score({column}, ?), bm25_score({text_column}, ?)) \
                      AS score FROM {table} ORDER BY score DESC LIMIT {limit}"
                 ),
-                vec![Value::Vector(embedding), Value::Text(terms)],
+                vec![Value::Vector(embedding), Value::Text(terms.into())],
             )
         }
         (Some(_), None) => {
@@ -292,7 +292,7 @@ fn hybrid_search(db: &mut Database, arguments: &Json, limits: &Limits) -> ToolRe
                 "SELECT *, bm25_score({text_column}, ?) AS score \
                  FROM {table} ORDER BY score DESC LIMIT {limit}"
             ),
-            vec![Value::Text(terms)],
+            vec![Value::Text(terms.into())],
         ),
     };
 
@@ -363,7 +363,7 @@ fn bind_params(arguments: &Json) -> Result<Vec<Value>, ToolError> {
         .map(|param| match param {
             Json::Null => Ok(Value::Null),
             Json::Bool(flag) => Ok(Value::Integer(i64::from(*flag))),
-            Json::String(text) => Ok(Value::Text(text.clone())),
+            Json::String(text) => Ok(Value::Text(text.clone().into())),
             Json::Number(number) => match number.as_i64() {
                 Some(integer) => Ok(Value::Integer(integer)),
                 None => number
@@ -444,7 +444,7 @@ fn render_value(value: &Value) -> Json {
         Value::Null => Json::Null,
         Value::Integer(integer) => json!(integer),
         Value::Real(real) => json!(real),
-        Value::Text(text) => json!(text),
+        Value::Text(text) => json!(text.as_str()),
         Value::Blob(bytes) => json!(format!("<{} bytes>", bytes.len())),
         // An embedding is hundreds of floats that mean nothing to a reader and
         // would swamp the response. The dimension is the useful part.
@@ -540,7 +540,7 @@ mod tests {
         let rows = ResultSet {
             columns: vec!["a".to_string()],
             rows: (0..10)
-                .map(|_| vec![Value::Text("x".repeat(1000))])
+                .map(|_| vec![Value::Text("x".repeat(1000).into())])
                 .collect(),
         };
         let limits = Limits {

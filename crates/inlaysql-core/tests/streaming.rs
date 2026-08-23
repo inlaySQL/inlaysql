@@ -133,7 +133,7 @@ fn seeded(rows: i64) -> (Engine, Rc<ScanCounts>) {
                 &[
                     Value::Integer(id),
                     Value::Integer(id % 7),
-                    Value::Text(format!("row-{id}")),
+                    Value::Text(format!("row-{id}").into()),
                 ],
             )
             .unwrap();
@@ -270,7 +270,7 @@ fn the_tree_backed_scan_also_resumes_exactly_where_it_stopped() {
         engine
             .execute(
                 "INSERT INTO t (id, body) VALUES (?, ?)",
-                &[Value::Integer(id), Value::Text(format!("row-{id}"))],
+                &[Value::Integer(id), Value::Text(format!("row-{id}").into())],
             )
             .unwrap();
     }
@@ -330,7 +330,7 @@ fn every_construct_that_reads_a_column_still_sees_it() {
         // reference inside a different `Expr` variant.
         (
             "SELECT CASE WHEN n = 0 THEN body ELSE 'x' END FROM t WHERE id = 7",
-            vec![vec![Value::Text("row-7".to_string())]],
+            vec![vec![Value::Text("row-7".to_string().into())]],
         ),
         (
             "SELECT id FROM t WHERE body LIKE 'row-3' ",
@@ -369,8 +369,8 @@ fn every_construct_that_reads_a_column_still_sees_it() {
         (
             "SELECT body, body FROM t WHERE id = 4",
             vec![vec![
-                Value::Text("row-4".to_string()),
-                Value::Text("row-4".to_string()),
+                Value::Text("row-4".to_string().into()),
+                Value::Text("row-4".to_string().into()),
             ]],
         ),
     ];
@@ -392,7 +392,7 @@ fn select_star_still_returns_every_column() {
         vec![vec![
             Value::Integer(2),
             Value::Integer(2),
-            Value::Text("row-2".to_string()),
+            Value::Text("row-2".to_string().into()),
         ]]
     );
 }
@@ -419,7 +419,7 @@ fn joined() -> Engine {
         engine
             .execute(
                 "INSERT INTO a (id, tag) VALUES (?, ?)",
-                &[Value::Integer(id), Value::Text(format!("tag-{id}"))],
+                &[Value::Integer(id), Value::Text(format!("tag-{id}").into())],
             )
             .unwrap();
     }
@@ -431,7 +431,7 @@ fn joined() -> Engine {
                 &[
                     Value::Integer(id),
                     Value::Integer(a_id),
-                    Value::Text(format!("note-{id}")),
+                    Value::Text(format!("note-{id}").into()),
                 ],
             )
             .unwrap();
@@ -561,7 +561,7 @@ fn probe_tables(outer: i64, inner: i64, index: bool) -> (Engine, Rc<ScanCounts>)
                 &[
                     Value::Integer(id),
                     Value::Integer(id),
-                    Value::Text(format!("row-{id}")),
+                    Value::Text(format!("row-{id}").into()),
                 ],
             )
             .unwrap();

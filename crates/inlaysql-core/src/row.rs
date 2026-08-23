@@ -405,7 +405,7 @@ fn decode_value(cursor: &mut Cursor<'_>) -> Result<Value> {
             let bytes = cursor.take(len)?;
             let text = core::str::from_utf8(bytes)
                 .map_err(|_| Error::Corrupt("text column is not valid UTF-8".to_string()))?;
-            Ok(Value::Text(String::from(text)))
+            Ok(Value::Text(String::from(text).into()))
         }
         TAG_BLOB => {
             let len = cursor.u32()? as usize;
@@ -563,7 +563,7 @@ mod tests {
             Value::Null,
             Value::Integer(-42),
             Value::Real(1.5),
-            Value::Text("héllo".to_string()),
+            Value::Text("héllo".to_string().into()),
             Value::Blob(vec![0, 1, 2, 255]),
             Value::Vector(vec![0.25, -0.5, 1.0]),
         ];
@@ -582,7 +582,7 @@ mod tests {
             Value::Null,
             Value::Integer(-42),
             Value::Real(1.5),
-            Value::Text("héllo".to_string()),
+            Value::Text("héllo".to_string().into()),
             Value::Blob(vec![0, 1, 2, 255]),
             Value::Vector(vec![0.25, -0.5, 1.0]),
         ];
@@ -610,7 +610,7 @@ mod tests {
             &[
                 Value::Vector(vec![0.5, -0.25, 1.0]),
                 Value::Integer(9),
-                Value::Text("after".to_string()),
+                Value::Text("after".to_string().into()),
             ],
             &[DataType::QuantizedVector(3)],
         );
@@ -620,7 +620,7 @@ mod tests {
         let decoded = decode_row_masked(&bytes, &mask).unwrap();
         assert_eq!(decoded[0], Value::Null);
         assert_eq!(decoded[1], Value::Integer(9));
-        assert_eq!(decoded[2], Value::Text("after".to_string()));
+        assert_eq!(decoded[2], Value::Text("after".to_string().into()));
     }
 
     /// A mask narrower than the stored row must not silently null the columns
@@ -630,7 +630,7 @@ mod tests {
     fn columns_past_the_mask_are_decoded_rather_than_dropped() {
         let row = vec![
             Value::Integer(1),
-            Value::Text("kept".to_string()),
+            Value::Text("kept".to_string().into()),
             Value::Integer(3),
         ];
         let bytes = encode_row(&row);
@@ -665,13 +665,13 @@ mod tests {
 
     #[test]
     fn encoding_is_byte_stable() {
-        let row = vec![Value::Integer(7), Value::Text("a".to_string())];
+        let row = vec![Value::Integer(7), Value::Text("a".to_string().into())];
         assert_eq!(encode_row(&row), encode_row(&row.clone()));
     }
 
     #[test]
     fn truncated_input_is_rejected_not_panicked() {
-        let bytes = encode_row(&[Value::Text("abc".to_string())]);
+        let bytes = encode_row(&[Value::Text("abc".to_string().into())]);
         let err = decode_row(&bytes[..bytes.len() - 2]).unwrap_err();
         assert!(matches!(err, Error::Corrupt(_)));
     }

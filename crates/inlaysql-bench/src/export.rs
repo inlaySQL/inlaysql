@@ -273,7 +273,7 @@ fn measure_inlaysql(
             "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
             &[
                 Value::Integer(doc.id as i64),
-                Value::Text(doc.body.clone()),
+                Value::Text(doc.body.clone().into()),
                 Value::Vector(doc.embedding.clone()),
             ],
         )?;
@@ -307,7 +307,7 @@ fn measure_inlaysql(
             &hybrid_sql,
             &[
                 Value::Vector(query.embedding.clone()),
-                Value::Text(query.text.clone()),
+                Value::Text(query.text.clone().into()),
             ],
         )?;
         hybrid_samples.push(at.elapsed());

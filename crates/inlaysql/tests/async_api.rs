@@ -135,7 +135,7 @@ fn async_and_blocking_databases_agree() {
                 "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
                 &[
                     Value::Integer(index as i64 + 1),
-                    Value::Text(body.to_string()),
+                    Value::Text(body.to_string().into()),
                     Value::Vector(hashed_embedding(body, DIM)),
                 ],
             )
@@ -147,7 +147,7 @@ fn async_and_blocking_databases_agree() {
                 hybrid,
                 &[
                     Value::Vector(hashed_embedding(query, DIM)),
-                    Value::Text(query.to_string()),
+                    Value::Text(query.to_string().into()),
                 ],
             )
             .await
@@ -165,7 +165,7 @@ fn async_and_blocking_databases_agree() {
                 "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
                 &[
                     Value::Integer(index as i64 + 1),
-                    Value::Text(body.to_string()),
+                    Value::Text(body.to_string().into()),
                     Value::Vector(hashed_embedding(body, DIM)),
                 ],
             )
@@ -176,7 +176,7 @@ fn async_and_blocking_databases_agree() {
                 hybrid,
                 &[
                     Value::Vector(hashed_embedding(query, DIM)),
-                    Value::Text(query.to_string()),
+                    Value::Text(query.to_string().into()),
                 ],
             )
             .expect("query");
@@ -232,7 +232,7 @@ fn synchronous_access_to_the_same_database_is_available() {
                 for id in 1..=3i64 {
                     db.execute(
                         "INSERT INTO t (id, body) VALUES (?, ?)",
-                        &[Value::Integer(id), Value::Text(format!("row {id}"))],
+                        &[Value::Integer(id), Value::Text(format!("row {id}").into())],
                     )?;
                 }
                 Ok(db.query("SELECT id FROM t", &[])?.rows.len())
@@ -280,7 +280,7 @@ fn an_arc_wrapped_database_runs_statements_from_several_os_threads() {
                 thread::spawn(move || {
                     block_on(db.execute(
                         "INSERT INTO t (id, body) VALUES (?, ?)",
-                        &[Value::Integer(id), Value::Text(format!("row {id}"))],
+                        &[Value::Integer(id), Value::Text(format!("row {id}").into())],
                     ))
                     .expect("insert from another thread")
                 })

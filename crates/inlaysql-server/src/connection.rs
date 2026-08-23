@@ -929,9 +929,9 @@ fn decode_binary_param(
         // DATE, DATETIME, TIMESTAMP. The engine has no temporal type, so these
         // are decoded to keep the packet in step and handed on as the text a
         // client would have sent for a string column.
-        0x0a | 0x0c | 0x07 => Value::Text(decode_datetime(reader)?),
+        0x0a | 0x0c | 0x07 => Value::Text(decode_datetime(reader)?.into()),
         // TIME
-        0x0b => Value::Text(decode_time(reader)?),
+        0x0b => Value::Text(decode_time(reader)?.into()),
         // The blob family stays bytes; everything else is text if it is valid
         // UTF-8, and bytes if it is not.
         // TINY_BLOB, MEDIUM_BLOB, LONG_BLOB, BLOB.
@@ -939,7 +939,7 @@ fn decode_binary_param(
         _ => {
             let bytes = reader.lenenc_bytes()?.unwrap_or_default();
             match std::str::from_utf8(bytes) {
-                Ok(text) => Value::Text(text.to_string()),
+                Ok(text) => Value::Text(text.to_string().into()),
                 Err(_) => Value::Blob(bytes.to_vec()),
             }
         }
@@ -1163,7 +1163,7 @@ mod tests {
         let mut reader = Reader::new(&bytes);
         assert_eq!(
             decode_binary_param(&mut reader, 0xfe, false).unwrap(),
-            Value::Text("abc".to_string())
+            Value::Text("abc".to_string().into())
         );
         let mut reader = Reader::new(&bytes);
         assert_eq!(
@@ -1184,7 +1184,7 @@ mod tests {
         let mut reader = Reader::new(&bytes);
         assert_eq!(
             decode_binary_param(&mut reader, 0x0c, false).unwrap(),
-            Value::Text("2026-08-17 14:30:05".to_string())
+            Value::Text("2026-08-17 14:30:05".to_string().into())
         );
         assert_eq!(reader.u8().unwrap(), 42);
     }

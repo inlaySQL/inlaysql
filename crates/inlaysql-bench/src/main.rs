@@ -274,7 +274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
             &[
                 Value::Integer(index as i64),
-                Value::Text(body.clone()),
+                Value::Text(body.clone().into()),
                 Value::Vector(hashed_embedding(body, config.dim)),
             ],
         )?;
@@ -315,7 +315,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // whole load. Measuring it separately keeps it out of the latency numbers
     // and makes the cost visible instead of hiding it in a p99.
     let warmup = Instant::now();
-    db.query(&text_only, &[Value::Text("database".to_string())])?;
+    db.query(&text_only, &[Value::Text("database".to_string().into())])?;
     println!("index build on first read: {:.2?}", warmup.elapsed());
 
     println!("\nquery latency ({} queries each)", config.queries);
@@ -334,7 +334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     report("vector", &vector_times);
 
     let text_times = measure(&queries, |query| {
-        db.query(&text_only, &[Value::Text(query.to_string())])
+        db.query(&text_only, &[Value::Text(query.to_string().into())])
             .map(|_| ())
     })?;
     report("bm25", &text_times);
@@ -344,7 +344,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &hybrid,
             &[
                 Value::Vector(hashed_embedding(query, config.dim)),
-                Value::Text(query.to_string()),
+                Value::Text(query.to_string().into()),
             ],
         )
         .map(|_| ())

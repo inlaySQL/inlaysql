@@ -97,7 +97,7 @@ fn seeded(rows: i64) -> (Engine, Rc<Cell<usize>>) {
         engine
             .execute(
                 "INSERT INTO kv (id, body) VALUES (?, ?)",
-                &[Value::Integer(id), Value::Text(format!("row-{id}"))],
+                &[Value::Integer(id), Value::Text(format!("row-{id}").into())],
             )
             .unwrap();
     }
@@ -113,7 +113,10 @@ fn a_prepared_statement_is_parsed_once_however_often_it_runs() {
     let lookup = engine.prepare("SELECT body FROM kv WHERE id = ?").unwrap();
     for id in 1..=20 {
         let rows = engine.run_query(&lookup, &[Value::Integer(id)]).unwrap();
-        assert_eq!(rows.rows, vec![vec![Value::Text(format!("row-{id}"))]]);
+        assert_eq!(
+            rows.rows,
+            vec![vec![Value::Text(format!("row-{id}").into())]]
+        );
     }
 
     assert_eq!(
@@ -166,7 +169,7 @@ fn a_prepared_insert_writes_a_different_row_each_time() {
         engine
             .run(
                 &insert,
-                &[Value::Integer(id), Value::Text(format!("row-{id}"))],
+                &[Value::Integer(id), Value::Text(format!("row-{id}").into())],
             )
             .unwrap();
     }
@@ -231,7 +234,7 @@ fn a_prepared_retrieval_query_rebinds_its_embedding_and_its_terms() {
                 "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
                 &[
                     Value::Integer(id),
-                    Value::Text(body.to_string()),
+                    Value::Text(body.to_string().into()),
                     Value::Vector(embedding),
                 ],
             )

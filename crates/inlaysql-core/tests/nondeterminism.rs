@@ -50,15 +50,15 @@ fn the_clock_reaches_sql_only_through_the_injected_trait() {
 
     assert_eq!(
         scalar(&mut engine, "SELECT datetime('now')"),
-        Value::Text("2001-09-09 01:46:40".to_string())
+        Value::Text("2001-09-09 01:46:40".to_string().into())
     );
     assert_eq!(
         scalar(&mut engine, "SELECT date('now')"),
-        Value::Text("2001-09-09".to_string())
+        Value::Text("2001-09-09".to_string().into())
     );
     assert_eq!(
         scalar(&mut engine, "SELECT time('now')"),
-        Value::Text("01:46:40".to_string())
+        Value::Text("01:46:40".to_string().into())
     );
     assert_eq!(
         scalar(&mut engine, "SELECT unixepoch('now')"),
@@ -66,21 +66,21 @@ fn the_clock_reaches_sql_only_through_the_injected_trait() {
     );
     assert_eq!(
         scalar(&mut engine, "SELECT strftime('%Y-%m-%d', 'now')"),
-        Value::Text("2001-09-09".to_string())
+        Value::Text("2001-09-09".to_string().into())
     );
 
     // The bare keyword forms read the same clock as the functions.
     assert_eq!(
         scalar(&mut engine, "SELECT CURRENT_TIMESTAMP"),
-        Value::Text("2001-09-09 01:46:40".to_string())
+        Value::Text("2001-09-09 01:46:40".to_string().into())
     );
     assert_eq!(
         scalar(&mut engine, "SELECT CURRENT_DATE"),
-        Value::Text("2001-09-09".to_string())
+        Value::Text("2001-09-09".to_string().into())
     );
     assert_eq!(
         scalar(&mut engine, "SELECT CURRENT_TIME"),
-        Value::Text("01:46:40".to_string())
+        Value::Text("01:46:40".to_string().into())
     );
 }
 
@@ -91,7 +91,7 @@ fn a_different_injected_clock_gives_a_different_answer() {
     let mut engine = engine_at(0, 1);
     assert_eq!(
         scalar(&mut engine, "SELECT date('now')"),
-        Value::Text("1970-01-01".to_string())
+        Value::Text("1970-01-01".to_string().into())
     );
 }
 

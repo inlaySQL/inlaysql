@@ -65,7 +65,7 @@ fn insert(db: &mut Database, id: i64) {
         "INSERT INTO docs VALUES (?, ?, ?)",
         &[
             Value::Integer(id),
-            Value::Text(format!("document {id}")),
+            Value::Text(format!("document {id}").into()),
             Value::Vector(vector(id as u64)),
         ],
     )

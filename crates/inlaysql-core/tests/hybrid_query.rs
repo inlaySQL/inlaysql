@@ -95,7 +95,7 @@ fn open() -> Engine {
                 "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
                 &[
                     Value::Integer(doc.id),
-                    Value::Text(doc.body.to_string()),
+                    Value::Text(doc.body.to_string().into()),
                     Value::Vector(doc.embedding.to_vec()),
                 ],
             )
@@ -125,7 +125,7 @@ fn text_only(engine: &mut Engine) -> ResultSet {
     engine
         .query(
             "SELECT id, bm25_score(body, ?) AS score FROM docs LIMIT 8",
-            &[Value::Text(QUERY_TEXT.to_string())],
+            &[Value::Text(QUERY_TEXT.to_string().into())],
         )
         .expect("text query")
 }
@@ -137,7 +137,7 @@ fn hybrid(engine: &mut Engine) -> ResultSet {
              FROM docs ORDER BY score DESC LIMIT 3",
             &[
                 Value::Vector(QUERY_EMBEDDING.to_vec()),
-                Value::Text(QUERY_TEXT.to_string()),
+                Value::Text(QUERY_TEXT.to_string().into()),
             ],
         )
         .expect("hybrid query")
@@ -224,7 +224,7 @@ fn where_and_limit_apply_to_retrieval_results() {
              FROM docs WHERE id >= 3 ORDER BY score DESC LIMIT 2",
             &[
                 Value::Vector(QUERY_EMBEDDING.to_vec()),
-                Value::Text(QUERY_TEXT.to_string()),
+                Value::Text(QUERY_TEXT.to_string().into()),
             ],
         )
         .expect("filtered hybrid query");
@@ -286,7 +286,7 @@ fn insert_order_does_not_change_the_ranking() {
                 "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
                 &[
                     Value::Integer(doc.id),
-                    Value::Text(doc.body.to_string()),
+                    Value::Text(doc.body.to_string().into()),
                     Value::Vector(doc.embedding.to_vec()),
                 ],
             )

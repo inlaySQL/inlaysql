@@ -210,7 +210,7 @@ fn render_value(value: &Value) -> Json {
         Value::Null => Json::Null,
         Value::Integer(integer) => json!(integer),
         Value::Real(real) => json!(real),
-        Value::Text(text) => json!(text),
+        Value::Text(text) => json!(text.as_str()),
         Value::Blob(bytes) => json!(format!("<{} bytes>", bytes.len())),
         Value::Vector(embedding) => json!(format!("<vector({})>", embedding.len())),
     }
@@ -235,7 +235,7 @@ fn parse_params(params: Option<&str>) -> Result<Vec<Value>, JsError> {
         .map(|value| match value {
             Json::Null => Ok(Value::Null),
             Json::Bool(flag) => Ok(Value::Integer(i64::from(*flag))),
-            Json::String(text) => Ok(Value::Text(text.clone())),
+            Json::String(text) => Ok(Value::Text(text.clone().into())),
             Json::Number(number) => match number.as_i64() {
                 Some(integer) => Ok(Value::Integer(integer)),
                 None => number

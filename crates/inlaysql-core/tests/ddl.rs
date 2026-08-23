@@ -424,7 +424,7 @@ fn altering_a_table_makes_its_prepared_statements_stale() {
     let statement = engine.prepare("SELECT b FROM t").expect("prepare");
     assert_eq!(
         engine.run_query(&statement, &[]).unwrap().rows[0][0],
-        Value::Text("y".to_string())
+        Value::Text("y".to_string().into())
     );
 
     run(&mut engine, "ALTER TABLE t DROP COLUMN a");

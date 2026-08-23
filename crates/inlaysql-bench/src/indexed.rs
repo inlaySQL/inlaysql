@@ -226,8 +226,8 @@ fn inlaysql_lookup(
     for id in 1..=rows as i64 {
         let bound = [
             Value::Integer(id),
-            Value::Text(email(id)),
-            Value::Text(payload.to_string()),
+            Value::Text(email(id).into()),
+            Value::Text(payload.to_string().into()),
         ];
         if let Err(inlaysql::Error::Transaction(_)) = db.execute_prepared(&insert, &bound) {
             db.commit()?;
@@ -254,7 +254,7 @@ fn inlaysql_lookup(
     let started = Instant::now();
     for key in keys {
         let at = Instant::now();
-        let result = db.query_prepared(&lookup, &[Value::Text(key.clone())])?;
+        let result = db.query_prepared(&lookup, &[Value::Text(key.clone().into())])?;
         debug_assert_eq!(result.rows.len(), 1, "every key matches exactly one row");
         samples.push(at.elapsed());
     }
@@ -272,7 +272,8 @@ fn inlaysql_lookup(
         let low = email(start);
         let high = email(start + RANGE_SIZE as i64);
         let at = Instant::now();
-        let result = db.query_prepared(&range, &[Value::Text(low), Value::Text(high)])?;
+        let result =
+            db.query_prepared(&range, &[Value::Text(low.into()), Value::Text(high.into())])?;
         debug_assert_eq!(
             result.rows.len(),
             RANGE_SIZE,

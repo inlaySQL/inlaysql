@@ -428,7 +428,7 @@ fn writers_whose_log_regions_wrap_repeatedly_lose_no_row() {
                             &[
                                 Value::Integer(id),
                                 Value::Integer(id),
-                                Value::Text(body.clone()),
+                                Value::Text(body.clone().into()),
                             ],
                         ) {
                             Ok(_) => break,

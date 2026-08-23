@@ -724,9 +724,9 @@ fn handle_show(sql: &str, catalog: &Catalog, session: &Session) -> Intercepted {
             .iter()
             .map(|warning| {
                 vec![
-                    Value::Text("Warning".to_string()),
+                    Value::Text("Warning".to_string().into()),
                     Value::Integer(warning.code as i64),
-                    Value::Text(warning.message.clone()),
+                    Value::Text(warning.message.clone().into()),
                 ]
             })
             .collect();
@@ -751,8 +751,8 @@ fn handle_show(sql: &str, catalog: &Catalog, session: &Session) -> Intercepted {
             return rows(
                 &["Database", "Create Database"],
                 vec![vec![
-                    Value::Text(name.clone()),
-                    Value::Text(format!("CREATE DATABASE `{name}`")),
+                    Value::Text(name.clone().into()),
+                    Value::Text(format!("CREATE DATABASE `{name}`").into()),
                 ]],
             );
         }
@@ -775,7 +775,7 @@ fn show_databases(rest: &str, session: &Session) -> Intercepted {
     rows(
         &["Database"],
         if matched {
-            vec![vec![Value::Text(name)]]
+            vec![vec![Value::Text(name.into())]]
         } else {
             Vec::new()
         },
@@ -798,9 +798,9 @@ fn show_tables(rest: &str, full: bool, catalog: &Catalog, session: &Session) -> 
                 continue;
             }
         }
-        let mut row = vec![Value::Text(table.name.clone())];
+        let mut row = vec![Value::Text(table.name.clone().into())];
         if full {
-            row.push(Value::Text("BASE TABLE".to_string()));
+            row.push(Value::Text("BASE TABLE".to_string().into()));
         }
         data.push(row);
     }
@@ -885,14 +885,18 @@ fn columns_result(table: &Table, catalog: &Catalog, full: bool, like: Option<&st
         // reported under its own name rather than under one that would
         // mislead.
         let collation = if is_text {
-            Value::Text(crate::infoschema::mysql_collation_name(column.collation).to_string())
+            Value::Text(
+                crate::infoschema::mysql_collation_name(column.collation)
+                    .to_string()
+                    .into(),
+            )
         } else {
             Value::Null
         };
 
         let mut row = vec![
-            Value::Text(column.name.clone()),
-            Value::Text(mysql_type_name(column.ty)),
+            Value::Text(column.name.clone().into()),
+            Value::Text(mysql_type_name(column.ty).into()),
         ];
         if full {
             row.push(collation);
@@ -900,15 +904,17 @@ fn columns_result(table: &Table, catalog: &Catalog, full: bool, like: Option<&st
         row.extend([
             // Every column is nullable: the engine refuses NOT NULL outright,
             // so claiming otherwise would be a schema this database cannot have.
-            Value::Text("YES".to_string()),
-            Value::Text(key.to_string()),
+            Value::Text("YES".to_string().into()),
+            Value::Text(key.to_string().into()),
             // Likewise DEFAULT — refused, therefore always absent.
             Value::Null,
-            Value::Text(String::new()),
+            Value::Text(String::new().into()),
         ]);
         if full {
-            row.push(Value::Text("select,insert,update,references".to_string()));
-            row.push(Value::Text(String::new()));
+            row.push(Value::Text(
+                "select,insert,update,references".to_string().into(),
+            ));
+            row.push(Value::Text(String::new().into()));
         }
         data.push(row);
     }
@@ -946,20 +952,20 @@ fn show_keys(rest: &str, catalog: &Catalog) -> Intercepted {
     let mut data = Vec::new();
     let key_row = |key_name: &str, non_unique: i64, column: &str, index_type: &str| {
         vec![
-            Value::Text(table.name.clone()),
+            Value::Text(table.name.clone().into()),
             Value::Integer(non_unique),
-            Value::Text(key_name.to_string()),
+            Value::Text(key_name.to_string().into()),
             Value::Integer(1),
-            Value::Text(column.to_string()),
-            Value::Text("A".to_string()),
+            Value::Text(column.to_string().into()),
+            Value::Text("A".to_string().into()),
             Value::Null,
             Value::Null,
             Value::Null,
-            Value::Text("YES".to_string()),
-            Value::Text(index_type.to_string()),
-            Value::Text(String::new()),
-            Value::Text(String::new()),
-            Value::Text("YES".to_string()),
+            Value::Text("YES".to_string().into()),
+            Value::Text(index_type.to_string().into()),
+            Value::Text(String::new().into()),
+            Value::Text(String::new().into()),
+            Value::Text("YES".to_string().into()),
             Value::Null,
         ]
     };
@@ -1022,7 +1028,7 @@ fn show_variables(rest: &str, session: &Session) -> Intercepted {
                 .map(|pattern| like_matches(pattern, name))
                 .unwrap_or(true)
         })
-        .map(|(name, value)| vec![Value::Text(name), Value::Text(value)])
+        .map(|(name, value)| vec![Value::Text(name.into()), Value::Text(value.into())])
         .collect();
     rows(&["Variable_name", "Value"], data)
 }
@@ -1038,12 +1044,16 @@ fn show_engines() -> Intercepted {
             "Savepoints",
         ],
         vec![vec![
-            Value::Text("InlaySQL".to_string()),
-            Value::Text("DEFAULT".to_string()),
-            Value::Text("Copy-on-write B+ tree with MVCC and hybrid retrieval".to_string()),
-            Value::Text("YES".to_string()),
-            Value::Text("NO".to_string()),
-            Value::Text("NO".to_string()),
+            Value::Text("InlaySQL".to_string().into()),
+            Value::Text("DEFAULT".to_string().into()),
+            Value::Text(
+                "Copy-on-write B+ tree with MVCC and hybrid retrieval"
+                    .to_string()
+                    .into(),
+            ),
+            Value::Text("YES".to_string().into()),
+            Value::Text("NO".to_string().into()),
+            Value::Text("NO".to_string().into()),
         ]],
     )
 }
@@ -1061,10 +1071,10 @@ fn show_table_status(rest: &str, catalog: &Catalog, session: &Session) -> Interc
         })
         .map(|table| {
             vec![
-                Value::Text(table.name.clone()),
-                Value::Text("InlaySQL".to_string()),
+                Value::Text(table.name.clone().into()),
+                Value::Text("InlaySQL".to_string().into()),
                 Value::Integer(10),
-                Value::Text("Dynamic".to_string()),
+                Value::Text("Dynamic".to_string().into()),
                 // Row counts are not tracked; NULL says "unknown", which is
                 // true, where 0 would say "empty", which may not be.
                 Value::Null,
@@ -1077,10 +1087,10 @@ fn show_table_status(rest: &str, catalog: &Catalog, session: &Session) -> Interc
                 Value::Null,
                 Value::Null,
                 Value::Null,
-                Value::Text("utf8mb4_general_ci".to_string()),
+                Value::Text("utf8mb4_general_ci".to_string().into()),
                 Value::Null,
-                Value::Text(String::new()),
-                Value::Text(schema.clone()),
+                Value::Text(String::new().into()),
+                Value::Text(schema.clone().into()),
             ]
         })
         .collect();
@@ -1143,7 +1153,10 @@ fn show_create_table(rest: &str, catalog: &Catalog) -> Intercepted {
 
     rows(
         &["Table", "Create Table"],
-        vec![vec![Value::Text(table.name.clone()), Value::Text(ddl)]],
+        vec![vec![
+            Value::Text(table.name.clone().into()),
+            Value::Text(ddl.into()),
+        ]],
     )
 }
 
@@ -1278,17 +1291,17 @@ fn session_expression(expr: &str, session: &Session) -> Option<Value> {
     let call = lower.replace(' ', "");
 
     match call.as_str() {
-        "version()" => return Some(Value::Text(SERVER_VERSION.to_string())),
+        "version()" => return Some(Value::Text(SERVER_VERSION.to_string().into())),
         "database()" | "schema()" => {
             return Some(match &session.database {
-                Some(name) => Value::Text(name.clone()),
+                Some(name) => Value::Text(name.clone().into()),
                 None => Value::Null,
             })
         }
         "last_insert_id()" => return Some(Value::Integer(session.last_insert_id as i64)),
         "connection_id()" => return Some(Value::Integer(session.connection_id as i64)),
         "user()" | "current_user()" | "current_user" | "session_user()" | "system_user()" => {
-            return Some(Value::Text(format!("{}@localhost", session.user)))
+            return Some(Value::Text(format!("{}@localhost", session.user).into()))
         }
         "null" => return Some(Value::Null),
         _ => {}
@@ -1299,7 +1312,7 @@ fn session_expression(expr: &str, session: &Session) -> Option<Value> {
         // off in the one order that handles every spelling.
         let name = system_variable_name(trimmed);
         return Some(match session.variable(&name) {
-            Some(value) => Value::Text(value),
+            Some(value) => Value::Text(value.into()),
             // An unknown system variable is NULL rather than an error, which
             // is what MySQL returns for `SELECT @@nonexistent` in a session
             // context and what drivers probing for optional variables expect.
@@ -1308,12 +1321,12 @@ fn session_expression(expr: &str, session: &Session) -> Option<Value> {
     }
     if let Some(name) = trimmed.strip_prefix('@') {
         return Some(match session.user_variable(&unquote_identifier(name)) {
-            Some(value) => Value::Text(value.to_string()),
+            Some(value) => Value::Text(value.to_string().into()),
             None => Value::Null,
         });
     }
     if let Some(text) = unquote_string(trimmed) {
-        return Some(Value::Text(text));
+        return Some(Value::Text(text.into()));
     }
     if let Ok(number) = trimmed.parse::<i64>() {
         return Some(Value::Integer(number));
@@ -1398,7 +1411,7 @@ mod tests {
 
     fn text(value: &Value) -> String {
         match value {
-            Value::Text(t) => t.clone(),
+            Value::Text(t) => t.to_string(),
             Value::Integer(i) => i.to_string(),
             Value::Null => "NULL".to_string(),
             other => format!("{other:?}"),
@@ -1725,7 +1738,11 @@ mod tests {
             let rows = result(&format!("SELECT {spelling}"));
             assert_eq!(
                 rows.rows[0][0],
-                Value::Text("STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION".to_string()),
+                Value::Text(
+                    "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"
+                        .to_string()
+                        .into()
+                ),
                 "{spelling}"
             );
         }
@@ -1735,7 +1752,7 @@ mod tests {
     fn aliases_are_honoured() {
         let rows = result("SELECT VERSION() AS v, DATABASE() AS db");
         assert_eq!(rows.columns, vec!["v", "db"]);
-        assert_eq!(rows.rows[0][1], Value::Text("app".to_string()));
+        assert_eq!(rows.rows[0][1], Value::Text("app".to_string().into()));
     }
 
     /// An ordinary query must reach the engine untouched — the shim is not
@@ -1960,7 +1977,7 @@ mod tests {
         match intercept("SHOW WARNINGS", &[], &catalog(), &mut session) {
             Intercepted::Rows(rows) => {
                 assert_eq!(rows.columns, vec!["Level", "Code", "Message"]);
-                assert_eq!(rows.rows[0][0], Value::Text("Warning".to_string()));
+                assert_eq!(rows.rows[0][0], Value::Text("Warning".to_string().into()));
                 assert_eq!(rows.rows[0][1], Value::Integer(1618));
             }
             other => panic!("{other:?}"),

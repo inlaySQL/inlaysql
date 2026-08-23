@@ -62,7 +62,7 @@ fn load(db: &mut Database, rows: usize, dim: usize) {
             "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
             &[
                 Value::Integer(id as i64),
-                Value::Text(format!("document number {id} about vectors and storage")),
+                Value::Text(format!("document number {id} about vectors and storage").into()),
                 Value::Vector(embedding(id, dim)),
             ],
         )
@@ -76,7 +76,7 @@ fn hybrid_query(db: &mut Database, dim: usize) -> Vec<Vec<Value>> {
          FROM docs ORDER BY score DESC LIMIT 5",
         &[
             Value::Vector(embedding(42, dim)),
-            Value::Text("document number 42".to_string()),
+            Value::Text("document number 42".to_string().into()),
         ],
     )
     .expect("hybrid query")

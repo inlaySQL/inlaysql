@@ -49,7 +49,7 @@ impl Client {
                 "INSERT INTO notes (id, body, embedding) VALUES (?, ?, ?)",
                 &[
                     Value::Integer(id),
-                    Value::Text(body.to_string()),
+                    Value::Text(body.to_string().into()),
                     Value::Vector(embedding.to_vec()),
                 ],
             )

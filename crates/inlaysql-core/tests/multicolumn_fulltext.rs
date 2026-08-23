@@ -131,8 +131,8 @@ fn insert_docs(engine: &mut Engine) {
                 "INSERT INTO docs (id, title, body) VALUES (?, ?, ?)",
                 &[
                     Value::Integer(id as i64 + 1),
-                    Value::Text(title.to_string()),
-                    Value::Text(body.to_string()),
+                    Value::Text(title.to_string().into()),
+                    Value::Text(body.to_string().into()),
                 ],
             )
             .expect("insert");
@@ -170,7 +170,7 @@ fn oracle() -> Bm25Index {
 
 fn multi_column_query(engine: &mut Engine, sql: &str, term: &str) -> ResultSet {
     engine
-        .query(sql, &[Value::Text(term.to_string())])
+        .query(sql, &[Value::Text(term.to_string().into())])
         .unwrap_or_else(|error| panic!("query `{sql}` failed: {error}"))
 }
 
@@ -339,7 +339,7 @@ fn a_bare_multi_column_create_index_is_still_a_b_tree_by_default() {
     let err = engine
         .query(
             "SELECT id, bm25_score(title, body, ?) AS score FROM docs",
-            &[Value::Text("falcon".to_string())],
+            &[Value::Text("falcon".to_string().into())],
         )
         .unwrap_err();
     assert!(matches!(err, inlaysql_core::Error::Index(_)), "got {err}");

@@ -379,7 +379,7 @@ mod tests {
     fn the_class_tags_order_null_below_numbers_below_text_below_blobs() {
         let null = encode(&Value::Null);
         let number = encode(&Value::Integer(i64::MIN));
-        let text = encode(&Value::Text(String::new()));
+        let text = encode(&Value::Text(String::new().into()));
         let blob = encode(&Value::Blob(Vec::new()));
         assert!(null < number);
         assert!(number < text);
@@ -409,10 +409,22 @@ mod tests {
 
     #[test]
     fn a_text_prefix_sorts_below_the_longer_string() {
-        assert!(encode(&Value::Text("a".to_string())) < encode(&Value::Text("ab".to_string())));
-        assert!(encode(&Value::Text("a".to_string())) < encode(&Value::Text("a\0".to_string())));
-        assert!(encode(&Value::Text(String::new())) < encode(&Value::Text("\0".to_string())));
-        assert!(encode(&Value::Text("a\u{1}".to_string())) > encode(&Value::Text("a".to_string())));
+        assert!(
+            encode(&Value::Text("a".to_string().into()))
+                < encode(&Value::Text("ab".to_string().into()))
+        );
+        assert!(
+            encode(&Value::Text("a".to_string().into()))
+                < encode(&Value::Text("a\0".to_string().into()))
+        );
+        assert!(
+            encode(&Value::Text(String::new().into()))
+                < encode(&Value::Text("\0".to_string().into()))
+        );
+        assert!(
+            encode(&Value::Text("a\u{1}".to_string().into()))
+                > encode(&Value::Text("a".to_string().into()))
+        );
     }
 
     /// The escape has to keep one column from spilling into the next: `("a",
@@ -421,8 +433,18 @@ mod tests {
     fn one_columns_encoding_cannot_be_read_as_another_columns() {
         let pair = |a: &str, b: &str| {
             let mut out = Vec::new();
-            encode_value(&mut out, &Value::Text(a.to_string()), Collation::Binary).unwrap();
-            encode_value(&mut out, &Value::Text(b.to_string()), Collation::Binary).unwrap();
+            encode_value(
+                &mut out,
+                &Value::Text(a.to_string().into()),
+                Collation::Binary,
+            )
+            .unwrap();
+            encode_value(
+                &mut out,
+                &Value::Text(b.to_string().into()),
+                Collation::Binary,
+            )
+            .unwrap();
             out
         };
         assert_ne!(pair("a", "b"), pair("a\0b", ""));
@@ -543,18 +565,18 @@ mod tests {
             Value::Real(1.5),
             Value::Real(f64::MAX),
             Value::Real(f64::INFINITY),
-            Value::Text(String::new()),
-            Value::Text("\0".to_string()),
-            Value::Text("\0\0".to_string()),
-            Value::Text("\u{1}".to_string()),
-            Value::Text("A".to_string()),
-            Value::Text("a".to_string()),
-            Value::Text("a\0".to_string()),
-            Value::Text("ab".to_string()),
-            Value::Text("abc".to_string()),
-            Value::Text("é".to_string()),
-            Value::Text("日本語".to_string()),
-            Value::Text("\u{10ffff}".to_string()),
+            Value::Text(String::new().into()),
+            Value::Text("\0".to_string().into()),
+            Value::Text("\0\0".to_string().into()),
+            Value::Text("\u{1}".to_string().into()),
+            Value::Text("A".to_string().into()),
+            Value::Text("a".to_string().into()),
+            Value::Text("a\0".to_string().into()),
+            Value::Text("ab".to_string().into()),
+            Value::Text("abc".to_string().into()),
+            Value::Text("é".to_string().into()),
+            Value::Text("日本語".to_string().into()),
+            Value::Text("\u{10ffff}".to_string().into()),
             Value::Blob(Vec::new()),
             Value::Blob(vec![0]),
             Value::Blob(vec![0, 0]),
@@ -578,7 +600,7 @@ mod tests {
             let bytes: Vec<u8> = state.to_le_bytes()[..(state % 8) as usize + 1].to_vec();
             values.push(Value::Blob(bytes.clone()));
             values.push(Value::Text(
-                String::from_utf8_lossy(&bytes).into_owned().to_string(),
+                String::from_utf8_lossy(&bytes).into_owned().into(),
             ));
         }
         values
@@ -692,8 +714,8 @@ mod tests {
     /// but its own under the second.
     #[test]
     fn nocase_folds_the_key_and_binary_does_not() {
-        let ada = Value::Text("Ada".to_string());
-        let shouty = Value::Text("ADA".to_string());
+        let ada = Value::Text("Ada".to_string().into());
+        let shouty = Value::Text("ADA".to_string().into());
         let nocase = &[Collation::NoCase];
 
         let folded = KeyRange::equality("i", &[&shouty], nocase).unwrap();
@@ -710,8 +732,8 @@ mod tests {
     #[test]
     fn two_rows_that_fold_together_are_still_two_entries() {
         let nocase = &[Collation::NoCase];
-        let one = entry_key("i", &[&Value::Text("Ada".to_string())], nocase, 1).unwrap();
-        let two = entry_key("i", &[&Value::Text("ADA".to_string())], nocase, 2).unwrap();
+        let one = entry_key("i", &[&Value::Text("Ada".to_string().into())], nocase, 1).unwrap();
+        let two = entry_key("i", &[&Value::Text("ADA".to_string().into())], nocase, 2).unwrap();
         assert_ne!(one, two);
         assert_eq!(one[..one.len() - 8], two[..two.len() - 8]);
         assert_eq!(row_id_from_entry(&one).unwrap(), 1);
@@ -726,7 +748,10 @@ mod tests {
         let key = |a: &str, b: &str| {
             probe_prefix(
                 "i",
-                &[&Value::Text(a.to_string()), &Value::Text(b.to_string())],
+                &[
+                    &Value::Text(a.to_string().into()),
+                    &Value::Text(b.to_string().into()),
+                ],
                 collations,
             )
             .unwrap()
@@ -740,9 +765,10 @@ mod tests {
     #[test]
     fn an_rtrim_range_includes_the_padded_spellings() {
         let rtrim = &[Collation::RTrim];
-        let range = KeyRange::equality("i", &[&Value::Text("a".to_string())], rtrim).unwrap();
+        let range =
+            KeyRange::equality("i", &[&Value::Text("a".to_string().into())], rtrim).unwrap();
         for stored in ["a", "a ", "a    "] {
-            let key = entry_key("i", &[&Value::Text(stored.to_string())], rtrim, 3).unwrap();
+            let key = entry_key("i", &[&Value::Text(stored.to_string().into())], rtrim, 3).unwrap();
             assert!(
                 key >= range.start && key < *range.end.as_ref().unwrap(),
                 "{stored:?} fell outside its own range"

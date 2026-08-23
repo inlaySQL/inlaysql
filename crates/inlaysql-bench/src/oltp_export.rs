@@ -235,7 +235,10 @@ fn measure_inlaysql(
     let started = Instant::now();
     for (id, body) in rows {
         let at = Instant::now();
-        db.execute_prepared(&insert, &[Value::Integer(*id), Value::Text(body.clone())])?;
+        db.execute_prepared(
+            &insert,
+            &[Value::Integer(*id), Value::Text(body.clone().into())],
+        )?;
         writes.push(at.elapsed());
     }
     let write_elapsed = started.elapsed();

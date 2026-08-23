@@ -140,7 +140,7 @@ fn seeded() -> SharedStorage {
                 "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
                 &[
                     Value::Integer(index as i64 + 1),
-                    Value::Text(body.to_string()),
+                    Value::Text(body.to_string().into()),
                     Value::Vector(embedding.to_vec()),
                 ],
             )
@@ -159,7 +159,7 @@ fn hybrid_ids(engine: &mut Engine) -> Vec<i64> {
              FROM docs ORDER BY score DESC LIMIT 4",
             &[
                 Value::Vector(vec![1.0, 0.2, 0.0]),
-                Value::Text("embedded database".to_string()),
+                Value::Text("embedded database".to_string().into()),
             ],
         )
         .unwrap()
@@ -212,7 +212,7 @@ fn a_write_after_the_checkpoint_invalidates_the_saved_index() {
                 "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
                 &[
                     Value::Integer(99),
-                    Value::Text("late arriving embedded document".to_string()),
+                    Value::Text("late arriving embedded document".to_string().into()),
                     Value::Vector(vec![0.8, 0.1, 0.0]),
                 ],
             )
@@ -425,7 +425,7 @@ fn create_index_builds_from_the_existing_rows() {
                     "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
                     &[
                         Value::Integer(index as i64 + 1),
-                        Value::Text(body.to_string()),
+                        Value::Text(body.to_string().into()),
                         Value::Vector(embedding.to_vec()),
                     ],
                 )
@@ -478,7 +478,7 @@ fn drop_index_removes_the_declaration_and_the_saved_copy() {
                     "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
                     &[
                         Value::Integer(index as i64 + 1),
-                        Value::Text(body.to_string()),
+                        Value::Text(body.to_string().into()),
                         Value::Vector(embedding.to_vec()),
                     ],
                 )
@@ -531,7 +531,7 @@ fn open_implicit_indexes_everything_as_before() {
                 "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
                 &[
                     Value::Integer(index as i64 + 1),
-                    Value::Text(body.to_string()),
+                    Value::Text(body.to_string().into()),
                     Value::Vector(embedding.to_vec()),
                 ],
             )
@@ -573,7 +573,7 @@ fn a_database_written_before_create_index_is_grandfathered() {
                     "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
                     &[
                         Value::Integer(index as i64 + 1),
-                        Value::Text(body.to_string()),
+                        Value::Text(body.to_string().into()),
                         Value::Vector(embedding.to_vec()),
                     ],
                 )

@@ -65,7 +65,7 @@ fn main() -> Result<(), inlaysql::Error> {
             "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
             &[
                 Value::Integer(*id),
-                Value::Text(body.to_string()),
+                Value::Text(body.to_string().into()),
                 // A real deployment puts model output here; this demo uses the
                 // hashing stand-in from `inlaysql::embedding`.
                 Value::Vector(hashed_embedding(body, DIM)),
@@ -74,7 +74,7 @@ fn main() -> Result<(), inlaysql::Error> {
     }
 
     let query_embedding = Value::Vector(hashed_embedding(SEMANTIC_QUERY, DIM));
-    let query_text = Value::Text(LEXICAL_QUERY.to_string());
+    let query_text = Value::Text(LEXICAL_QUERY.to_string().into());
 
     println!("keywords: {LEXICAL_QUERY:?}");
     println!("embedded query: {SEMANTIC_QUERY:?}\n");

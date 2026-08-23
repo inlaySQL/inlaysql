@@ -5875,7 +5875,7 @@ fn bind_literal(value: &AstValue, binder: &mut Binder) -> Result<PlanExpr> {
         }
         AstValue::SingleQuotedString(s)
         | AstValue::DoubleQuotedString(s)
-        | AstValue::EscapedStringLiteral(s) => Value::Text(s.clone()),
+        | AstValue::EscapedStringLiteral(s) => Value::Text(s.clone().into()),
         AstValue::Boolean(b) => Value::Integer(i64::from(*b)),
         AstValue::HexStringLiteral(hex) => Value::Blob(parse_blob_literal(hex)?),
         other => {
@@ -6258,7 +6258,7 @@ mod tests {
             "INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)",
             &[
                 Value::Integer(1),
-                Value::Text("hello".to_string()),
+                Value::Text("hello".to_string().into()),
                 Value::Vector(vec![1.0, 0.0, 0.0]),
             ],
             &catalog(),
@@ -6294,7 +6294,7 @@ mod tests {
             insert.source,
             InsertSource::Values(vec![vec![
                 Some(PlanExpr::Param(0)),
-                Some(PlanExpr::Literal(Value::Text("x".to_string()))),
+                Some(PlanExpr::Literal(Value::Text("x".to_string().into()))),
                 // Not `Some(NULL)`: the statement never named this column, so
                 // its default applies rather than an explicit `NULL`.
                 None,
@@ -6647,7 +6647,7 @@ mod tests {
     fn hybrid_select_becomes_one_fused_score() {
         let params = vec![
             Value::Vector(vec![1.0, 0.0, 0.0]),
-            Value::Text("rust".to_string()),
+            Value::Text("rust".to_string().into()),
         ];
         let plan = plan(
             "SELECT id, body, fuse(vector_score(embedding, ?), bm25_score(body, ?)) AS score \
@@ -6739,7 +6739,7 @@ mod tests {
                     affinity: CompareAffinity::Text,
                     op: BinaryOp::Eq,
                     left: Box::new(PlanExpr::Column(1)),
-                    right: Box::new(PlanExpr::Literal(Value::Text("x".to_string()))),
+                    right: Box::new(PlanExpr::Literal(Value::Text("x".to_string().into()))),
                 }),
             })
         );

@@ -384,7 +384,7 @@ fn build(
     session: &Session,
 ) -> (&'static [&'static str], Vec<Vec<Value>>) {
     let schema = schema_name(session);
-    let text = |value: &str| Value::Text(value.to_string());
+    let text = |value: &str| Value::Text(value.to_string().into());
 
     match relation {
         Relation::Schemata => (
@@ -931,7 +931,7 @@ fn compare(cell: &Value, operand: &Operand, params: &[Value], like: bool) -> boo
 fn render(value: &Value) -> String {
     match value {
         Value::Null => String::new(),
-        Value::Text(text) => text.clone(),
+        Value::Text(text) => text.to_string(),
         Value::Integer(i) => i.to_string(),
         Value::Real(r) => r.to_string(),
         Value::Blob(bytes) => String::from_utf8_lossy(bytes).into_owned(),
@@ -1315,7 +1315,7 @@ fn literal_value(text: &str) -> Option<Value> {
         return Some(Value::Null);
     }
     if let Some(text) = unquote_string(text) {
-        return Some(Value::Text(text));
+        return Some(Value::Text(text.into()));
     }
     if let Ok(n) = text.parse::<i64>() {
         return Some(Value::Integer(n));

@@ -164,7 +164,7 @@ fn inlaysql_points(
         let at = Instant::now();
         db.execute_prepared(
             &insert,
-            &[Value::Integer(id), Value::Text(payload.to_string())],
+            &[Value::Integer(id), Value::Text(payload.to_string().into())],
         )?;
         writes.push(at.elapsed());
     }
@@ -229,7 +229,7 @@ fn inlaysql_batched_write(
         let at = Instant::now();
         match db.execute_prepared(
             &insert,
-            &[Value::Integer(id), Value::Text(payload.to_string())],
+            &[Value::Integer(id), Value::Text(payload.to_string().into())],
         ) {
             Ok(_) => {}
             // The engine refuses a statement that would overflow the log, and
@@ -240,7 +240,7 @@ fn inlaysql_batched_write(
                 db.begin()?;
                 db.execute_prepared(
                     &insert,
-                    &[Value::Integer(id), Value::Text(payload.to_string())],
+                    &[Value::Integer(id), Value::Text(payload.to_string().into())],
                 )?;
             }
             Err(other) => return Err(other.into()),

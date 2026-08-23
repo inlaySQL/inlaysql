@@ -16,7 +16,7 @@ fn insert(engine: &mut Engine, id: i64, body: &str) {
     engine
         .execute(
             "INSERT INTO docs (id, body) VALUES (?, ?)",
-            &[Value::Integer(id), Value::Text(body.to_string())],
+            &[Value::Integer(id), Value::Text(body.to_string().into())],
         )
         .unwrap();
 }

@@ -307,7 +307,7 @@ pub fn text_value(value: &Value) -> Option<Vec<u8>> {
         Value::Null => None,
         Value::Integer(i) => Some(i.to_string().into_bytes()),
         Value::Real(r) => Some(format_real(*r).into_bytes()),
-        Value::Text(s) => Some(s.clone().into_bytes()),
+        Value::Text(s) => Some(s.as_bytes().to_vec()),
         Value::Blob(b) => Some(b.clone()),
         Value::Vector(v) => Some(format_vector(v).into_bytes()),
     }
