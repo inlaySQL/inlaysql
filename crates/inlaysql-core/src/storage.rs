@@ -219,12 +219,13 @@ impl<D: Device> Storage for TreeStorage<D> {
     ) -> Result<Vec<(RowId, RowBuf)>> {
         let mut resume = RowKeyBuf::new();
         let resume = after.map(|id| resume.key(table, id));
-        // The row-id-and-value walk: a table scan decodes the row id out of the
-        // key and throws the rest away, so it reads the id straight out of the
-        // borrowed entry rather than cloning the key only to discard it (the
-        // same fast path `scan_index_row_ids` gives the index probe).
+        // The raw-leaf row-id-and-value walk: a table scan reads the row id out
+        // of the key and throws the rest away, so it parses leaf cells in place
+        // — no `Rc<Node>`, no per-cell key `Vec` — rather than decoding the
+        // page only to discard it (the same fast path `scan_index_row_ids`
+        // gives the index probe).
         self.tree
-            .scan_prefix_row_values_from(&table_prefix(table), resume, limit)
+            .scan_prefix_row_values_raw_from(&table_prefix(table), resume, limit)
     }
 
     fn put_meta(&mut self, key: &str, bytes: &[u8]) -> Result<()> {

@@ -44,7 +44,7 @@ pub const DEFAULT_PAGE_SIZE: usize = 4096;
 pub const MIN_PAGE_SIZE: usize = 64;
 
 /// Byte offset and width of each header field.
-const OFF_KIND: usize = 0;
+pub const OFF_KIND: usize = 0;
 const OFF_CELL_COUNT: usize = 2;
 const OFF_FREE_START: usize = 4;
 const OFF_LEFTMOST: usize = 8;
@@ -404,6 +404,118 @@ fn decode_internal_cell(bytes: &[u8], page_size: usize, slot: usize) -> Result<S
         key: bytes[slot + 2..key_end].to_vec(),
         child: get_u64(bytes, key_end)?,
     })
+}
+
+// ----------------------------------------------------- borrowed raw-leaf scan
+
+/// A leaf cell parsed with its key borrowed from the page bytes rather than
+/// copied into an owned `Vec`.
+///
+/// This is the scan fast path's leaf-cell view: a sequential scan reads the row
+/// id out of the key and tests it against the walk bounds, and never keeps the
+/// key — so copying it (as [`decode_leaf_cell`] does for the cached [`Node`])
+/// is an allocation a scan will immediately throw away. The value is still
+/// materialised exactly as [`decode_leaf_cell`] materialises it.
+pub struct LeafCellRef<'a> {
+    /// The cell key, borrowed from the page bytes it was parsed from.
+    pub key: &'a [u8],
+    /// The value — inline bytes shared, or an overflow pointer.
+    pub value: ValueRef,
+}
+
+/// Parse one leaf cell, borrowing the key.
+///
+/// The same corruption checks as [`decode_leaf_cell`] — a slot or key or value
+/// running past the end of the page is corruption, never a silent truncation —
+/// only the key is a slice into `bytes` instead of an owned copy.
+pub fn decode_leaf_cell_ref<'a>(
+    bytes: &'a [u8],
+    page_size: usize,
+    slot: usize,
+) -> Result<LeafCellRef<'a>> {
+    if slot + 3 > page_size {
+        return Err(Error::Corrupt(
+            "leaf cell runs past end of page".to_string(),
+        ));
+    }
+    let key_len = get_u16(bytes, slot)? as usize;
+    let key_end = slot + 2 + key_len;
+    if key_end + 1 > page_size {
+        return Err(Error::Corrupt("leaf key runs past end of page".to_string()));
+    }
+    let key = &bytes[slot + 2..key_end];
+    match bytes[key_end] {
+        VALUE_INLINE => {
+            if key_end + 5 > page_size {
+                return Err(Error::Corrupt(
+                    "leaf value length runs past end of page".to_string(),
+                ));
+            }
+            let value_len = get_u32(bytes, key_end + 1)? as usize;
+            let value_end = key_end + 5 + value_len;
+            if value_end > page_size {
+                return Err(Error::Corrupt(
+                    "leaf value runs past end of page".to_string(),
+                ));
+            }
+            Ok(LeafCellRef {
+                key,
+                value: ValueRef::Inline(Rc::from(&bytes[key_end + 5..value_end])),
+            })
+        }
+        VALUE_OVERFLOW => {
+            if key_end + 17 > page_size {
+                return Err(Error::Corrupt(
+                    "overflow pointer runs past end of page".to_string(),
+                ));
+            }
+            let first = get_u64(bytes, key_end + 1)?;
+            let len = get_u64(bytes, key_end + 9)? as usize;
+            Ok(LeafCellRef {
+                key,
+                value: ValueRef::Overflow { first, len },
+            })
+        }
+        other => Err(Error::Corrupt(alloc::format!(
+            "unknown leaf value tag {other}"
+        ))),
+    }
+}
+
+/// Run `f` over every leaf cell of `bytes`, in key order, with each cell's key
+/// borrowed from the page.
+///
+/// The header checks [`decode`] performs — page length, the slot directory not
+/// overlapping the cell area — are repeated here, so a raw scan is held to the
+/// same corruption standard as a decoded one. `f` is called while `bytes` is
+/// borrowed, so it may not outlive the call.
+pub fn scan_leaf_cells<'a>(
+    bytes: &'a [u8],
+    page_size: usize,
+    mut f: impl FnMut(&'a [u8], ValueRef) -> Result<()>,
+) -> Result<()> {
+    if bytes.len() != page_size {
+        return Err(Error::Corrupt(alloc::format!(
+            "page is {} bytes, expected {page_size}",
+            bytes.len()
+        )));
+    }
+    let count = get_u16(bytes, OFF_CELL_COUNT)? as usize;
+    let free_start = get_u16(bytes, OFF_FREE_START)? as usize;
+    if free_start > page_size {
+        return Err(Error::Corrupt("free start past end of page".to_string()));
+    }
+    if HEADER_SIZE + SLOT_SIZE * count > free_start {
+        return Err(Error::Corrupt(
+            "slot directory overlaps cell area".to_string(),
+        ));
+    }
+    for i in 0..count {
+        let slot = get_u16(bytes, HEADER_SIZE + SLOT_SIZE * i)? as usize;
+        let cell = decode_leaf_cell_ref(bytes, page_size, slot)?;
+        f(cell.key, cell.value)?;
+    }
+    Ok(())
 }
 
 // --------------------------------------------------------- little-endian I/O

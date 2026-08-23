@@ -1352,6 +1352,10 @@ impl<D: Device> CowBTree<D> {
     /// [`crate::storage::row_key`] builds. Over any other key space the eight
     /// bytes are meaningless, which is why this is not the general walk and why
     /// it is crate-private.
+    ///
+    /// This is the decoded-node parity oracle for the raw-leaf walk
+    /// ([`CowBTree::scan_prefix_row_values_raw_from`]); test-only.
+    #[cfg(test)]
     pub(crate) fn scan_prefix_row_values_from(
         &self,
         prefix: &[u8],
@@ -1370,7 +1374,8 @@ impl<D: Device> CowBTree<D> {
     /// (row id out of the borrowed key, value resolved, no key clone). Crate-
     /// private for the same reason as [`CowBTree::scan_prefix_row_values_from`]:
     /// it only answers correctly over a key space whose keys end in an eight-
-    /// byte big-endian row id.
+    /// byte big-endian row id. Test-only parity oracle for the raw-leaf walk.
+    #[cfg(test)]
     pub(crate) fn scan_range_row_values_from(
         &self,
         start: &[u8],
@@ -1389,6 +1394,42 @@ impl<D: Device> CowBTree<D> {
             limit,
         };
         self.walk_row_values(self.read_root(), &bounds, self.has_pending, &mut out)?;
+        Ok(out)
+    }
+
+    /// The raw-leaf form of [`CowBTree::scan_prefix_row_values_from`] — same
+    /// bounds, order, resume and value semantics, but leaf pages are parsed in
+    /// place rather than decoded into a cached node. This is the production
+    /// path for a table scan; the decoded walk is its parity oracle.
+    pub(crate) fn scan_prefix_row_values_raw_from(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(RowId, RowBuf)>> {
+        let upper = prefix_upper_bound(prefix);
+        self.scan_range_row_values_raw_from(prefix, upper.as_deref(), after, limit)
+    }
+
+    /// The raw-leaf form of [`CowBTree::scan_range_row_values_from`].
+    pub(crate) fn scan_range_row_values_raw_from(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(RowId, RowBuf)>> {
+        let mut out = Vec::new();
+        if limit == 0 || end.is_some_and(|end| end <= start) {
+            return Ok(out);
+        }
+        let bounds = WalkBounds {
+            start,
+            end,
+            after,
+            limit,
+        };
+        self.walk_raw_row_values(self.read_root(), &bounds, self.has_pending, &mut out)?;
         Ok(out)
     }
 
@@ -2075,6 +2116,27 @@ impl<D: Device> CowBTree<D> {
         }
     }
 
+    /// Read a page's *raw* bytes — the open transaction's copy when `pending` is
+    /// set, the committed data area otherwise — and hand them to `f`.
+    ///
+    /// [`CowBTree::with_page_bytes`] for a page that is not yet decoded: the raw
+    /// scan fast path reads the bytes and parses leaf cells in place, so it
+    /// needs the bytes, not a cached [`Node`].
+    fn with_raw_page<T>(
+        &self,
+        id: PageId,
+        pending: bool,
+        f: impl FnOnce(usize, &[u8]) -> Result<T>,
+    ) -> Result<T> {
+        if pending {
+            if let Some(bytes) = self.dirty.get(&id) {
+                return f(self.page_size, bytes);
+            }
+        }
+        let offset = crate::wal::data_offset_for(self.page_size, self.format_version, id);
+        self.with_page_bytes(offset, f)
+    }
+
     /// Turn a value being written into its leaf representation: inline bytes
     /// when they fit a page with their key, otherwise a freshly allocated
     /// overflow chain.
@@ -2299,6 +2361,10 @@ impl<D: Device> CowBTree<D> {
     /// `Vec<u8>`, and the value is resolved exactly as [`CowBTree::walk`]
     /// resolves it. A table scan decodes the row id out of the key and throws
     /// the rest away, so this walk skips that clone-and-discard.
+    ///
+    /// Test-only: the raw-leaf walk ([`CowBTree::walk_raw_row_values`]) is the
+    /// production path, and this decoded walk is its parity oracle.
+    #[cfg(test)]
     fn walk_row_values(
         &self,
         id: PageId,
@@ -2342,6 +2408,77 @@ impl<D: Device> CowBTree<D> {
                     if below_upper && above_lower {
                         self.walk_row_values(separator.child, bounds, pending, out)?;
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [`CowBTree::walk_row_values`]'s raw-leaf sibling, for the sequential
+    /// scan.
+    ///
+    /// Internal nodes are decoded and navigated exactly as the general walk
+    /// does — they are few, and their separators have to be read to descend.
+    /// Leaf pages are *not* decoded into a cached [`Node`]: their cells are
+    /// parsed with the key borrowed straight off the page bytes
+    /// ([`page::scan_leaf_cells`]), so a scan of a leaf allocates no `Rc<Node>`,
+    /// no `Vec<Entry>` and no per-cell key `Vec`.
+    ///
+    /// That is a scan-only win and deliberately not the universal read path: a
+    /// point lookup / `get` still decodes once and serves from the cache, where
+    /// the owned key is already paid for and re-reading raw bytes would be
+    /// strictly worse (`PERF.md`, AHL-493's cache-resident regression).
+    fn walk_raw_row_values(
+        &self,
+        id: PageId,
+        bounds: &WalkBounds<'_>,
+        pending: bool,
+        out: &mut Vec<(RowId, RowBuf)>,
+    ) -> Result<()> {
+        if id == 0 || out.len() >= bounds.limit {
+            return Ok(());
+        }
+        // Read the raw bytes once and dispatch on the kind byte: a leaf is
+        // parsed in place, an internal node is decoded for navigation.
+        let internal = self.with_raw_page(id, pending, |page_size, bytes| {
+            match bytes[page::OFF_KIND] {
+                page::KIND_LEAF => {
+                    page::scan_leaf_cells(bytes, page_size, |key, value| {
+                        if out.len() >= bounds.limit {
+                            return Ok(());
+                        }
+                        if !bounds.admits(key) {
+                            return Ok(());
+                        }
+                        let value = self.resolve_value_at(&value, pending)?;
+                        out.push((trailing_row_id(key)?, value));
+                        Ok(())
+                    })?;
+                    Ok(None)
+                }
+                page::KIND_INTERNAL => Ok(Some(page::decode(page_size, bytes)?)),
+                other => Err(Error::Corrupt(alloc::format!("unknown node kind {other}"))),
+            }
+        })?;
+
+        if let Some(Node::Internal { leftmost, cells }) = internal {
+            if cells.is_empty() || bounds.starts_below(&cells[0].key) {
+                self.walk_raw_row_values(leftmost, bounds, pending, out)?;
+            }
+            for (i, separator) in cells.iter().enumerate() {
+                if out.len() >= bounds.limit {
+                    return Ok(());
+                }
+                let below_upper = match bounds.end {
+                    Some(end) => separator.key.as_slice() < end,
+                    None => true,
+                };
+                let above_lower = match cells.get(i + 1) {
+                    Some(next) => bounds.starts_below(&next.key),
+                    None => true,
+                };
+                if below_upper && above_lower {
+                    self.walk_raw_row_values(separator.child, bounds, pending, out)?;
                 }
             }
         }
@@ -3565,30 +3702,35 @@ mod tests {
             db.commit().unwrap();
         }
 
-        let by_row_values = db
-            .scan_prefix_row_values_from(b"\x01tbl\0", None, usize::MAX)
+        let by_raw = db
+            .scan_prefix_row_values_raw_from(b"\x01tbl\0", None, usize::MAX)
             .unwrap();
         let by_general_walk = db.scan_prefix(b"\x01tbl\0").unwrap();
-        assert_eq!(by_row_values.len(), by_general_walk.len());
-        assert_eq!(by_row_values.len(), 900);
-        for ((row_id, value), (key, general_value)) in
-            by_row_values.iter().zip(by_general_walk.iter())
-        {
+        assert_eq!(by_raw.len(), by_general_walk.len());
+        assert_eq!(by_raw.len(), 900);
+        for ((row_id, value), (key, general_value)) in by_raw.iter().zip(by_general_walk.iter()) {
             assert_eq!(
                 *row_id,
                 crate::storage::row_id_from_key(key).unwrap(),
-                "row-value walk disagreed with the general walk's row id"
+                "raw row-value walk disagreed with the general walk's row id"
             );
             assert_eq!(value.as_slice(), general_value.as_slice());
         }
 
+        // The decoded-node walk is the parity oracle: raw and decoded agree row
+        // for row, so a change to either cannot drift silently from the other.
+        let by_decoded = db
+            .scan_prefix_row_values_from(b"\x01tbl\0", None, usize::MAX)
+            .unwrap();
+        assert_eq!(by_raw, by_decoded);
+
         // A resumed, batched read reassembles to the whole-range answer.
-        let expected = by_row_values;
+        let expected = by_raw;
         let mut resumed = Vec::new();
         let mut after: Option<Vec<u8>> = None;
         loop {
             let batch = db
-                .scan_prefix_row_values_from(b"\x01tbl\0", after.as_deref(), 5)
+                .scan_prefix_row_values_raw_from(b"\x01tbl\0", after.as_deref(), 5)
                 .unwrap();
             if batch.is_empty() {
                 break;
@@ -3625,7 +3767,7 @@ mod tests {
         db.put(&row_key(3), b"three").unwrap();
 
         let by_row_values = db
-            .scan_prefix_row_values_from(b"t\0", None, usize::MAX)
+            .scan_prefix_row_values_raw_from(b"t\0", None, usize::MAX)
             .unwrap();
         let by_general_walk = db.scan_prefix(b"t\0").unwrap();
         assert_eq!(by_row_values.len(), 3);
@@ -3656,7 +3798,7 @@ mod tests {
         db.commit().unwrap();
 
         let by_row_values = db
-            .scan_prefix_row_values_from(b"t\0", None, usize::MAX)
+            .scan_prefix_row_values_raw_from(b"t\0", None, usize::MAX)
             .unwrap();
         let by_general_walk = db.scan_prefix(b"t\0").unwrap();
         assert_eq!(by_row_values.len(), 2);
