@@ -37,11 +37,13 @@ use crate::fusion::{reciprocal_rank_fusion, sort_by_score_desc};
 use crate::hnsw_paged::PagedHnswIndex;
 use crate::plan::{
     Aggregate, AlterAction, AlterTablePlan, ConflictAction, ConflictUpdate, CreateTablePlan,
-    DeletePlan, DropTablePlan, FrameBound, FromItem, InsertPlan, InsertSource, OnConflict, Order,
-    OrderKey, Plan, ScalarPlan, ScoreExpr, SelectItem, SelectPlan, SetOp, SetOperationPlan,
-    SubqueryBody, UpdatePlan, WindowFn, WindowFunc,
+    DeletePlan, DropTablePlan, FrameBound, FromItem, InsertPlan, InsertSource, JoinKind,
+    OnConflict, Order, OrderKey, Plan, ScalarPlan, ScoreExpr, SelectItem, SelectPlan, SetOp,
+    SetOperationPlan, SubqueryBody, UpdatePlan, WindowFn, WindowFunc,
 };
-use crate::row::{decode_row, decode_row_masked, encode_typed_row, ColumnMask, RowBuf};
+use crate::row::{
+    decode_row, decode_row_masked, decode_value_at, encode_typed_row, ColumnMask, RowBuf,
+};
 use crate::shared::SharedStorage;
 use crate::sql::{self, TableRules};
 use crate::statement::Statement;
@@ -3586,7 +3588,7 @@ impl Engine {
             self.candidate_bytes(&driving.table, &None, env.params())?,
             driving_mask,
         ));
-        let side = self.join_inner(
+        let mut side = self.join_inner(
             &plan.from,
             1,
             driving.table.columns.len(),
@@ -3598,11 +3600,82 @@ impl Engine {
         let mut skipped = 0usize;
         let mut emitted = 0usize;
         let mut projected = Vec::with_capacity(plan.items.len());
-        let joiner = NestedLoopJoin::new(outer, side, join.kind, join.on.as_ref(), env);
         let direct_projection = plan
             .items
             .iter()
             .all(|item| !matches!(item, SelectItem::Expr { .. }));
+
+        // Selective late materialisation (SLM) on the outer side: when the
+        // driving table's projected columns are just its row id, the outer scan
+        // decodes only the join key — one bare `Value` per row, no `Vec<Value>`
+        // container — and the row id is read off the scan, never decoded. This
+        // is the outer half of `PERF.md`'s "materialisation point = projection";
+        // the inner side stays the cached decoded table.
+        if let JoinInner::Hash(hash) = &mut side {
+            let outer_width = driving.table.columns.len();
+            let rowid_only = driving.table.rowid_alias().is_some_and(|rowid| {
+                plan.items.iter().all(|item| match item {
+                    SelectItem::Column { index, .. } => *index >= outer_width || *index == rowid,
+                    SelectItem::Score { .. } => true,
+                    SelectItem::Expr { .. } => false,
+                })
+            });
+            if hash_key_is_full_on
+                && direct_projection
+                && rowid_only
+                && join.kind == JoinKind::Inner
+            {
+                let rowid = driving.table.rowid_alias().unwrap();
+                let key_ordinal = hash.key_ordinal();
+                for row in RowScan::new(&self.storage, &driving.table.name) {
+                    let (row_id, row_bytes) = row?;
+                    let key = decode_value_at(row_bytes.as_slice(), key_ordinal)?;
+                    hash.prepare_key(&key);
+                    for index in 0..hash.rows().len() {
+                        if !hash.candidate_matches_key(index, &key) {
+                            continue;
+                        }
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+                        projected.clear();
+                        let inner = &hash.rows()[index];
+                        for item in &plan.items {
+                            match item {
+                                SelectItem::Column { index: col, .. } if *col == rowid => {
+                                    projected.push(Value::Integer(row_id as i64));
+                                }
+                                SelectItem::Column { index: col, .. } => projected.push(
+                                    inner
+                                        .get(*col - outer_width)
+                                        .cloned()
+                                        .unwrap_or(Value::Null),
+                                ),
+                                SelectItem::Score { .. } => projected.push(Value::Null),
+                                SelectItem::Expr { .. } => {
+                                    unreachable!("direct_projection excludes expressions")
+                                }
+                            }
+                        }
+                        sink(&projected)?;
+                        emitted += 1;
+                        if limit.is_some_and(|limit| emitted >= limit) {
+                            return Ok(ResultSet {
+                                columns,
+                                rows: Vec::new(),
+                            });
+                        }
+                    }
+                }
+                return Ok(ResultSet {
+                    columns,
+                    rows: Vec::new(),
+                });
+            }
+        }
+
+        let joiner = NestedLoopJoin::new(outer, side, join.kind, join.on.as_ref(), env);
         if hash_key_is_full_on && direct_projection {
             joiner.try_for_each_hash_pair(|_, score, outer, inner| {
                 if skipped < offset {

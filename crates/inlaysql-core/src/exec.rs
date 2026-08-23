@@ -739,7 +739,7 @@ impl HashJoin {
     }
 
     /// The bucket [`HashJoin::prepare`] selected.
-    fn rows(&self) -> &[Vec<Value>] {
+    pub fn rows(&self) -> &[Vec<Value>] {
         if self.current == usize::MAX {
             return &[];
         }
@@ -758,6 +758,30 @@ impl HashJoin {
             .get(index)
             .and_then(|row| row.get(self.table.inner_key))
             .is_some_and(|inner| outer != &Value::Null && outer == inner)
+    }
+
+    /// The outer joined-row ordinal the key is read from. For a single join
+    /// this is the driving table's own column ordinal, which is what the
+    /// key-only outer scan needs to decode just that column.
+    pub fn key_ordinal(&self) -> usize {
+        self.key
+    }
+
+    /// Narrow the inner side to the bucket `key` selects, without an outer row
+    /// slice — the key-only outer scan reads the key as a bare `Value`.
+    pub fn prepare_key(&mut self, key: &Value) {
+        self.current = match key {
+            Value::Null => usize::MAX,
+            value => (hash_value(value) as usize) & self.table.mask,
+        };
+    }
+
+    /// [`HashJoin::candidate_matches`] for a bare key.
+    pub fn candidate_matches_key(&self, index: usize, key: &Value) -> bool {
+        self.rows()
+            .get(index)
+            .and_then(|row| row.get(self.table.inner_key))
+            .is_some_and(|inner| key != &Value::Null && key == inner)
     }
 }
 

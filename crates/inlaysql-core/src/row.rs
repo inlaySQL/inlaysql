@@ -324,6 +324,28 @@ pub fn decode_row_ref_masked<'a>(bytes: &'a [u8], mask: &ColumnMask) -> Result<V
     Ok(values)
 }
 
+/// Decode exactly one column of a row, skipping every other column.
+///
+/// The join fast path needs one column per outer row — the hash key — and
+/// never the rest, so a full [`decode_row_masked`] would allocate a `Vec<Value>`
+/// per row only to read a single cell out of it. This walks the tag format to
+/// `ordinal` (still `O(ordinal)`, the same as [`decode_row_masked`], since the
+/// format has no column directory — `docs/architecture.md` D5) but allocates no
+/// container, and decodes no column it does not return.
+pub fn decode_value_at(bytes: &[u8], ordinal: usize) -> Result<Value> {
+    let mut cursor = Cursor::new(bytes);
+    let count = cursor.count(1)?;
+    if ordinal >= count {
+        return Err(Error::Corrupt(
+            "column ordinal past the end of the row".to_string(),
+        ));
+    }
+    for _ in 0..ordinal {
+        skip_value(&mut cursor)?;
+    }
+    decode_value(&mut cursor)
+}
+
 fn decode_value_ref<'a>(cursor: &mut Cursor<'a>) -> Result<ValueRef<'a>> {
     let tag = cursor.u8()?;
     match tag {
