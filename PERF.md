@@ -596,7 +596,28 @@ format version bump, a DST pass, and the pre-1.0 recreate policy. Do not reach
 for it before the allocation work above, because it is the expensive kind of
 change and the profile may show it is not where the time is.
 
+### The raw-leaf scan borrows too (AHL-466)
+
+The decoded-`Node` path was converted to borrow one shared page `Rc<[u8]>` per
+page (AHL-455), but the **raw-leaf scan** — `CowBTree::walk_raw_row_values`,
+the `RowScan` a join's outer side reads through — was the last path still
+allocating per cell: `decode_leaf_cell_ref` materialised a fresh `Rc<[u8]>` per
+cell (`ValueRef::Owned(Rc::from(...))`), and `resolve_value_at` re-cloned it.
+The scan reads the page into a transient scratch buffer, so it had to copy.
+
+AHL-466 folds it into the same pattern: the scan keeps the leaf behind one
+`Rc<[u8]>`, the cells are `ValueRef::Inline` ranges into it, and each row's
+value becomes a `RowBuf::Shared` by a refcount bump. One allocation per leaf
+page instead of one per cell.
+
+Measured interleaved on the join harness (`--suite joins --rows 20000`), the
+PK-inner full shape — the one this file calls miss-bound — moved from ~19.6 ms
+p50 and 1.37x slower than SQLite (journal) to ~14.1 ms p50 and parity (1.07x).
+The row-at-a-time harness (`query_prepared_each`, unchanged) reports the outer
+scan's allocations per projected row falling from ~1.7 to ~0.6.
+
 ---
+
 
 ## 3. The other write and scan paths
 
