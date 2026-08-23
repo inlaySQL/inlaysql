@@ -360,7 +360,7 @@ mod tests {
             bytes: Rc::from(&[][..]),
             entries: vec![Entry {
                 key: Key::Owned(key.to_vec()),
-                value: ValueRef::Inline(Rc::from(vec![0u8; 32])),
+                value: ValueRef::Owned(Rc::from(vec![0u8; 32])),
             }],
         })
     }

@@ -625,7 +625,7 @@ impl<D: Device> CowBTree<D> {
                 Node::Leaf { entries, .. } => {
                     let result = match entries.binary_search_by(|e| node.key(&e.key).cmp(key)) {
                         Ok(i) => self
-                            .resolve_value_at(&entries[i].value, pending)
+                            .resolve_value_at(Some(node.bytes()), &entries[i].value, pending)
                             .map(Some)?,
                         Err(_) => None,
                     };
@@ -730,7 +730,7 @@ impl<D: Device> CowBTree<D> {
             return Ok(None);
         };
         let result = match entries.binary_search_by(|e| node.key(&e.key).cmp(key)) {
-            Ok(i) => Some(self.resolve_value_at(&entries[i].value, false)?),
+            Ok(i) => Some(self.resolve_value_at(Some(node.bytes()), &entries[i].value, false)?),
             Err(_) => None,
         };
         Ok(Some(result))
@@ -2187,7 +2187,7 @@ impl<D: Device> CowBTree<D> {
     /// a leaf does.
     fn store_value(&mut self, key: &[u8], value: &[u8]) -> Result<ValueRef> {
         if page::inline_entry_fits(self.page_size, key, value) {
-            return Ok(ValueRef::Inline(Rc::from(value)));
+            return Ok(ValueRef::Owned(Rc::from(value)));
         }
         let payload = page::overflow_payload_size(self.page_size);
         let count = value.len().div_ceil(payload);
@@ -2219,9 +2219,31 @@ impl<D: Device> CowBTree<D> {
     /// contiguous buffer is not something an `Rc` clone can avoid, and it was
     /// never the common case this file's profile is about (`PERF.md`'s fixed
     /// payload is well under one page).
-    fn resolve_value_at(&self, value: &ValueRef, pending: bool) -> Result<RowBuf> {
+    fn resolve_value_at(
+        &self,
+        node_bytes: Option<&Rc<[u8]>>,
+        value: &ValueRef,
+        pending: bool,
+    ) -> Result<RowBuf> {
         match value {
-            ValueRef::Inline(bytes) => Ok(RowBuf::Shared(Rc::clone(bytes))),
+            ValueRef::Inline(range) => {
+                // `None` is only ever passed by the raw-leaf scan, whose values
+                // are always `Owned` — a borrowed inline value there would be a
+                // bug in that path, not a corrupt file.
+                let Some(bytes) = node_bytes else {
+                    return Err(Error::Corrupt(
+                        "borrowed inline value outside a decoded page".to_string(),
+                    ));
+                };
+                Ok(RowBuf::Shared {
+                    bytes: Rc::clone(bytes),
+                    range: range.clone(),
+                })
+            }
+            ValueRef::Owned(bytes) => Ok(RowBuf::Shared {
+                bytes: Rc::clone(bytes),
+                range: 0..bytes.len(),
+            }),
             ValueRef::Overflow { first, len } => {
                 // A value larger than the write-ahead-log region could never
                 // have been committed (its record would not fit), so this bound
@@ -2301,7 +2323,7 @@ impl<D: Device> CowBTree<D> {
                     if !bounds.admits(key) {
                         continue;
                     }
-                    let value = self.resolve_value_at(&entry.value, pending)?;
+                    let value = self.resolve_value_at(Some(node.bytes()), &entry.value, pending)?;
                     out.push((key.to_vec(), value));
                 }
             }
@@ -2431,7 +2453,7 @@ impl<D: Device> CowBTree<D> {
                     if !bounds.admits(key) {
                         continue;
                     }
-                    let value = self.resolve_value_at(&entry.value, pending)?;
+                    let value = self.resolve_value_at(Some(node.bytes()), &entry.value, pending)?;
                     out.push((trailing_row_id(key)?, value));
                 }
             }
@@ -2498,7 +2520,7 @@ impl<D: Device> CowBTree<D> {
                         if !bounds.admits(key) {
                             return Ok(());
                         }
-                        let value = self.resolve_value_at(&value, pending)?;
+                        let value = self.resolve_value_at(None, &value, pending)?;
                         out.push((trailing_row_id(key)?, value));
                         Ok(())
                     })?;

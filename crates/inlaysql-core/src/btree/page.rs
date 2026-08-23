@@ -79,20 +79,23 @@ pub const KIND_OVERFLOW: u8 = 2;
 /// (`value_len u32 | value`); `tag 1` is overflow (`first page u64 | total
 /// length u64`).
 ///
-/// The inline case is `Rc<[u8]>`, not `Vec<u8>` (`AHL-478`): a decoded `Node`
-/// is cached behind its own `Rc` (`btree::cache::PageCache`), and every read
-/// that hits the cache used to clone these bytes byte-for-byte to hand a
-/// caller an owned `Vec<u8>` — `CowBTree::resolve_value_at`, the specific
-/// site `PERF.md` names as untouched and largest. Reference-counting the
-/// inline bytes too turns that clone into a refcount bump: still one
-/// allocation the first time a page is decoded off the device, and zero on
-/// every cache hit after that. Nothing about the on-disk format changes —
-/// this is purely how the decoded bytes are held in memory once read.
+/// The inline case is a *borrowed byte range* into the page's shared buffer
+/// when it came from a [`decode`], and an owned `Rc<[u8]>` when the write path
+/// or the raw-leaf scan materialised it. A decoded `Node` is cached behind its
+/// own `Rc` (`btree::cache::PageCache`), and every read that hits the cache
+/// used to clone these bytes byte-for-byte to hand a caller an owned `Vec<u8>`
+/// — `CowBTree::resolve_value_at`, the specific site `PERF.md` names as
+/// untouched and largest. Borrowing the range turns that into a refcount bump
+/// of the one shared page buffer: one allocation per page decode, zero per
+/// cell and zero on every cache hit after that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueRef {
-    /// The value bytes, stored in the leaf cell itself, shared with the
-    /// cached page they were decoded from.
-    Inline(Rc<[u8]>),
+    /// The value bytes, stored in the leaf cell itself, as a byte range into
+    /// the page's shared buffer.
+    Inline(Range<usize>),
+    /// The value bytes, owned because the write path or the raw-leaf scan had
+    /// to copy them out of a transient buffer (see [`ValueRef::Inline`]).
+    Owned(Rc<[u8]>),
     /// The value lives in a chain of overflow pages starting at `first`, and is
     /// `len` bytes long in total.
     Overflow {
@@ -101,6 +104,27 @@ pub enum ValueRef {
         /// Total length of the value across the whole chain, in bytes.
         len: usize,
     },
+}
+
+impl ValueRef {
+    /// The inline value bytes, borrowed from `bytes` or the owned value; `None`
+    /// for an overflow pointer.
+    pub fn inline_bytes<'a>(&'a self, bytes: &'a [u8]) -> Option<&'a [u8]> {
+        match self {
+            ValueRef::Inline(range) => Some(&bytes[range.clone()]),
+            ValueRef::Owned(value) => Some(value),
+            ValueRef::Overflow { .. } => None,
+        }
+    }
+
+    /// The byte length of the inline value, or `0` for an overflow pointer.
+    pub fn inline_len(&self) -> usize {
+        match self {
+            ValueRef::Inline(range) => range.len(),
+            ValueRef::Owned(value) => value.len(),
+            ValueRef::Overflow { .. } => 0,
+        }
+    }
 }
 
 /// A decoded key/value pair from a leaf page.
@@ -209,7 +233,7 @@ pub fn leaf_size(source: &[u8], entries: &[Entry]) -> usize {
 /// makes a split always possible — see [`leaf_split_point`]'s caller in
 /// `btree/tree.rs`.
 pub fn inline_entry_fits(page_size: usize, key: &[u8], value: &[u8]) -> bool {
-    HEADER_SIZE + SLOT_SIZE + leaf_cell_size(key, &ValueRef::Inline(Rc::from(value)))
+    HEADER_SIZE + SLOT_SIZE + leaf_cell_size(key, &ValueRef::Owned(Rc::from(value)))
         <= page_size / 2
 }
 
@@ -218,7 +242,7 @@ fn leaf_cell_size(key: &[u8], value: &ValueRef) -> usize {
     2 + key.len()
         + 1
         + match value {
-            ValueRef::Inline(bytes) => 4 + bytes.len(),
+            ValueRef::Inline(_) | ValueRef::Owned(_) => 4 + value.inline_len(),
             ValueRef::Overflow { .. } => 16,
         }
 }
@@ -366,7 +390,13 @@ fn encode_leaf_cell(source: &[u8], entry: &Entry) -> Result<Vec<u8>> {
     push_u16(&mut out, key.len())?;
     out.extend_from_slice(key);
     match &entry.value {
-        ValueRef::Inline(value) => {
+        ValueRef::Inline(range) => {
+            let value = &source[range.clone()];
+            out.push(VALUE_INLINE);
+            push_u32(&mut out, value.len())?;
+            out.extend_from_slice(value);
+        }
+        ValueRef::Owned(value) => {
             out.push(VALUE_INLINE);
             push_u32(&mut out, value.len())?;
             out.extend_from_slice(value);
@@ -454,7 +484,7 @@ fn decode_leaf_cell(bytes: &[u8], page_size: usize, slot: usize) -> Result<Entry
             }
             Ok(Entry {
                 key,
-                value: ValueRef::Inline(Rc::from(&bytes[key_end + 5..value_end])),
+                value: ValueRef::Inline(key_end + 5..value_end),
             })
         }
         VALUE_OVERFLOW => {
@@ -549,7 +579,7 @@ pub fn decode_leaf_cell_ref<'a>(
             }
             Ok(LeafCellRef {
                 key,
-                value: ValueRef::Inline(Rc::from(&bytes[key_end + 5..value_end])),
+                value: ValueRef::Owned(Rc::from(&bytes[key_end + 5..value_end])),
             })
         }
         VALUE_OVERFLOW => {
@@ -668,7 +698,7 @@ mod tests {
     fn entry(key: &[u8], value: &[u8]) -> Entry {
         Entry {
             key: Key::Owned(key.to_vec()),
-            value: ValueRef::Inline(Rc::from(value)),
+            value: ValueRef::Owned(Rc::from(value)),
         }
     }
 
@@ -692,7 +722,10 @@ mod tests {
         assert_eq!(decoded.len(), 3);
         for (entry, original) in decoded.iter().zip(entries.iter()) {
             assert_eq!(node.key(&entry.key), original.key.resolve(&[]));
-            assert_eq!(entry.value, original.value);
+            assert_eq!(
+                entry.value.inline_bytes(node.bytes()),
+                original.value.inline_bytes(&[])
+            );
         }
     }
 

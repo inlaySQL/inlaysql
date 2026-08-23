@@ -20,7 +20,7 @@
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::ops::Deref;
+use core::ops::{Deref, Range};
 
 use crate::error::{Error, Result};
 use crate::quantize::Q8Vector;
@@ -47,8 +47,13 @@ pub enum RowBuf {
     /// Bytes cloned or assembled outside the page cache: an overflow chain,
     /// or a row written by the open transaction and not yet committed.
     Owned(Vec<u8>),
-    /// Bytes shared with the cached page they were read from.
-    Shared(Rc<[u8]>),
+    /// A byte range into a page's shared buffer, held alive by the `Rc`.
+    Shared {
+        /// The page's shared buffer the row's bytes are a slice of.
+        bytes: Rc<[u8]>,
+        /// The row's byte range inside `bytes`.
+        range: Range<usize>,
+    },
 }
 
 impl RowBuf {
@@ -56,7 +61,7 @@ impl RowBuf {
     pub fn as_slice(&self) -> &[u8] {
         match self {
             RowBuf::Owned(bytes) => bytes,
-            RowBuf::Shared(bytes) => bytes,
+            RowBuf::Shared { bytes, range } => &bytes[range.clone()],
         }
     }
 
@@ -71,7 +76,7 @@ impl RowBuf {
     pub fn into_vec(self) -> Vec<u8> {
         match self {
             RowBuf::Owned(bytes) => bytes,
-            RowBuf::Shared(bytes) => bytes.to_vec(),
+            RowBuf::Shared { bytes, range } => bytes[range].to_vec(),
         }
     }
 }
@@ -98,7 +103,8 @@ impl From<Vec<u8>> for RowBuf {
 
 impl From<Rc<[u8]>> for RowBuf {
     fn from(bytes: Rc<[u8]>) -> Self {
-        RowBuf::Shared(bytes)
+        let range = 0..bytes.len();
+        RowBuf::Shared { bytes, range }
     }
 }
 
