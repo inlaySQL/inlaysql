@@ -30,6 +30,7 @@
 //! old materialising loop did.
 
 use alloc::boxed::Box;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -384,7 +385,21 @@ impl<'a> JoinInner<'a> {
         match self {
             JoinInner::Materialised { width, .. } => *width,
             JoinInner::Probe(probe) => probe.width,
-            JoinInner::Hash(hash) => hash.width,
+            JoinInner::Hash(hash) => hash.table.width(),
+        }
+    }
+
+    /// Whether this side is narrowed by a hash build.
+    pub fn is_hash(&self) -> bool {
+        matches!(self, JoinInner::Hash(_))
+    }
+
+    /// For an exact hash-key `ON`, verify one candidate without invoking the
+    /// generic expression evaluator. `None` means this is not a hash side.
+    fn hash_candidate_matches(&self, index: usize, outer: &[Value]) -> Option<bool> {
+        match self {
+            JoinInner::Hash(hash) => Some(hash.candidate_matches(index, outer)),
+            JoinInner::Materialised { .. } | JoinInner::Probe(_) => None,
         }
     }
 }
@@ -612,6 +627,21 @@ impl<'a> IndexProbe<'a> {
 /// "equal ⇒ same bucket" hold without any cross-class or case-folding
 /// normalisation here.
 pub(crate) struct HashJoin {
+    table: Rc<HashJoinTable>,
+    /// The joined-row ordinal the outer key is read from.
+    key: usize,
+    /// The bucket the last [`HashJoin::prepare`] selected; `usize::MAX` is the
+    /// empty sentinel (a `NULL` or missing key), which reads as an empty range.
+    current: usize,
+}
+
+/// The immutable, expensive half of a hash join.
+///
+/// It is separate from [`HashJoin`]'s per-execution probe cursor so an engine
+/// can retain one bounded prepared build across executions without sharing
+/// mutable query state. Rows never change under one committed MVCC snapshot;
+/// the engine versions and invalidates this object at that boundary.
+pub(crate) struct HashJoinTable {
     /// Every inner row, contiguous and grouped by bucket, so a probe reads one
     /// cache-friendly run instead of chasing a bucket header per lookup. Rows
     /// are placed in scan order and the scan is row-id ascending, so each
@@ -624,11 +654,8 @@ pub(crate) struct HashJoin {
     /// `offsets.len() - 2`, a power of two, so a hash indexes a bucket with a
     /// mask instead of a modulo.
     mask: usize,
-    /// The joined-row ordinal the outer key is read from.
-    key: usize,
-    /// The bucket the last [`HashJoin::prepare`] selected; `usize::MAX` is the
-    /// empty sentinel (a `NULL` or missing key), which reads as an empty range.
-    current: usize,
+    /// The inner row ordinal whose value selects a bucket.
+    inner_key: usize,
     /// The inner table's declared width, what a `LEFT JOIN` pads with.
     width: usize,
 }
@@ -644,14 +671,13 @@ impl HashJoin {
     /// whole inner side in one contiguous allocation and groups each bucket's
     /// rows adjacently, so a probe walks a single run instead of a chain of
     /// small allocations.
-    pub fn build(
+    pub fn build_table(
         storage: &dyn Storage,
         table: &str,
         mask: ColumnMask,
-        key: usize,
         inner_key: usize,
         width: usize,
-    ) -> Result<Self> {
+    ) -> Result<Rc<HashJoinTable>> {
         let mut rows: Vec<Vec<Value>> = Vec::new();
         for row in RowScan::new(storage, table) {
             rows.push(decode_row_masked(&row?.1, &mask)?);
@@ -685,21 +711,30 @@ impl HashJoin {
             placed[slot] = row;
             counts[bucket] = slot + 1;
         }
-        Ok(Self {
+        Ok(Rc::new(HashJoinTable {
             rows: placed,
             offsets,
             mask: mask_bits,
+            inner_key,
+            width,
+        }))
+    }
+
+    /// Attach one execution's outer-key ordinal and probe cursor to a shared
+    /// immutable build.
+    pub fn from_table(table: Rc<HashJoinTable>, key: usize) -> Self {
+        Self {
+            table,
             key,
             current: usize::MAX,
-            width,
-        })
+        }
     }
 
     /// Narrow the inner side to the bucket `outer`'s key selects.
     fn prepare(&mut self, outer: &[Value]) {
         self.current = match outer.get(self.key) {
             Some(Value::Null) | None => usize::MAX,
-            Some(value) => (hash_value(value) as usize) & self.mask,
+            Some(value) => (hash_value(value) as usize) & self.table.mask,
         };
     }
 
@@ -708,9 +743,68 @@ impl HashJoin {
         if self.current == usize::MAX {
             return &[];
         }
-        let start = self.offsets[self.current];
-        let end = self.offsets[self.current + 1];
-        &self.rows[start..end]
+        let start = self.table.offsets[self.current];
+        let end = self.table.offsets[self.current + 1];
+        &self.table.rows[start..end]
+    }
+
+    /// Compare the exact key after the bucket narrowed candidates. Hash
+    /// collisions remain possible, so equality cannot be omitted entirely.
+    fn candidate_matches(&self, index: usize, outer: &[Value]) -> bool {
+        let Some(outer) = outer.get(self.key) else {
+            return false;
+        };
+        self.rows()
+            .get(index)
+            .and_then(|row| row.get(self.table.inner_key))
+            .is_some_and(|inner| outer != &Value::Null && outer == inner)
+    }
+}
+
+impl HashJoinTable {
+    /// Conservative resident-memory accounting for the cache budget.
+    ///
+    /// The outer `Vec` owns every row header, each row owns its `Value` array,
+    /// and blob/vector/text payloads are counted as well. `Text` is an `Arc`,
+    /// but each decoded inner cell creates its own allocation before any probe
+    /// clones it, so charging its bytes here is the honest retained cost.
+    pub fn resident_bytes(&self) -> usize {
+        let mut bytes = core::mem::size_of::<Self>()
+            .saturating_add(
+                self.rows
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<Vec<Value>>()),
+            )
+            .saturating_add(
+                self.offsets
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<usize>()),
+            );
+        for row in &self.rows {
+            bytes =
+                bytes.saturating_add(row.capacity().saturating_mul(core::mem::size_of::<Value>()));
+            for value in row {
+                bytes = bytes.saturating_add(match value {
+                    Value::Text(text) => {
+                        text.len().saturating_add(2 * core::mem::size_of::<usize>())
+                    }
+                    Value::Blob(blob) => blob
+                        .capacity()
+                        .saturating_add(2 * core::mem::size_of::<usize>()),
+                    Value::Vector(vector) => vector
+                        .capacity()
+                        .saturating_mul(core::mem::size_of::<f32>())
+                        .saturating_add(2 * core::mem::size_of::<usize>()),
+                    Value::Null | Value::Integer(_) | Value::Real(_) => 0,
+                });
+            }
+        }
+        bytes
+    }
+
+    /// The declared inner width used to pad an unmatched `LEFT JOIN`.
+    fn width(&self) -> usize {
+        self.width
     }
 }
 
@@ -835,6 +929,100 @@ impl<'a> NestedLoopJoin<'a> {
             next: 0,
             matched: false,
         });
+        Ok(())
+    }
+
+    /// Consume a join into a borrowed-row callback, reusing the outer row's
+    /// value buffer for every candidate it produces.
+    ///
+    /// The iterator API has to hand ownership of every matching `Vec<Value>`
+    /// to its caller, so it cannot reclaim that allocation on the next
+    /// `next()`. A callback finishes with the slice before this method resumes:
+    /// truncate back to the outer width, append the next inner candidate, and
+    /// emit again. SQL filtering and `LEFT JOIN` padding are identical to the
+    /// iterator implementation below; only ownership changes.
+    pub fn try_for_each_borrowed(
+        mut self,
+        hash_key_is_full_on: bool,
+        mut each: impl FnMut(RowId, Option<f32>, &[Value]) -> Result<bool>,
+    ) -> Result<()> {
+        for row in self.outer.by_ref() {
+            let row = row?;
+            self.inner.prepare(&row.values)?;
+            let id = row.id;
+            let score = row.score;
+            let mut joined = row.values;
+            let outer_width = joined.len();
+            let mut matched = false;
+
+            for index in 0..self.inner.rows().len() {
+                joined.truncate(outer_width);
+                self.inner.append_row_into(index, &mut joined);
+                let keep = match (hash_key_is_full_on, self.on) {
+                    (true, Some(_)) => self
+                        .inner
+                        .hash_candidate_matches(index, &joined[..outer_width])
+                        .unwrap_or(false),
+                    (false, Some(on)) => {
+                        eval::is_truthy(&eval::evaluate(on, &joined, Computed::NONE, self.env)?)
+                    }
+                    (_, None) => true,
+                };
+                if keep {
+                    matched = true;
+                    if !each(id, score, &joined)? {
+                        return Ok(());
+                    }
+                }
+            }
+
+            if !matched && self.kind == JoinKind::Left {
+                joined.truncate(outer_width);
+                joined.extend(core::iter::repeat_n(Value::Null, self.inner.width()));
+                if !each(id, score, &joined)? {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume an exact-key hash join as borrowed outer/inner pairs.
+    ///
+    /// This is the fused form for a direct-column projection: the hash key is
+    /// the complete `ON`, so after rejecting a rare bucket collision there is
+    /// no expression that needs a contiguous joined row. The consumer can
+    /// address the two slices by ordinal and the operator never clones the
+    /// inner row into a temporary joined buffer.
+    pub fn try_for_each_hash_pair(
+        mut self,
+        mut each: impl FnMut(RowId, Option<f32>, &[Value], Option<&[Value]>) -> Result<bool>,
+    ) -> Result<()> {
+        debug_assert!(self.inner.is_hash());
+        for row in self.outer.by_ref() {
+            let row = row?;
+            self.inner.prepare(&row.values)?;
+            let id = row.id;
+            let score = row.score;
+            let mut matched = false;
+            for index in 0..self.inner.rows().len() {
+                if !self
+                    .inner
+                    .hash_candidate_matches(index, &row.values)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                matched = true;
+                let inner = &self.inner.rows()[index];
+                if !each(id, score, &row.values, Some(inner))? {
+                    return Ok(());
+                }
+            }
+            if !matched && self.kind == JoinKind::Left && !each(id, score, &row.values, None)? {
+                return Ok(());
+            }
+        }
         Ok(())
     }
 }

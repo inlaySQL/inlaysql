@@ -282,12 +282,11 @@ fn inlaysql_joins(
         let started = Instant::now();
         for _ in 0..repeats {
             let at = Instant::now();
-            let result = db.query_prepared(stmt, &[])?;
-            debug_assert_eq!(
-                result.rows.len(),
-                expected,
-                "row count changed between runs"
-            );
+            // SQLite's side below steps and drops one row at a time. Use the
+            // matching InlaySQL API rather than retaining a `Vec<Vec<Value>>`
+            // that the workload only inspects for its count.
+            let rows_returned = db.query_prepared_each(stmt, &[], |_| Ok(()))?;
+            debug_assert_eq!(rows_returned, expected, "row count changed between runs");
             samples.push(at.elapsed());
         }
         Ok(Timing {
