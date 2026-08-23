@@ -3,18 +3,18 @@
 //!
 //! # What is being compared
 //!
-//! The AHL-464 shape: `posts.user_id = users.id`, in both directions the
-//! index nested-loop join rule (`Engine::join_probe`,
-//! `crates/inlaysql-core/src/engine.rs`) actually takes:
+//! The AHL-464 shape: `posts.user_id = users.id`, in both directions the join
+//! rule (`Engine::join_inner`, `crates/inlaysql-core/src/engine.rs`) actually
+//! takes — a full scan hashes the inner table, while a `LIMIT` keeps the index
+//! nested-loop probe:
 //!
 //! * **PK inner** — `FROM posts JOIN users ON posts.user_id = users.id`. The
 //!   inner table is `users`, and the join key is `users.id`, its `INTEGER
-//!   PRIMARY KEY`, so each outer row costs one tree descent.
+//!   PRIMARY KEY`.
 //! * **Secondary-index inner** — `FROM users JOIN posts ON posts.user_id =
 //!   users.id`. The inner table is `posts`, and the join key is
 //!   `posts.user_id`, a scalar B-tree index (`CREATE INDEX posts_user_id ON
-//!   posts (user_id)`), so each outer row costs an index entry-range read
-//!   plus one descent per matched post. This is the exact query `PERF.md`
+//!   posts (user_id)`). This is the exact query `PERF.md`
 //!   names: "`SELECT ... FROM users JOIN posts ON posts.user_id = users.id`
 //!   reads the posts one user has rather than the posts table."
 //!
@@ -22,9 +22,12 @@
 //! is a stage of the streaming pipeline (AHL-462) and a `LIMIT` on an
 //! unindexed-order plan stops the outer scan as soon as it has enough rows —
 //! `PERF.md` gives the counted case (`LIMIT 2` over a probed join fetches two
-//! inner rows, not the whole inner table). Whether that shows up as a
-//! wall-clock win over SQLite, which has no equivalent streaming guarantee, is
-//! exactly what this row is for finding out rather than asserting.
+//! inner rows, not the whole inner table). Without a `LIMIT` the same query
+//! builds a hash table over the inner side instead of probing it once per
+//! outer row. Whether either shows up as a
+//! wall-clock win over SQLite, which has no equivalent streaming guarantee and
+//! no hash join, is exactly what this row is for finding out rather than
+//! asserting.
 //!
 //! There is no unindexed/materialising row here — that fallback path (an
 //! equality that is not on the inner table's key or a leading index column)

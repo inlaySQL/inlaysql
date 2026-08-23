@@ -319,6 +319,8 @@ pub(crate) enum JoinInner<'a> {
     },
     /// The rows one outer key names, fetched per outer row (Phase 2 item 4).
     Probe(Box<IndexProbe<'a>>),
+    /// The inner table keyed into a hash table, probed per outer row in O(1).
+    Hash(HashJoin),
 }
 
 impl<'a> JoinInner<'a> {
@@ -335,6 +337,10 @@ impl<'a> JoinInner<'a> {
         match self {
             JoinInner::Materialised { .. } => Ok(()),
             JoinInner::Probe(probe) => probe.prepare(outer),
+            JoinInner::Hash(hash) => {
+                hash.prepare(outer);
+                Ok(())
+            }
         }
     }
 
@@ -343,6 +349,7 @@ impl<'a> JoinInner<'a> {
         match self {
             JoinInner::Materialised { rows, .. } => rows,
             JoinInner::Probe(probe) => probe.rows(),
+            JoinInner::Hash(hash) => hash.rows(),
         }
     }
 
@@ -356,11 +363,14 @@ impl<'a> JoinInner<'a> {
     /// read again after this outer row's pairing loop moves past them — they
     /// were already decoded once, by `IndexProbe::fetch`, so cloning them a
     /// second time into the pairing buffer was pure waste. This takes instead:
-    /// one decode per row, not one decode plus one clone.
+    /// one decode per row, not one decode plus one clone. A hash join's rows
+    /// are shared across every outer row that reaches their bucket, so they
+    /// clone, the same as the materialised side.
     fn take_row(&mut self, index: usize) -> Vec<Value> {
         match self {
             JoinInner::Materialised { rows, .. } => rows[index].clone(),
             JoinInner::Probe(probe) => probe.take_row(index),
+            JoinInner::Hash(hash) => hash.rows()[index].clone(),
         }
     }
 
@@ -369,6 +379,7 @@ impl<'a> JoinInner<'a> {
         match self {
             JoinInner::Materialised { width, .. } => *width,
             JoinInner::Probe(probe) => probe.width,
+            JoinInner::Hash(hash) => hash.width,
         }
     }
 }
@@ -573,6 +584,121 @@ impl<'a> IndexProbe<'a> {
             _ => core::mem::take(&mut self.matched[index]),
         }
     }
+}
+
+/// A join's inner side, materialised once and keyed into a hash table.
+///
+/// The alternative to [`IndexProbe`] for a full-scan equi-join: instead of one
+/// B-tree descent per outer row, the whole inner table is read once, bucketed
+/// by the join key, and each outer row then reads its own bucket in O(1). That
+/// trades an up-front O(inner) scan and build for O(outer) probes, which wins
+/// whenever the outer side is large — the common ORM join — and loses when a
+/// `LIMIT` would have let an index probe stop after a few outer rows, which is
+/// why the planner (see [`crate::engine::Engine::join_inner`]) only hands one
+/// out on a full scan.
+///
+/// # Correctness
+///
+/// The hash is a *candidate* narrowing, exactly like [`IndexProbe`]: the `ON`
+/// is still re-evaluated over every row the bucket holds. For that to never
+/// miss a pair, two keys the `ON`'s equality compares equal must hash to the
+/// same bucket. The planner only builds one when the two key columns share a
+/// declared storage class and the collation is binary, which is what makes
+/// "equal ⇒ same bucket" hold without any cross-class or case-folding
+/// normalisation here.
+pub(crate) struct HashJoin {
+    /// The inner rows, bucketed by the hash of their key. Rows are inserted in
+    /// scan order and the scan is row-id ascending, so each bucket is row-id
+    /// ascending — the order the materialising path would have replayed them
+    /// in, so the pairs come out in the same order.
+    buckets: Vec<Vec<Vec<Value>>>,
+    /// `buckets.len() - 1`, a power of two, so a hash indexes a bucket with a
+    /// mask instead of a modulo.
+    mask: usize,
+    /// The joined-row ordinal the outer key is read from.
+    key: usize,
+    /// The bucket the last [`HashJoin::prepare`] selected; `usize::MAX` is the
+    /// empty sentinel (a `NULL` or missing key), which indexes past the end of
+    /// `buckets` and reads as no rows.
+    current: usize,
+    /// The inner table's declared width, what a `LEFT JOIN` pads with.
+    width: usize,
+}
+
+impl HashJoin {
+    /// Build the hash table by scanning `table` once, keying each decoded row
+    /// on its `inner_key` column and remembering where the outer key is read
+    /// from.
+    pub fn build(
+        storage: &dyn Storage,
+        table: &str,
+        mask: ColumnMask,
+        key: usize,
+        inner_key: usize,
+        width: usize,
+    ) -> Result<Self> {
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for row in RowScan::new(storage, table) {
+            rows.push(decode_row_masked(&row?.1, &mask)?);
+        }
+        let buckets_len = rows.len().next_power_of_two().max(16);
+        let mask_bits = buckets_len - 1;
+        let mut buckets: Vec<Vec<Vec<Value>>> = (0..buckets_len).map(|_| Vec::new()).collect();
+        for row in rows {
+            let bucket = (hash_value(&row[inner_key]) as usize) & mask_bits;
+            buckets[bucket].push(row);
+        }
+        Ok(Self {
+            buckets,
+            mask: mask_bits,
+            key,
+            current: usize::MAX,
+            width,
+        })
+    }
+
+    /// Narrow the inner side to the bucket `outer`'s key selects.
+    fn prepare(&mut self, outer: &[Value]) {
+        self.current = match outer.get(self.key) {
+            Some(Value::Null) | None => usize::MAX,
+            Some(value) => (hash_value(value) as usize) & self.mask,
+        };
+    }
+
+    /// The bucket [`HashJoin::prepare`] selected.
+    fn rows(&self) -> &[Vec<Value>] {
+        match self.buckets.get(self.current) {
+            Some(bucket) => bucket,
+            None => &[],
+        }
+    }
+}
+
+/// The bucket a key selects.
+///
+/// [`HashJoin`] is only built for a same-class, binary-collation key, so this
+/// matches on the value's class and no two keys the `ON`'s equality compares
+/// equal can land in different buckets.
+fn hash_value(value: &Value) -> u64 {
+    match value {
+        Value::Integer(integer) => (*integer as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        Value::Text(text) => fnv1a(text.as_bytes()),
+        Value::Blob(bytes) => fnv1a(bytes),
+        // A `NULL`/`REAL`/`VECTOR` key never reaches here: `NULL` is handled
+        // before the hash is asked, and the planner refuses those classes.
+        Value::Null | Value::Real(_) | Value::Vector(_) => 0,
+    }
+}
+
+/// FNV-1a, chosen because it is deterministic and `no_std`: the hash only has
+/// to be stable and well-spread, not cryptographic.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    hash
 }
 
 /// The row id a key names, when it names one.

@@ -30,16 +30,16 @@ use crate::collation::Collation;
 use crate::error::{Error, Result};
 use crate::eval::{self, Computed, Env, SharedRng, SubqueryRunner};
 use crate::exec::{
-    Decode, DecodeFilter, ExecRow, Filter, IndexProbe, JoinInner, NestedLoopJoin, ProbeKind,
-    RowBytes, RowStream,
+    Decode, DecodeFilter, ExecRow, Filter, HashJoin, IndexProbe, JoinInner, NestedLoopJoin,
+    ProbeKind, RowBytes, RowStream,
 };
 use crate::fusion::{reciprocal_rank_fusion, sort_by_score_desc};
 use crate::hnsw_paged::PagedHnswIndex;
 use crate::plan::{
     Aggregate, AlterAction, AlterTablePlan, ConflictAction, ConflictUpdate, CreateTablePlan,
-    DeletePlan, DropTablePlan, FrameBound, InsertPlan, InsertSource, OnConflict, Order, OrderKey,
-    Plan, ScalarPlan, ScoreExpr, SelectItem, SelectPlan, SetOp, SetOperationPlan, SubqueryBody,
-    UpdatePlan, WindowFn, WindowFunc,
+    DeletePlan, DropTablePlan, FrameBound, FromItem, InsertPlan, InsertSource, OnConflict, Order,
+    OrderKey, Plan, ScalarPlan, ScoreExpr, SelectItem, SelectPlan, SetOp, SetOperationPlan,
+    SubqueryBody, UpdatePlan, WindowFn, WindowFunc,
 };
 use crate::row::{decode_row, decode_row_masked, encode_typed_row, ColumnMask, RowBuf};
 use crate::shared::SharedStorage;
@@ -3206,6 +3206,19 @@ impl Engine {
         // fetch — see [`Engine::retrieve_filtered`] — because a fixed candidate
         // budget filtered afterwards under-fills a restrictive `WHERE`.
         let params = env.params();
+
+        // A join's inner side is chosen here rather than per row. A hash join
+        // pays an up-front O(inner) scan to build its table, then O(1) per
+        // outer row; an index probe pays a B-tree descent per outer row with no
+        // build. The hash join therefore wins only when the outer side is
+        // scanned in full — a `LIMIT` (or an `EXISTS` cap, which `fetch`
+        // already reflects) would have stopped after a few outer rows and made
+        // the probe cheaper, and a `WHERE` that pins the primary key makes the
+        // outer side a single row. Score queries are excluded because their
+        // driving side is a bounded candidate set, not a scan of the table.
+        let driving_is_a_point_lookup =
+            pinned_rowid(&driving.table, plan.filter.as_ref(), params).is_some();
+        let full_scan = fetch.is_none() && plan.score.is_none() && !driving_is_a_point_lookup;
         let mut stream: RowStream<'_> = if plan.joins.is_empty() {
             match (&driving.derived, &plan.score, &plan.filter) {
                 // A derived table has no storage to stream from, so it
@@ -3281,7 +3294,14 @@ impl Engine {
                         rows: self.run_body(body, env, None)?,
                         width,
                     },
-                    None => self.join_inner(&inner.table, offset_of, join.on.as_ref(), &mask)?,
+                    None => self.join_inner(
+                        &plan.from,
+                        index + 1,
+                        offset_of,
+                        join.on.as_ref(),
+                        &mask,
+                        full_scan,
+                    )?,
                 };
                 offset_of += width;
                 stream = Box::new(NestedLoopJoin::new(
@@ -3412,20 +3432,40 @@ impl Engine {
         ))
     }
 
-    /// Where one join's inner rows come from: an index probe when the `ON`
-    /// justifies one, the whole table otherwise.
+    /// Where one join's inner rows come from: a hash table on a full scan, an
+    /// index probe when the `ON` justifies one, the whole table otherwise.
     ///
     /// `offset_of` is where the inner table's columns begin in the joined row,
     /// which is what translates the plan's ordinals — held against the
-    /// concatenation of every table in `FROM` order — onto this table.
+    /// concatenation of every table in `FROM` order — onto this table. `from`
+    /// and `inner_index` name the tables before and at the join, so a hash-join
+    /// key can be checked for a matching declared class on both sides.
     fn join_inner(
         &self,
-        inner: &Table,
+        from: &[FromItem],
+        inner_index: usize,
         offset_of: usize,
         on: Option<&crate::plan::Expr>,
         mask: &ColumnMask,
+        full_scan: bool,
     ) -> Result<JoinInner<'_>> {
+        let inner = &from[inner_index].table;
         let inner_mask = mask.slice(offset_of, inner.columns.len());
+
+        if full_scan {
+            if let Some((key, _ty)) = hash_join_key(from, inner_index, offset_of, on) {
+                let hash = HashJoin::build(
+                    &self.storage,
+                    &inner.name,
+                    inner_mask,
+                    key.outer,
+                    key.inner,
+                    inner.columns.len(),
+                )?;
+                return Ok(JoinInner::Hash(hash));
+            }
+        }
+
         match self.join_probe(inner, offset_of, on) {
             Some((key, ty, collation, kind)) => Ok(JoinInner::probe(IndexProbe::new(
                 &self.storage,
@@ -4272,6 +4312,60 @@ struct JoinKey {
     /// materialising path finds would make the join's answer depend on whether
     /// an index happened to exist.
     collation: Collation,
+}
+
+/// The join key a hash join can build on, or `None` when none qualifies.
+///
+/// A hash join can only be handed a key whose equality it can reproduce with a
+/// hash: the two columns have to share a declared storage class (so equal
+/// values are the same [`Value`] class and hash alike — an `INTEGER` next to a
+/// `REAL` compares as `f64` and would need normalisation the hash does not do)
+/// and the collation has to be binary (a `NOCASE` text key would fold two
+/// byte-unequal texts into one match). [`HashJoin`] re-evaluates the `ON` over
+/// its candidates, so a hash that *over*-groups is slow, but one that splits
+/// equal keys apart is wrong — which is what both conditions rule out.
+fn hash_join_key(
+    from: &[FromItem],
+    inner_index: usize,
+    offset_of: usize,
+    on: Option<&crate::plan::Expr>,
+) -> Option<(JoinKey, DataType)> {
+    let inner = &from[inner_index].table;
+    let mut keys = Vec::new();
+    collect_join_keys(on?, offset_of, inner.columns.len(), &mut keys);
+    for key in keys {
+        if key.collation != Collation::Binary {
+            continue;
+        }
+        let inner_ty = inner.columns[key.inner].ty;
+        if !matches!(
+            inner_ty,
+            DataType::Integer | DataType::Text | DataType::Blob
+        ) {
+            continue;
+        }
+        if outer_column_type(from, inner_index, key.outer) == inner_ty {
+            return Some((key, inner_ty));
+        }
+    }
+    None
+}
+
+/// The declared type of a joined-row column that belongs to one of the tables
+/// the join has already produced, i.e. an ordinal below `offset_of`.
+fn outer_column_type(from: &[FromItem], inner_index: usize, ordinal: usize) -> DataType {
+    let mut base = 0;
+    for item in &from[..inner_index] {
+        let width = item.table.columns.len();
+        if ordinal < base + width {
+            return item.table.columns[ordinal - base].ty;
+        }
+        base += width;
+    }
+    // Unreachable for a valid plan — a join key's outer ordinal is below
+    // `offset_of`, the sum of these widths. `Numeric` never equals a hashable
+    // class, so a plan that somehow reached here simply declines the hash join.
+    DataType::Numeric
 }
 
 /// Whether a probe of `value` against a column declared `ty` can be answered
