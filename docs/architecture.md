@@ -86,10 +86,15 @@ still shows decode dominating after streaming lands.
 
 ### D6 — Planner stays rule-based, gets real rules (cost model later)
 Before a cost model, add the rules that pay: equality/range predicate → B-tree index
-probe (G4's new indexes), index nested-loop join when the `ON` is an equality on the
-inner table's PK or an indexed column, LIMIT/projection pushdown, and `COUNT(*)`
-fast path. A genuine cost-based planner (statistics, join reordering) is later work,
-after ANALYZE-style stats exist. Do not build the cost model before the access paths.
+probe (G4's new indexes), an index nested-loop join when the `ON` is an equality on the
+inner table's PK or an indexed column, and a hash join of the inner table for a
+full-scan equi-join on same-storage-class keys, LIMIT/projection pushdown, and
+`COUNT(*)` fast path. The join split is by shape, not size: a `LIMIT` or a
+point-pinning `WHERE` keeps the probe (few outer rows → few descents), while a full
+scan prefers the hash table (one O(inner) build amortised over every outer row). A
+genuine cost-based planner (statistics, join reordering, choosing hash vs probe by
+cardinality) is later work, after ANALYZE-style stats exist. Do not build the cost
+model before the access paths.
 
 ### D7 — Types follow SQLite affinity, not strict names
 Replace the strict `resolve_data_type` whitelist with SQLite's affinity rules

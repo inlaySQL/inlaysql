@@ -1128,10 +1128,13 @@ fn joins_agree_with_and_without_the_index() {
     ]);
 }
 
-/// The point of the whole change: the inner table is probed, not walked.
+/// The index probe is the access path an *early-stopping* join takes: with a
+/// `LIMIT`, the inner table is probed, not walked.
 ///
 /// The driving table is still scanned — it has to be — so this is asserted per
-/// table rather than per statement.
+/// table rather than per statement. A full scan (no `LIMIT`) prefers the hash
+/// join instead; see
+/// [`a_full_scan_join_builds_a_hash_table_instead_of_probing`].
 #[test]
 fn an_indexed_join_probes_the_inner_table_instead_of_scanning_it() {
     let (mut indexed, probe) = engine();
@@ -1144,13 +1147,13 @@ fn an_indexed_join_probes_the_inner_table_instead_of_scanning_it() {
 
     for sql in [
         // By secondary index.
-        "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k",
-        "SELECT a.id, b.id FROM a LEFT JOIN b ON b.k = a.k",
-        "SELECT a.id, b.id FROM a JOIN b ON a.s = b.s",
+        "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k LIMIT 2",
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON b.k = a.k LIMIT 2",
+        "SELECT a.id, b.id FROM a JOIN b ON a.s = b.s LIMIT 2",
         // By row id.
-        "SELECT a.id, b.id FROM a JOIN b ON a.k = b.id",
+        "SELECT a.id, b.id FROM a JOIN b ON a.k = b.id LIMIT 2",
         // With a residual conjunct, which does not disturb the probe.
-        "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND a.s = b.s",
+        "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND a.s = b.s LIMIT 2",
     ] {
         probe.reset();
         rows(&mut indexed, sql, &[]);
@@ -1167,10 +1170,54 @@ fn an_indexed_join_probes_the_inner_table_instead_of_scanning_it() {
     plain_probe.reset();
     rows(
         &mut plain,
-        "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k",
+        "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k LIMIT 2",
         &[],
     );
     assert!(plain_probe.scans_of("b") > 0);
+}
+
+/// A full scan prefers the hash join over the index probe: the inner table is
+/// read once into buckets, not descended into once per outer row.
+///
+/// This is the O(inner) build + O(outer) probe trade against the index probe's
+/// O(outer) descents: it wins when the outer side is scanned in full and loses
+/// when a `LIMIT` stops the scan early — which is exactly the split the two
+/// tests around this one draw.
+#[test]
+fn a_full_scan_join_builds_a_hash_table_instead_of_probing() {
+    let (mut indexed, probe) = engine();
+    let (mut plain, _) = engine();
+    for engine in [&mut indexed, &mut plain] {
+        for sql in JOIN_SETUP {
+            run(engine, sql);
+        }
+    }
+    for sql in JOIN_INDEXES {
+        run(&mut indexed, sql);
+    }
+
+    for sql in [
+        "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k",
+        "SELECT a.id, b.id FROM a LEFT JOIN b ON a.k = b.k",
+        "SELECT a.id, b.id FROM a JOIN b ON a.s = b.s",
+        "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k AND a.s = b.s",
+    ] {
+        probe.reset();
+        let indexed_rows = rows(&mut indexed, sql, &[]);
+        // The hash join scans the inner table once to build, and never does a
+        // point read by row id.
+        assert!(
+            probe.scans_of("b") > 0,
+            "`{sql}` did not scan the inner table to build the hash"
+        );
+        assert_eq!(probe.reads.get(), 0, "`{sql}` probed by row id instead");
+        // And it answers exactly as the unindexed scan does.
+        assert_eq!(
+            indexed_rows,
+            rows(&mut plain, sql, &[]),
+            "`{sql}` disagreed with the unindexed scan"
+        );
+    }
 }
 
 /// Every shape the rule declines, and it must decline rather than guess: each
@@ -1219,6 +1266,9 @@ fn a_join_the_rule_does_not_cover_falls_back_to_the_scan() {
 /// id, so a probe that handed them on as it read them would emit the pairs in an
 /// order the materialising path never produces. Here the second column's order
 /// is deliberately the reverse of the row-id order.
+///
+/// A `LIMIT` is what selects the probe path here: a full scan would hash the
+/// inner table and never consult this index.
 #[test]
 fn a_composite_index_answers_a_join_on_its_leading_column_in_row_id_order() {
     let (mut indexed, probe) = engine();
@@ -1239,7 +1289,7 @@ fn a_composite_index_answers_a_join_on_its_leading_column_in_row_id_order() {
     }
     run(&mut indexed, "CREATE INDEX b_ks ON b (k, s)");
 
-    let sql = "SELECT b.id FROM a JOIN b ON a.k = b.k";
+    let sql = "SELECT b.id FROM a JOIN b ON a.k = b.k LIMIT 4";
     probe.reset();
     let probed = rows(&mut indexed, sql, &[]);
     assert_eq!(probe.scans_of("b"), 0, "the composite index was not used");

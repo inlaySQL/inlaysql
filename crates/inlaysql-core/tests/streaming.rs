@@ -582,9 +582,14 @@ fn pairs(engine: &mut Engine, sql: &str) -> Vec<Vec<Value>> {
 /// reads all 2,000 before the first pair; the probe reads five rows, one per
 /// outer row, and never scans the inner table at all. Both answer the same
 /// thing, which is what makes the numbers worth comparing.
+///
+/// The `LIMIT` is what selects the probe here: a full scan (no `LIMIT`) would
+/// hash the inner table instead — see
+/// `a_full_scan_join_builds_a_hash_table_instead_of_probing` in
+/// `btree_index.rs`.
 #[test]
 fn a_probed_join_does_not_read_the_whole_inner_table() {
-    let sql = "SELECT o.id, i.body FROM o JOIN i ON o.k = i.k";
+    let sql = "SELECT o.id, i.body FROM o JOIN i ON o.k = i.k LIMIT 5";
 
     let (mut plain, plain_counts) = probe_tables(5, 2000, false);
     let expected = pairs(&mut plain, sql);
@@ -612,11 +617,12 @@ fn a_probed_join_does_not_read_the_whole_inner_table() {
 }
 
 /// The same for a probe by `INTEGER PRIMARY KEY`, which needs no secondary
-/// index at all: one tree descent per outer row.
+/// index at all: one tree descent per outer row. The `LIMIT` selects the probe
+/// path, where a full scan would hash the inner table.
 #[test]
 fn a_row_id_probe_reads_one_inner_row_per_outer_row() {
     let (mut engine, counts) = probe_tables(5, 2000, false);
-    let sql = "SELECT o.id, i.body FROM o JOIN i ON o.k = i.id";
+    let sql = "SELECT o.id, i.body FROM o JOIN i ON o.k = i.id LIMIT 5";
     assert_eq!(pairs(&mut engine, sql).len(), 5);
     assert!(
         counts.rows.get() < 100,
@@ -624,6 +630,28 @@ fn a_row_id_probe_reads_one_inner_row_per_outer_row() {
         counts.rows.get()
     );
     assert_eq!(counts.reads.get(), 5);
+}
+
+/// A full scan (no `LIMIT`, no point-pinning `WHERE`) prefers the hash join:
+/// the inner table is read once into buckets, and no outer row pays a descent.
+/// Correctness is unchanged — the answer is the same the materialising path
+/// gives — which is what makes the access-path choice safe to make by shape
+/// alone.
+#[test]
+fn a_full_scan_join_hashes_the_inner_table_once() {
+    let sql = "SELECT o.id, i.body FROM o JOIN i ON o.k = i.k";
+
+    let (mut plain, _) = probe_tables(5, 2000, false);
+    let expected = pairs(&mut plain, sql);
+
+    let (mut indexed, counts) = probe_tables(5, 2000, true);
+    assert_eq!(pairs(&mut indexed, sql), expected);
+    // The inner table is scanned to build the hash — no point reads at all.
+    assert!(
+        counts.rows.get() >= 2000,
+        "the hash join did not scan the inner table"
+    );
+    assert_eq!(counts.reads.get(), 0, "the hash join probed by row id");
 }
 
 /// A `LIMIT` on the outer side short-circuits the whole thing: the outer scan
