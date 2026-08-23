@@ -90,7 +90,7 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::mem::size_of;
 
-use super::page::{Entry, Node, PageId, Separator, ValueRef};
+use super::page::{Entry, Key, Node, PageId, Separator, ValueRef};
 
 /// Default page cache budget, in bytes, for one open database handle.
 ///
@@ -110,11 +110,14 @@ const ALLOC_OVERHEAD: usize = 16;
 /// size classes. It counts the `Vec` of cells, each cell's key, and each
 /// inline value, plus a constant per allocation.
 pub fn node_footprint(node: &Node) -> usize {
+    let mut total = size_of::<Node>() + ALLOC_OVERHEAD + node.bytes().len() + ALLOC_OVERHEAD;
     match node {
-        Node::Leaf(entries) => {
-            let mut total = size_of::<Node>() + ALLOC_OVERHEAD + entries.len() * size_of::<Entry>();
+        Node::Leaf { entries, .. } => {
+            total += entries.len() * size_of::<Entry>() + ALLOC_OVERHEAD;
             for entry in entries {
-                total += entry.key.len() + ALLOC_OVERHEAD;
+                if let Key::Owned(bytes) = &entry.key {
+                    total += bytes.len() + ALLOC_OVERHEAD;
+                }
                 if let ValueRef::Inline(bytes) = &entry.value {
                     total += bytes.len() + ALLOC_OVERHEAD;
                 }
@@ -122,10 +125,11 @@ pub fn node_footprint(node: &Node) -> usize {
             total
         }
         Node::Internal { cells, .. } => {
-            let mut total =
-                size_of::<Node>() + ALLOC_OVERHEAD + cells.len() * size_of::<Separator>();
+            total += cells.len() * size_of::<Separator>() + ALLOC_OVERHEAD;
             for cell in cells {
-                total += cell.key.len() + ALLOC_OVERHEAD;
+                if let Key::Owned(bytes) = &cell.key {
+                    total += bytes.len() + ALLOC_OVERHEAD;
+                }
             }
             total
         }
@@ -352,10 +356,13 @@ mod tests {
     use alloc::vec;
 
     fn leaf(key: &[u8]) -> Rc<Node> {
-        Rc::new(Node::Leaf(vec![Entry {
-            key: key.to_vec(),
-            value: ValueRef::Inline(Rc::from(vec![0u8; 32])),
-        }]))
+        Rc::new(Node::Leaf {
+            bytes: Rc::from(&[][..]),
+            entries: vec![Entry {
+                key: Key::Owned(key.to_vec()),
+                value: ValueRef::Inline(Rc::from(vec![0u8; 32])),
+            }],
+        })
     }
 
     fn cache_of(entries: usize) -> PageCache {

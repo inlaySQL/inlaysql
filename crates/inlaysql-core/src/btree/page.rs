@@ -30,6 +30,7 @@ use alloc::rc::Rc;
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ops::Range;
 
 use crate::error::{Error, Result};
 
@@ -103,10 +104,16 @@ pub enum ValueRef {
 }
 
 /// A decoded key/value pair from a leaf page.
+///
+/// The key is either a byte range into the page's shared buffer or an owned
+/// `Vec<u8>` for a key the write path has just produced. A page *decode*
+/// always produces the borrowed form, so a cache miss allocates one shared
+/// buffer plus a view per cell where it used to allocate one owned `Vec` per
+/// key; the owned form exists only for keys a split/insert is about to encode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     /// The key.
-    pub key: Vec<u8>,
+    pub key: Key,
     /// The value — inline bytes, or a pointer to an overflow chain.
     pub value: ValueRef,
 }
@@ -115,18 +122,45 @@ pub struct Entry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Separator {
     /// The smallest key in `child`'s subtree at split time.
-    pub key: Vec<u8>,
+    pub key: Key,
     /// The child page to the right of this separator.
     pub child: PageId,
+}
+
+/// A key, borrowed from a node's shared page buffer or owned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Key {
+    /// A byte range into the node's shared [`Node::bytes`].
+    Borrowed(Range<usize>),
+    /// A key the write path produced and has not yet encoded into a page.
+    Owned(Vec<u8>),
+}
+
+impl Key {
+    /// The key bytes, borrowed from `bytes` or the owned key.
+    pub fn resolve<'a>(&'a self, bytes: &'a [u8]) -> &'a [u8] {
+        match self {
+            Key::Borrowed(range) => &bytes[range.clone()],
+            Key::Owned(key) => key,
+        }
+    }
 }
 
 /// A decoded B-tree node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Node {
     /// A leaf holding its entries in key order.
-    Leaf(Vec<Entry>),
+    Leaf {
+        /// The raw page bytes every borrowed key range indexes into, shared by
+        /// the page cache so a cache hit is a refcount bump with no re-decode.
+        bytes: Rc<[u8]>,
+        /// The cells, in key order.
+        entries: Vec<Entry>,
+    },
     /// An internal node holding the leftmost child and separator cells.
     Internal {
+        /// The raw page bytes every borrowed separator key range indexes into.
+        bytes: Rc<[u8]>,
         /// The child to the left of every separator.
         leftmost: PageId,
         /// Separator cells, in key order.
@@ -134,13 +168,33 @@ pub enum Node {
     },
 }
 
+impl Node {
+    /// The shared page bytes this node's borrowed keys index into.
+    pub fn bytes(&self) -> &Rc<[u8]> {
+        match self {
+            Node::Leaf { bytes, .. } | Node::Internal { bytes, .. } => bytes,
+        }
+    }
+
+    /// The key bytes, borrowed from the shared page buffer or the owned key.
+    pub fn key<'a>(&'a self, key: &'a Key) -> &'a [u8] {
+        match key {
+            Key::Borrowed(range) => &self.bytes()[range.clone()],
+            Key::Owned(bytes) => bytes,
+        }
+    }
+}
+
 /// Number of bytes a leaf page needs to hold `entries`.
-pub fn leaf_size(entries: &[Entry]) -> usize {
+///
+/// `source` is the shared page bytes the entries' borrowed key ranges index
+/// into.
+pub fn leaf_size(source: &[u8], entries: &[Entry]) -> usize {
     HEADER_SIZE
         + SLOT_SIZE * entries.len()
         + entries
             .iter()
-            .map(|e| leaf_cell_size(&e.key, &e.value))
+            .map(|e| leaf_cell_size(key_bytes(source, &e.key), &e.value))
             .sum::<usize>()
 }
 
@@ -169,23 +223,49 @@ fn leaf_cell_size(key: &[u8], value: &ValueRef) -> usize {
         }
 }
 
+/// The key bytes for `key`, borrowed from `source` or the owned key.
+fn key_bytes<'a>(source: &'a [u8], key: &'a Key) -> &'a [u8] {
+    match key {
+        Key::Borrowed(range) => &source[range.clone()],
+        Key::Owned(bytes) => bytes,
+    }
+}
+
 /// Number of bytes an internal page needs to hold `cells`.
-pub fn internal_size(cells: &[Separator]) -> usize {
-    HEADER_SIZE + SLOT_SIZE * cells.len() + cells.iter().map(|c| 2 + c.key.len() + 8).sum::<usize>()
+///
+/// `source` is the shared page bytes the cells' borrowed key ranges index into.
+pub fn internal_size(source: &[u8], cells: &[Separator]) -> usize {
+    HEADER_SIZE
+        + SLOT_SIZE * cells.len()
+        + cells
+            .iter()
+            .map(|c| 2 + key_bytes(source, &c.key).len() + 8)
+            .sum::<usize>()
 }
 
 /// Encode a leaf page.
-pub fn encode_leaf(page_size: usize, entries: &[Entry]) -> Result<Vec<u8>> {
+///
+/// `source` is the shared page bytes the entries' borrowed key ranges index
+/// into; the encoded page copies those key bytes out of it.
+pub fn encode_leaf(page_size: usize, source: &[u8], entries: &[Entry]) -> Result<Vec<u8>> {
     let contents = entries
         .iter()
-        .map(encode_leaf_cell)
+        .map(|entry| encode_leaf_cell(source, entry))
         .collect::<Result<Vec<_>>>()?;
     encode_page(page_size, KIND_LEAF, 0, &contents)
 }
 
 /// Encode an internal page.
-pub fn encode_internal(page_size: usize, leftmost: PageId, cells: &[Separator]) -> Result<Vec<u8>> {
-    let contents = cells.iter().map(encode_internal_cell).collect::<Vec<_>>();
+pub fn encode_internal(
+    page_size: usize,
+    source: &[u8],
+    leftmost: PageId,
+    cells: &[Separator],
+) -> Result<Vec<u8>> {
+    let contents = cells
+        .iter()
+        .map(|cell| encode_internal_cell(source, cell))
+        .collect::<Vec<_>>();
     encode_page(page_size, KIND_INTERNAL, leftmost, &contents)
 }
 
@@ -222,14 +302,21 @@ pub fn decode(page_size: usize, bytes: &[u8]) -> Result<Node> {
             for slot in slots {
                 entries.push(decode_leaf_cell(bytes, page_size, slot)?);
             }
-            Ok(Node::Leaf(entries))
+            Ok(Node::Leaf {
+                bytes: Rc::from(bytes),
+                entries,
+            })
         }
         KIND_INTERNAL => {
             let mut cells = Vec::with_capacity(count);
             for slot in slots {
                 cells.push(decode_internal_cell(bytes, page_size, slot)?);
             }
-            Ok(Node::Internal { leftmost, cells })
+            Ok(Node::Internal {
+                bytes: Rc::from(bytes),
+                leftmost,
+                cells,
+            })
         }
         other => Err(Error::Corrupt(alloc::format!("unknown node kind {other}"))),
     }
@@ -273,10 +360,11 @@ pub fn decode_overflow(page_size: usize, bytes: &[u8]) -> Result<(PageId, Vec<u8
     Ok((next, bytes[OVERFLOW_HEADER_SIZE..].to_vec()))
 }
 
-fn encode_leaf_cell(entry: &Entry) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(2 + entry.key.len() + 1 + 16);
-    push_u16(&mut out, entry.key.len())?;
-    out.extend_from_slice(&entry.key);
+fn encode_leaf_cell(source: &[u8], entry: &Entry) -> Result<Vec<u8>> {
+    let key = key_bytes(source, &entry.key);
+    let mut out = Vec::with_capacity(2 + key.len() + 1 + 16);
+    push_u16(&mut out, key.len())?;
+    out.extend_from_slice(key);
     match &entry.value {
         ValueRef::Inline(value) => {
             out.push(VALUE_INLINE);
@@ -292,12 +380,13 @@ fn encode_leaf_cell(entry: &Entry) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn encode_internal_cell(cell: &Separator) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + cell.key.len() + 8);
+fn encode_internal_cell(source: &[u8], cell: &Separator) -> Vec<u8> {
+    let key = key_bytes(source, &cell.key);
+    let mut out = Vec::with_capacity(2 + key.len() + 8);
     // The key length is a separator key, always small in practice; a u16 that
     // overflows here would already have failed leaf encoding.
-    push_u16(&mut out, cell.key.len()).expect("separator key too long");
-    out.extend_from_slice(&cell.key);
+    push_u16(&mut out, key.len()).expect("separator key too long");
+    out.extend_from_slice(key);
     push_u64(&mut out, cell.child);
     out
 }
@@ -348,7 +437,7 @@ fn decode_leaf_cell(bytes: &[u8], page_size: usize, slot: usize) -> Result<Entry
     if key_end + 1 > page_size {
         return Err(Error::Corrupt("leaf key runs past end of page".to_string()));
     }
-    let key = bytes[slot + 2..key_end].to_vec();
+    let key = Key::Borrowed(slot + 2..key_end);
     match bytes[key_end] {
         VALUE_INLINE => {
             if key_end + 5 > page_size {
@@ -401,7 +490,7 @@ fn decode_internal_cell(bytes: &[u8], page_size: usize, slot: usize) -> Result<S
         ));
     }
     Ok(Separator {
-        key: bytes[slot + 2..key_end].to_vec(),
+        key: Key::Borrowed(slot + 2..key_end),
         child: get_u64(bytes, key_end)?,
     })
 }
@@ -578,7 +667,7 @@ mod tests {
 
     fn entry(key: &[u8], value: &[u8]) -> Entry {
         Entry {
-            key: key.to_vec(),
+            key: Key::Owned(key.to_vec()),
             value: ValueRef::Inline(Rc::from(value)),
         }
     }
@@ -590,37 +679,57 @@ mod tests {
             entry(b"bb", b"22"),
             entry(b"ccc", b"333"),
         ];
-        let encoded = encode_leaf(512, &entries).unwrap();
+        // Every key is owned, so no shared page buffer is indexed here.
+        let encoded = encode_leaf(512, &[], &entries).unwrap();
         assert_eq!(encoded.len(), 512);
-        assert_eq!(decode(512, &encoded).unwrap(), Node::Leaf(entries.to_vec()));
+        let node = decode(512, &encoded).unwrap();
+        let Node::Leaf {
+            entries: decoded, ..
+        } = &node
+        else {
+            panic!("not a leaf");
+        };
+        assert_eq!(decoded.len(), 3);
+        for (entry, original) in decoded.iter().zip(entries.iter()) {
+            assert_eq!(node.key(&entry.key), original.key.resolve(&[]));
+            assert_eq!(entry.value, original.value);
+        }
     }
 
     #[test]
     fn an_internal_round_trips() {
         let cells = [
             Separator {
-                key: b"m".to_vec(),
+                key: Key::Owned(b"m".to_vec()),
                 child: 7,
             },
             Separator {
-                key: b"zz".to_vec(),
+                key: Key::Owned(b"zz".to_vec()),
                 child: 99,
             },
         ];
-        let encoded = encode_internal(512, 3, &cells).unwrap();
-        assert_eq!(
-            decode(512, &encoded).unwrap(),
-            Node::Internal {
-                leftmost: 3,
-                cells: cells.to_vec()
-            }
-        );
+        let encoded = encode_internal(512, &[], 3, &cells).unwrap();
+        let node = decode(512, &encoded).unwrap();
+        let Node::Internal {
+            leftmost,
+            cells: decoded,
+            ..
+        } = &node
+        else {
+            panic!("not an internal node");
+        };
+        assert_eq!(*leftmost, 3);
+        assert_eq!(decoded.len(), 2);
+        for (cell, original) in decoded.iter().zip(cells.iter()) {
+            assert_eq!(node.key(&cell.key), original.key.resolve(&[]));
+            assert_eq!(cell.child, original.child);
+        }
     }
 
     #[test]
     fn a_node_that_does_not_fit_is_rejected() {
         let entries = [entry(&[0u8; 600], b"v")];
-        assert!(encode_leaf(512, &entries).is_err());
+        assert!(encode_leaf(512, &[], &entries).is_err());
     }
 
     #[test]
@@ -638,14 +747,23 @@ mod tests {
     #[test]
     fn an_overflow_pointer_round_trips() {
         let entries = [Entry {
-            key: b"k".to_vec(),
+            key: Key::Owned(b"k".to_vec()),
             value: ValueRef::Overflow {
                 first: 9,
                 len: 1024,
             },
         }];
-        let encoded = encode_leaf(512, &entries).unwrap();
-        assert_eq!(decode(512, &encoded).unwrap(), Node::Leaf(entries.to_vec()));
+        let encoded = encode_leaf(512, &[], &entries).unwrap();
+        let node = decode(512, &encoded).unwrap();
+        let Node::Leaf {
+            entries: decoded, ..
+        } = &node
+        else {
+            panic!("not a leaf");
+        };
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(node.key(&decoded[0].key), b"k");
+        assert_eq!(decoded[0].value, entries[0].value);
     }
 
     #[test]

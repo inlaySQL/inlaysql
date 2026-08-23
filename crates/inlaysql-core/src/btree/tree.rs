@@ -42,7 +42,7 @@ use crate::traits::RowId;
 
 use super::cache::{self, PageCache, DEFAULT_PAGE_CACHE_BYTES};
 use super::device::{CommitPoint, Device};
-use super::page::{self, Entry, Node, PageId, Separator, ValueRef};
+use super::page::{self, Entry, Key, Node, PageId, Separator, ValueRef};
 
 /// The magic bytes at the front of the header.
 const MAGIC: &[u8; 8] = b"INLAYSQL";
@@ -622,8 +622,8 @@ impl<D: Device> CowBTree<D> {
             // and the descent only reads it, so nothing is copied per level.
             let node = self.node_at(id, pending)?;
             match &*node {
-                Node::Leaf(entries) => {
-                    let result = match entries.binary_search_by(|e| e.key.as_slice().cmp(key)) {
+                Node::Leaf { entries, .. } => {
+                    let result = match entries.binary_search_by(|e| node.key(&e.key).cmp(key)) {
                         Ok(i) => self
                             .resolve_value_at(&entries[i].value, pending)
                             .map(Some)?,
@@ -634,8 +634,10 @@ impl<D: Device> CowBTree<D> {
                     }
                     return Ok(result);
                 }
-                Node::Internal { leftmost, cells } => {
-                    let idx = child_index(cells, key);
+                Node::Internal {
+                    leftmost, cells, ..
+                } => {
+                    let idx = child_index(node.bytes(), cells, key);
                     id = if idx == 0 {
                         *leftmost
                     } else {
@@ -719,7 +721,7 @@ impl<D: Device> CowBTree<D> {
         // this check needs.
         drop(slot);
         let node = self.node_at(leaf, false)?;
-        let Node::Leaf(entries) = &*node else {
+        let Node::Leaf { entries, .. } = &*node else {
             // A page id this cursor named is no longer a leaf. Unreachable
             // under the invariant `reseek`'s doc comment states — a page id
             // names one immutable node for the file's lifetime — but a full
@@ -727,7 +729,7 @@ impl<D: Device> CowBTree<D> {
             // trust a cursor that turned out not to describe a leaf.
             return Ok(None);
         };
-        let result = match entries.binary_search_by(|e| e.key.as_slice().cmp(key)) {
+        let result = match entries.binary_search_by(|e| node.key(&e.key).cmp(key)) {
             Ok(i) => Some(self.resolve_value_at(&entries[i].value, false)?),
             Err(_) => None,
         };
@@ -775,12 +777,15 @@ impl<D: Device> CowBTree<D> {
                 separator,
             } => {
                 let cells = vec![Separator {
-                    key: separator,
+                    key: Key::Owned(separator),
                     child: right,
                 }];
                 let id = self.alloc_page();
-                self.dirty
-                    .insert(id, page::encode_internal(self.page_size, left, &cells)?);
+                // Every key is owned, so no shared page buffer is indexed here.
+                self.dirty.insert(
+                    id,
+                    page::encode_internal(self.page_size, &[], left, &cells)?,
+                );
                 self.pending_root = id;
             }
         }
@@ -1851,18 +1856,19 @@ impl<D: Device> CowBTree<D> {
     fn insert_into(&mut self, id: PageId, key: &[u8], value: &[u8]) -> Result<InsertOutcome> {
         if id == 0 {
             let entries = vec![Entry {
-                key: key.to_vec(),
+                key: Key::Owned(key.to_vec()),
                 value: self.store_value(key, value)?,
             }];
             let new_id = self.alloc_page();
+            // Every key is owned, so no shared page buffer is indexed here.
             self.dirty
-                .insert(new_id, page::encode_leaf(self.page_size, &entries)?);
+                .insert(new_id, page::encode_leaf(self.page_size, &[], &entries)?);
             return Ok(InsertOutcome::Replaced { id: new_id });
         }
 
         match self.read_node(id)? {
-            Node::Leaf(mut entries) => {
-                match entries.binary_search_by(|e| e.key.as_slice().cmp(key)) {
+            Node::Leaf { bytes, mut entries } => {
+                match entries.binary_search_by(|e| e.key.resolve(&bytes).cmp(key)) {
                     Ok(i) => {
                         let new_value = self.store_value(key, value)?;
                         let old_value = core::mem::replace(&mut entries[i].value, new_value);
@@ -1873,26 +1879,31 @@ impl<D: Device> CowBTree<D> {
                     Err(i) => entries.insert(
                         i,
                         Entry {
-                            key: key.to_vec(),
+                            key: Key::Owned(key.to_vec()),
                             value: self.store_value(key, value)?,
                         },
                     ),
                 }
-                if page::leaf_size(&entries) <= self.page_size {
+                if page::leaf_size(&bytes, &entries) <= self.page_size {
                     let new_id = self.page_slot(id);
                     self.dirty
-                        .insert(new_id, page::encode_leaf(self.page_size, &entries)?);
+                        .insert(new_id, page::encode_leaf(self.page_size, &bytes, &entries)?);
                     Ok(InsertOutcome::Replaced { id: new_id })
                 } else {
-                    let mid = leaf_split_point(&entries, self.page_size);
+                    let mid = leaf_split_point(&bytes, &entries, self.page_size);
                     let right = entries.split_off(mid);
-                    let separator = right[0].key.clone();
+                    // The promoted separator is copied out of the leaf's bytes:
+                    // the parent's page is a different buffer, so the key cannot
+                    // stay borrowed across the boundary.
+                    let separator = right[0].key.resolve(&bytes).to_vec();
                     let left_id = self.page_slot(id);
                     let right_id = self.alloc_page();
+                    self.dirty.insert(
+                        left_id,
+                        page::encode_leaf(self.page_size, &bytes, &entries)?,
+                    );
                     self.dirty
-                        .insert(left_id, page::encode_leaf(self.page_size, &entries)?);
-                    self.dirty
-                        .insert(right_id, page::encode_leaf(self.page_size, &right)?);
+                        .insert(right_id, page::encode_leaf(self.page_size, &bytes, &right)?);
                     Ok(InsertOutcome::Split {
                         left: left_id,
                         right: right_id,
@@ -1900,9 +1911,13 @@ impl<D: Device> CowBTree<D> {
                     })
                 }
             }
-            Node::Internal { leftmost, cells } => {
-                let idx = child_index(&cells, key);
-                let child = child_pointer(&cells, leftmost, key);
+            Node::Internal {
+                bytes,
+                leftmost,
+                cells,
+            } => {
+                let idx = child_index(&bytes, &cells, key);
+                let child = child_pointer(&bytes, &cells, leftmost, key);
                 match self.insert_into(child, key, value)? {
                     InsertOutcome::Replaced { id: new_child } => {
                         let mut new_leftmost = leftmost;
@@ -1911,7 +1926,12 @@ impl<D: Device> CowBTree<D> {
                         let new_id = self.page_slot(id);
                         self.dirty.insert(
                             new_id,
-                            page::encode_internal(self.page_size, new_leftmost, &new_cells)?,
+                            page::encode_internal(
+                                self.page_size,
+                                &bytes,
+                                new_leftmost,
+                                &new_cells,
+                            )?,
                         );
                         Ok(InsertOutcome::Replaced { id: new_id })
                     }
@@ -1927,7 +1947,7 @@ impl<D: Device> CowBTree<D> {
                             new_cells.insert(
                                 0,
                                 Separator {
-                                    key: separator,
+                                    key: Key::Owned(separator),
                                     child: right,
                                 },
                             );
@@ -1936,36 +1956,51 @@ impl<D: Device> CowBTree<D> {
                             new_cells.insert(
                                 idx,
                                 Separator {
-                                    key: separator,
+                                    key: Key::Owned(separator),
                                     child: right,
                                 },
                             );
                         }
-                        if page::internal_size(&new_cells) <= self.page_size {
+                        if page::internal_size(&bytes, &new_cells) <= self.page_size {
                             let new_id = self.page_slot(id);
                             self.dirty.insert(
                                 new_id,
-                                page::encode_internal(self.page_size, new_leftmost, &new_cells)?,
+                                page::encode_internal(
+                                    self.page_size,
+                                    &bytes,
+                                    new_leftmost,
+                                    &new_cells,
+                                )?,
                             );
                             Ok(InsertOutcome::Replaced { id: new_id })
                         } else {
                             // Split the internal node. With the entry-size
                             // guard in `put`, `new_cells` always has at least
                             // two cells here, so both halves are non-empty.
-                            let mid = internal_split_point(&new_cells, self.page_size);
+                            let mid = internal_split_point(&bytes, &new_cells, self.page_size);
                             let right_cells = new_cells.split_off(mid);
-                            let promoted = right_cells[0].key.clone();
+                            let promoted = right_cells[0].key.resolve(&bytes).to_vec();
                             let right_leftmost = right_cells[0].child;
                             let right_rest = right_cells[1..].to_vec();
                             let left_id = self.page_slot(id);
                             let right_id = self.alloc_page();
                             self.dirty.insert(
                                 left_id,
-                                page::encode_internal(self.page_size, new_leftmost, &new_cells)?,
+                                page::encode_internal(
+                                    self.page_size,
+                                    &bytes,
+                                    new_leftmost,
+                                    &new_cells,
+                                )?,
                             );
                             self.dirty.insert(
                                 right_id,
-                                page::encode_internal(self.page_size, right_leftmost, &right_rest)?,
+                                page::encode_internal(
+                                    self.page_size,
+                                    &bytes,
+                                    right_leftmost,
+                                    &right_rest,
+                                )?,
                             );
                             Ok(InsertOutcome::Split {
                                 left: left_id,
@@ -1984,8 +2019,8 @@ impl<D: Device> CowBTree<D> {
             return Ok(0);
         }
         match self.read_node(id)? {
-            Node::Leaf(mut entries) => {
-                if let Ok(i) = entries.binary_search_by(|e| e.key.as_slice().cmp(key)) {
+            Node::Leaf { bytes, mut entries } => {
+                if let Ok(i) = entries.binary_search_by(|e| e.key.resolve(&bytes).cmp(key)) {
                     let removed = entries.remove(i);
                     if let ValueRef::Overflow { first, .. } = removed.value {
                         self.free_overflow_chain(first)?;
@@ -2004,13 +2039,17 @@ impl<D: Device> CowBTree<D> {
                 } else {
                     let new_id = self.page_slot(id);
                     self.dirty
-                        .insert(new_id, page::encode_leaf(self.page_size, &entries)?);
+                        .insert(new_id, page::encode_leaf(self.page_size, &bytes, &entries)?);
                     Ok(new_id)
                 }
             }
-            Node::Internal { leftmost, cells } => {
-                let idx = child_index(&cells, key);
-                let child = child_pointer(&cells, leftmost, key);
+            Node::Internal {
+                bytes,
+                leftmost,
+                cells,
+            } => {
+                let idx = child_index(&bytes, &cells, key);
+                let child = child_pointer(&bytes, &cells, leftmost, key);
                 let new_child = self.delete_from(child, key)?;
                 let mut new_leftmost = leftmost;
                 let mut new_cells = cells;
@@ -2018,7 +2057,7 @@ impl<D: Device> CowBTree<D> {
                 let new_id = self.page_slot(id);
                 self.dirty.insert(
                     new_id,
-                    page::encode_internal(self.page_size, new_leftmost, &new_cells)?,
+                    page::encode_internal(self.page_size, &bytes, new_leftmost, &new_cells)?,
                 );
                 Ok(new_id)
             }
@@ -2253,21 +2292,24 @@ impl<D: Device> CowBTree<D> {
         // per entry — the walk pays it only for the entries it actually keeps.
         let node = self.node_at(id, pending)?;
         match &*node {
-            Node::Leaf(entries) => {
+            Node::Leaf { entries, .. } => {
                 for entry in entries {
                     if out.len() >= bounds.limit {
                         return Ok(());
                     }
-                    if !bounds.admits(&entry.key) {
+                    let key = node.key(&entry.key);
+                    if !bounds.admits(key) {
                         continue;
                     }
                     let value = self.resolve_value_at(&entry.value, pending)?;
-                    out.push((entry.key.clone(), value));
+                    out.push((key.to_vec(), value));
                 }
             }
-            Node::Internal { leftmost, cells } => {
+            Node::Internal {
+                leftmost, cells, ..
+            } => {
                 // Below the first separator, so only its lower edge constrains.
-                if cells.is_empty() || bounds.starts_below(&cells[0].key) {
+                if cells.is_empty() || bounds.starts_below(node.key(&cells[0].key)) {
                     self.walk(*leftmost, bounds, pending, out)?;
                 }
                 for (i, separator) in cells.iter().enumerate() {
@@ -2275,14 +2317,14 @@ impl<D: Device> CowBTree<D> {
                         return Ok(());
                     }
                     let below_upper = match bounds.end {
-                        Some(end) => separator.key.as_slice() < end,
+                        Some(end) => node.key(&separator.key) < end,
                         None => true,
                     };
                     // The slot spans `[separator.key, next.key)`, so it is worth
                     // descending only when the caller's lower bounds fall inside
                     // it — `start` for the range, `after` for the resume.
                     let above_lower = match cells.get(i + 1) {
-                        Some(next) => bounds.starts_below(&next.key),
+                        Some(next) => bounds.starts_below(node.key(&next.key)),
                         None => true,
                     };
                     if below_upper && above_lower {
@@ -2315,19 +2357,22 @@ impl<D: Device> CowBTree<D> {
         }
         let node = self.node_at(id, pending)?;
         match &*node {
-            Node::Leaf(entries) => {
+            Node::Leaf { entries, .. } => {
                 for entry in entries {
                     if out.len() >= bounds.limit {
                         return Ok(());
                     }
-                    if !bounds.admits(&entry.key) {
+                    let key = node.key(&entry.key);
+                    if !bounds.admits(key) {
                         continue;
                     }
-                    out.push(trailing_row_id(&entry.key)?);
+                    out.push(trailing_row_id(key)?);
                 }
             }
-            Node::Internal { leftmost, cells } => {
-                if cells.is_empty() || bounds.starts_below(&cells[0].key) {
+            Node::Internal {
+                leftmost, cells, ..
+            } => {
+                if cells.is_empty() || bounds.starts_below(node.key(&cells[0].key)) {
                     self.walk_row_ids(*leftmost, bounds, pending, out)?;
                 }
                 for (i, separator) in cells.iter().enumerate() {
@@ -2335,11 +2380,11 @@ impl<D: Device> CowBTree<D> {
                         return Ok(());
                     }
                     let below_upper = match bounds.end {
-                        Some(end) => separator.key.as_slice() < end,
+                        Some(end) => node.key(&separator.key) < end,
                         None => true,
                     };
                     let above_lower = match cells.get(i + 1) {
-                        Some(next) => bounds.starts_below(&next.key),
+                        Some(next) => bounds.starts_below(node.key(&next.key)),
                         None => true,
                     };
                     if below_upper && above_lower {
@@ -2377,20 +2422,23 @@ impl<D: Device> CowBTree<D> {
         }
         let node = self.node_at(id, pending)?;
         match &*node {
-            Node::Leaf(entries) => {
+            Node::Leaf { entries, .. } => {
                 for entry in entries {
                     if out.len() >= bounds.limit {
                         return Ok(());
                     }
-                    if !bounds.admits(&entry.key) {
+                    let key = node.key(&entry.key);
+                    if !bounds.admits(key) {
                         continue;
                     }
                     let value = self.resolve_value_at(&entry.value, pending)?;
-                    out.push((trailing_row_id(&entry.key)?, value));
+                    out.push((trailing_row_id(key)?, value));
                 }
             }
-            Node::Internal { leftmost, cells } => {
-                if cells.is_empty() || bounds.starts_below(&cells[0].key) {
+            Node::Internal {
+                leftmost, cells, ..
+            } => {
+                if cells.is_empty() || bounds.starts_below(node.key(&cells[0].key)) {
                     self.walk_row_values(*leftmost, bounds, pending, out)?;
                 }
                 for (i, separator) in cells.iter().enumerate() {
@@ -2398,11 +2446,11 @@ impl<D: Device> CowBTree<D> {
                         return Ok(());
                     }
                     let below_upper = match bounds.end {
-                        Some(end) => separator.key.as_slice() < end,
+                        Some(end) => node.key(&separator.key) < end,
                         None => true,
                     };
                     let above_lower = match cells.get(i + 1) {
-                        Some(next) => bounds.starts_below(&next.key),
+                        Some(next) => bounds.starts_below(node.key(&next.key)),
                         None => true,
                     };
                     if below_upper && above_lower {
@@ -2461,8 +2509,13 @@ impl<D: Device> CowBTree<D> {
             }
         })?;
 
-        if let Some(Node::Internal { leftmost, cells }) = internal {
-            if cells.is_empty() || bounds.starts_below(&cells[0].key) {
+        if let Some(Node::Internal {
+            bytes,
+            leftmost,
+            cells,
+        }) = internal
+        {
+            if cells.is_empty() || bounds.starts_below(cells[0].key.resolve(&bytes)) {
                 self.walk_raw_row_values(leftmost, bounds, pending, out)?;
             }
             for (i, separator) in cells.iter().enumerate() {
@@ -2470,11 +2523,11 @@ impl<D: Device> CowBTree<D> {
                     return Ok(());
                 }
                 let below_upper = match bounds.end {
-                    Some(end) => separator.key.as_slice() < end,
+                    Some(end) => separator.key.resolve(&bytes) < end,
                     None => true,
                 };
                 let above_lower = match cells.get(i + 1) {
-                    Some(next) => bounds.starts_below(&next.key),
+                    Some(next) => bounds.starts_below(next.key.resolve(&bytes)),
                     None => true,
                 };
                 if below_upper && above_lower {
@@ -2597,10 +2650,12 @@ impl ReadCursor {
 fn bound_key(source: Option<(Rc<Node>, usize)>) -> Option<Vec<u8>> {
     let (node, idx) = source?;
     match &*node {
-        Node::Internal { cells, .. } => cells.get(idx).map(|cell| cell.key.clone()),
+        Node::Internal { cells, .. } => cells
+            .get(idx)
+            .map(|cell| cell.key.resolve(node.bytes()).to_vec()),
         // Unreachable: `get_from` only ever records a source while looking at
         // an `Internal` node's own cells.
-        Node::Leaf(_) => None,
+        Node::Leaf { .. } => None,
     }
 }
 
@@ -2618,8 +2673,8 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// The child pointer to follow for `key`, given `cells` and `leftmost`.
-fn child_pointer(cells: &[Separator], leftmost: PageId, key: &[u8]) -> PageId {
-    let idx = child_index(cells, key);
+fn child_pointer(bytes: &[u8], cells: &[Separator], leftmost: PageId, key: &[u8]) -> PageId {
+    let idx = child_index(bytes, cells, key);
     if idx == 0 {
         leftmost
     } else {
@@ -2760,8 +2815,8 @@ fn decode_counter(bytes: &[u8]) -> Result<u64> {
 /// neighbour holds strictly smaller keys. The child for `key` is therefore the
 /// one whose separator is the last separator `<= key`; the leftmost child is
 /// used when `key` is smaller than every separator.
-fn child_index(cells: &[Separator], key: &[u8]) -> usize {
-    cells.partition_point(|c| c.key.as_slice() <= key)
+fn child_index(bytes: &[u8], cells: &[Separator], key: &[u8]) -> usize {
+    cells.partition_point(|c| c.key.resolve(bytes) <= key)
 }
 
 /// Point child `idx` at `new_child`. Index 0 is the leftmost pointer.
@@ -2795,9 +2850,9 @@ fn key_fits(page_size: usize, key: &[u8]) -> bool {
 /// entries have very different sizes (e.g. small metadata rows next to large
 /// rows carrying a vector). Every entry fits alone — either inline or as an
 /// overflow pointer (see [`key_fits`]) — so the result is always at least one.
-fn leaf_split_point(entries: &[Entry], page_size: usize) -> usize {
+fn leaf_split_point(bytes: &[u8], entries: &[Entry], page_size: usize) -> usize {
     let mut split = 1;
-    while split < entries.len() && page::leaf_size(&entries[..split]) <= page_size {
+    while split < entries.len() && page::leaf_size(bytes, &entries[..split]) <= page_size {
         split += 1;
     }
     split - 1
@@ -2805,9 +2860,9 @@ fn leaf_split_point(entries: &[Entry], page_size: usize) -> usize {
 
 /// The split point for an overfull internal node: the largest number of leading
 /// separators that still fit a page.
-fn internal_split_point(cells: &[Separator], page_size: usize) -> usize {
+fn internal_split_point(bytes: &[u8], cells: &[Separator], page_size: usize) -> usize {
     let mut split = 1;
-    while split < cells.len() && page::internal_size(&cells[..split]) <= page_size {
+    while split < cells.len() && page::internal_size(bytes, &cells[..split]) <= page_size {
         split += 1;
     }
     split - 1
