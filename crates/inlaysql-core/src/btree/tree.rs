@@ -1346,7 +1346,13 @@ impl<D: Device> CowBTree<D> {
     /// straight out of the borrowed entry — the same shape argument
     /// [`CowBTree::scan_range_row_ids_from`] relies on — and resolves the
     /// value, without cloning the key.
-    pub fn scan_prefix_row_values_from(
+    ///
+    /// **Precondition:** `prefix` must be a *table* prefix — every key under it
+    /// ends with its row id as eight big-endian bytes, the shape
+    /// [`crate::storage::row_key`] builds. Over any other key space the eight
+    /// bytes are meaningless, which is why this is not the general walk and why
+    /// it is crate-private.
+    pub(crate) fn scan_prefix_row_values_from(
         &self,
         prefix: &[u8],
         after: Option<&[u8]>,
@@ -1361,8 +1367,11 @@ impl<D: Device> CowBTree<D> {
     ///
     /// The row-id-and-value form of [`CowBTree::scan_range_from`]: same pruning,
     /// same order, same `WalkBounds` semantics — only the leaf branch differs
-    /// (row id out of the borrowed key, value resolved, no key clone).
-    pub fn scan_range_row_values_from(
+    /// (row id out of the borrowed key, value resolved, no key clone). Crate-
+    /// private for the same reason as [`CowBTree::scan_prefix_row_values_from`]:
+    /// it only answers correctly over a key space whose keys end in an eight-
+    /// byte big-endian row id.
+    pub(crate) fn scan_range_row_values_from(
         &self,
         start: &[u8],
         end: Option<&[u8]>,
@@ -3591,12 +3600,74 @@ mod tests {
             resumed.extend(batch);
         }
         assert_eq!(resumed.len(), expected.len());
-        for ((row_id, value), (expected_id, expected_value)) in
-            resumed.iter().zip(expected.iter())
+        for ((row_id, value), (expected_id, expected_value)) in resumed.iter().zip(expected.iter())
         {
             assert_eq!(row_id, expected_id);
             assert_eq!(value.as_slice(), expected_value.as_slice());
         }
+    }
+
+    /// The row-values walk has to see the open transaction's uncommitted rows
+    /// exactly as the general walk does — a pending page is resolved the same
+    /// way on both paths, so the fast path cannot skip the in-transaction
+    /// state.
+    #[test]
+    fn a_row_values_walk_sees_the_open_transaction() {
+        let row_key = |id: u64| {
+            let mut key = b"t\0".to_vec();
+            key.extend_from_slice(&id.to_be_bytes());
+            key
+        };
+        let mut db = CowBTree::create(disk(), PAGE).unwrap();
+        db.put(&row_key(1), b"one").unwrap();
+        db.commit().unwrap();
+        db.put(&row_key(2), b"two").unwrap();
+        db.put(&row_key(3), b"three").unwrap();
+
+        let by_row_values = db
+            .scan_prefix_row_values_from(b"t\0", None, usize::MAX)
+            .unwrap();
+        let by_general_walk = db.scan_prefix(b"t\0").unwrap();
+        assert_eq!(by_row_values.len(), 3);
+        assert_eq!(by_row_values.len(), by_general_walk.len());
+        for ((row_id, value), (key, general_value)) in
+            by_row_values.iter().zip(by_general_walk.iter())
+        {
+            assert_eq!(*row_id, crate::storage::row_id_from_key(key).unwrap());
+            assert_eq!(value.as_slice(), general_value.as_slice());
+        }
+    }
+
+    /// An overflow-backed row value is resolved whole by the row-values walk,
+    /// agreeing with the general walk: inline and overflow values round-trip
+    /// identically through the fast path.
+    #[test]
+    fn a_row_values_walk_resolves_overflow_values() {
+        let row_key = |id: u64| {
+            let mut key = b"t\0".to_vec();
+            key.extend_from_slice(&id.to_be_bytes());
+            key
+        };
+        let mut db = CowBTree::create(disk(), PAGE).unwrap();
+        let small = b"small".to_vec();
+        let big = vec![7u8; PAGE * 3];
+        db.put(&row_key(1), &small).unwrap();
+        db.put(&row_key(2), &big).unwrap();
+        db.commit().unwrap();
+
+        let by_row_values = db
+            .scan_prefix_row_values_from(b"t\0", None, usize::MAX)
+            .unwrap();
+        let by_general_walk = db.scan_prefix(b"t\0").unwrap();
+        assert_eq!(by_row_values.len(), 2);
+        for ((row_id, value), (key, general_value)) in
+            by_row_values.iter().zip(by_general_walk.iter())
+        {
+            assert_eq!(*row_id, crate::storage::row_id_from_key(key).unwrap());
+            assert_eq!(value.as_slice(), general_value.as_slice());
+        }
+        // The large value really did spill to overflow, and it came back whole.
+        assert_eq!(by_row_values[1].1.as_slice(), &big[..]);
     }
 
     /// A too-short key is corruption, not a panic — the row-id walk has to
