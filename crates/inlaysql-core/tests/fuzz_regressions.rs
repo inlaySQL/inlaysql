@@ -178,3 +178,192 @@ fn a_json_number_that_needs_more_than_fifteen_digits_round_trips_byte_for_byte()
         "a second round trip was not a fixed point"
     );
 }
+
+// ---------------------------------------------------------------- termination
+//
+// The `Trust` workflow's `sql_parser` run did not crash — it *timed out*, and
+// the two findings below are what that turned out to be. Neither is a panic,
+// so `fuzz_smoke.rs`'s property (a `Result`, never an abort) held while the
+// process sat there; a timeout is the only signal an input like this gives.
+
+/// 810 bytes of nested `replace()`.
+///
+/// Each level quadruples its subject, so forty levels ask for 4^40 bytes and
+/// the engine spends the rest of its life trying to build them. libFuzzer's
+/// default per-input timeout is 1200 seconds, which is why one input turned a
+/// 300-second fuzz target into a 46-minute CI job.
+///
+/// The bound is SQLite's: `SQLITE_MAX_LENGTH`, and `sqlite3` 3.54.0 refuses
+/// this same statement rather than building it. The length is computed from
+/// the operand sizes *before* the allocation, so this is a refusal and not a
+/// failed `Vec` growth.
+#[test]
+fn a_string_function_that_multiplies_is_refused_before_it_allocates() {
+    let mut nested = String::from("'a'");
+    for _ in 0..40 {
+        nested = format!("replace({nested},'a','aaaa')");
+    }
+    let sql = format!("SELECT {nested}");
+    assert!(sql.len() < 1_000, "fixture grew: {} bytes", sql.len());
+
+    // Two guards now stand between this input and the allocation, and the
+    // nesting one happens to reach it first — forty levels is past
+    // `MAX_NESTING_DEPTH`. What the test pins is the property the fuzzer
+    // measured, which is neither guard by name: the call *returns*.
+    let start = std::time::Instant::now();
+    let mut engine = inlaysql_core::mem::engine().expect("in-memory engine");
+    engine
+        .execute(&sql, &[])
+        .expect_err("an unbounded string was built");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(30),
+        "refusal took {:?}",
+        start.elapsed()
+    );
+
+    // And the length bound itself, reached by amplification wide enough to
+    // need only six levels: 64^6 bytes from a statement of a few hundred.
+    let wide = "a".repeat(64);
+    let mut amplifying = String::from("'a'");
+    for _ in 0..6 {
+        amplifying = format!("replace({amplifying},'a','{wide}')");
+    }
+    let error = engine
+        .execute(&format!("SELECT {amplifying}"), &[])
+        .expect_err("an unbounded string was built");
+    assert!(
+        matches!(error, inlaysql_core::Error::TooBig(_)),
+        "expected a length refusal, got {error:?}"
+    );
+}
+
+/// The same bound on the other functions whose output can outgrow their input.
+///
+/// Kept shallow on purpose: the nesting guard now refuses anything past
+/// [`MAX_NESTING_DEPTH`], so amplification has to come from the width of each
+/// step rather than the count of them — which is the honest shape of the
+/// threat anyway, since one `replace()` can multiply by as much as its
+/// replacement is long.
+#[test]
+fn every_growing_function_shares_one_length_bound() {
+    let mut engine = inlaysql_core::mem::engine().expect("in-memory engine");
+
+    // `hex()` only doubles, so within the nesting limit it cannot reach the
+    // length bound at all — sixteen levels from eight bytes is half a
+    // megabyte. That is worth pinning rather than asserting the opposite:
+    // the two guards compose, and this is which one does the work here.
+    let mut doubling = String::from("'aaaaaaaa'");
+    for _ in 0..16 {
+        doubling = format!("hex({doubling})");
+    }
+    assert!(
+        engine.execute(&format!("SELECT {doubling}"), &[]).is_ok(),
+        "sixteen doublings of hex() should be well inside the bound"
+    );
+
+    let wide = "a".repeat(64);
+    let mut amplifying = String::from("'a'");
+    for _ in 0..6 {
+        amplifying = format!("replace({amplifying},'a','{wide}')");
+    }
+    assert!(
+        matches!(
+            engine.execute(&format!("SELECT {amplifying}"), &[]),
+            Err(inlaysql_core::Error::TooBig(_))
+        ),
+        "six 64x replacements were not bounded"
+    );
+}
+
+/// A value that stays under the bound is untouched by it.
+#[test]
+fn the_length_bound_does_not_reject_ordinary_strings() {
+    let mut engine = inlaysql_core::mem::engine().expect("in-memory engine");
+    for sql in [
+        "SELECT replace('a rust database', 'rust', 'fast')",
+        "SELECT hex('inlaysql')",
+        "SELECT 'a' || 'b' || 'c'",
+    ] {
+        assert!(engine.execute(sql, &[]).is_ok(), "{sql} was refused");
+    }
+}
+
+/// 4,000 `||` in a row: no parenthesis anywhere, so the nesting guard above
+/// never sees it, and the left-leaning AST it builds took the planner's
+/// recursion straight off the end of a 2 MiB thread stack — an abort, not an
+/// error, reachable from the MCP server and the MySQL wire alike.
+#[test]
+fn a_flat_operator_chain_is_refused_rather_than_overflowing_the_stack() {
+    let sql = format!("SELECT 'a'{}", "||'b'".repeat(4_000));
+    let error = inlaysql_core::sql::plan(&sql, &[], &Catalog::new())
+        .expect_err("a 4,000-operator chain was accepted");
+    assert!(
+        matches!(error, inlaysql_core::Error::Unsupported(ref m) if m.contains("chains")),
+        "expected a chain-length refusal, got {error:?}"
+    );
+}
+
+/// Every chaining shape, not just `||` — each one builds the same left spine.
+#[test]
+fn chain_length_is_bounded_whatever_the_operator() {
+    for sql in [
+        format!("SELECT 'a'{}", "||'b'".repeat(4_000)),
+        format!("SELECT 1 WHERE 1=1{}", " OR 1=1".repeat(4_000)),
+        format!("SELECT {}1", "-".repeat(4_000)),
+        format!("SELECT {}1", "NOT ".repeat(4_000)),
+    ] {
+        assert!(
+            inlaysql_core::sql::plan(&sql, &[], &Catalog::new()).is_err(),
+            "an unbounded chain was accepted: {}…",
+            &sql[..40]
+        );
+    }
+}
+
+/// The bound must not catch what an application actually writes. A wide
+/// `VALUES` list and a long `IN (...)` are commas, which start a new
+/// expression rather than extending one — this is the distinction that keeps
+/// an ORM's bulk insert working.
+#[test]
+fn commas_are_not_a_chain() {
+    let values = (0..2_000)
+        .map(|i| format!("({i})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("INSERT INTO t (a) VALUES {values}");
+    assert!(
+        !matches!(
+            inlaysql_core::sql::plan(&sql, &[], &Catalog::new()),
+            Err(inlaysql_core::Error::Unsupported(ref m)) if m.contains("chains")
+        ),
+        "a 2,000-row VALUES list was read as one expression chain"
+    );
+
+    let list = (0..2_000)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT a FROM t WHERE a IN ({list})");
+    assert!(
+        !matches!(
+            inlaysql_core::sql::plan(&sql, &[], &Catalog::new()),
+            Err(inlaysql_core::Error::Unsupported(ref m)) if m.contains("chains")
+        ),
+        "a 2,000-element IN list was read as one expression chain"
+    );
+}
+
+/// And ordinary expressions are untouched.
+#[test]
+fn reasonable_chains_still_parse() {
+    for sql in [
+        "SELECT 1 + 2 * 3 - 4",
+        "SELECT 'a' || 'b' || 'c'",
+        "SELECT 1 = 1 AND 2 = 2 OR 3 = 3",
+    ] {
+        assert!(
+            inlaysql_core::sql::plan(sql, &[], &Catalog::new()).is_ok(),
+            "{sql} was refused"
+        );
+    }
+}

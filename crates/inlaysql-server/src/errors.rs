@@ -181,6 +181,16 @@ pub fn from_engine(error: &Error) -> MysqlError {
         Error::FormatVersion(message) => {
             MysqlError::new(1112, "42000", format!("Unsupported file format: {message}"))
         }
+
+        // 1301 is MySQL's own answer to this exact situation — a string
+        // function whose result outgrew what the server will hand back. MySQL
+        // truncates and warns where we refuse outright, which is the
+        // divergence `docs/server.md` records rather than the code choice.
+        Error::TooBig(message) => MysqlError::new(
+            1301,
+            "HY000",
+            format!("Result of a string function was too large: {message}"),
+        ),
     }
 }
 

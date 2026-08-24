@@ -58,6 +58,13 @@ jobs:
       # A crash fails this job on purpose. The usual argument for filing an
       # issue instead is that a red check blocks merges — that does not apply
       # here, because this workflow gates nothing. `ci.yml` does the gating.
+      # `-timeout=25` is not decoration. libFuzzer's default per-input timeout
+      # is 1200 seconds, so a single non-terminating input makes a 300-second
+      # target run for twenty minutes — which is how one nested `replace()`
+      # chain turned this job into a 46-minute run before the input was even
+      # named. A slow input is still a finding; it is now a finding that
+      # reports in 25 seconds. `-rss_limit_mb` is pinned for the same reason:
+      # so the budget is stated here rather than inherited.
       - name: Fuzz every target
         run: |
           seconds="${{ github.event.inputs.fuzz_seconds || '300' }}"
@@ -65,7 +72,8 @@ jobs:
           failed=0
           for target in sql_parser storage row_codec json_parser; do
             echo "::group::$target (${seconds}s)"
-            if cargo +nightly fuzz run "$target" -- -max_total_time="$seconds" \
+            if cargo +nightly fuzz run "$target" -- \
+                 -max_total_time="$seconds" -timeout=25 -rss_limit_mb=2048 \
                  > "fuzz/status/$target.log" 2>&1; then
               echo "$target: clean" >> fuzz/status/summary.txt
             else

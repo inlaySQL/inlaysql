@@ -54,6 +54,17 @@ pub enum Error {
     /// likewise not corruption; it is a format this build no longer opens (see
     /// `docs/recovery.md` for the policy). Either way the file is not read.
     FormatVersion(String),
+    /// An expression asked for a string or blob larger than
+    /// [`crate::eval::MAX_LENGTH`].
+    ///
+    /// This is SQLite's `SQLITE_TOOBIG`, and it exists for the same reason:
+    /// the string functions compose, so their *output* sizes multiply.
+    /// `replace(x, 'a', 'aaaa')` nested forty deep asks for 4^40 bytes from an
+    /// 810-byte statement, and without a bound the engine spends the rest of
+    /// its life trying to build it. The length is computed before the
+    /// allocation is attempted, so this is a refusal rather than a failed
+    /// `Vec` growth.
+    TooBig(String),
 }
 
 impl fmt::Display for Error {
@@ -75,6 +86,7 @@ impl fmt::Display for Error {
             Error::Index(m) => write!(f, "index error: {m}"),
             Error::Corrupt(m) => write!(f, "corrupt data: {m}"),
             Error::FormatVersion(m) => write!(f, "format version mismatch: {m}"),
+            Error::TooBig(m) => write!(f, "string or blob too big: {m}"),
         }
     }
 }

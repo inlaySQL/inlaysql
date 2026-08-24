@@ -1187,10 +1187,19 @@ pub fn evaluate_aggregate(
                 if value == Value::Null {
                     continue;
                 }
+                let text = as_text(&value)?;
+                // Checked per row rather than up front: the group's size is
+                // not known before it is walked, and an aggregate over enough
+                // rows reaches the bound without any one row being large.
+                let separator_len = if any { separator.len() } else { 0 };
+                check_length(
+                    out.len() as i128 + separator_len as i128 + text.len() as i128,
+                    "group_concat()",
+                )?;
                 if any {
                     out.push_str(&separator);
                 }
-                out.push_str(&as_text(&value)?);
+                out.push_str(&text);
                 any = true;
             }
             Ok(if any {
@@ -1463,12 +1472,37 @@ fn comparison(
 // -------------------------------------------------------------- text and casts
 
 /// `a || b`: `NULL` if either side is, otherwise both sides rendered as text.
+/// The largest string or blob an expression may produce.
+///
+/// SQLite's `SQLITE_MAX_LENGTH` default, matched deliberately: the string
+/// functions compose, and composition multiplies output size, so an engine
+/// without this bound can be asked for an unbounded value by a bounded
+/// statement. Verified against `sqlite3` 3.54.0, which refuses the same
+/// forty-deep `replace()` chain rather than building it.
+pub const MAX_LENGTH: usize = 1_000_000_000;
+
+/// Refuse a length past [`MAX_LENGTH`] before anything allocates it.
+///
+/// Takes `i128` because callers compute the prospective length with signed,
+/// widened arithmetic — the point is to answer the question without first
+/// performing the allocation that answering it naively would require.
+fn check_length(length: i128, what: &str) -> Result<()> {
+    if length > MAX_LENGTH as i128 {
+        return Err(Error::TooBig(alloc::format!(
+            "{what} would produce {length} bytes, over the {MAX_LENGTH}-byte limit"
+        )));
+    }
+    Ok(())
+}
+
 fn concat(left: Value, right: Value) -> Result<Value> {
     if left == Value::Null || right == Value::Null {
         return Ok(Value::Null);
     }
     let mut text = as_text(&left)?;
-    text.push_str(&as_text(&right)?);
+    let right = as_text(&right)?;
+    check_length(text.len() as i128 + right.len() as i128, "||")?;
+    text.push_str(&right);
     Ok(Value::Text(text.into()))
 }
 
@@ -2165,6 +2199,19 @@ fn replace(values: &[Value]) -> Result<Value> {
     }
     let subject = as_text(&values[0])?;
     let replacement = as_text(&values[2])?;
+
+    // The result's length is exact arithmetic, so it is checked *before*
+    // `String::replace` is asked to build it. Nested calls multiply — each
+    // level's output is the next level's subject — so a statement that fits
+    // in a packet can otherwise ask for more bytes than exist.
+    // Signed and widened: a replacement shorter than the pattern shrinks the
+    // subject, and the intermediate product exceeds `u64` long before the
+    // length itself does.
+    let occurrences = subject.matches(pattern.as_str()).count() as i128;
+    let grown =
+        subject.len() as i128 + occurrences * (replacement.len() as i128 - pattern.len() as i128);
+    check_length(grown, "replace()")?;
+
     Ok(Value::Text(subject.replace(&pattern, &replacement).into()))
 }
 
@@ -2227,6 +2274,9 @@ fn hex_of(value: &Value) -> Result<String> {
         Value::Blob(bytes) => bytes.clone(),
         other => as_text(other)?.into_bytes(),
     };
+    // `hex()` doubles, so it composes into the same multiplication `replace()`
+    // does; the capacity below is the allocation worth refusing before it.
+    check_length(bytes.len() as i128 * 2, "hex()")?;
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         const DIGITS: &[u8; 16] = b"0123456789ABCDEF";

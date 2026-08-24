@@ -47,8 +47,43 @@ const DEFAULT_SCORE_LABEL: &str = "score";
 /// How deeply parentheses may nest in one statement.
 ///
 /// Generous next to anything a person writes, and far below what it takes to
-/// exhaust a stack.
-const MAX_NESTING_DEPTH: usize = 64;
+/// exhaust a stack. This constant used to be 64, and "far below" was an
+/// assertion rather than a measurement — it was wrong. Measured on a 2 MiB
+/// stack, which is what a spawned thread gets and therefore what a server
+/// connection and a test both get, planning and evaluating
+/// `abs(abs(...abs(1)...))`:
+///
+/// | build | deepest nesting that survives |
+/// | --- | --- |
+/// | debug (`cargo test`) | 26 — 28 aborts the process |
+/// | release | past 64 |
+///
+/// So the old limit was safe in release and permitted a stack overflow in
+/// every debug build, including the ones CI runs and the ones the fuzzer
+/// builds with `-Cdebug-assertions`. 16 keeps a margin against the *debug*
+/// cliff, which is the binding one, and leaves more room still for `wasm32`,
+/// whose default stack is smaller than a native thread's. Nothing an
+/// application writes comes close: an ORM's nested `where` closures reach
+/// five or six.
+const MAX_NESTING_DEPTH: usize = 16;
+
+/// How many infix operators may chain together without parentheses.
+///
+/// Parentheses are not the only way to build a deep expression tree. `a || b
+/// || c` is left-associative, so a flat chain of *n* operators is an AST *n*
+/// levels deep with no parenthesis anywhere in it — invisible to
+/// [`MAX_NESTING_DEPTH`], and the planner recurses down that left spine.
+/// Measured on a 2 MiB thread stack (what a spawned thread gets, and so what a
+/// server connection gets): 1,000 operators plan fine, 2,000 abort the process
+/// with a stack overflow.
+///
+/// SQLite's own limit for this is `SQLITE_MAX_EXPR_DEPTH`, 1,000. Ours is
+/// lower because that is the number our planner crashed *near*, not a number
+/// it survives with room to spare — the frames here are larger than SQLite's.
+/// 512 keeps a 2x margin against the measured cliff and is still far past any
+/// chain a person or an ORM writes; an ORM's long `IN (?, ?, ...)` list is
+/// commas, which do not chain.
+const MAX_CHAIN_LENGTH: usize = 512;
 
 /// Reject a statement whose parentheses nest deeper than [`MAX_NESTING_DEPTH`].
 ///
@@ -76,24 +111,98 @@ fn check_nesting(sql: &str) -> Result<()> {
     // `SELECT '((('` working.
     let mut in_single = false;
     let mut in_double = false;
+    // One chain counter per parenthesis depth: operators at depth `d` chain
+    // with each other, and a nested `(...)` starts its own chain. Fixed size,
+    // because `depth` is already bounded above — no allocation in this pass.
+    let mut chain = [0usize; MAX_NESTING_DEPTH + 1];
 
-    for byte in sql.bytes() {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if in_single || in_double {
+            match byte {
+                b'\'' if in_single => in_single = false,
+                b'"' if in_double => in_double = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
         match byte {
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b'(' if !in_single && !in_double => {
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'(' => {
                 depth += 1;
                 if depth > MAX_NESTING_DEPTH {
                     return Err(Error::Unsupported(alloc::format!(
                         "expression nests more than {MAX_NESTING_DEPTH} levels deep"
                     )));
                 }
+                chain[depth] = 0;
             }
-            b')' if !in_single && !in_double => depth = depth.saturating_sub(1),
+            b')' => depth = depth.saturating_sub(1),
+            // A comma ends one expression and starts the next, so the chain
+            // restarts. This is what keeps a long `VALUES (..), (..), (..)`
+            // or a wide projection from being read as one enormous chain.
+            b',' => chain[depth] = 0,
             _ => {}
         }
+
+        // Operator tokens. A two-byte operator (`||`, `<=`, `<>`, `!=`) is one
+        // operator, so a symbol immediately following another symbol does not
+        // count again — otherwise the effective bound would be half the
+        // documented one for exactly the chain shape it exists to catch.
+        // Word-shaped operators are matched whole, so an identifier that
+        // merely contains one (`in_stock`) is not mistaken for it.
+        let is_operator = |b: u8| {
+            matches!(
+                b,
+                b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'<' | b'>' | b'|' | b'&' | b'~' | b'!'
+            )
+        };
+        if is_operator(byte) {
+            if i == 0 || !is_operator(bytes[i - 1]) {
+                chain[depth] += 1;
+            }
+        } else if byte.is_ascii_alphabetic() {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = &sql[start..i];
+            if is_operator_word(word) {
+                chain[depth] += 1;
+            }
+            if chain[depth] > MAX_CHAIN_LENGTH {
+                return Err(Error::Unsupported(alloc::format!(
+                    "expression chains more than {MAX_CHAIN_LENGTH} operators"
+                )));
+            }
+            continue;
+        }
+
+        if chain[depth] > MAX_CHAIN_LENGTH {
+            return Err(Error::Unsupported(alloc::format!(
+                "expression chains more than {MAX_CHAIN_LENGTH} operators"
+            )));
+        }
+        i += 1;
     }
     Ok(())
+}
+
+/// Whether a bare word is an operator that chains rather than an operand.
+fn is_operator_word(word: &str) -> bool {
+    // `eq_ignore_ascii_case` rather than lowercasing: this runs before the
+    // parser on every statement, and it may not allocate.
+    const OPERATORS: &[&str] = &[
+        "AND", "OR", "NOT", "IS", "LIKE", "GLOB", "REGEXP", "MATCH", "BETWEEN", "COLLATE",
+        "ESCAPE", "IN",
+    ];
+    OPERATORS
+        .iter()
+        .any(|candidate| word.eq_ignore_ascii_case(candidate))
 }
 
 /// Parse and resolve one SQL statement against `catalog`.
