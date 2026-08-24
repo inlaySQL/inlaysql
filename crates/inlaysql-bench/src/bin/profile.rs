@@ -150,11 +150,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "points" => run_points(&config, &path),
         "indexed" => run_indexed(&config, &path),
         "indexed-range" => run_indexed_range(&config, &path),
-        "joins" => run_joins(&config, &path),
+        "joins" => run_joins(&config, &path, Shapes::All),
+        "joins-limit" => run_joins(&config, &path, Shapes::LimitOnly),
         "writes" => run_writes(&config, &path),
         other => {
             eprintln!(
-                "unknown suite `{other}`, expected points, indexed, indexed-range, joins or writes"
+                "unknown suite `{other}`, expected points, indexed, indexed-range, joins, \
+                 joins-limit or writes"
             );
             std::process::exit(2);
         }
@@ -352,11 +354,32 @@ fn run_indexed_range(config: &Config, path: &Path) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// Which of `run_joins`'s four query shapes the timed loop cycles through.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shapes {
+    /// All four, as `PERF.md`'s "join and range profile" section profiled them.
+    All,
+    /// Only the two `LIMIT 10` shapes.
+    ///
+    /// These are the standing loss `BENCHMARK.md` publishes — 4.65x and 5.81x
+    /// slower than SQLite where the full-join shapes are 1.20x slower and 3.65x
+    /// faster — and they cannot be seen in the `All` profile at all. A full
+    /// join takes ~11 ms and a `LIMIT 10` takes ~20 µs, so cycling the four
+    /// evenly gives the two shapes under investigation about one sample in
+    /// five hundred. Profiling them together does not dilute the answer, it
+    /// erases it.
+    LimitOnly,
+}
+
 /// `joins`: `users` x `posts`, PK inner and secondary-index inner, cycling
-/// through all four shapes `crates/inlaysql-bench/src/joins.rs` measures — the
+/// through the shapes `crates/inlaysql-bench/src/joins.rs` measures — the
 /// exact workload `PERF.md`'s "join and range profile" section names
 /// (`--suite joins --rows 20000 --queries 100 --limit 10`).
-fn run_joins(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn run_joins(
+    config: &Config,
+    path: &Path,
+    shapes: Shapes,
+) -> Result<(), Box<dyn std::error::Error>> {
     const POSTS_PER_USER: usize = 8;
     let mut db = config.open(path)?;
     db.execute(
@@ -415,24 +438,37 @@ fn run_joins(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Err
     ))?;
     // Force the first plan/index build cost outside the timed window, exactly
     // as the suite's own comment does for the retrieval workload.
-    let shapes: [&Statement; 4] = [
+    let all: [&Statement; 4] = [
         &pk_inner,
         &pk_inner_limit,
         &indexed_inner,
         &indexed_inner_limit,
     ];
-    for shape in &shapes {
+    // Every shape is warmed, whichever subset is then timed, so the two loops
+    // start from the same plan cache and the same warm pages.
+    for shape in &all {
         db.query_prepared(shape, &[])?;
     }
+    let timed: Vec<&Statement> = match shapes {
+        Shapes::All => all.to_vec(),
+        Shapes::LimitOnly => vec![&pk_inner_limit, &indexed_inner_limit],
+    };
 
     announce_query_phase();
     let mut cycle = 0usize;
     let (iterations, elapsed) = run_for(config.seconds, || {
-        let shape = shapes[cycle % shapes.len()];
+        let shape = timed[cycle % timed.len()];
         cycle += 1;
         db.query_prepared(shape, &[]).map(|_| ())
     })?;
-    report("joins", iterations, elapsed);
+    report(
+        match shapes {
+            Shapes::All => "joins",
+            Shapes::LimitOnly => "joins-limit",
+        },
+        iterations,
+        elapsed,
+    );
     Ok(())
 }
 

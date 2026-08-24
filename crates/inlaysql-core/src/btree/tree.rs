@@ -2128,6 +2128,65 @@ impl<D: Device> CowBTree<D> {
         self.with_page_bytes(offset, page::decode)
     }
 
+    /// The cached node for `id`, if this read is allowed to use the cache and
+    /// the page is resident.
+    ///
+    /// "Allowed" is the whole of the subtlety. The cache holds *committed*
+    /// pages only, so a `pending` read of a page this transaction has dirtied
+    /// must not be served from it — the transaction has to read its own writes,
+    /// and the cached copy is the version before them. Every other case is a
+    /// plain lookup, and a miss is indistinguishable from a page that is not
+    /// cacheable at all.
+    fn cached_page(&self, id: PageId, pending: bool) -> Option<Rc<Node>> {
+        if pending && self.dirty.contains_key(&id) {
+            return None;
+        }
+        if !cache::data_area_page(self.page_size, self.format_version, id) {
+            return None;
+        }
+        self.cache.try_borrow_mut().ok()?.get(id)
+    }
+
+    /// Put a freshly decoded committed node in the cache, under the same rule
+    /// [`CowBTree::cached_page`] reads it back by.
+    fn cache_committed(&self, id: PageId, pending: bool, node: &Rc<Node>) {
+        if pending && self.dirty.contains_key(&id) {
+            return;
+        }
+        if !cache::data_area_page(self.page_size, self.format_version, id) {
+            return;
+        }
+        if let Ok(mut cache) = self.cache.try_borrow_mut() {
+            cache.insert(id, Rc::clone(node));
+        }
+    }
+
+    /// Push every admitted row of one leaf page into `out`.
+    ///
+    /// Shared by the raw read and the cache hit in
+    /// [`CowBTree::walk_raw_row_values`] so the two provably admit the same
+    /// rows: whether the bytes came from the device or from a resident node,
+    /// the cells are read the same way and bounded the same way.
+    fn scan_leaf_into(
+        &self,
+        shared: &Rc<[u8]>,
+        bounds: &WalkBounds<'_>,
+        pending: bool,
+        out: &mut Vec<(RowId, RowBuf)>,
+    ) -> Result<()> {
+        page::scan_leaf_cells(shared, self.page_size, |key, value| {
+            if out.len() >= bounds.limit {
+                return Ok(());
+            }
+            if !bounds.admits(key) {
+                return Ok(());
+            }
+            let value = self.resolve_value_at(Some(shared), &value, pending)?;
+            out.push((trailing_row_id(key)?, value));
+            Ok(())
+        })
+    }
+
     /// Read one page into the reusable scratch buffer and hand it to `f`.
     ///
     /// The buffer is what removes the per-read heap allocation the tree used to
@@ -2512,45 +2571,79 @@ impl<D: Device> CowBTree<D> {
         if id == 0 || out.len() >= bounds.limit {
             return Ok(());
         }
+
+        // A resident page needs neither a read nor a copy, whatever kind it
+        // turns out to be: since AHL-455 a decoded `Node` carries the very page
+        // bytes a leaf scan wants to borrow from, so a hit is `Rc::clone` and
+        // nothing else. This scan used to skip the cache entirely and go
+        // straight to the device — `with_page_bytes` has no cache in it — which
+        // meant a prepared query re-`pread`ing and re-copying the same pages on
+        // every execution. The profile of the `LIMIT 10` join shapes is what
+        // found it: 31% of self time in `memmove`, two thirds of that under
+        // `FileDevice::read` beneath this function and most of the rest copying
+        // whole pages into fresh `Rc`s.
+        let cached = match self.cached_page(id, pending) {
+            Some(node) => match &*node {
+                Node::Leaf { bytes, .. } => {
+                    let shared = Rc::clone(bytes);
+                    self.scan_leaf_into(&shared, bounds, pending, out)?;
+                    return Ok(());
+                }
+                Node::Internal { .. } => Some(node),
+            },
+            None => None,
+        };
+
         // Read the raw bytes once and dispatch on the kind byte: a leaf is
         // parsed in place, an internal node is decoded for navigation.
-        let internal = self.with_raw_page(id, pending, |page_size, bytes| {
-            match bytes[page::OFF_KIND] {
-                page::KIND_LEAF => {
-                    // Keep the page bytes behind one shared `Rc<[u8]>` for the
-                    // whole leaf: `scan_leaf_cells` now yields `ValueRef::Inline`
-                    // ranges into it (AHL-455's pattern), so each row's value
-                    // becomes a `RowBuf::Shared` via a refcount bump rather than
-                    // a per-cell `Rc::from` copy. The page's `Rc` — not the
-                    // transient scratch `bytes` — is what the cells borrow from,
-                    // and it is kept alive by every `RowBuf::Shared` that clones
-                    // it, so the rows can safely outlive this callback.
-                    let shared: Rc<[u8]> = Rc::from(bytes);
-                    page::scan_leaf_cells(&shared, page_size, |key, value| {
-                        if out.len() >= bounds.limit {
-                            return Ok(());
+        let internal = match cached {
+            Some(node) => Some(node),
+            None => {
+                let decoded = self.with_raw_page(id, pending, |page_size, bytes| {
+                    match bytes[page::OFF_KIND] {
+                        page::KIND_LEAF => {
+                            // Keep the page bytes behind one shared `Rc<[u8]>`
+                            // for the whole leaf: `scan_leaf_cells` yields
+                            // `ValueRef::Inline` ranges into it (AHL-455's
+                            // pattern), so each row's value becomes a
+                            // `RowBuf::Shared` via a refcount bump rather than a
+                            // per-cell `Rc::from` copy. The page's `Rc` — not
+                            // the transient scratch `bytes` — is what the cells
+                            // borrow from, and it is kept alive by every
+                            // `RowBuf::Shared` that clones it, so the rows can
+                            // safely outlive this callback.
+                            let shared: Rc<[u8]> = Rc::from(bytes);
+                            self.scan_leaf_into(&shared, bounds, pending, out)?;
+                            Ok(None)
                         }
-                        if !bounds.admits(key) {
-                            return Ok(());
-                        }
-                        let value = self.resolve_value_at(Some(&shared), &value, pending)?;
-                        out.push((trailing_row_id(key)?, value));
-                        Ok(())
-                    })?;
-                    Ok(None)
+                        page::KIND_INTERNAL => Ok(Some(Rc::new(page::decode(page_size, bytes)?))),
+                        other => Err(Error::Corrupt(alloc::format!("unknown node kind {other}"))),
+                    }
+                })?;
+                // An internal node this scan decoded is worth keeping for the
+                // same reason a descent's is: the next execution of the same
+                // query walks the same spine. Leaves are deliberately not
+                // inserted — they were never decoded into a `Node` here, and
+                // decoding one purely to cache it would give back the
+                // allocation this scan exists to avoid.
+                if let Some(node) = &decoded {
+                    self.cache_committed(id, pending, node);
                 }
-                page::KIND_INTERNAL => Ok(Some(page::decode(page_size, bytes)?)),
-                other => Err(Error::Corrupt(alloc::format!("unknown node kind {other}"))),
+                decoded
             }
-        })?;
+        };
 
-        if let Some(Node::Internal {
-            bytes,
-            leftmost,
-            cells,
-        }) = internal
-        {
-            if cells.is_empty() || bounds.starts_below(cells[0].key.resolve(&bytes)) {
+        if let Some(node) = internal {
+            let Node::Internal {
+                bytes,
+                leftmost,
+                cells,
+            } = &*node
+            else {
+                return Ok(());
+            };
+            let (leftmost, cells) = (*leftmost, cells);
+            if cells.is_empty() || bounds.starts_below(cells[0].key.resolve(bytes)) {
                 self.walk_raw_row_values(leftmost, bounds, pending, out)?;
             }
             for (i, separator) in cells.iter().enumerate() {
@@ -2558,11 +2651,11 @@ impl<D: Device> CowBTree<D> {
                     return Ok(());
                 }
                 let below_upper = match bounds.end {
-                    Some(end) => separator.key.resolve(&bytes) < end,
+                    Some(end) => separator.key.resolve(bytes) < end,
                     None => true,
                 };
                 let above_lower = match cells.get(i + 1) {
-                    Some(next) => bounds.starts_below(next.key.resolve(&bytes)),
+                    Some(next) => bounds.starts_below(next.key.resolve(bytes)),
                     None => true,
                 };
                 if below_upper && above_lower {

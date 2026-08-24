@@ -344,6 +344,69 @@ The AHL-472 anomaly is also resolved: `wal::encode_record` does **not** appear
 in a clean read profile. It was an artifact of the contaminated window, not a
 write encoder running during reads.
 
+### The `LIMIT 10` joins, profiled on their own — the raw scan never asked the cache
+
+The two `LIMIT 10` join shapes are the standing loss `BENCHMARK.md` publishes,
+and until now they had never been profiled, because they *cannot* be seen in
+the `joins` profile: a full join takes ~11 ms and a `LIMIT 10` takes ~20 µs, so
+cycling all four shapes evenly gives the two under investigation about one
+sample in five hundred. `profile.rs` grew a `joins-limit` suite that runs only
+those two, and 30 seconds of `sample` over it says:
+
+| Category | Self time |
+| --- | --- |
+| `_platform_memmove` | **31.4%** |
+| allocator (`malloc`/`free` family) | ~16.9% |
+| `_platform_memcmp` (+ its stub) | 11.4% |
+| `JoinInner::prepare` → `scan_index_ro` | ~12% |
+| `PageCache::get` | 3.0% |
+
+Attributing the `memmove` by caller is what located it:
+
+| Caller | Share of `memmove` |
+| --- | --- |
+| `FileDevice::read`, beneath `walk_raw_row_values` | 62.9% |
+| `page::decode` → `Rc<[u8]>::copy_from_slice` | 20.3% |
+| `walk_raw_row_values` → `Rc<[u8]>::copy_from_slice` | 12.0% |
+
+**Ninety-five percent of the copying is whole pages, and the cause is that the
+raw scan had no cache in it.** `CowBTree::with_page_bytes` — the only way
+`walk_raw_row_values` reads a page — calls `device.read` directly.
+`committed_node`, the descent path, consults `PageCache` first; the raw scan
+never did. So a *prepared* query re-`pread`ing and re-copying the same pages on
+every single execution, then copying each leaf a second time into a fresh
+`Rc<[u8]>` for the parsed rows to borrow from, and decoding every internal node
+on its spine from scratch each time.
+
+The fix uses machinery that was already there. Since AHL-455 a decoded `Node`
+carries the page bytes its borrowed keys index into, so a cache hit hands back
+exactly what the leaf scan wants — `Rc::clone`, no syscall, no copy, whatever
+kind the page turns out to be. `walk_raw_row_values` now asks the cache first,
+and inserts the internal nodes it decodes so the next execution walks the same
+spine for free. Leaves are deliberately *not* inserted: they were never decoded
+into a `Node` here, and decoding one purely to cache it would give back the
+allocation this scan exists to avoid.
+
+Measured with `REPEATS=3 SUITE=joins ./bench/repeat.sh` on both sides, median
+of three runs each:
+
+| Shape | Before | After | vs journal SQLite |
+| --- | --- | --- | --- |
+| PK inner, `LIMIT 10` | 17.46 µs | **10.21 µs** | 5.43x → **3.20x slower** |
+| Secondary-index inner, `LIMIT 10` | 21.58 µs | **15.17 µs** | 5.85x → **4.09x slower** |
+| PK inner, full join | 11.23 ms | 10.61 ms | ~1.1x slower |
+
+**1.71x and 1.42x on the two published losses**, and about 6% on the PK full
+join. The `indexed` suite is unchanged within its own noise (range p50 13.46 µs
+against 14.08 µs, on a run whose spread report puts 12.9% on that row), which
+is what should happen: the index entry walk is a different function and this
+did not touch it.
+
+What is still there, and is now the next thing: 11.4% in `memcmp` during
+descent, ~17% in the allocator, and one index descent per outer row in
+`JoinInner::prepare`. The last of those is what AHL-479 predicted and what the
+retained-cursor idea in "the structural fix" below is aimed at.
+
 ### The write path: a commit was paying a second fsync (AHL-480)
 
 Profiled with the harness's new `writes` suite — a single-connection durable
