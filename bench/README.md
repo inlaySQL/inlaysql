@@ -11,6 +11,9 @@ SUITE=retrieval ./bench/run.sh      # just the retrieval workload
 
 ./bench/compare.sh                  # vs DuckDB, pgvector, MySQL, PostgreSQL (needs Docker)
 
+REPEATS=5 ./bench/repeat.sh         # run.sh five times, report the median and the spread
+REPEATS=5 SUITE=retrieval ./bench/repeat.sh
+
 # The HNSW parameter grid behind the shipped defaults. Not in `all`: it is
 # one graph build per (M, ef_construction) point and takes minutes.
 cargo run --release -p inlaysql-bench -- --suite sweep --docs 20000
@@ -32,6 +35,44 @@ plain PostgreSQL, InlaySQL as a library — see "OLTP: MySQL and PostgreSQL,
 matched durability" below), and the server-to-server OLTP comparison
 (InlaySQL's own MySQL wire against MySQL's, same client, a couple of
 concurrency levels — see "Server-to-server" below).
+
+## How many times to run it
+
+Once is not enough, and the project learned that the expensive way. Two
+consecutive editions of `BENCHMARK.md` carried figures that moved for reasons
+no commit could explain: point reads halved between two runs a few hours apart
+on a path neither commit touched, while one SQLite configuration fell and the
+other rose in the same window. Nothing was wrong with the harness. A
+latency-shaped micro-benchmark on a laptop simply has an error bar of roughly a
+factor of two, and publishing a single run to three significant digits pretends
+otherwise.
+
+`./bench/repeat.sh` is the answer to that. It runs `run.sh` N times with
+identical parameters, keeps every raw file, and reports each number's median
+across the runs together with its **spread** — how far the best and worst runs
+disagreed, as a fraction of the median:
+
+```
+  spread      column        median           min           max  row
+   80.7%         max       90.63µs       71.88µs      145.04µs  bm25
+   10.4%         p50       50.75µs       50.42µs       55.71µs  bm25
+```
+
+Read the `max` columns and shrug: a `max` is one unlucky sample and is supposed
+to swing. Read a wide `p50` or a wide ops/s as the measurement failing, not the
+engine. **A figure whose spread is 10% or more should not be quoted to three
+digits**, and `BENCHMARK.md` should say what the spread was rather than pick
+the run that flattered us.
+
+The alignment is positional and strict: identical parameters and an identical
+seed produce identical structure, so if two runs disagree about their *shape*
+rather than their numbers, `summarise.py` refuses rather than averaging two
+different benchmarks together. `./bench/summarise.py a.txt b.txt c.txt` runs
+the same comparison over result files you already have.
+
+What repeating cannot fix: it measures the machine's variance, not its bias.
+Something stealing a core for the whole sitting is paid by every run, so the
+spread stays narrow while the median is wrong. Note what else was running.
 
 ## Suite: points — InlaySQL vs SQLite
 

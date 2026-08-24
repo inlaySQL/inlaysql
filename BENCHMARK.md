@@ -354,15 +354,21 @@ engines. "Comparable" is not "hardware-durable".
   "Server-to-server".
 - **No sustained or multi-core saturation workload.** Everything here is a
   latency-shaped micro-benchmark on one machine.
-- **No controlled machine state.** The two halves of this edition ran about
-  twenty minutes apart under visibly different load (idle, then Docker Desktop
-  with eleven unrelated containers), and several figures moved by more than
-  this commit could possibly explain — point reads by 1.86x in the losing
-  direction, vector search by 1.88x in the compare half. Nothing here is run
-  repeatedly and nothing reports a confidence interval, so a single figure is
-  worth roughly a factor of two and only the same-run ratios are worth reading
-  closely. Pinning the machine state, or repeating each run, is the fix and it
-  is not done.
+- **No controlled machine state, and no error bar on this edition.** The two
+  halves ran about twenty minutes apart under visibly different load (idle,
+  then Docker Desktop with eleven unrelated containers), and several figures
+  moved by more than this commit could possibly explain — point reads by 1.86x
+  in the losing direction, vector search by 1.88x in the compare half. Every
+  number on this page is one run, so a single figure is worth roughly a factor
+  of two and only the same-run ratios are worth reading closely.
+
+  Half the fix now exists: `REPEATS=5 ./bench/repeat.sh` runs the whole suite
+  five times and reports each number's median and how far the runs disagreed,
+  and `bench/README.md`'s "How many times to run it" explains how to read the
+  spread. **This edition predates it and does not use it** — the next one
+  should, and should print the spread beside every figure it quotes. Pinning
+  the machine state itself is still not done and probably cannot be, which is
+  exactly why the spread has to be published instead.
 - **Cold-cache reads.** The point-read rows are warm; an application that
   opens, reads a handful and exits sees worse, because our miss path is dearer
   than SQLite's.

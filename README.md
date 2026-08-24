@@ -570,6 +570,7 @@ OS-facing crate turns up in its dependency tree.
 ```sh
 ./bench/run.sh                  # points, indexed, joins, vectors, quantisation, retrieval (pinned params)
 ./bench/compare.sh              # DuckDB, pgvector, MySQL, PostgreSQL (needs Docker)
+REPEATS=5 ./bench/repeat.sh     # run.sh five times: median plus how far the runs disagreed
 ```
 
 Every number below is [`BENCHMARK.md`](BENCHMARK.md), regenerated at commit
