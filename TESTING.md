@@ -13,7 +13,7 @@ cargo test --workspace          # everything below except the sweeps and the fuz
 | --- | --- | --- |
 | Deterministic simulation (crash / torn write) | `crates/inlaysql-core/tests/dst_sweep.rs` | 10,000 seeds on `main`, on tags, and on a PR labelled `full-ci` |
 | Index recovery under the same faults | `crates/inlaysql/tests/index_recovery_dst.rs` | 10,000 schedules (2,500 seeds × 4 index shapes), in the same job |
-| Free list page reuse under the same faults (opt-in, AHL-481) | `crates/inlaysql-core/tests/free_list_reuse_dst.rs` | 300 seeds every push; 5,000 exists as `--ignored` but is not yet wired into `ci.yml`'s `sweep` job the way the other two are — run it by hand |
+| Free list page reuse under the same faults (opt-in, AHL-481) | `crates/inlaysql-core/tests/free_list_reuse_dst.rs` | 300 seeds every push; 5,000 in the same `sweep` job as the other two (`ci.yml`'s "Sweep page reuse") |
 | A churn workload stops growing the file once reuse is on (opt-in, AHL-481) | `crates/inlaysql/tests/free_list_growth.rs` | every push |
 | The streaming executor stops early only when that is still the right answer | `crates/inlaysql-core/tests/streaming.rs` | every push |
 | SQL Logic Test subset | `crates/inlaysql/tests/sqllogictest/` | every push — **1094/1094** |
@@ -86,10 +86,15 @@ gives an honest answer to both, over the same fault schedule, so this sweep
 is the one place page id reuse itself is under DST rather than merely
 compiled. A fast 300-seed pass runs in `cargo test --workspace`; the
 5,000-seed pass above is `--ignored`, the same way `dst_sweep.rs` and
-`index_recovery_dst.rs` are — but, unlike them, it is not yet wired into
-`ci.yml`'s `sweep` job or `docker/test.sh`'s `sweep`/`all` targets, so today
-it only runs when someone runs the command above by hand. Worth closing, and
-written down here rather than left to look automatic.
+`index_recovery_dst.rs` are, and runs beside them in `ci.yml`'s `sweep` job
+and in `docker/test.sh`'s `sweep`/`all` targets.
+
+This paragraph used to say the opposite — that the 5,000-seed pass ran only
+when somebody typed it by hand. That was half right and is recorded because
+the half that was wrong is the dangerous kind: `ci.yml` had gained the step
+("Sweep page reuse") without this file being updated, while `docker/test.sh`
+genuinely had not, so the script that exists to reproduce CI's sweep job did
+not reproduce it. Both are now the same three steps in the same order.
 `crates/inlaysql/tests/free_list_growth.rs` checks
 the property that motivates it directly rather than under fault injection: a
 sustained write/delete/write/checkpoint workload stops growing the file once
