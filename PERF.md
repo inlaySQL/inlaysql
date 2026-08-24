@@ -419,9 +419,19 @@ were run against it rather than left to CI:
 | `index_recovery_dst` | 10,000 schedules | pass, 364 s |
 | `free_list_reuse_dst` (page id reuse) | 5,000 seeds | pass, 129 s |
 
-The third matters most here: the other two answer "unknown, so never reclaim"
-to the free list and never recycle a page id, so a cache keyed by page id is
-only genuinely under test in that one.
+**Correction, and it is the important part of this section.** The first
+edition of these lines said the page-reuse sweep was "the one that matters for
+this change", on the reasoning that a cache keyed by page id is only under test
+where page ids are recycled. An independent review checked whether that sweep
+reaches the changed code and it does not: `free_list_reuse_dst` verifies
+through `db.scan()` → `scan_prefix` → `walk`, the *decoded* walk, and
+`walk_raw_row_values` is never executed by it. So the three sweeps establish
+that the change breaks nothing they cover, which is worth having and is not the
+same claim. The path that does exercise the leaf cache hit is
+`a_row_values_walk_agrees_with_the_general_walk`, whose batched resume loop
+runs after a `scan_prefix` has warmed leaves into the cache — a unit test, not
+a fault-injection sweep. **A fault-injection sweep that drives the raw scan
+under page reuse does not exist and is owed.**
 
 The two guards that make it safe, by reading: `cached_page` refuses the cache
 when `pending && dirty.contains_key(&id)` — the same two-step `node_at` and
@@ -432,9 +442,20 @@ equivalent to the raw one because `page::decode` refuses any buffer that is not
 `page_size` and stores `Rc::from(bytes)` for the whole page, and
 `scan_leaf_cells` re-checks that length itself.
 
-Recorded with its weakness stated: that reading was done by the author of the
-change, not independently, and an independent review is still owed. The sweeps
-are the part that does not care who wrote it.
+That reading has since been checked independently, against all five of the
+failure modes above plus the question of whether `scan_leaf_into` can diverge
+between its two callers. Verdict: no defect, each item refuted with the code
+that refutes it. The review is also what produced the correction above — the
+author's own summary had claimed sweep coverage the sweep does not provide,
+which is the failure mode a self-review is worst at catching.
+
+One thing it surfaced that this change did **not** introduce, recorded because
+it is real: `invalidate_for_reuse` clears a handle's decoded cache only when
+that handle has `page_reuse` enabled, and `note_page_reuse_enabled` flushes
+only the device's raw-page cache, never another handle's `PageCache`. Two
+handles on one file in one process, one with reuse on and one with it off, and
+the second can serve a reclaimed page's previous occupant from its own cache.
+The decoded walk already had this; the raw scan now shares it.
 
 ### The write path: a commit was paying a second fsync (AHL-480)
 

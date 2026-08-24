@@ -825,4 +825,138 @@ mod tests {
         bytes[OFF_KIND] = KIND_LEAF;
         assert!(decode_overflow(512, &bytes).is_err());
     }
+
+    // ------------------------------------- the two leaf parsers are one parser
+
+    /// What one leaf page's cells look like once parsed, in a form both
+    /// parsers can be compared in: the key copied out, and the value exactly
+    /// as each returned it.
+    type Parsed = Result<Vec<(Vec<u8>, ValueRef)>>;
+
+    /// Read one leaf page both ways and return what each made of it.
+    ///
+    /// [`decode`] materialises a whole [`Node`] through [`decode_leaf_cell`];
+    /// [`scan_leaf_cells`] walks the same page through
+    /// [`decode_leaf_cell_ref`]. Two independent implementations of one parse,
+    /// which is only safe while they agree.
+    fn both_ways(page_size: usize, bytes: &[u8]) -> (Parsed, Parsed) {
+        let decoded = decode(page_size, bytes).and_then(|node| match &node {
+            Node::Leaf { entries, .. } => Ok(entries
+                .iter()
+                .map(|entry| (node.key(&entry.key).to_vec(), entry.value.clone()))
+                .collect()),
+            Node::Internal { .. } => Err(Error::Corrupt("not a leaf".to_string())),
+        });
+
+        let mut scanned = Vec::new();
+        let walk = scan_leaf_cells(bytes, page_size, |key, value| {
+            scanned.push((key.to_vec(), value));
+            Ok(())
+        })
+        .map(|()| scanned);
+
+        (decoded, walk)
+    }
+
+    /// The two parsers must admit exactly the same cells, on any page.
+    ///
+    /// This is the project's fast-path/slow-path rule applied to a pair that
+    /// did not have it: `decode_leaf_cell_ref`'s doc *claims* "the same
+    /// corruption checks as `decode_leaf_cell`", and nothing enforced the
+    /// claim. It became load-bearing when the raw leaf scan started reading
+    /// through the page cache, because a cached page is now parsed by
+    /// `decode_leaf_cell` and an uncached one by `decode_leaf_cell_ref` — the
+    /// same page, either parser, decided only by whether it happened to be
+    /// resident. A divergence would show up as one query returning different
+    /// rows depending on cache state, which is the worst shape a bug can take:
+    /// it would not reproduce.
+    #[test]
+    fn both_leaf_parsers_agree_on_well_formed_pages() {
+        let shapes: Vec<Vec<Entry>> = vec![
+            vec![],
+            vec![entry(b"k", b"v")],
+            vec![entry(b"", b"")],
+            vec![entry(b"a", b"1"), entry(b"b", b"2"), entry(b"c", b"3")],
+            vec![entry(b"long-ish key", &[7u8; 200])],
+            vec![Entry {
+                key: Key::Owned(b"spilled".to_vec()),
+                value: ValueRef::Overflow {
+                    first: 42,
+                    len: 100_000,
+                },
+            }],
+            vec![
+                entry(b"inline", b"short"),
+                Entry {
+                    key: Key::Owned(b"overflowed".to_vec()),
+                    value: ValueRef::Overflow { first: 9, len: 1 },
+                },
+            ],
+        ];
+
+        for entries in shapes {
+            let page = encode_leaf(512, &[], &entries).unwrap();
+            let (decoded, scanned) = both_ways(512, &page);
+            assert_eq!(
+                decoded.unwrap(),
+                scanned.unwrap(),
+                "the two parsers disagree on a well-formed page"
+            );
+        }
+    }
+
+    /// And they must *fail* together too. A parser that accepts a corrupt page
+    /// the other rejects is the same divergence wearing a different hat: the
+    /// cached path would serve rows the uncached path calls corruption.
+    #[test]
+    fn both_leaf_parsers_agree_on_corrupt_pages() {
+        let entries = vec![
+            entry(b"alpha", b"one"),
+            entry(b"beta", b"two"),
+            Entry {
+                key: Key::Owned(b"gamma".to_vec()),
+                value: ValueRef::Overflow { first: 3, len: 40 },
+            },
+        ];
+        let clean = encode_leaf(512, &[], &entries).unwrap();
+
+        // Walk a byte at a time through the header and slot directory — where
+        // a flip changes counts and offsets rather than payload — and a sample
+        // of the cell area beyond it.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut probes: Vec<usize> = (0..64).collect();
+        for _ in 0..192 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            probes.push((state % 512) as usize);
+        }
+
+        for at in probes {
+            for flip in [0x01u8, 0x80, 0xff] {
+                let mut page = clean.clone();
+                page[at] ^= flip;
+                // Only leaves reach `scan_leaf_cells` — `walk_raw_row_values`
+                // dispatches on the kind byte first — so a flip that turns the
+                // page into another kind is out of contract, not a divergence.
+                if page[OFF_KIND] != KIND_LEAF {
+                    continue;
+                }
+                let (decoded, scanned) = both_ways(512, &page);
+                assert_eq!(
+                    decoded.is_ok(),
+                    scanned.is_ok(),
+                    "byte {at} flipped by {flip:#04x}: one parser accepted the page and the \
+                     other rejected it"
+                );
+                if let (Ok(decoded), Ok(scanned)) = (decoded, scanned) {
+                    assert_eq!(
+                        decoded, scanned,
+                        "byte {at} flipped by {flip:#04x}: both parsers accepted the page and \
+                         read different cells out of it"
+                    );
+                }
+            }
+        }
+    }
 }
