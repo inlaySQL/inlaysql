@@ -697,16 +697,87 @@ in `PLAN.md` is where that work is scoped.
 is pgvector on vector-only search, ~4x" until the AHL-495 regeneration: the
 current published pair is 147 µs here against pgvector's 198 µs, and the honest
 reading is *close, not a rout* — their number includes a socket round trip and
-ours does not. The avenues below are still the ones that would widen it, in
-order of expected value:
-1. **Quantised distance kernels.** `VECTOR(n, INT8)` already shrinks storage 4x;
-   computing distances *in* int8 with SIMD, rather than converting to `f32`
-   first, makes the memory-bandwidth win a compute win too.
+ours does not.
+
+### The exact-`f32` distance kernel is already vectorised, and it is half the query
+
+`PLAN.md`'s W4 prescribes "SIMD distance kernels (NEON/AVX-512 behind a leaf
+crate)" as the vector half of getting retrieval to 100x. That premise was never
+checked against the compiled output, and it does not survive contact with it.
+
+`crates/inlaysql-core/src/hnsw.rs`'s `distance` sums into eight explicit
+accumulators specifically so the compiler may reassociate, and on aarch64 it
+takes the offer. The inner loop, from `--emit asm`:
+
+```
+LBB279_4:
+	ldp	q3, q2, [x14], #32     ; 8 floats of a
+	ldp	q5, q4, [x15], #32     ; 8 floats of b
+	fmul.4s	v3, v3, v5
+	fmul.4s	v2, v2, v4
+	fadd.4s	v0, v0, v2
+	fadd.4s	v1, v1, v3
+	subs	x13, x13, #1
+	b.ne	LBB279_4
+```
+
+Eight floats per iteration, full-width NEON, with one scalar horizontal
+reduction at the end of the call. Hand-written intrinsics would be writing out
+what the compiler already emits.
+
+`cargo test --release -p inlaysql-core --test vector_query_cost -- --nocapture
+--ignored` measures what that leaves. On 2,000 vectors at dim 384, `k = 10`,
+uniformly random directions (the ANN worst case) with held-out queries:
+
+| | |
+| --- | --- |
+| Query mean | 57.16 µs |
+| Distance calls per query | 1,318 |
+| The dot products alone | 30.01 µs — **52% of the query** |
+| The same, with `fmla` (`mul_add`) | 27.65 µs — 48% |
+
+Three things follow, and they reorder the work:
+
+1. **Kernel work has a ceiling of 52%**, and an infinitely fast kernel still
+   leaves a 27 µs query. This is not where a 100x lives.
+2. **Fusing to `fmla` is worth 4% of the query** and changes what the index
+   computes — FMA rounds once where multiply-then-add rounds twice — so it
+   trades bit-reproducible recall for four percent. Rejected on those terms.
+3. **1,318 distance calls over a 2,000-vector corpus** is a graph doing two
+   thirds of the work of the brute-force scan it replaced. The lever is doing
+   *fewer* comparisons, not faster ones — and it is not `ef_search`, which is
+   already priced correctly on this corpus:
+
+| `ef_search` | calls/query | recall@10 | mean |
+| --- | --- | --- | --- |
+| 16 (floored to 20 by the multiplier) | 660 | 0.587 | 25.49 µs |
+| 32 | 885 | 0.721 | 36.03 µs |
+| **64 (shipped)** | 1,318 | 0.897 | 56.09 µs |
+| 128 | 1,765 | 0.986 | 84.27 µs |
+
+Halving the budget halves the time and costs a third of the recall. The
+shipped default is on the curve, not above it.
+
+So the remaining vector work is the **48% that is not arithmetic** — candidate
+heaps, the visited set, neighbour-list fetches — and the graph's own
+selectivity at small corpus sizes. Both need a profile of the query phase
+before anything is written; `bin/profile.rs` does not cover the retrieval suite
+yet, and adding it is the first step.
+
+The avenues below are the ones that would widen the pgvector margin, in order
+of expected value, now reordered by the above:
+1. **The traversal, not the kernel.** Half the query is heap and set
+   bookkeeping around the distance calls. Profile it first.
 2. **Memory layout.** Neighbour lists and vectors laid out for sequential access
    during a graph walk, so the prefetcher works for us.
-3. **Quantised paged nodes**  — `PagedHnswIndex` stores exact
+3. **Quantised distance kernels.** `VECTOR(n, INT8)` already shrinks storage 4x;
+   computing distances *in* int8, rather than converting to `f32` first, makes
+   the memory-bandwidth win a compute win too. Note the int8 path currently
+   measures *slower* than exact (155.21 µs against 88.29 µs on the published
+   suite), so this is a repair before it is an optimisation.
+4. **Quantised paged nodes**  — `PagedHnswIndex` stores exact
    `f32` even for an int8 column, so the paged path currently forfeits the 4x.
-4. ~~**Filter-aware walks** instead of over-fetching.~~ — **done.** The
+5. ~~**Filter-aware walks** instead of over-fetching.~~ — **done.** The
    `WHERE` is compiled into a row predicate and pushed into the index walk:
    rejected rows are traversed but neither returned nor counted, so a
    selective filter no longer widens the probe in geometric re-runs. See
