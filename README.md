@@ -345,8 +345,8 @@ for a composite key — builds an ordinary ordered B-tree over one or more
 `INTEGER`/`REAL`/`TEXT` columns (AHL-423), living in the same copy-on-write
 tree as the rows, so it gets WAL, crash recovery and MVCC rebase for free. A
 top-level equality or range predicate on an indexed column becomes a range
-probe instead of a full scan — worth roughly 851x over the engine's own
-unindexed scan (`BENCHMARK.md`) — and `CREATE UNIQUE INDEX` enforces a
+probe instead of a full scan — worth 504.65x on point probes and 122.85x on
+range scans over the engine's own unindexed scan (`BENCHMARK.md`) — and `CREATE UNIQUE INDEX` enforces a
 uniqueness constraint at insert time. The same index also answers the inner
 side of a join: `FROM posts JOIN users ON posts.user_id = users.id` probes
 `users` by one tree descent per outer row instead of materialising and
@@ -568,16 +568,17 @@ OS-facing crate turns up in its dependency tree.
 ## Performance
 
 ```sh
-LOOKUPS=50000 ./bench/run.sh      # points, indexed, joins, concurrency, vectors, retrieval
-./bench/compare.sh                # DuckDB, pgvector, MySQL, PostgreSQL (needs Docker)
+./bench/run.sh                  # points, indexed, joins, vectors, quantisation, retrieval (pinned params)
+./bench/compare.sh              # DuckDB, pgvector, MySQL, PostgreSQL (needs Docker)
 ```
 
 Every number below is [`BENCHMARK.md`](BENCHMARK.md), regenerated at commit
-`49e98e4` on a developer machine at load average 5.4 (running Chrome, LM
-Studio and other applications). One developer machine — reproduce it, do not
-trust it. The machine was loaded enough that absolute throughput is depressed
-relative to a quiet machine, but because every engine was measured in the same
-run under the same conditions, the comparisons remain fair. See
+`9aba437` on a developer machine. One developer machine — reproduce it, do
+not trust it. The SQLite and `sqlite-vec` figures come from the 2026-08-24
+run; the DuckDB, pgvector, MySQL and PostgreSQL figures come from the
+2026-08-20 run (load average 5.4), because `bench/compare.sh` was not
+re-run. Because every engine within a run was measured in the same
+conditions, the comparisons remain fair. See
 [`bench/README.md`](bench/README.md) for how each comparison is kept fair:
 matched schema, prepared statements on both sides, matched durability
 (`fullfsync` on macOS, which is what makes these numbers mean anything at
@@ -592,25 +593,25 @@ harder target.
 
 | Workload | InlaySQL | SQLite, durable | SQLite, fastest |
 | --- | --- | --- | --- |
-| Point read by primary key | **1,363,754 ops/s**, 541 ns p50 | 274,272 ops/s (**4.97x**) | 1,023,733 ops/s (**1.33x**) |
-| Point read, secondary index | **451,602 ops/s**, 1.92 µs p50 | 272,933 ops/s (**1.66x**) | 692,973 ops/s (we lose 1.54x) |
-| Indexed range scan, 50 rows | 66,508 ops/s, 13.96 µs p50 | 136,527 ops/s (we lose 2.05x) | 187,926 ops/s (we lose 2.82x) |
-| Join, PK inner, full scan | 54.12 ms | 9.97 ms (we lose 5.56x) | — |
-| Join, secondary-index inner, full scan | 169.07 ms | 15.91 ms (we lose 10.71x) | — |
-| Durable write, one commit each | **239 ops/s**, 4.00 ms p50 | 91 ops/s (**2.63x**) | — |
-| Concurrent durable writers, 8 threads | **692 commits/s**, 0.0% aborted | 93 commits/s (**7.4x**) | — |
+| Point read by primary key | **636,980 ops/s**, 958 ns p50 | 295,232 ops/s (**2.16x**) | 1,117,360 ops/s (we lose 1.75x) |
+| Point read, secondary index | **354,533 ops/s**, 2.33 µs p50 | 141,166 ops/s (**1.61x**) | 307,056 ops/s (we lose 0.87x) |
+| Indexed range scan, 50 rows | 64,916 ops/s, 14.38 µs p50 | 41,160 ops/s (**1.58x**) | 113,277 ops/s (we lose 1.74x) |
+| Join, PK inner, full scan | 13.15 ms p50 | 9.39 ms p50 (we lose 1.43x) | — |
+| Join, secondary-index inner, full scan | **4.99 ms p50** | 15.32 ms p50 (we win 3.07x) | — |
+| Durable write, one commit each | **226 ops/s**, 3.99 ms p50 | 87 ops/s (**2.60x**) | — |
+| Concurrent durable writers, 8 threads | **736 commits/s**, 0.0% aborted | 80 commits/s (**9.2x**) | — |
 
-A single indexed point probe wins — the index itself is worth roughly 851x
-over the engine's own unindexed scan. **Iterating rows is where we lose**: a
-50-row range scan and both join shapes above are slower than SQLite, and the
-`LIMIT 10` form of the same two joins narrows from 5.6–10.7x down to
-1.9–3.6x, which is what pins the cost as per-row rather than per-query. This
-is the top open performance target — [`PERF.md`](PERF.md) has the profile,
-and index selection stops at the narrow rule in
-[What this is not](#what-this-is-not).
+A single indexed point probe wins — the index itself is worth 504.65x over
+the engine's own unindexed scan. **Iterating rows is where we lose**: the
+50-row range scan and the PK-inner join shape are slower than SQLite (1.74x
+and 1.43x), and the `LIMIT 10` form of the same two joins stays 5.3–5.7x
+behind, which is what pins the remaining cost as per-row rather than
+per-query. This is the top open performance target —
+[`PERF.md`](PERF.md) has the profile, and index selection stops at the
+narrow rule in [What this is not](#what-this-is-not).
 
 The point-read win is the page cache (AHL-420): caching decoded pages took
-warm p50 from 6.75 µs to 500 ns, past SQLite in *both* configurations above —
+warm p50 from 6.75 µs to ~1 µs, past SQLite's *durable* configuration above —
 including WAL mode with `synchronous=NORMAL`, the fastest reading
 configuration SQLite has. The cache needs no invalidation protocol because
 the tree is copy-on-write and (until recently) never reused a page id; a free
@@ -623,12 +624,12 @@ handle warms up more slowly.
 
 Durable writes win because we pay one `fsync` per commit against the
 journal's several; batching the same workload into one commit per many rows
-reaches 33,888 ops/s at 21.21 µs (**142x**) — a bulk-load number, not the
+reaches 56,839 ops/s at 11.50 µs (**251x**) — a bulk-load number, not the
 transaction one above. Concurrent writers now scale where they used to
 flatten: the reservation gate used to hold ~100% of wall clock re-deriving
 committed state on every commit, so no two commits ever overlapped in the
 sync window; with the gate down to ~0.9 ms (AHL-468), group commit (AHL-461)
-batches most fsyncs and 8 writers do 2.8x the work of one instead of 1.45x.
+batches most fsyncs and 8 writers do 3.01x the work of one instead of 1.45x.
 
 ### Against `sqlite-vec`, DuckDB and pgvector
 
@@ -637,8 +638,8 @@ exhaustive oracle:
 
 | Corpus | recall@10 | InlaySQL p50 | vs `sqlite-vec` |
 | --- | --- | --- | --- |
-| Text-derived embeddings | 1.000 | 70.83 µs | **9.52x faster at 100% of its recall** |
-| Uniform random | 0.922 | 98.00 µs | 6.88x faster at 92.2% of its recall |
+| Text-derived embeddings | 1.000 | 82.46 µs | **8.34x faster at 100% of its recall** |
+| Uniform random | 0.922 | 104.96 µs | 6.50x faster at 92.2% of its recall |
 
 Both corpus shapes are published because only one of them flatters us:
 uniformly random vectors in 384 dimensions have no structure for a graph
@@ -648,8 +649,8 @@ quantisation costs 0.014 recall on the realistic corpus for a 3.96x smaller
 resident vector payload.
 
 Hybrid retrieval (vector + BM25, fused in one SQL statement) at 2,000
-documents: ingest 14,628 docs/s, vector p50 71.58 µs, BM25 p50 305.00 µs,
-hybrid p50 382.25 µs.
+documents: ingest 17,182 docs/s, vector p50 87.88 µs, BM25 p50 347.50 µs,
+hybrid p50 453.88 µs.
 
 Against DuckDB and pgvector, one corpus and one exhaustive ground truth
 shared by all three engines — see
