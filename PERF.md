@@ -752,9 +752,54 @@ and two queries plus client-side fusion there.
 (347.50 µs of 453.88 µs at 2,000 documents); an inverted-index layout with
 dense document ordinals, a bounded top-`k` heap and a MaxScore walk took it to
 47.75 µs of a 95.17 µs hybrid — 50%, with the vector leg now the larger share.
-Scores and ranking are unchanged, ties included. Per-block impact bounds
-(block-max WAND) are the next step on that path and are not implemented; R6
-in `PLAN.md` is where that work is scoped.
+Scores and ranking are unchanged, ties included.
+
+### Block-max WAND: built, measured, reverted
+
+`PLAN.md`'s R6 names per-block impact bounds as the next step after MaxScore,
+and there was real headroom to aim at. `tests/bm25_skipping_headroom.rs` counts
+the documents a query still visits by counting filter calls:
+
+| Corpus | visits at `k=10` | visits at `k=∞` | skipped |
+| --- | --- | --- | --- |
+| Flat vocabulary (the benchmark's) | 1,381 | 1,800 | 23.3% |
+| Zipf-ish vocabulary | 1,103 | 1,943 | 43.2% |
+
+So MaxScore leaves 1,371 visits that a perfect bound would remove. Block-max
+was implemented against that — one `Impact` per 128 postings, rebuilt in
+`commit` for terms written since the last one, with a stale term falling back
+to its term-wide ceiling so a moved posting can never be bounded by a stale
+block. It works, it is correct, and it does not pay:
+
+| Block size | flat: visits | Zipf: visits |
+| --- | --- | --- |
+| none (MaxScore only) | 1,381 | 1,103 |
+| 128 | 1,380 | 1,103 |
+| 32 | 1,380 | 1,101 |
+| 8 | 1,359 | 974 |
+
+And the cost is real. Median of three `REPEATS=3 SUITE=retrieval` runs each
+side: **BM25 p50 49.54 µs → 52.92 µs and hybrid 99.75 µs → 105.58 µs**, because
+the per-candidate bound check is dearer than the 0.1% of visits it removes.
+
+**Why it fails here is a property of the data, not the implementation.** These
+documents are 8 to 32 terms long, so almost every term frequency is 1 or 2, so
+a block's maximum frequency *is* the list's maximum frequency and the block
+bound is the term bound. Block-max WAND earns its keep on long documents with
+high term-frequency variance — web-scale text — and this corpus has neither.
+The `k=∞` column is also the thing to notice: 1,800 of 2,000 documents match at
+least one query term, because the vocabulary is twenty words. On a corpus where
+a query term matches 1% of documents, both the headroom and the bounds would
+look completely different.
+
+So it is reverted, and the instrument stays. Anyone picking R6 back up should
+run `bm25_skipping_headroom` on the corpus they actually care about first — and
+if the answer is a realistic corpus with long documents, the implementation is
+in this file's history rather than lost.
+
+The next BM25 work is therefore not more skipping. It is the remaining
+per-visit cost, and it has not been profiled: `bin/profile.rs` has no retrieval
+suite.
 
 **The pgvector vector-only loss is closed.** This section read "the open loss
 is pgvector on vector-only search, ~4x" until the AHL-495 regeneration: the
