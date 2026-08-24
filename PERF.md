@@ -407,6 +407,35 @@ descent, ~17% in the allocator, and one index descent per outer row in
 `JoinInner::prepare`. The last of those is what AHL-479 predicted and what the
 retained-cursor idea in "the structural fix" below is aimed at.
 
+**Why a cache in the read path is a correctness change, and what was run.**
+Serving a page from a cache rather than from the device is exactly the class of
+change AHL-406 came from — a database recovered to a state no commit ever
+wrote, with no checksum failing anywhere — so the three fault-injection sweeps
+were run against it rather than left to CI:
+
+| Sweep | Schedules | Result |
+| --- | --- | --- |
+| `dst_sweep` (crash / torn write) | 10,000 seeds | pass, 117 s |
+| `index_recovery_dst` | 10,000 schedules | pass, 364 s |
+| `free_list_reuse_dst` (page id reuse) | 5,000 seeds | pass, 129 s |
+
+The third matters most here: the other two answer "unknown, so never reclaim"
+to the free list and never recycle a page id, so a cache keyed by page id is
+only genuinely under test in that one.
+
+The two guards that make it safe, by reading: `cached_page` refuses the cache
+when `pending && dirty.contains_key(&id)` — the same two-step `node_at` and
+`committed_node` already perform, so a transaction still reads its own writes —
+and `cache_committed` carries the identical guard, so a page read as *dirty*
+bytes is never inserted as though it were committed. The leaf fast path is
+equivalent to the raw one because `page::decode` refuses any buffer that is not
+`page_size` and stores `Rc::from(bytes)` for the whole page, and
+`scan_leaf_cells` re-checks that length itself.
+
+Recorded with its weakness stated: that reading was done by the author of the
+change, not independently, and an independent review is still owed. The sweeps
+are the part that does not care who wrote it.
+
 ### The write path: a commit was paying a second fsync (AHL-480)
 
 Profiled with the harness's new `writes` suite — a single-connection durable
