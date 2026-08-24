@@ -535,24 +535,24 @@ On one developer machine — 5,000 documents, dim 128, 100 queries, top-10:
 
 | Engine | recall@10 | vector p50 | hybrid p50 | agree |
 | --- | --- | --- | --- | --- |
-| InlaySQL (HNSW + BM25) | 0.993 | 0.73 ms | **1.57 ms** | 0.975 |
-| DuckDB (exhaustive + `fts` BM25) | 0.999 | 5.46 ms | 15.2 ms | 0.966 |
-| DuckDB (`vss` HNSW + `fts` BM25) | 0.992 | 4.35 ms | 14.2 ms | 0.954 |
-| pgvector (HNSW + `ts_rank`) | 0.987 | **0.17 ms** | 18.8 ms | 0.456 |
-| pgvector (exhaustive + `ts_rank`) | 0.999 | 0.59 ms | 18.9 ms | 0.465 |
+| InlaySQL (HNSW + BM25) | 1.000 | 147 µs | **191 µs** | 0.988 |
+| DuckDB (exhaustive + `fts` BM25) | 0.999 | 4.81 ms | 11.90 ms | 0.966 |
+| DuckDB (`vss` HNSW + `fts` BM25) | 0.993 | 3.97 ms | 11.38 ms | 0.958 |
+| pgvector (HNSW + `ts_rank`) | 0.987 | 198 µs | 14.16 ms | 0.456 |
+| pgvector (exhaustive + `ts_rank`) | 0.999 | 509 µs | 14.14 ms | 0.465 |
 
-Two results, and one of them is a loss.
+**We win hybrid by roughly 60x**, because it is one statement here and two
+queries plus client-side fusion everywhere else. That multiple was ~10x when
+this table was first written and ~14–17x an edition ago; most of the latest
+jump is the BM25 index rewrite (`crates/inlaysql-core/src/bm25.rs`), which took
+our hybrid p50 from 875 µs to 191 µs while every baseline stayed put.
 
-**We win hybrid by roughly 10x**, because it is one statement here and two
-queries plus client-side fusion everywhere else.
-
-**pgvector beats us on vector search by 4x — over a network.** It is a server;
-every one of those 0.17 ms includes a client round trip that a library in your
-own process does not pay, and it still wins. That row predates AHL-372, which
-tuned the index and took roughly 3x off query latency at these sizes, so it is
-stale and understates us — but the direction of the result is not something a
-rerun is expected to reverse, and the row stays until someone reruns it with
-Docker to hand.
+**The vector-only loss to pgvector is gone, and was never a rout.** This table
+used to read "pgvector beats us on vector search by 4x — over a network"; it is
+now 198 µs to our 147 µs, on a run where the machine was busy and our own idle
+measurement of the same index was 68.79 µs. Their number still includes a
+client round trip a library in your own process does not pay, so read the
+current gap as close in our favour rather than as a win worth quoting.
 
 ### Reading the table
 
@@ -880,11 +880,13 @@ reader to discover in a suspicious ratio:
 
 Not included here, for the same reason the OLTP section above withholds its
 own: this file describes methodology, and `BENCHMARK.md` is where a
-regenerated number lives. The first server-to-server run (AHL-495) is
-published there — reads 1.52x MySQL at one connection and 1.10x at eight,
-writes 0.70x and 0.21x — measured under a load average of 5.4, which is
-stated on that page and is the reason a repeat on a quiet machine is still
-worth doing. Run `./bench/compare.sh` yourself to reproduce it.
+regenerated number lives. The current run is published there — reads 1.03x
+MySQL at one connection and a dead heat at eight, writes 0.54x and 0.17x —
+measured with eleven unrelated containers on the machine, which is stated on
+that page and is the reason a repeat on a quiet machine is still worth doing.
+The first such run (AHL-495) read 1.52x and 1.10x on reads under a load average
+of 5.4; neither run had a controlled machine, and the read margin is inside the
+spread between them. Run `./bench/compare.sh` yourself to reproduce it.
 
 ## What these numbers are not
 

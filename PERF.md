@@ -681,13 +681,21 @@ an entry range it has already read.
 ## 4. Retrieval
 
 Already winning where it is measured: ~15.8x over `sqlite-vec` at 100k vectors
-(9.52x on the 2,000-vector suite `BENCHMARK.md` publishes), and 14–17x over
-both DuckDB and pgvector on hybrid, because hybrid is one statement here and
-two queries plus client-side fusion there.
+(7.56x on the 2,000-vector suite `BENCHMARK.md` publishes), and ~60x over
+DuckDB and ~74x over pgvector on hybrid, because hybrid is one statement here
+and two queries plus client-side fusion there.
+
+**The BM25 leg is no longer the expensive half.** It was 79% of the hybrid p50
+(347.50 µs of 453.88 µs at 2,000 documents); an inverted-index layout with
+dense document ordinals, a bounded top-`k` heap and a MaxScore walk took it to
+47.75 µs of a 95.17 µs hybrid — 50%, with the vector leg now the larger share.
+Scores and ranking are unchanged, ties included. Per-block impact bounds
+(block-max WAND) are the next step on that path and are not implemented; R6
+in `PLAN.md` is where that work is scoped.
 
 **The pgvector vector-only loss is closed.** This section read "the open loss
 is pgvector on vector-only search, ~4x" until the AHL-495 regeneration: the
-current published pair is 78 µs here against pgvector's 159 µs, and the honest
+current published pair is 147 µs here against pgvector's 198 µs, and the honest
 reading is *close, not a rout* — their number includes a socket round trip and
 ours does not. The avenues below are still the ones that would widen it, in
 order of expected value:
