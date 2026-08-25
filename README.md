@@ -882,7 +882,15 @@ in this paragraph until AHL-494 implemented them.
 ## What this is not
 
 Explicit non-goals for the current stage, all of them scheduled work rather
-than oversights:
+than oversights.
+
+If the question is specifically "could our organisation run this in
+production?", [`docs/enterprise-readiness.md`](docs/enterprise-readiness.md)
+answers it directly: the gaps that would stop a deployment, ranked by
+deployment risk, each one citing the code it is about and marked with whether
+it was verified in this repository or reported by an audit and not yet
+reproduced. It is a less flattering document than this section and a more
+useful one.
 
 - **Retrieval indexes are explicit and single-column.** A `TEXT` column is
   only full-text indexed after `CREATE INDEX idx ON t (body)` (or in a

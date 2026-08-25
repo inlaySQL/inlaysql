@@ -140,6 +140,7 @@ Full map: [`README.md#layout`](README.md#layout). Short version:
 | The load-bearing design decisions, and what each rules out | [`docs/architecture.md`](docs/architecture.md) |
 | Where a point read's time goes, and what to optimise next | [`PERF.md`](PERF.md) |
 | MySQL server mode, its security posture and its divergences | [`docs/server.md`](docs/server.md) |
+| What stops a production deployment today, ranked, with verification status | [`docs/enterprise-readiness.md`](docs/enterprise-readiness.md) |
 | Crash recovery / WAL | [`docs/recovery.md`](docs/recovery.md) |
 | Retrieval indexes (BM25, HNSW, staleness) | [`docs/indexes.md`](docs/indexes.md) |
 | MCP server mode | [`docs/mcp.md`](docs/mcp.md) |
