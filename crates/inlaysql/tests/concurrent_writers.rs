@@ -543,6 +543,82 @@ fn a_handle_inside_a_transaction_keeps_its_pinned_snapshot() {
     assert_eq!(select_ids(&mut reader), vec![1, 2]);
 }
 
+/// The retrieval indexes of a handle whose own commit was rebased.
+///
+/// A foreign commit is normally discovered by the per-statement
+/// [`Database`] refresh, which is what
+/// `crates/inlaysql-core/tests/foreign_commit_indexes.rs` covers. This is the
+/// one shape that refresh cannot see: B commits *while* A's transaction is
+/// open, A's disjoint transaction is rebased onto B's root at `COMMIT`, and A
+/// therefore already holds the root containing B's row — the committed state
+/// never "moves" again from A's point of view.
+///
+/// So B's document is committed underneath a full-text index that was never
+/// told about it. Only the engine's own record of which version its indexes
+/// describe can catch that; the row store gets it right either way, which is
+/// exactly why the assertion has to be a search rather than a `SELECT`.
+#[test]
+fn a_rebased_commit_does_not_leave_the_other_handles_row_out_of_the_index() {
+    let temp = TempDb::new("rebase-index-gap");
+    let device = temp.device();
+
+    let mut creator = Database::open_on(device.clone()).unwrap();
+    creator
+        .execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)", &[])
+        .unwrap();
+    creator
+        .execute("CREATE INDEX docs_body ON docs (body)", &[])
+        .unwrap();
+    drop(creator);
+
+    let mut a = Database::open_on(device.clone()).unwrap();
+    let mut b = Database::open_on(device.clone()).unwrap();
+
+    // A pins its snapshot and buffers a row. Nothing is committed yet.
+    a.begin().unwrap();
+    a.execute(
+        "INSERT INTO docs (id, body) VALUES (1, 'aardvark from the pinned handle')",
+        &[],
+    )
+    .unwrap();
+
+    // B commits a disjoint row while A's transaction is open.
+    b.execute(
+        "INSERT INTO docs (id, body) VALUES (2, 'marmalade from the other handle')",
+        &[],
+    )
+    .unwrap();
+
+    // Disjoint keys, so this rebases rather than conflicting.
+    a.commit().unwrap();
+
+    let hits = a
+        .query(
+            "SELECT id, bm25_score(body, ?) AS score FROM docs ORDER BY score DESC LIMIT 2",
+            &[Value::Text("marmalade".into())],
+        )
+        .unwrap()
+        .rows;
+    assert_eq!(
+        hits.first().map(|row| row[0].clone()),
+        Some(Value::Integer(2)),
+        "the row the rebase committed underneath A is missing from A's full-text index"
+    );
+
+    // And A's own row is still there: catching up on B's must not retire it.
+    let own = a
+        .query(
+            "SELECT id, bm25_score(body, ?) AS score FROM docs ORDER BY score DESC LIMIT 2",
+            &[Value::Text("aardvark".into())],
+        )
+        .unwrap()
+        .rows;
+    assert_eq!(
+        own.first().map(|row| row[0].clone()),
+        Some(Value::Integer(1))
+    );
+}
+
 #[test]
 fn a_rolled_back_transaction_also_releases_the_pin() {
     let temp = TempDb::new("transaction-pinned-rollback");

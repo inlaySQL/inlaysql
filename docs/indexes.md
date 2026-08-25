@@ -119,9 +119,59 @@ compares that stamp to the committed counter:
 | different | rows changed after the index was saved | rebuild |
 | absent / unparseable | no usable index | rebuild |
 
-There is no third case, and no attempt to work out *how far* behind an index
-is. Incremental catch-up would need a change log the engine does not keep, and
-getting it subtly wrong is precisely the failure this design refuses to allow.
+There is no third case for a *saved* index, and no attempt to work out how far
+behind a blob is: the bytes on disk carry one stamp for the whole index, so
+"how far" is not a question they can answer.
+
+### A live handle is a different question
+
+A handle that is already open is not reading a blob — it holds a live index it
+built itself, and it knows exactly which version that index describes. When
+another handle commits, the per-statement snapshot refresh
+(`Engine::adopt_committed_state`) has a source the open path does not: the
+change log (`crates/inlaysql-core/src/cdc.rs`), which names every row that
+changed and is written in the same commit as the change. So the gap is replayed
+rather than rebuilt (`Engine::catch_up_indexes`): each row the log names is
+dropped from its table's retrieval indexes and re-derived from the committed
+row, and nothing else is touched.
+
+This is not a micro-optimisation. Without it, *every* connection paid a full
+re-index of every table on its next statement after *any* other connection
+committed a row, because the saved blob's stamp is stale for all but one commit
+in `INDEX_PERSIST_INTERVAL` (1024). On a server with `n` connections that is
+`n` full rebuilds per write.
+
+It declines, and falls back to the wholesale rebuild, in exactly the cases
+where replaying would be a guess rather than a derivation:
+
+| Situation | Why replay is not available |
+| --- | --- |
+| the catalog also moved | an index this handle has never opened has no incremental form |
+| the log no longer reaches back that far | past `CDC_RETENTION` (4096 statements) the record is gone; this also bounds the replay |
+| a record in the range is missing or empty | the handle cannot know what changed, which is when guessing must not be an option |
+| a vector backend keeps itself in the database | its graph, live set and entry point moved in the file underneath the copy this handle holds in memory; only re-opening re-reads them |
+
+`crates/inlaysql-core/tests/foreign_commit_indexes.rs` counts calls to
+`FullTextIndex::insert`/`VectorIndex::insert` to pin the cost, and asserts the
+caught-up index answers identically to one built from the rows — the property,
+not a timing threshold.
+
+### The commit that rebases
+
+One case is not a refresh at all. If handle B commits while handle A's
+transaction is open, A's disjoint transaction is *rebased* onto B's root at
+`COMMIT` (see `merge_monotonic_metadata`), so A ends up holding a root
+containing B's rows without the committed state ever moving from A's point of
+view — `Storage::refresh` has nothing to report. B's rows are then committed
+underneath an index that was never told about them.
+
+`Engine::indexed_version` is what catches it: it records the version the live
+indexes actually describe, and a rebase leaves it behind the counter, which is
+what makes the next statement replay the gap.
+`a_rebased_commit_does_not_leave_the_other_handles_row_out_of_the_index` in
+`crates/inlaysql/tests/concurrent_writers.rs` asserts it with a search rather
+than a `SELECT`, because the row store gets this right either way and only the
+index does not.
 
 ## On-disk layout
 
@@ -184,8 +234,12 @@ points at chunks from two different saves.
 - Explicitly, on `Database::checkpoint()`. Worth calling after a bulk load and
   before closing.
 
-Skipping it is always safe. It costs a rebuild on the next open and nothing
-else.
+Skipping it is always safe. It costs a rebuild on the next *open* — and
+nothing else: a handle that is already open catches its live indexes up from
+the change log instead of consulting the stale blob (see
+[A live handle is a different question](#a-live-handle-is-a-different-question)),
+so the interval governs open time alone rather than what every other
+connection pays per commit.
 
 ## What the tests assert
 

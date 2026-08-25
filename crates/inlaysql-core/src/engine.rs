@@ -16,7 +16,7 @@
 //! `docs/indexes.md`.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -329,6 +329,27 @@ pub struct Engine {
     write_version: u64,
     /// The `write_version` the persisted indexes were saved at.
     persisted_version: u64,
+    /// The `write_version` the *live* retrieval indexes are known to describe
+    /// in full.
+    ///
+    /// Normally exactly `write_version`: this handle indexes every row it
+    /// writes before it commits it. It falls behind in two places, and both
+    /// are why it exists as a separate number rather than being read off
+    /// `write_version`:
+    ///
+    /// * Another handle committed. The gap names exactly the change-log
+    ///   versions this handle has not applied, which is what
+    ///   [`Engine::catch_up_indexes`](Self::catch_up_indexes) replays instead
+    ///   of re-reading every row of every table.
+    /// * This handle's own commit was *rebased* onto a concurrent one (see
+    ///   [`Engine::commit_storage`](Self::commit_storage)). The winner's rows
+    ///   are now committed underneath this handle's indexes without
+    ///   [`Storage::refresh`] ever reporting a move — this handle already
+    ///   holds the rebased root. Leaving this behind at the pre-commit value
+    ///   is what makes the next statement notice; without it the missing rows
+    ///   would stay missing from this handle's indexes until some unrelated
+    ///   commit happened to force a rebuild.
+    indexed_version: u64,
     /// Rows changed by the statement in flight, awaiting a change record.
     pending_changes: Vec<(String, RowId, ChangeKind)>,
     /// The newest change version that has been dropped from the log.
@@ -430,6 +451,7 @@ impl Engine {
             last_insert_row_id: None,
             write_version,
             persisted_version: write_version,
+            indexed_version: write_version,
             pending_changes: Vec::new(),
             cdc_floor,
             parses: Cell::new(0),
@@ -816,6 +838,7 @@ impl Engine {
     /// So the engine reloads itself from the store before returning the error.
     /// The statement failed, the handle is usable, and retrying is correct.
     fn commit_storage(&mut self) -> Result<()> {
+        let predicted = self.write_version;
         match self.storage.commit() {
             Ok(()) => {
                 // The storage layer may have rebased this statement after a
@@ -829,6 +852,22 @@ impl Engine {
                         .unwrap_or_default();
                 self.cdc_floor =
                     read_counter(&self.storage, CDC_FLOOR_KEY, "change floor")?.unwrap_or_default();
+                if self.write_version == predicted {
+                    // Nobody got between this handle and the root it committed
+                    // onto, so its indexes describe every committed row: the
+                    // rows it just wrote were indexed before `end_write` ran.
+                    self.indexed_version = self.write_version;
+                } else {
+                    // A rebase. The winner's rows are committed underneath this
+                    // handle's indexes, which have never seen them, and
+                    // [`Storage::refresh`] will not report it — this handle
+                    // already holds the rebased root. `indexed_version` stays
+                    // where the previous commit left it, which is the version
+                    // the next statement's catch-up has to replay from; the one
+                    // version of overlap it re-applies is this statement's own,
+                    // and re-applying a row is idempotent.
+                    self.indexed_version = self.indexed_version.min(self.write_version);
+                }
                 Ok(())
             }
             Err(Error::Conflict) => {
@@ -873,7 +912,14 @@ impl Engine {
         if self.in_transaction {
             return Ok(());
         }
-        if !self.storage.refresh()? {
+        // `refresh` answering `false` means the committed *root* has not moved
+        // since this handle last looked, which is almost always the same thing
+        // as "this handle is current". The exception is a rebased commit: the
+        // root moved *while* this handle was committing onto it, so it already
+        // holds the winner's root and `refresh` has nothing to report, yet its
+        // indexes never saw the winner's rows. `indexed_version` is what
+        // records that, and it is the reason this is not a plain early return.
+        if !self.storage.refresh()? && self.indexed_version == self.write_version {
             return Ok(());
         }
         self.adopt_committed_state()
@@ -895,16 +941,31 @@ impl Engine {
     /// saved index against; if it has not moved, no row changed and the indexes
     /// in memory are exactly as current as they were. The **catalog** decides
     /// which indexes exist at all, so a foreign `CREATE TABLE` or `CREATE
-    /// INDEX` has to be honoured even though it changed no row. When either
-    /// moved, [`Engine::restore_indexes`](Self::restore_indexes) runs — the
-    /// same code as on open, which loads a saved index whose stamp matches the
-    /// new write version and rebuilds from the rows only when it does not.
+    /// INDEX` has to be honoured even though it changed no row.
+    ///
+    /// When only the write version moved, the change log names exactly the
+    /// rows that moved with it, and
+    /// [`Engine::catch_up_indexes`](Self::catch_up_indexes) applies those and
+    /// nothing else. That is the difference between "one connection inserted
+    /// one row" costing one re-indexed document and costing every document in
+    /// the database, once per other connection — the shape that made this the
+    /// dominant cost on a multi-connection server, because a saved index blob
+    /// is stamped at the version it was written at and is therefore stale for
+    /// all but one in [`INDEX_PERSIST_INTERVAL`] commits.
+    ///
+    /// Only when the catalog moved too, or the log cannot answer, does
+    /// [`Engine::restore_indexes`](Self::restore_indexes) run — the same code
+    /// as on open, which loads a saved index whose stamp matches the new write
+    /// version and rebuilds from the rows only when it does not.
     fn adopt_committed_state(&mut self) -> Result<()> {
         let catalog = match self.storage.get_meta(CATALOG_KEY)? {
             Some(bytes) => Catalog::decode(&bytes)?,
             None => Catalog::new(),
         };
-        let previous_version = self.write_version;
+        // Not `write_version`: after a rebased commit this handle's indexes
+        // describe an *older* version than the counter does. See
+        // [`Engine::indexed_version`](Self::indexed_version).
+        let previous_version = self.indexed_version;
         let previous_catalog = core::mem::replace(&mut self.catalog, catalog);
         // Unconditional, and before the early return below: the constraints
         // cache is keyed off a catalog this handle no longer holds, whether or
@@ -925,14 +986,150 @@ impl Engine {
             return Ok(());
         }
 
+        // Anything this handle had queued describes rows from before the state
+        // it just adopted; the commit that would have published them is gone.
+        self.pending_changes.clear();
+
+        // The catalog is what decides which indexes exist and over which
+        // columns, so a schema this handle has not seen leaves nothing to
+        // catch up *to* — an index it has never opened has no incremental
+        // form. That falls through to the wholesale restore below.
+        if self.catalog == previous_catalog && self.catch_up_indexes(previous_version)? {
+            self.indexed_version = self.write_version;
+            // Same reset the rebuild path below does, and for the same reason:
+            // the blob on disk is stamped at a version that is no longer
+            // current, and rewriting megabytes of index is not the business of
+            // the read that happened to notice. Leaving it alone would make a
+            // handle that has only ever read start saving indexes — a write,
+            // which a read-only handle cannot make at all.
+            self.persisted_version = self.write_version;
+            return self.refresh_indexes();
+        }
+
         self.persisted_version = self.write_version;
         self.text_indexes.clear();
         self.vector_indexes.clear();
         self.indexes_dirty = false;
-        // Anything this handle had queued describes rows from before the state
-        // it just adopted; the commit that would have published them is gone.
-        self.pending_changes.clear();
         self.restore_indexes()
+    }
+
+    /// Apply the rows another handle committed since `from` to the retrieval
+    /// indexes this handle already holds, or answer `false` when they have to
+    /// be rebuilt from every row instead.
+    ///
+    /// # Why this is sound
+    ///
+    /// The precondition is `indexed_version`'s invariant: this handle's
+    /// retrieval indexes describe every committed row as of `from`. The change
+    /// log names every row that changed after it — that is the whole contract
+    /// of [`crate::cdc`], and it is written in the same commit as the change,
+    /// so a row cannot move without a record. Reconciling exactly those rows
+    /// therefore lands on the same index as reading all of them would; the
+    /// last test in `tests/foreign_commit_indexes.rs` asserts that
+    /// equivalence against a freshly built index rather than trusting the
+    /// argument.
+    ///
+    /// Each row is reconciled rather than replayed: the id is dropped from
+    /// every retrieval index of its table and then re-derived from the
+    /// committed row, if there still is one. This handle has no record of what
+    /// a row used to say, so a targeted "remove the old text" is not available
+    /// — and it is not needed, because dropping and re-deriving is correct for
+    /// an insert, an update and a delete alike, is idempotent, and collapses
+    /// any number of changes to one row into one unit of work.
+    ///
+    /// # When it declines
+    ///
+    /// * The log no longer reaches back to `from`. A consumer that fell behind
+    ///   the retention window has to resynchronise from a scan, and so does an
+    ///   index. This also bounds the work: the replay can never span more than
+    ///   [`CDC_RETENTION`] statements, because past that the log itself is the
+    ///   thing that is missing.
+    /// * A record inside the range is missing or empty. Every version in the
+    ///   retained range has exactly one non-empty record, so this cannot
+    ///   happen — and if it did it would mean this handle cannot know what
+    ///   changed, which is precisely when guessing must not be an option.
+    /// * A vector backend keeps itself in the database. Its graph, its live
+    ///   set and its entry point are in the file, and another handle's commit
+    ///   moved them underneath the copy this handle holds in memory; only
+    ///   re-opening it re-reads them. Feeding incremental edits to a stale
+    ///   in-memory view of a shared graph would corrupt it, which is the one
+    ///   outcome worse than a rebuild.
+    fn catch_up_indexes(&mut self, from: u64) -> Result<bool> {
+        if from > self.write_version || from < self.cdc_floor {
+            return Ok(false);
+        }
+        if self
+            .vector_indexes
+            .values()
+            .any(|index| index.is_self_persisting())
+        {
+            return Ok(false);
+        }
+
+        // Deduplicated per table: the reconcile below is idempotent, so a row
+        // touched by ten of the replayed statements is still one unit of work.
+        let mut touched: BTreeMap<String, BTreeSet<RowId>> = BTreeMap::new();
+        for version in (from + 1)..=self.write_version {
+            let Some(bytes) = self.storage.get_meta(&cdc::record_key(version))? else {
+                return Ok(false);
+            };
+            if bytes.is_empty() {
+                return Ok(false);
+            }
+            for change in cdc::decode_record(version, &bytes)? {
+                touched
+                    .entry(change.table.to_ascii_lowercase())
+                    .or_default()
+                    .insert(change.id);
+            }
+        }
+
+        for (name, ids) in &touched {
+            // A table the catalog does not name was dropped and recreated
+            // inside the replayed range, back to a schema equal to this
+            // handle's. Its rows are reconciled under the name that survived,
+            // if any; there is no backend under this one to reconcile.
+            let Some(table) = self.catalog.table(name).cloned() else {
+                continue;
+            };
+            let declared: Vec<Index> = self
+                .catalog
+                .indexes_for(&table.name)
+                .into_iter()
+                .filter(|index| index.kind.is_retrieval())
+                .cloned()
+                .collect();
+            // A table with no retrieval index has nothing that a rebuild would
+            // have redone either: its B-tree entries are durable rows the
+            // writer committed beside the change.
+            if declared.is_empty() {
+                continue;
+            }
+            for &id in ids {
+                self.indexes_dirty = true;
+                for index in &declared {
+                    let key = retrieval_key(&index.table, &index.columns);
+                    match index.kind {
+                        IndexKind::FullText => {
+                            if let Some(backend) = self.text_indexes.get_mut(&key) {
+                                backend.remove(id)?;
+                            }
+                        }
+                        IndexKind::Vector => {
+                            if let Some(backend) = self.vector_indexes.get_mut(&key) {
+                                backend.remove(id)?;
+                            }
+                        }
+                        IndexKind::BTree => unreachable!("filtered out above"),
+                    }
+                }
+                if let Some(bytes) = self.storage.get_row(&table.name, id)? {
+                    let row = decode_row(&bytes)?;
+                    self.index_row_retrieval(&table, id, &row)?;
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Discard every piece of in-memory state and rebuild it from the store.
@@ -1727,6 +1924,10 @@ impl Engine {
                 self.index_row_retrieval(table, id, &row)?;
             }
         }
+        // Every table has just been read or restored at the committed state,
+        // so this is the one place that can set the invariant outright rather
+        // than maintain it.
+        self.indexed_version = self.write_version;
         self.refresh_indexes()
     }
 
