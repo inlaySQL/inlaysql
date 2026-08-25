@@ -12,12 +12,20 @@
 //! matters now that the option is public: a caller reaching this through
 //! ordinary `CREATE TABLE`/`INSERT`/`DELETE` gets the same win, not just
 //! `CowBTree` callers who already knew this existed.
+//!
+//! The fourth is about the price rather than the win:
+//! `the_size_question_covers_the_free_list_rows_committing_will_add` pins the
+//! one thing turning reuse on changes for every batched writer in the engine —
+//! committing now writes free-list rows of its own, so
+//! `Storage::transaction_is_nearly_full` has to count them or the answer
+//! arrives after the transaction is already too large to commit.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use inlaysql::{Database, EngineOptions, FileDevice, Value};
-use inlaysql_core::btree::{CowBTree, DEFAULT_PAGE_SIZE};
+use inlaysql_core::btree::{CowBTree, DEFAULT_PAGE_CACHE_BYTES, DEFAULT_PAGE_SIZE};
+use inlaysql_core::{RowId, Storage, TreeStorage};
 
 /// A database file that deletes itself when the test ends, whatever the
 /// outcome — including a panic. Same pattern as `concurrent_writers.rs`'s
@@ -289,4 +297,74 @@ fn print_size_over_time_for_report() {
             on_tree.pages_reused()
         );
     }
+}
+
+/// `Storage::transaction_is_nearly_full` has to warn *before* the transaction
+/// becomes uncommittable, and with `page_reuse` on it did not.
+///
+/// The question was answered from the dirty set as it stood, and committing
+/// with reuse on then does more work: `CowBTree::finalize_free_list` turns
+/// every page the transaction superseded into a durable free-list row, and
+/// deletes the row of every page it drew from the free list, *before* the
+/// commit record is built. That work lands after the last moment anybody could
+/// have asked, so a writer that batched exactly the way the contract tells it
+/// to was handed a record too large for the log region and a transaction it
+/// could never commit — the failure
+/// `crates/inlaysql/tests/large_statements.rs`'s
+/// `a_commit_refused_for_size_leaves_a_usable_handle` exists to keep survivable
+/// and this one exists to keep from happening at all.
+///
+/// The shape here is the worst case rather than a typical one, and it is a
+/// realistic statement: deleting rows whose values live in overflow chains.
+/// `CowBTree::free_overflow_chain` supersedes every page of the chain, so the
+/// dirty set barely moves — the row itself is a few bytes of leaf — while the
+/// free-list work owed grows by a chain's worth of pages per row. Measured
+/// against the code without the fix: 2 dirty pages (8,272 bytes) when the
+/// backend was last asked, 187,903 pages by the time the record was built, and
+/// a refusal at 771,905,580 bytes against a 1,048,576-byte region.
+#[test]
+fn the_size_question_covers_the_free_list_rows_committing_will_add() {
+    let db = TempDb::new("nearly-full-with-reuse");
+    let device = FileDevice::open(db.path()).expect("open");
+    let mut storage = TreeStorage::open_on_with_options(device, DEFAULT_PAGE_CACHE_BYTES, true)
+        .expect("open_on_with_options");
+
+    // Wide enough that every value needs an overflow chain of its own.
+    const ROWS: RowId = 200;
+    const WIDTH: usize = 64 * 1024;
+    for id in 1..=ROWS {
+        storage
+            .put_row("t", id, &vec![(id % 251) as u8; WIDTH])
+            .expect("put");
+        storage.commit().expect("commit a loading row");
+    }
+
+    // The protocol every batched writer in this engine follows: write, ask,
+    // commit when told. Every one of those commits has to succeed, or the
+    // answer arrived too late to be worth having.
+    let mut commits = 0;
+    for id in 1..=ROWS {
+        storage.delete_row("t", id).expect("delete");
+        if storage.transaction_is_nearly_full() {
+            storage.commit().unwrap_or_else(|error| {
+                panic!(
+                    "commit {commits} was refused after the backend said the transaction \
+                     was nearly full at row {id}: {error}"
+                )
+            });
+            commits += 1;
+        }
+    }
+    storage.commit().expect("final commit");
+
+    assert!(
+        commits > 0,
+        "the size question never fired, so this proved nothing about when it fires"
+    );
+    assert!(
+        inlaysql_core::traits::scan_all(&storage, "t")
+            .expect("scan")
+            .is_empty(),
+        "every row was deleted, so the table has to be empty"
+    );
 }

@@ -505,11 +505,27 @@ transaction and the header is written last.
 `a_rebuild_by_another_handle_is_adopted_rather_than_overwritten` pins it and
 fails against the code without it.
 
-**`PagedHnswIndex` has the same exposure and does not do this.** A rebuild
-reassigns node indices exactly the way a BM25 rebuild reassigns term ordinals,
-and a handle holding a stale `node_count` and `live` map would read the new
-graph through the old indices. It is written down here rather than fixed
-alongside, because it needs its own crash tests and its own pass.
+**`PagedHnswIndex` had the same exposure and now closes it the same way.** A
+rebuild reassigns node indices exactly the way a BM25 rebuild reassigns term
+ordinals, and it was reachable: a handle left behind by another handle's
+rebuild answered a query with an entirely different set of rows.
+`PagedHnswIndex::adopt_stored_graph` re-reads the header on every commit and
+every search, drops the node cache when it moved, and marks the resident
+`RowId -> node` map for rebuilding. That last part is deferred to the next
+`&mut self` call rather than done on the spot, because it is the one `O(nodes)`
+step and no *read* needs it — a search answers out of the records it walks, so
+a `SELECT` that happens to be the first thing to notice a foreign rebuild pays
+one metadata read, not a scan of the graph.
+
+The symptom is worth naming, because it is not BM25's. There is no count to
+underflow and nothing loud: `entry` and `entry_level` are where a walk
+*starts*, so a stale pair starts it at whatever row now holds that index and
+returns the wrong neighbours; a stale `node_count` either refuses a good record
+as corrupt (too low) or lets an insert overwrite a node the live graph still
+uses (too high). `hnsw_paged.rs`'s
+`a_rebuild_by_another_handle_is_adopted_rather_than_overwritten` asserts on
+returned ids against an oracle that ran the identical insert sequence on
+storage nobody else touched, and fails against the code without the fix.
 
 ### The trait change
 

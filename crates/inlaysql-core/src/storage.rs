@@ -307,15 +307,24 @@ impl<D: Device> Storage for TreeStorage<D> {
         self.tree.refresh()
     }
 
-    /// True once the open transaction has grown past half the log region.
+    /// True once the open transaction has grown past half the log region —
+    /// counting what committing it will still add.
     ///
     /// The ceiling is hard: a record larger than the region cannot be written,
     /// and the commit fails. Half of it is the margin — the caller checks
     /// between writes, and the write that follows a `true` answer can still
     /// copy a whole root-to-leaf path into the transaction before the commit
     /// happens.
+    ///
+    /// The size asked about is [`CowBTree::projected_record_len`] and not
+    /// `pending_record_len`, which is the exact size of the record *as it
+    /// stands*: with `page_reuse` on, the commit writes free-list rows of its
+    /// own before it builds that record, so the exact answer to the wrong
+    /// question let a batch run past the ceiling and strand itself. See that
+    /// method — the difference between the two is the whole of this
+    /// contract's "warn before the transaction becomes uncommittable".
     fn transaction_is_nearly_full(&self) -> bool {
-        self.tree.pending_record_len() * 2 >= self.tree.log_capacity()
+        self.tree.projected_record_len() * 2 >= self.tree.log_capacity()
     }
 
     /// The one backend that can answer this: a committed root already *is* an

@@ -243,6 +243,15 @@ pub trait Storage {
     /// So the backend answers instead, and the caller commits when it says so.
     /// The default is `false`: a backend with no such limit never needs to
     /// interrupt anyone.
+    ///
+    /// **The answer has to cover what committing will still add, not only what
+    /// the transaction is holding now.** A backend that does bookkeeping of its
+    /// own inside `commit` — the copy-on-write tree writes free-list rows there
+    /// when `page_reuse` is on — does that work after the last moment anybody
+    /// could have asked, and a caller who stopped exactly when told is then
+    /// left holding a transaction that can never be committed. Answering `true`
+    /// too early costs one extra commit; answering it too late costs the whole
+    /// batch. See `CowBTree::projected_record_len`.
     fn transaction_is_nearly_full(&self) -> bool {
         false
     }

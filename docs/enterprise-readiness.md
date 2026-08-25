@@ -431,15 +431,26 @@ hurt:
   every superseded page is abandoned rather than reclaimed with `page_reuse`
   off, which is the default (blocker 4). This is the number that decides
   whether the trade is worth taking, and it is not small.
-* **With `page_reuse` on, the build is refused for size**, which is a finding
-  in its own right and is *not* specific to this index.
-  `Storage::transaction_is_nearly_full` answers from the dirty set as it
-  stands; committing with reuse on then writes free-list entries of its own, so
-  a batch that was under the ceiling when it was last asked is over it by the
-  time the record is built. Measured: refused at 1,076,352 bytes against a
+* **With `page_reuse` on, the build was refused for size** — a finding in its
+  own right, *not* specific to this index, and now fixed.
+  `Storage::transaction_is_nearly_full` answered from the dirty set as it
+  stood; committing with reuse on then writes free-list rows of its own, so a
+  batch that was under the ceiling when it was last asked was over it by the
+  time the record was built. Measured: refused at 1,076,352 bytes against a
   1,048,576-byte region, having last been asked at 524,288. **Any batched
-  writer that trusts that method is exposed to this** — the index-save path in
-  `persist_indexes` asks the same question for the same reason.
+  writer that trusted that method was exposed to it** — the index-save path in
+  `persist_indexes` asks the same question for the same reason — and the worst
+  case was far past a factor of two: deleting rows whose values live in
+  overflow chains supersedes a chain of pages per row while barely moving the
+  dirty set, which was measured at 2 dirty pages when last asked and 187,903 by
+  the time the record was built. The backend now answers with
+  `CowBTree::projected_record_len`, which adds one record entry per free-list
+  row the commit still owes, so the answer covers the work committing will do
+  rather than only the work already done. Over-reserving costs one extra
+  commit; under-reserving stranded the transaction.
+  `the_size_question_covers_the_free_list_rows_committing_will_add`
+  (`crates/inlaysql/tests/free_list_growth.rs`) fails against the code without
+  it.
 * **A read inside an open transaction, after many documents, can be refused.**
   Index commits are deferred to the first read that needs them, and that read
   is normally outside any transaction, where the backend commits itself in
@@ -452,22 +463,31 @@ segment-and-merge design every production full-text engine uses — postings
 written once as immutable runs and merged in the background, instead of
 read-modify-written in place — and it is a project of its own.
 
-**What building it found in `PagedHnswIndex` — *reported*, not fixed.** Two
-`Database` handles on one database hold two objects over the *same* structure
-in the file. When one of them rebuilds — which is what any handle does on
-opening to a stamp that is not current — it rewrites that structure and
-reassigns its internal indices underneath the other, **without changing a
-row**, so nothing moves the `write_version` `adopt_committed_state` watches and
-the other handle never notices. For BM25 that showed up as an arithmetic
-underflow on the live document count and, worse and silently, as two handles
-handing the same term ordinal to two different words;
+**What building it found in `PagedHnswIndex` — since fixed.** Two `Database`
+handles on one database hold two objects over the *same* structure in the file.
+When one of them rebuilds — which is what any handle does on opening to a stamp
+that is not current — it rewrites that structure and reassigns its internal
+indices underneath the other, **without changing a row**, so nothing moves the
+`write_version` `adopt_committed_state` watches and the other handle never
+notices. For BM25 that showed up as an arithmetic underflow on the live
+document count and, worse and silently, as two handles handing the same term
+ordinal to two different words;
 `PagedBm25Index::adopt_stored_statistics` closes it by re-reading the header on
-every commit and every search instead of remembering it, and
-`a_rebuild_by_another_handle_is_adopted_rather_than_overwritten` fails against
-the code without it. **`PagedHnswIndex` has the same exposure and does not do
-this** — a rebuild reassigns node indices exactly the way a BM25 rebuild
-reassigns term ordinals. It is written down rather than fixed alongside,
-because changing that backend's protocol needs its own crash tests.
+every commit and every search instead of remembering it.
+
+`PagedHnswIndex` had the identical exposure with node indices, and it was
+reachable rather than theoretical: a handle left behind by another handle's
+rebuild answered a query with a completely different set of rows — no error,
+no count to underflow, just the walk starting at whatever row now occupies the
+remembered entry point. `PagedHnswIndex::adopt_stored_graph` closes it the same
+way, re-reading the header on every commit and every search and dropping the
+node cache when it moved; the resident `RowId -> node` map is rebuilt lazily on
+the next maintenance call, because it is the one `O(nodes)` step and a search
+never consults it. Both regression tests —
+`a_rebuild_by_another_handle_is_adopted_rather_than_overwritten`, one per
+module — fail against the code without their fix, and the vector one asserts on
+returned ids against an oracle rather than on internal state, because ids are
+where the damage showed.
 
 **What is not fixed, and what the measurement says about it.**
 
@@ -476,10 +496,10 @@ because changing that backend's protocol needs its own crash tests.
   side does not have this problem: re-opening a paged BM25 index reads its
   header and nothing else, because it keeps no resident row-id map, so
   adopting another handle's commit is O(1).
-* The paged BM25 index is reachable from `EngineOptions` and from
-  `Database::open_on_with_options`, and **is not yet wired to a server flag**
-  the way `--paged-vectors` is; `crates/inlaysql-server` was being changed
-  concurrently and was left alone.
+* The paged BM25 index is now wired to a server flag the same way
+  `--paged-vectors` is: `ServerOptions::paged_text_indexes` /
+  `inlaysql serve --mysql --paged-text`, off by default and documented as a
+  trade in `docs/server.md`.
 * Each connection still carries its own 8 MiB decoded page cache
   (`DEFAULT_PAGE_CACHE_BYTES`), on top of the 8 MiB raw-page cache shared per
   file. With both indexes paged this is most of what a connection holds.

@@ -171,10 +171,11 @@
 //! is dropped whenever they moved. That method's comment has the two failure
 //! modes it prevents, one loud and one silent.
 //!
-//! [`crate::hnsw_paged::PagedHnswIndex`] has the same exposure — a rebuild
-//! reassigns node indices the same way — and does not do this. It is recorded
-//! in `docs/indexes.md` rather than fixed here, because changing that
-//! backend's protocol is not this module's business.
+//! [`crate::hnsw_paged::PagedHnswIndex`] had the same exposure — a rebuild
+//! reassigns node indices the same way — and now closes it the same way, in
+//! [`crate::hnsw_paged::PagedHnswIndex::adopt_stored_graph`]. Its symptom was
+//! the one a graph has rather than the one a count has: a stale entry point
+//! walks somebody else's adjacency and returns the wrong neighbours.
 //!
 //! # Read-your-writes, and who owns the transaction
 //!

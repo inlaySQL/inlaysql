@@ -81,8 +81,21 @@ SERVE --mysql OPTIONS:
                        search that misses the cache reads from the file, and
                        every other connection's commit costs this one a
                        re-open of the graph, which is O(nodes). It does
-                       nothing for BM25, which has no paged backend and stays
-                       resident once per connection.
+                       nothing for BM25 on its own; --paged-text is the
+                       separate lever for that.
+    --paged-text       Keep full-text (BM25) indexes in the database file
+                       instead of in each connection's memory. Off by default.
+                       A TRADE IN THE OTHER DIRECTION: the in-memory index
+                       holds the term dictionary and every postings list once
+                       per connection (~1,800 B/document once the dictionary
+                       saturates, ~17 GiB at 10M documents); this replaces
+                       that with a bounded cache flat at 15.9 MiB whatever the
+                       corpus size. Scores are identical, bit for bit. The
+                       cost is on writes: an inverted-index update touches a
+                       page per distinct term, so a 2,000-document bulk load
+                       grew the file by 1,260 MiB with --page-reuse off. It
+                       does nothing for vector indexes; --paged-vectors is the
+                       separate lever for that.
     --query-memory <bytes>
                        Most memory one statement may hold in an ORDER BY,
                        GROUP BY, DISTINCT or window step (default 536870912).
@@ -275,6 +288,7 @@ fn serve_mysql(args: &[String]) -> Result<(), String> {
             }
             "--page-reuse" => options.page_reuse = true,
             "--paged-vectors" => options.paged_vector_indexes = true,
+            "--paged-text" => options.paged_text_indexes = true,
             "--reset-superuser" => options.reset_superuser = true,
             "--query-memory" => options.query_memory_bytes = number(rest.next(), "--query-memory")?,
             "--max-execution-time" => {

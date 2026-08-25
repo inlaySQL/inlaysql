@@ -996,7 +996,8 @@ useful one.
   the default because the trade is real and it is not the ANN one: writes cost
   a page per distinct term of the document, so a bulk load grows the file by
   hundreds of kilobytes per document. `docs/indexes.md` has the layout and the
-  full cost; there is no server flag for it yet.
+  full cost; `inlaysql serve --mysql --paged-text` is the server flag for it,
+  documented in `docs/server.md` alongside `--paged-vectors`.
 - **A paged index stores exact `f32` vectors even for an int8 column.**
   `VECTOR(n, INT8)` shrinks the row and the in-memory graph; the paged graph's
   node records do not quantise yet, so on an int8 column the paged index trades

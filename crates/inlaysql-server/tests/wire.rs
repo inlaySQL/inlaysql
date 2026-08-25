@@ -2547,6 +2547,80 @@ fn churn_through_a_server(name: &str, enabled: bool) -> u64 {
     std::fs::metadata(server.path()).expect("stat").len()
 }
 
+/// `--paged-text` reaches every connection's handle the same way
+/// `--paged-vectors` does: it is one field on `EngineOptions`, and what this
+/// test is actually for is that the flag really is wired all the way through
+/// `Server::bind` to a connection that can build, query and remove from a
+/// full-text index under it — and that what it built is really in the file,
+/// not merely in this process, by reading it back from a second server bound
+/// to the same database the way an operator's restart would.
+#[test]
+fn paged_text_indexes_flag_serves_full_text_queries_and_survives_a_restart() {
+    let server = TestServer::start_tuned("paged-text", "s3cret", |options| {
+        options.paged_text_indexes = true;
+    });
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)");
+    client.ok_query("CREATE INDEX docs_body ON docs (body)");
+    client.ok_query(
+        "INSERT INTO docs (id, body) VALUES \
+         (1, 'alpha alpha alpha'), (2, 'beta beta beta'), (3, 'alpha beta')",
+    );
+
+    // `bm25_score` is an index walk, not a per-row scalar over the whole
+    // table — a document with zero occurrences of the term is not returned at
+    // all, not merely scored zero. Doc 1 says "alpha" three times, doc 3 once,
+    // doc 2 not at all, so only the first two come back, doc 1 ranked above
+    // doc 3 by a separation wide enough that tie-breaking cannot matter.
+    let ranked = client
+        .ok_query(
+            "SELECT id, bm25_score(body, 'alpha') AS score FROM docs \
+             ORDER BY score DESC, id ASC",
+        )
+        .rows();
+    assert_eq!(ranked.column("id"), vec!["1", "3"]);
+
+    // A delete has to reach the postings too, not just the row.
+    client.ok_query("DELETE FROM docs WHERE id = 1");
+    let after_delete = client
+        .ok_query(
+            "SELECT id, bm25_score(body, 'alpha') AS score FROM docs \
+             ORDER BY score DESC, id ASC",
+        )
+        .rows();
+    assert_eq!(after_delete.column("id"), vec!["3"]);
+    client.quit();
+
+    // A second server on the same file, with the same flag, as an operator
+    // restarting one would run it — not `TestServer::reopened`, which binds
+    // plain defaults and would prove nothing about this flag. The postings
+    // have to already be on disk: nothing on this path rebuilds an index from
+    // the rows it describes unless its stamp says it must.
+    let restart_options = ServerOptions {
+        bind: "127.0.0.1".to_string(),
+        port: 0,
+        user: "root".to_string(),
+        password: server.password.clone(),
+        paged_text_indexes: true,
+        ..ServerOptions::default()
+    };
+    let restarted = Server::bind(server.path(), &restart_options).expect("re-bind");
+    let addr = restarted.local_addr().expect("local_addr");
+    std::thread::spawn(move || {
+        let _ = restarted.run();
+    });
+    let mut after_restart = Client::connect(addr, "root", &server.password, None)
+        .expect("the restarted server should still serve this database");
+    let restarted_ranking = after_restart
+        .ok_query(
+            "SELECT id, bm25_score(body, 'alpha') AS score FROM docs \
+             ORDER BY score DESC, id ASC",
+        )
+        .rows();
+    assert_eq!(restarted_ranking.column("id"), vec!["3"]);
+    after_restart.quit();
+}
+
 /// A statement larger than one packet has to be reassembled from its
 /// continuations, and a row larger than one packet has to be split into them.
 #[test]

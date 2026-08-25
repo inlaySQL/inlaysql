@@ -103,6 +103,7 @@ socket, and the message does not say which half of the credential was wrong.
 | `--statement-text` | off | Hold the statement each connection is running, so `SHOW PROCESSLIST`'s `Info` and the slow-query log can name it. **A decision about user data. Read the section below.** |
 | `--page-reuse` | off | Reclaim superseded pages instead of growing the file for ever. **Read the section below before using it.** |
 | `--paged-vectors` | off | Keep vector indexes in the file instead of in each connection's memory. Recall is identical; latency and foreign-commit cost are not. **Read the section below before using it.** |
+| `--paged-text` | off | Keep full-text (BM25) indexes in the file instead of in each connection's memory. Scores are identical; file growth on writes is not. **Read the section below before using it.** |
 
 An empty password means an empty password: any client that can reach the port
 can read and write the database. The server says so at startup.
@@ -633,14 +634,64 @@ Three costs, in the order they will bite:
   writer already applied them, in the file — so what makes it current is
   reading it again, which walks its node records to rebuild the row-id map.
   See `Engine::adopt_self_persisting_vector_indexes`.
-* **It does nothing for BM25.** `Bm25Index` has no paged backend at all, so
-  the term dictionary, every postings list, the per-document term lists and
-  the row-id map stay resident once per connection. In the table above that is
-  most of the 35 MiB that remains, and on a large text corpus it is the whole
-  bill.
+* **It does nothing for BM25 on its own.** `--paged-text` (below) is the
+  separate lever for that half. Without it, the term dictionary, every
+  postings list, the per-document term lists and the row-id map stay resident
+  once per connection. In the table above that is most of the 35 MiB that
+  remains, and on a large text corpus it is the whole bill.
 
 The flag is off by default for the same reason `--page-reuse` is: which way
 the trade falls depends on the corpus, and the operator is the one who knows.
+
+### `--paged-text`: what it fixes, and what it costs
+
+The full-text twin of `--paged-vectors`, and the other half of
+`docs/enterprise-readiness.md` blocker 6. It sets
+`EngineOptions::paged_text_indexes` for every connection's handle:
+`PagedBm25Index` puts the term dictionary, the postings and the per-document
+term lists in the database file as ordinary rows, read through a bounded
+entry cache, instead of holding all of it in RAM.
+
+**Measured, not estimated**, by `crates/inlaysql/tests/index_memory_cost.rs`.
+The in-memory `Bm25Index` falls as its dictionary saturates and flattens near
+1,800 bytes resident per document — roughly 17 GiB at ten million documents,
+per connection. `PagedBm25Index` holds none of that:
+
+| documents | in-memory `Bm25Index` | `PagedBm25Index` |
+| --- | --- | --- |
+| 2,000 | ~4,474 B/document | 15.9 MiB, flat |
+| 8,000 | ~3,126 B/document | 15.9 MiB, flat |
+
+Identical at both sizes, because what stays resident is a bounded entry cache
+and a page cache — neither sized by the corpus — not anything per document.
+
+**The scores are identical, bit for bit.** The same arithmetic that computes
+`idf` and length normalisation is called by both backends rather than
+transcribed twice, and `crates/inlaysql-core/tests/bm25_paged_agreement.rs`
+and `crates/inlaysql/tests/paged_full_text.rs` compare whole result sets — ids
+and score bits — to prove it.
+
+**This is not a free win, and the cost is on writes, not on search.** An
+inverted-index update touches a page per *distinct* term the document
+contains — on the order of a hundred for a 120-token chunk of English — where
+the in-memory index absorbs the same update in RAM at no I/O cost at all.
+Measured on a bulk load of 2,000 documents with `--page-reuse` off (the
+default): the file grew by **1,260 MiB**. `--page-reuse` reclaims those
+abandoned pages afterward; it does not reduce how many a document's insert
+dirties, and turning it on for a large batched load can itself refuse the
+batch for size (`docs/enterprise-readiness.md`, blocker 6, has the full
+accounting).
+
+**Turning on both `--paged-vectors` and `--paged-text` gives the 10-million-row
+hybrid corpus a memory answer for the first time** — flat, bounded resident
+cost instead of one that grows with the corpus. It is not yet an ingest
+answer: the write cost above is real, and the actual fix is a
+segment-and-merge design that does not exist yet. Do not read "memory is
+solved" as "this is solved" — the ceiling moved, it did not go away.
+
+The flag is off by default for the same reason `--page-reuse` and
+`--paged-vectors` are: which way the trade falls depends on the corpus, and
+the operator is the one who knows.
 
 ### Backing up a running server
 

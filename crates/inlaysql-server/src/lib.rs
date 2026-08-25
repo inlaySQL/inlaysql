@@ -247,16 +247,64 @@ pub struct ServerOptions {
     ///   O(nodes) per foreign commit, where an in-memory index pays O(rows
     ///   that commit touched). See
     ///   `inlaysql_core`'s `Engine::adopt_self_persisting_vector_indexes`.
-    /// * **It does nothing for the full-text index.** `Bm25Index` has no paged
-    ///   backend at all, so the term dictionary, every postings list, the
-    ///   per-document term lists and the row-id map stay resident, once per
-    ///   connection — on a hybrid corpus, the larger half of the bill. See
+    /// * **It does nothing for the full-text index on its own.**
+    ///   [`ServerOptions::paged_text_indexes`] is the separate lever for that
+    ///   half; until it too is on, the term dictionary, every postings list,
+    ///   the per-document term lists and the row-id map stay resident, once
+    ///   per connection — on a hybrid corpus, the larger half of the bill. See
     ///   `docs/enterprise-readiness.md`, blocker 6.
     ///
     /// Asked for rather than inherited, for the same reason
     /// [`ServerOptions::page_reuse`] is: which way the trade falls depends on
     /// the corpus and on what the operator is short of.
     pub paged_vector_indexes: bool,
+    /// Keep each connection's full-text (BM25) indexes in the database file
+    /// instead of in its own memory
+    /// ([`inlaysql::EngineOptions::paged_text_indexes`]).
+    ///
+    /// **Off by default, and it is a trade in the other direction from
+    /// [`ServerOptions::paged_vector_indexes`]: this one is memory against
+    /// writes, not memory against per-search I/O.** The default in-memory
+    /// `Bm25Index` holds the term dictionary, every postings list and a
+    /// per-document term list, once per connection, at roughly 1,800 bytes
+    /// per document once the dictionary saturates — ten million documents is
+    /// on the order of 17 GiB, per connection
+    /// (`crates/inlaysql/tests/index_memory_cost.rs`). `PagedBm25Index` holds
+    /// none of that: measured at 15.9 MiB whether the corpus is 2,000
+    /// documents or 8,000, because what stays resident is a bounded entry
+    /// cache and a page cache, and neither is sized by the corpus.
+    ///
+    /// # What turning it on costs
+    ///
+    /// * **The bill is on writes, and it is not small.** An inverted-index
+    ///   update touches a page per *distinct* term the document contains —
+    ///   on the order of a hundred for a 120-token chunk of English — where
+    ///   the in-memory index absorbs the same update in RAM. Measured on a
+    ///   bulk load of 2,000 documents with [`ServerOptions::page_reuse`] off
+    ///   (the default): the file grew by 1,260 MiB. Page reuse reclaims the
+    ///   abandoned pages after the fact; it does not reduce how many a
+    ///   document's insert dirties.
+    /// * **It does nothing for vector indexes on its own.**
+    ///   [`ServerOptions::paged_vector_indexes`] is the separate lever for
+    ///   that half.
+    ///
+    /// The scores this backend returns are identical to the in-memory
+    /// backend's, bit for bit — asserted, not argued, by
+    /// `crates/inlaysql-core/tests/bm25_paged_agreement.rs` and
+    /// `crates/inlaysql/tests/paged_full_text.rs`.
+    ///
+    /// Turning both this and [`ServerOptions::paged_vector_indexes`] on gives
+    /// the 10M-row hybrid corpus a memory answer for the first time — flat,
+    /// bounded resident cost instead of growing with the corpus — but not yet
+    /// an ingest answer: the write cost above is real and unresolved, and the
+    /// real fix is a segment-and-merge design that does not exist yet. See
+    /// `docs/enterprise-readiness.md`, blocker 6, for the full accounting.
+    ///
+    /// Asked for rather than inherited, for the same reason
+    /// [`ServerOptions::page_reuse`] and [`ServerOptions::paged_vector_indexes`]
+    /// are: which way the trade falls depends on the corpus and on what the
+    /// operator is short of.
+    pub paged_text_indexes: bool,
     /// How long one statement may run before the server stops it, in
     /// milliseconds. `0` (the default) is no limit.
     ///
@@ -355,6 +403,10 @@ impl Default for ServerOptions {
             // A trade between resident memory and per-search I/O, and one that
             // also changes what a foreign commit costs. See the field's doc.
             paged_vector_indexes: false,
+            // A trade between resident memory and write amplification on the
+            // file — the ingest cost is real and unresolved, so this is asked
+            // for rather than assumed. See the field's doc.
+            paged_text_indexes: false,
             max_execution_time_ms: DEFAULT_MAX_EXECUTION_TIME_MS,
             // Overwriting a stored password is never something to do by
             // default; see the field's doc.
@@ -464,6 +516,7 @@ impl Server {
                 page_reuse: options.page_reuse,
                 query_memory_bytes: options.query_memory_bytes,
                 paged_vector_indexes: options.paged_vector_indexes,
+                paged_text_indexes: options.paged_text_indexes,
                 ..EngineOptions::default()
             },
         })
@@ -911,6 +964,10 @@ mod tests {
         // for an O(nodes) re-open on every other connection's commit, so it is
         // a decision an operator makes about their corpus, not a default.
         assert!(!options.paged_vector_indexes);
+        // A paged text index trades resident memory for write amplification
+        // on the file — a 2,000-document bulk load costs 1,260 MiB of file
+        // growth with page reuse off — so it is asked for the same way.
+        assert!(!options.paged_text_indexes);
         assert_eq!(options.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert_eq!(options.wait_timeout_secs, DEFAULT_WAIT_TIMEOUT_SECS);
         assert_eq!(options.wait_timeout_secs, 28800);

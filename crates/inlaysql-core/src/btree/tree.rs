@@ -610,6 +610,47 @@ impl<D: Device> CowBTree<D> {
                 .sum::<usize>()
     }
 
+    /// What [`CowBTree::commit`] will have to fit, which is not what the open
+    /// transaction is holding right now.
+    ///
+    /// [`CowBTree::pending_record_len`] is exact for the *current* dirty set,
+    /// and that is not the question a caller deciding whether to commit is
+    /// asking. With page reuse on, `commit` runs
+    /// [`CowBTree::finalize_free_list`] before it builds the record: every
+    /// committed page this transaction superseded becomes a durable free-list
+    /// row, every page it drew from the free list has its row deleted, and both
+    /// dirty pages of their own. All of that happens strictly *after* the last
+    /// moment anybody could have asked, so a batched writer that stopped
+    /// exactly when
+    /// [`Storage::transaction_is_nearly_full`](crate::Storage::transaction_is_nearly_full)
+    /// told it to was handed a record it could not commit and a transaction it
+    /// could never get rid of except by throwing it away.
+    ///
+    /// The reserve is one record entry per free-list row still owed. That is
+    /// not a proof of an upper bound — one row can copy a whole root-to-leaf
+    /// path, and rows sharing a leaf cost far less than a page each — but it is
+    /// the right *shape*: the work scales with the rows owed, not with the
+    /// bytes already written, which is exactly what the old answer missed. In
+    /// practice it is generous, and measured to be: a delete sweep over rows
+    /// with overflow chains owed 140 rows at the moment it was told to stop and
+    /// grew the record by 101 pages. Over-reserving only makes a caller commit
+    /// sooner; under-reserving strands a transaction, so this errs the way it
+    /// does on purpose.
+    ///
+    /// Zero with reuse off, where `finalize_free_list` writes nothing at all
+    /// and this is byte-for-byte the question it always was.
+    pub fn projected_record_len(&self) -> usize {
+        let owed = if self.reuse_enabled {
+            self.freed_this_txn.len() + self.consumed_this_txn.len()
+        } else {
+            0
+        };
+        // Per entry: the page id, its length, and the page — the same three
+        // `pending_record_len` counts, because a free-list row's cost to the
+        // record is a copied page like any other.
+        self.pending_record_len() + owed * (8 + 4 + self.page_size)
+    }
+
     /// The largest transaction this tree can commit, in bytes.
     pub fn log_capacity(&self) -> usize {
         crate::wal::max_record_len(self.page_size)
