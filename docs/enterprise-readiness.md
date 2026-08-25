@@ -32,7 +32,7 @@ each is closed with evidence. It is a scoreboard, not a claim.
 | 5 | ~1 MiB transaction and statement ceiling | measured; **open by choice** — see the entry |
 | 6 | Fully resident retrieval indexes, per connection | measured; **vector half has a lever**, BM25 half open |
 | 7 | Integer comparison through `f64` above 2^53 | **closed** |
-| 8 | No statement timeout; unbounded materialisation | **materialisation closed**, timeouts/`KILL` open |
+| 8 | No statement timeout; unbounded materialisation | **closed** — with two loops deliberately not interruptible, named in the entry |
 | 9 | No TLS, one user, no grants | **accounts and privileges closed**, TLS open |
 | 10 | Effectively no observability | **`EXPLAIN` closed**, metrics/processlist open |
 
@@ -443,11 +443,65 @@ differential rounds. Listed here because it is the shape of bug this document
 is for: silent, plausible, and aimed squarely at Snowflake ids and epoch
 nanoseconds.
 
-### 8. No statement timeout or cancellation; unbounded materialisation — *partly fixed*
+### 8. No statement timeout or cancellation; unbounded materialisation — *fixed, verified*
 
-**Still open:** there is no statement timeout and no `KILL`. Both need
-executor-level cancellation and are a separate project; `docs/server.md` says
-so in the protocol table rather than leaving it to be discovered.
+**Fixed — a statement can now be stopped.** The missing piece was a
+cancellation signal the executor honours, and it could not live in the engine:
+`inlaysql-core` is `no_std`, so it can neither read a clock nor own a thread
+that would interrupt one. So it is a trait beside the `Clock` one it resembles
+— `traits::Cancel`, answering "why must the statement in flight stop", with
+`Stopped::Timeout` and `Stopped::Killed` as the only two answers — and the core
+asks it from inside every loop that can run long: the batch loop of every
+sequential scan, the per-id loop of an index-range fetch, a join's pairing
+loop, the collect a blocking operator fills, the sort/group/window/distinct
+passes, and the write loops of `INSERT`, `UPDATE` and `DELETE`.
+
+The question is amortised over a fixed amount of *work* — a thousand rows,
+counted in rows rather than in calls so a scan that reads five hundred rows in
+one batch spends five hundred — and a handle with no signal installed pays one
+null branch and no call at all. The point-read path asks nothing whatever: it
+is a single tree descent with no loop in it, which
+`a_short_statement_is_never_asked` pins by counting the questions two hundred
+point reads produce and requiring zero. Measured as well as argued —
+`SUITE=points ./bench/run.sh`, four alternating pairs against the same commit
+without this change, throughput within a percent either way and `p50` inside
+the timer's own resolution.
+
+**Fixed — a statement timeout, and `KILL`.** `serve --mysql
+--max-execution-time <ms>` gives every statement a deadline (`0`, the default,
+is MySQL's own and means none), and `SET max_execution_time` lets a session
+change its own. `@@max_execution_time` and `SHOW VARIABLES` report it by
+reading the field the engine enforces, not a copy — the server learned that
+lesson once already, when it advertised `wait_timeout` values it never applied.
+`KILL [CONNECTION | QUERY] <id>` and `COM_PROCESS_KILL` end somebody else's,
+through a registry of live connections the accept loop owns; own account
+always, another account's with the superuser, `1094`/`1095` otherwise. A
+`KILL CONNECTION` shuts the target's socket down as well as setting the flag,
+so an idle connection goes at once instead of at its `wait_timeout`.
+
+**What a stopped statement leaves behind is nothing, and that is the part that
+was tested hardest.** Cancellation is noticed only while a statement is
+producing or collecting rows, never while it is making them durable, so it
+leaves through the same statement-atomicity path a `CHECK` violation leaves
+through. `crates/inlaysql-core/tests/cancellation.rs` does not check one
+convenient stopping point: it sweeps every one, tripping the signal on the
+first question, then the second, and so on until the statement completes, and
+after each stop asserts the table is byte-for-byte what it was and the handle
+still answers. `crates/inlaysql-server/tests/wire.rs` does the same over a
+socket against a live `UPDATE`, and pins the two error codes, the privilege
+rules and the idle-connection kill.
+
+**One thing is deliberately not interruptible**, and it is named rather than
+left to be found: a `bm25_score`/`vector_score` walk with no filter to push
+into it. `FullTextIndex::search` and `VectorIndex::search` are traits any
+backend implements and neither takes a signal, so closing that case means
+widening the trait everybody implements. A *filtered* retrieval query is
+interruptible, because the filter the engine pushes into the walk runs once per
+candidate and carries the check. The other is index rebuild on open or after
+another handle's commit, which is refused for a sharper reason: it runs with
+the indexes already cleared, so stopping it half-way would leave a handle whose
+`bm25_score` silently returns nothing for committed, visible rows — blocker 1's
+failure, reintroduced.
 
 **Fixed — the server no longer holds the answer.** A `SELECT` whose columns the
 plan can describe before it runs is written to the socket as the engine
@@ -542,9 +596,9 @@ exchange is refused with a clear error rather than faked.
 
 No metrics, no counters, no exporter, no `log` or `tracing` dependency. No
 query log or slow-query log, deliberately — the server logs accept failures and
-connection errors and "never the statement". No `SHOW PROCESSLIST`, no
-`KILL`. `information_schema` covers nine relations and refuses joins and
-subqueries.
+connection errors and "never the statement". No `SHOW PROCESSLIST` — though
+the registry one would read now exists, since `KILL` needed it (blocker 8).
+`information_schema` covers nine relations and refuses joins and subqueries.
 
 `EXPLAIN` now exists (`EXPLAIN`/`EXPLAIN QUERY PLAN`/`DESCRIBE <statement>`,
 over the wire as well as in the engine) and reports which access path the
@@ -553,10 +607,12 @@ nested loop, or which retrieval index answered a `bm25_score`/`vector_score`/
 `fuse`. It reports no row counts, costs or selectivity, because there is no
 statistics system here to draw them from; see `crates/inlaysql-core/src/explain.rs`.
 
-Some reported session variables are fiction: `wait_timeout` and the
-`net_*_timeout`s are reported but never enforced, and `max_connections` reports
-`0` while the real cap is 64. A reported timeout that is not honoured is worse
-than none, because a client tunes against it.
+Some reported session variables were fiction: `wait_timeout` and the
+`net_*_timeout`s were reported but never enforced, and `max_connections`
+reported `0` while the real cap was 64. That is closed under blocker 8 — every
+number the server reports is now read from the thing that applies it, which is
+why `max_execution_time` was wired the same way rather than recorded in the
+session's variable map like every setting this server does not model.
 
 ---
 

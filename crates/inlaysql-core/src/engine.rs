@@ -49,7 +49,8 @@ use crate::shared::SharedStorage;
 use crate::sql::{self, TableRules};
 use crate::statement::Statement;
 use crate::traits::{
-    scan_all, Clock, FullTextIndex, IndexFactory, Rng, RowId, RowScan, Scored, Storage, VectorIndex,
+    Cancel, Clock, FullTextIndex, IndexFactory, Interrupt, Rng, RowId, RowScan, Scored, Storage,
+    VectorIndex,
 };
 use crate::value::{DataType, Value};
 
@@ -321,6 +322,14 @@ pub struct Engine {
     /// `'now'` in one statement sees one instant — as SQLite's
     /// `sqlite3StmtCurrentTime` does.
     statement_now: Cell<i64>,
+    /// Where "stop this statement" is noticed.
+    ///
+    /// Empty unless a host installs a signal ([`Engine::set_cancel`]), and a
+    /// null branch per few thousand rows when it does not — the core cannot
+    /// time a statement out or hear a `KILL` on its own, so this is the seam
+    /// that lets whoever can say so. Armed once per statement, beside
+    /// `statement_now`, so a deadline covers exactly one statement.
+    interrupt: Interrupt,
     catalog: Catalog,
     /// Declared constraints, resolved against the catalog and kept until the
     /// catalog moves.
@@ -477,6 +486,7 @@ impl Engine {
                 Box::new(crate::mem::SeededRng::new(seed)) as Box<dyn Rng>
             )),
             statement_now: Cell::new(0),
+            interrupt: Interrupt::none(),
             clock,
             catalog,
             rules: BTreeMap::new(),
@@ -525,6 +535,30 @@ impl Engine {
     /// wants a specific stream sets its own.
     pub fn set_rng(&mut self, rng: Box<dyn Rng>) {
         self.rng = Rc::new(RefCell::new(rng));
+    }
+
+    /// Install the signal every long loop in this engine asks before carrying
+    /// on. See [`Cancel`].
+    ///
+    /// Until this is called there is no statement timeout and no way to stop a
+    /// running statement, because there is nothing in a `no_std` core that
+    /// could provide either. A host that installs one gets both, and one that
+    /// does not pays a null branch per few thousand rows.
+    pub fn set_cancel(&mut self, cancel: Box<dyn Cancel>) {
+        self.interrupt = Interrupt::with(cancel);
+    }
+
+    /// A cancellable sequential scan of `table`. Every scan the engine starts
+    /// goes through here rather than through [`RowScan::new`], which is what
+    /// makes "stop this statement" reach a table scan at all.
+    fn scan(&self, table: &str) -> RowScan<'_> {
+        RowScan::watched(&self.storage, table, &self.interrupt)
+    }
+
+    /// [`Engine::scan`], materialised — the write paths' view of a table, which
+    /// has to be read before it is changed (see [`crate::traits::scan_all`]).
+    fn scan_all(&self, table: &str) -> Result<Vec<(RowId, RowBuf)>> {
+        self.scan(table).collect()
     }
 
     /// The expression environment for the statement in flight.
@@ -641,6 +675,11 @@ impl Engine {
         // One clock reading per statement, taken before anything runs, so
         // every `'now'` inside it agrees.
         self.statement_now.set(self.clock.now_micros());
+        // And one arming of the cancellation signal, in the same place and for
+        // the same reason: a deadline has to cover exactly one statement, and a
+        // `KILL QUERY` that landed between two of them must not fall on the
+        // next one.
+        self.interrupt.begin_statement();
         // A write inside an open transaction has to fit what the storage
         // backend can hold in one commit. Refuse it *before* running it, so a
         // too-large transaction is reported without a half-written statement:
@@ -732,6 +771,7 @@ impl Engine {
         self.refresh_snapshot()?;
         statement.validate(&self.catalog, params)?;
         self.statement_now.set(self.clock.now_micros());
+        self.interrupt.begin_statement();
 
         let Plan::Select(select) = statement.plan() else {
             let result = self.run_refreshed(statement, params)?.into_rows()?;
@@ -1441,7 +1481,7 @@ impl Engine {
             // the rows they point at are about to stop existing.
             self.purge_index_entries(index)?;
         }
-        for (id, _) in scan_all(&self.storage, &table.name)? {
+        for (id, _) in self.scan_all(&table.name)? {
             self.storage.delete_row(&table.name, id)?;
             self.note_change(&table.name, id, ChangeKind::Delete);
         }
@@ -1507,7 +1547,7 @@ impl Engine {
                 }
                 // Rows are keyed by table name, so the move is a copy under the
                 // new name and a delete under the old one.
-                for (id, bytes) in scan_all(&self.storage, &before.name)? {
+                for (id, bytes) in self.scan_all(&before.name)? {
                     self.storage.put_row(target, id, &bytes)?;
                     self.storage.delete_row(&before.name, id)?;
                     self.note_change(target, id, ChangeKind::Insert);
@@ -1674,7 +1714,7 @@ impl Engine {
         table: &Table,
         mut change: impl FnMut(&mut Vec<Value>) -> Result<()>,
     ) -> Result<()> {
-        for (id, bytes) in scan_all(&self.storage, &table.name)? {
+        for (id, bytes) in self.scan_all(&table.name)? {
             let mut row = decode_row(&bytes)?;
             change(&mut row)?;
             self.storage
@@ -1861,7 +1901,7 @@ impl Engine {
         // Materialised, not streamed: the build writes as it goes (see
         // `build_btree_index`), and a statement must see the table as it stood
         // when it began — the same rule `UPDATE` and `DELETE` follow.
-        let rows = scan_all(&self.storage, &table.name)?;
+        let rows = self.scan_all(&table.name)?;
         if index.kind == IndexKind::BTree {
             if let Err(error) = self.build_btree_index(&table, &index, &rows) {
                 // The declaration is undone and the handle reloaded, because a
@@ -1931,6 +1971,9 @@ impl Engine {
         let ordinals = index_ordinals(table, index)?;
         let mut entries: Vec<(Vec<u8>, RowId)> = Vec::with_capacity(rows.len());
         for (id, bytes) in rows {
+            // Nothing is written yet, so a stop here is as clean as one during
+            // the scan that produced `rows`.
+            self.interrupt.check()?;
             let row = decode_row(bytes)?;
             let values = index_values(table, index, &row)?;
             entries.push((
@@ -1972,6 +2015,16 @@ impl Engine {
         // cleared first, so the entries written below are the whole index.
         self.purge_index_entries(index)?;
         for (key, _) in entries {
+            // Checked even though this loop commits as it goes, because the
+            // recovery for a build that failed part way through already exists
+            // and is what `create_index`'s error arm does: the declaration is
+            // dropped and the handle reloaded, which leaves the entries that
+            // reached the platter unreachable — nothing reads a prefix no
+            // declaration names, and the next `CREATE INDEX` of this name
+            // purges them before it starts. A `CREATE INDEX` over ten million
+            // rows is exactly the statement an operator wants to be able to
+            // stop.
+            self.interrupt.check()?;
             self.storage.put_index_entry(&key)?;
             // `CREATE INDEX` is refused inside a caller's transaction, so this
             // commit can only be making the engine's own work durable.
@@ -2005,11 +2058,16 @@ impl Engine {
             .map(|ordinal| table.columns[*ordinal].collation)
             .collect();
 
-        let stored: Vec<Vec<Value>> = RowScan::new(&self.storage, &table.name)
+        let stored: Vec<Vec<Value>> = self
+            .scan(&table.name)
             .map(|row| decode_row(&row?.1))
             .collect::<Result<_>>()?;
         for (index, row) in stored.iter().enumerate() {
+            // The inner loop, not the outer: this is O(rows squared) and the
+            // outer one advances once per `rows` comparisons, which on a large
+            // table is minutes between checks.
             for other in &stored[index + 1..] {
+                self.interrupt.check()?;
                 if unique_key_collides(&ordinals, &collations, row, other) {
                     return Err(conflict_error(
                         &table,
@@ -2112,7 +2170,25 @@ impl Engine {
             // emptied first, or the rows below would be indexed a second time
             // on top of the copy it just opened.
             self.reset_self_persisting_indexes(table)?;
-            for row in scan_all(&self.storage, &table.name)? {
+            // The one scan in this engine that is deliberately **not**
+            // cancellable, and it has to stay that way.
+            //
+            // By the time this loop runs the retrieval indexes have already
+            // been cleared and `persisted_version` already advanced, so an
+            // early return here would leave the handle holding empty indexes
+            // that claim to describe the committed rows — `bm25_score` and
+            // `vector_score` would then answer *nothing* for rows that are
+            // visibly there, with no error anywhere. That is the exact
+            // silent-wrong-answer failure `docs/enterprise-readiness.md`
+            // blocker 1 was about.
+            //
+            // It is also reached from two places where cancellation makes no
+            // sense at all: `refresh_snapshot`, which runs *before* a statement
+            // has been given a deadline, and `reload`, which is how the engine
+            // recovers from a statement that was itself cancelled. A rebuild
+            // is the engine repairing its own consistency, not the client's
+            // work, and the client is not entitled to interrupt it.
+            for row in crate::traits::scan_all(&self.storage, &table.name)? {
                 let (id, bytes) = row;
                 let row = decode_row(&bytes)?;
                 // Only the retrieval half. A B-tree index needs no rebuild:
@@ -2625,6 +2701,11 @@ impl Engine {
         let mut written = 0usize;
         let mut returned: Vec<Vec<Value>> = Vec::new();
         for mut row in proposed {
+            // Nothing here is durable yet — a cancelled `INSERT` leaves through
+            // `discard_failed_statement` with its buffered rows dropped, the
+            // same path a `CHECK` violation on the sixth row of six leaves
+            // through.
+            self.interrupt.check()?;
             // `assigned` is per row, not per statement: a multi-row `INSERT`
             // may name some keys and leave others to the engine, and only the
             // engine-chosen ones are what `last_insert_rowid()` is asking
@@ -3161,9 +3242,14 @@ impl Engine {
             ));
         }
         if let Some(ids) = self.indexed_candidates(table, filter.as_ref(), params)? {
-            return Ok(RowBytes::indexed(&self.storage, &table.name, ids));
+            return Ok(RowBytes::indexed(
+                &self.storage,
+                &table.name,
+                ids,
+                &self.interrupt,
+            ));
         }
-        Ok(RowBytes::Scan(RowScan::new(&self.storage, &table.name)))
+        Ok(RowBytes::Scan(self.scan(&table.name)))
     }
 
     /// The rows a *write* statement has to consider, materialised.
@@ -3337,7 +3423,7 @@ impl Engine {
             // No index covers this group, so the only way to know is to look
             // at every row. This is the O(rows)-per-write cost the constraint
             // used to have unconditionally.
-            None => scan_all(&self.storage, &table.name)?,
+            None => self.scan_all(&table.name)?,
         };
 
         let mut found = Vec::new();
@@ -3553,6 +3639,10 @@ impl Engine {
         let mut count = 0;
         let mut returned: Vec<Vec<Value>> = Vec::new();
         for (id, bytes) in self.candidate_rows(&table, &plan.filter, params)? {
+            // The candidates were read by a checked scan, but that finished
+            // before this loop started: an `UPDATE` over a million rows spends
+            // almost all of its time here, re-checking constraints and writing.
+            self.interrupt.check()?;
             let row = decode_row(&bytes)?;
             if !self.matches(&plan.filter, &row, &env)? {
                 continue;
@@ -3593,6 +3683,7 @@ impl Engine {
         let mut count = 0;
         let mut returned: Vec<Vec<Value>> = Vec::new();
         for (id, bytes) in self.candidate_rows(&table, &plan.filter, params)? {
+            self.interrupt.check()?;
             let row = decode_row(&bytes)?;
             if !self.matches(&plan.filter, &row, &env)? {
                 continue;
@@ -3892,6 +3983,7 @@ impl Engine {
                     join.kind,
                     join.on.as_ref(),
                     env,
+                    &self.interrupt,
                 ));
             }
             match &plan.filter {
@@ -3940,7 +4032,8 @@ impl Engine {
         // before it can produce a single output row, so this is where one
         // statement can take the process down and where the per-statement
         // ceiling is applied. See [`collect_bounded`].
-        let mut rows: Vec<ExecRow> = collect_bounded(stream, self.options.query_memory_bytes)?;
+        let mut rows: Vec<ExecRow> =
+            collect_bounded(stream, self.options.query_memory_bytes, &self.interrupt)?;
 
         if is_aggregate {
             rows = self.aggregate(plan, rows, env)?;
@@ -3952,16 +4045,22 @@ impl Engine {
         // (`docs/architecture.md` phase 1 item 6), so `SELECT DISTINCT` folds on a window
         // function's own output and `ORDER BY` may sort by one.
         if !plan.windows.is_empty() {
-            rows = window(plan, rows, env)?;
+            rows = window(plan, rows, env, &self.interrupt)?;
         }
 
         // `DISTINCT` folds *projected* rows, not stored ones, and it happens
         // before `ORDER BY` so that the order applies to what survives.
         if plan.distinct {
-            rows = distinct_rows(&plan.items, &plan.distinct_collations, rows, env)?;
+            rows = distinct_rows(
+                &plan.items,
+                &plan.distinct_collations,
+                rows,
+                env,
+                &self.interrupt,
+            )?;
         }
 
-        rows = sort_rows(rows, &plan.order, env)?;
+        rows = sort_rows(rows, &plan.order, env, &self.interrupt)?;
 
         // `OFFSET` skips before `LIMIT` counts; an offset past the end leaves
         // nothing, which is not an error.
@@ -4055,7 +4154,7 @@ impl Engine {
             {
                 let rowid = driving.table.rowid_alias().unwrap();
                 let key_ordinal = hash.key_ordinal();
-                for row in RowScan::new(&self.storage, &driving.table.name) {
+                for row in self.scan(&driving.table.name) {
                     let (row_id, row_bytes) = row?;
                     let key = decode_value_at(row_bytes.as_slice(), key_ordinal)?;
                     hash.prepare_key(&key);
@@ -4103,7 +4202,14 @@ impl Engine {
             }
         }
 
-        let joiner = NestedLoopJoin::new(outer, side, join.kind, join.on.as_ref(), env);
+        let joiner = NestedLoopJoin::new(
+            outer,
+            side,
+            join.kind,
+            join.on.as_ref(),
+            env,
+            &self.interrupt,
+        );
         if hash_key_is_full_on && direct_projection {
             joiner.try_for_each_hash_pair(|_, score, outer, inner| {
                 if skipped < offset {
@@ -4173,7 +4279,7 @@ impl Engine {
             .zip(1u64..)
             .map(|(values, id)| ExecRow::scanned(id, values))
             .collect();
-        rows = sort_rows(rows, &plan.order, env)?;
+        rows = sort_rows(rows, &plan.order, env, &self.interrupt)?;
 
         let offset = row_count(plan.offset.as_ref(), env)?.unwrap_or(0);
         if offset > 0 {
@@ -4247,6 +4353,7 @@ impl Engine {
                 ty,
                 collation,
                 kind,
+                &self.interrupt,
             ))),
             None => self.materialise_inner(inner, &inner_mask),
         }
@@ -4279,8 +4386,14 @@ impl Engine {
             }
         }
 
-        let table =
-            HashJoin::build_table(&self.storage, table_name, mask.clone(), inner_key, width)?;
+        let table = HashJoin::build_table(
+            &self.storage,
+            table_name,
+            mask.clone(),
+            inner_key,
+            width,
+            &self.interrupt,
+        )?;
         if !transaction_has_writes
             && self.options.hash_join_cache_bytes > 0
             && table.resident_bytes() <= self.options.hash_join_cache_bytes
@@ -4415,7 +4528,7 @@ impl Engine {
     /// query never mentions are walked past rather than allocated.
     fn materialise_inner(&self, table: &Table, mask: &ColumnMask) -> Result<JoinInner<'_>> {
         let mut rows = Vec::new();
-        for row in RowScan::new(&self.storage, &table.name) {
+        for row in self.scan(&table.name) {
             rows.push(decode_row_masked(&row?.1, mask)?);
         }
         Ok(JoinInner::Materialised {
@@ -4474,6 +4587,7 @@ impl Engine {
         } else {
             let mut keyed: Vec<(Vec<Value>, ExecRow)> = Vec::with_capacity(rows.len());
             for row in rows {
+                self.interrupt.check()?;
                 let mut keys = Vec::with_capacity(plan.group_by.len());
                 for expr in &plan.group_by {
                     keys.push(eval::evaluate(expr, &row.values, Computed::NONE, env)?);
@@ -4503,6 +4617,11 @@ impl Engine {
         let width = plan.from.iter().map(|item| item.table.columns.len()).sum();
         let mut out = Vec::with_capacity(groups.len());
         for group in groups {
+            // One check per *group*, and a group can be one row, so this is the
+            // per-row check for a high-cardinality `GROUP BY` and a cheap one
+            // for a low-cardinality fold whose real cost is in the evaluator
+            // below.
+            self.interrupt.check()?;
             // Borrowed, not cloned: the aggregate evaluator only reads the
             // group, and copying every row a third time is exactly the cost
             // `PERF.md` names against this function.
@@ -4602,8 +4721,17 @@ impl Engine {
         // closure is where they become rows and a `WHERE`. It runs inside the
         // walk — once per candidate the walk visits — so decode and predicate
         // cost is paid for visited candidates, not for the whole corpus.
-        let predicate: &dyn Fn(RowId) -> Result<bool> =
-            &|id| match self.storage.get_row(&table.name, id)? {
+        //
+        // It is also the one place cancellation reaches inside a retrieval
+        // walk. The walk itself is behind [`crate::FullTextIndex::search`] /
+        // [`crate::VectorIndex::search`], which any backend may implement and
+        // which take no signal, so an *unfiltered* search runs to completion
+        // however long it takes — the documented gap, `docs/server.md`. A
+        // filtered one is interruptible because this closure is called once per
+        // candidate the walk visits.
+        let predicate: &dyn Fn(RowId) -> Result<bool> = &|id| {
+            self.interrupt.check()?;
+            match self.storage.get_row(&table.name, id)? {
                 Some(bytes) => {
                     let row = decode_row_masked(&bytes, mask)?;
                     Ok(eval::is_truthy(&eval::evaluate(
@@ -4614,7 +4742,8 @@ impl Engine {
                     )?))
                 }
                 None => Ok(false),
-            };
+            }
+        };
 
         let hits = self.evaluate_score(table, score, candidate_limit, Some(predicate), env)?;
         let mut matched = Vec::with_capacity(hits.len().min(want));
@@ -5685,7 +5814,12 @@ fn window_row_computed(row: &ExecRow) -> Computed<'_> {
 /// partitioning once and answering every function per group) is what keeps
 /// that true without threading a join of every function's partition key
 /// together.
-fn window(plan: &SelectPlan, mut rows: Vec<ExecRow>, env: &Env<'_>) -> Result<Vec<ExecRow>> {
+fn window(
+    plan: &SelectPlan,
+    mut rows: Vec<ExecRow>,
+    env: &Env<'_>,
+    interrupt: &Interrupt,
+) -> Result<Vec<ExecRow>> {
     for row in &mut rows {
         row.windows = alloc::vec![Value::Null; plan.windows.len()];
     }
@@ -5699,6 +5833,7 @@ fn window(plan: &SelectPlan, mut rows: Vec<ExecRow>, env: &Env<'_>) -> Result<Ve
         // keys up front instead of inside the comparator.
         let mut keys: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
         for row in &rows {
+            interrupt.check()?;
             let mut key = Vec::with_capacity(wf.partition_by.len());
             for expr in &wf.partition_by {
                 key.push(eval::evaluate(
@@ -6154,7 +6289,12 @@ fn compare_sort_keys(a: &[SortKey], b: &[SortKey], order: &[Order]) -> core::cmp
 
 /// Sort the result rows by every `ORDER BY` term in turn. Ties always break on
 /// row id so a query returns the same order on every run.
-fn sort_rows(mut rows: Vec<ExecRow>, order: &[Order], env: &Env<'_>) -> Result<Vec<ExecRow>> {
+fn sort_rows(
+    mut rows: Vec<ExecRow>,
+    order: &[Order],
+    env: &Env<'_>,
+    interrupt: &Interrupt,
+) -> Result<Vec<ExecRow>> {
     if order.is_empty() {
         rows.sort_by_key(|row| row.id);
         return Ok(rows);
@@ -6167,6 +6307,13 @@ fn sort_rows(mut rows: Vec<ExecRow>, order: &[Order], env: &Env<'_>) -> Result<V
     // sort.
     let mut keyed: Vec<KeyedRow> = Vec::with_capacity(rows.len());
     for row in rows {
+        // The key-building pass, not the comparator below: this is where an
+        // `ORDER BY` expression is evaluated (once per row), and it is the half
+        // that scales with what the expression costs. The comparator only ever
+        // compares keys that are already values, so an `O(n log n)` run of it
+        // over an input `collect_bounded` has already capped is bounded work
+        // that would cost more to interrupt than to finish.
+        interrupt.check()?;
         let mut keys = Vec::with_capacity(order.len());
         for term in order {
             keys.push(match &term.key {
@@ -6318,9 +6465,11 @@ fn distinct_rows(
     collations: &[Collation],
     rows: Vec<ExecRow>,
     env: &Env<'_>,
+    interrupt: &Interrupt,
 ) -> Result<Vec<ExecRow>> {
     let mut projected = Vec::with_capacity(rows.len());
     for row in &rows {
+        interrupt.check()?;
         projected.push(project_row(items, row, env)?);
     }
     let keep = duplicate_keep_mask(&projected, collations, Keep::First);

@@ -1402,7 +1402,7 @@ mod tests {
 
     fn session() -> Session {
         Session::new(
-            1,
+            crate::control::Control::detached(1),
             "root",
             Some("app".to_string()),
             crate::session::Limits::default(),

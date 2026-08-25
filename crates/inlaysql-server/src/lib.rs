@@ -69,6 +69,7 @@
 mod acl;
 mod auth;
 mod connection;
+mod control;
 mod errors;
 mod infoschema;
 mod mysqlddl;
@@ -85,6 +86,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+use control::{Control, Registry};
 
 use inlaysql::{Database, EngineOptions, FileDevice};
 
@@ -120,6 +123,16 @@ pub const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 28800;
 /// default is the same 60 seconds, and a knob nobody turns is surface for
 /// nothing.
 pub const NET_WRITE_TIMEOUT_SECS: u64 = 60;
+
+/// How long one statement may run before the server stops it, in
+/// milliseconds. `0` is no limit, and is the default.
+///
+/// MySQL's own default for `max_execution_time`, and off for the same reason:
+/// a database cannot know what a legitimate statement costs on somebody else's
+/// data, and a timeout that fires on a nightly report is worse than none. It
+/// is a limit an operator sets knowing their workload — `--max-execution-time`
+/// — or a session sets for itself with `SET max_execution_time`.
+pub const DEFAULT_MAX_EXECUTION_TIME_MS: u64 = 0;
 
 /// How a [`Server`] should be set up.
 #[derive(Debug, Clone)]
@@ -242,6 +255,37 @@ pub struct ServerOptions {
     /// [`ServerOptions::page_reuse`] is: which way the trade falls depends on
     /// the corpus and on what the operator is short of.
     pub paged_vector_indexes: bool,
+    /// How long one statement may run before the server stops it, in
+    /// milliseconds. `0` (the default) is no limit.
+    ///
+    /// Until this existed a statement that ran long could not be stopped by
+    /// anyone — not the client, not the operator, not a timeout — so one
+    /// `SELECT` over a cross join held a connection slot until the process was
+    /// restarted. This is the ceiling that ends it, and `KILL` is the manual
+    /// form of the same mechanism.
+    ///
+    /// # Three things to know before setting it
+    ///
+    /// * **It applies to every statement, not only to `SELECT`.** MySQL's
+    ///   `max_execution_time` is read-only-`SELECT` only, because interrupting
+    ///   a write there is expensive. Here a statement is atomic — a cancelled
+    ///   `UPDATE` discards its buffered rows and the handle stays usable, the
+    ///   same path a `CHECK` violation on the last row of a multi-row `INSERT`
+    ///   already took — so the more useful reading is available and this takes
+    ///   it. `docs/server.md` names the difference.
+    /// * **It is per statement, not per transaction.** Ten statements inside
+    ///   one `BEGIN` each get the full budget.
+    /// * **It is a ceiling, not a guarantee of promptness.** The engine asks
+    ///   whether to stop once per few thousand rows, so a statement overruns by
+    ///   at most that much work — and a single retrieval-index walk
+    ///   (`bm25_score`, `vector_score`) with no `WHERE` pushed into it is not
+    ///   interruptible at all, because the index trait a third-party backend
+    ///   implements takes no cancellation signal. See `docs/server.md`.
+    ///
+    /// A session may change its own with `SET max_execution_time = <ms>`, and
+    /// `@@max_execution_time` reports the number actually in force — read off
+    /// the same field the engine reads, so the two cannot disagree.
+    pub max_execution_time_ms: u64,
     /// Set [`ServerOptions::user`]'s password from these options and make it a
     /// superuser, on a database that **already has** an account store.
     ///
@@ -273,6 +317,7 @@ impl Default for ServerOptions {
             // A trade between resident memory and per-search I/O, and one that
             // also changes what a foreign commit costs. See the field's doc.
             paged_vector_indexes: false,
+            max_execution_time_ms: DEFAULT_MAX_EXECUTION_TIME_MS,
             // Overwriting a stored password is never something to do by
             // default; see the field's doc.
             reset_superuser: false,
@@ -369,6 +414,7 @@ impl Server {
                 max_connections: options.max_connections.max(1),
                 read_timeout_secs: options.wait_timeout_secs,
                 write_timeout_secs: NET_WRITE_TIMEOUT_SECS,
+                max_execution_time_ms: options.max_execution_time_ms,
             },
             engine: EngineOptions {
                 page_reuse: options.page_reuse,
@@ -425,6 +471,11 @@ impl Server {
 
         let live = Arc::new(AtomicUsize::new(0));
         let next_id = AtomicU32::new(1);
+        // Every live connection, so that one connection's `KILL` can reach
+        // another's. The accept loop owns it because it is the only thing that
+        // knows when a connection begins and ends; each thread removes itself
+        // on the way out, however it ends.
+        let registry = Arc::new(Registry::new());
 
         for incoming in self.listener.incoming() {
             let stream = match incoming {
@@ -450,14 +501,41 @@ impl Server {
                 continue;
             }
 
+            // Built and registered on the *accept* thread, before the
+            // connection thread is spawned. A `KILL` racing a brand-new
+            // connection then either finds it or does not, rather than finding
+            // a half-initialised entry: the control exists in full or not at
+            // all.
+            let control = Arc::new(Control::new(id, limits.max_execution_time_ms));
+            match control::clone_socket(&stream) {
+                Ok(socket) => control.attach_socket(socket),
+                // `KILL CONNECTION` can still stop a running statement without
+                // this; what it loses is the ability to unblock an *idle* one
+                // before its socket timeout. A degradation worth naming, not a
+                // reason to refuse the connection.
+                Err(error) => eprintln!(
+                    "inlaysql: connection {id}: no second socket descriptor, so KILL will not \
+                     interrupt it while it is idle: {error}"
+                ),
+            }
+            registry.register(&control);
+
             let owned = live.clone();
+            let registry_for_thread = registry.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("inlaysql-conn-{id}"))
                 .spawn(move || {
                     let _slot = Slot(owned);
-                    if let Err(error) =
-                        serve_connection(stream, &path, id, limits, engine, bootstrap)
-                    {
+                    let _entry = Registered(registry_for_thread.clone(), id);
+                    if let Err(error) = serve_connection(
+                        stream,
+                        &path,
+                        control,
+                        limits,
+                        engine,
+                        bootstrap,
+                        registry_for_thread,
+                    ) {
                         // Never the statement, never the credentials — a
                         // server log is not the place for either.
                         eprintln!("inlaysql: connection {id} ended: {error}");
@@ -466,6 +544,7 @@ impl Server {
 
             if let Err(error) = spawned {
                 live.fetch_sub(1, Ordering::SeqCst);
+                registry.forget(id);
                 eprintln!("inlaysql: could not start a thread for connection {id}: {error}");
             }
         }
@@ -482,13 +561,27 @@ impl Drop for Slot {
     }
 }
 
+/// Removes a connection from the `KILL` registry however the thread ends —
+/// including a panic, which is the case that matters: an entry left behind
+/// would let a later `KILL` of a recycled id write into a control nothing is
+/// reading, and would make `SHOW PROCESSLIST` (when it exists) lie.
+struct Registered(Arc<Registry>, u32);
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        self.0.forget(self.1);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn serve_connection(
     stream: TcpStream,
     path: &Path,
-    id: u32,
+    control: Arc<Control>,
     limits: session::Limits,
     engine: EngineOptions,
     bootstrap: acl::Bootstrap,
+    registry: Arc<Registry>,
 ) -> io::Result<()> {
     // A request/response protocol gains nothing from waiting to coalesce small
     // writes, and loses a round trip's latency to it every time.
@@ -508,7 +601,7 @@ fn serve_connection(
     // Each connection opens the file for itself: this is the whole of D2. The
     // handles share this process's advisory lock and settle concurrent commits
     // between themselves with first-committer-wins.
-    let db = match open_database(path, engine) {
+    let mut db = match open_database(path, engine) {
         Ok(db) => db,
         Err(error) => {
             refuse(
@@ -519,7 +612,14 @@ fn serve_connection(
         }
     };
 
-    let result = connection::Connection::new(stream, write_half, db, id, limits, bootstrap).serve();
+    // The engine's only way to be told to stop. Installed before the first
+    // statement can run, so there is no window in which a connection is
+    // serving and cannot be killed.
+    db.set_cancel(Box::new(control::Signal::new(Arc::clone(&control))));
+
+    let result =
+        connection::Connection::new(stream, write_half, db, control, limits, bootstrap, registry)
+            .serve();
     // A socket timeout arrives as a bare `WouldBlock`/`TimedOut` from whatever
     // read or write was in flight, which in a log reads as an unexplained
     // "Resource temporarily unavailable". Name it instead: this is the one

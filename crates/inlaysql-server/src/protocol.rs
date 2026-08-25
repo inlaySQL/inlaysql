@@ -95,6 +95,12 @@ pub enum Command {
     StmtClose,
     /// Discard a kept statement's accumulated state.
     StmtReset,
+    /// Ask the server to end another connection — the command form of `KILL`.
+    ///
+    /// Deprecated in MySQL in favour of the statement, but `mysqladmin kill`
+    /// and older drivers still send it, and it is the same operation: the
+    /// four-byte body is the connection id.
+    ProcessKill,
     /// Anything else.
     Unknown(u8),
 }
@@ -107,6 +113,7 @@ impl Command {
             0x02 => Command::InitDb,
             0x03 => Command::Query,
             0x04 => Command::FieldList,
+            0x0c => Command::ProcessKill,
             0x0e => Command::Ping,
             0x16 => Command::StmtPrepare,
             0x17 => Command::StmtExecute,

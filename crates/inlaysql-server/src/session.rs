@@ -8,6 +8,9 @@
 //! committed, so it lives in its own field rather than the variable map.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use crate::control::Control;
 
 /// The version string this server reports.
 ///
@@ -44,6 +47,15 @@ pub struct Limits {
     pub read_timeout_secs: u64,
     /// The socket write timeout, in seconds. Reported as `net_write_timeout`.
     pub write_timeout_secs: u64,
+    /// The statement timeout a fresh connection starts with, in milliseconds,
+    /// `0` for none. Reported as `max_execution_time`.
+    ///
+    /// Unlike the three above it is not a fixed property of the server: a
+    /// session may change its own with `SET max_execution_time`, so what a
+    /// session *reports* is read off its own [`Control`] rather than from
+    /// here — see [`Session::variable`]. This is only the starting value the
+    /// accept loop hands each connection.
+    pub max_execution_time_ms: u64,
 }
 
 impl Default for Limits {
@@ -52,6 +64,7 @@ impl Default for Limits {
             max_connections: crate::DEFAULT_MAX_CONNECTIONS,
             read_timeout_secs: crate::DEFAULT_WAIT_TIMEOUT_SECS,
             write_timeout_secs: crate::NET_WRITE_TIMEOUT_SECS,
+            max_execution_time_ms: crate::DEFAULT_MAX_EXECUTION_TIME_MS,
         }
     }
 }
@@ -93,13 +106,28 @@ pub struct Session {
     warnings: Vec<Warning>,
     /// What this server enforces, and therefore what it reports.
     limits: Limits,
+    /// This connection's cancellation state: its statement timeout, and the
+    /// flag a `KILL` from another connection sets.
+    ///
+    /// Held here rather than copied out of because `max_execution_time` is
+    /// both settable by the session and enforced by the engine, and those two
+    /// must be the same number. A copy is how a server ends up reporting a
+    /// limit it does not apply — the mistake `Limits` exists to have stopped
+    /// making.
+    pub control: Arc<Control>,
 }
 
 impl Session {
-    /// A fresh session for `connection_id`.
-    pub fn new(connection_id: u32, user: &str, database: Option<String>, limits: Limits) -> Self {
+    /// A fresh session for the connection `control` belongs to.
+    pub fn new(
+        control: Arc<Control>,
+        user: &str,
+        database: Option<String>,
+        limits: Limits,
+    ) -> Self {
         Self {
-            connection_id,
+            connection_id: control.id(),
+            control,
             user: user.to_string(),
             database,
             autocommit: true,
@@ -206,6 +234,14 @@ impl Session {
                 return Some(self.limits.read_timeout_secs.to_string())
             }
             "net_write_timeout" => return Some(self.limits.write_timeout_secs.to_string()),
+            // Read off the live control, not out of `variables`, and not out
+            // of `Limits`: this one is settable per session, and a recorded
+            // copy would be a number a client could `SET` and read back while
+            // the engine went on applying a different one. `0` is MySQL's own
+            // spelling of "no limit" and is the default here too.
+            "max_execution_time" | "max_statement_time" => {
+                return Some(self.control.timeout_ms().to_string())
+            }
             // Said plainly, because a client may be deciding whether to trust
             // this link with a password.
             "have_ssl" | "have_openssl" => "DISABLED",
@@ -265,6 +301,7 @@ impl Session {
             "lower_case_table_names",
             "max_allowed_packet",
             "max_connections",
+            "max_execution_time",
             "net_read_timeout",
             "net_write_timeout",
             "performance_schema",
@@ -307,7 +344,7 @@ mod tests {
 
     #[test]
     fn a_set_variable_wins_over_the_default() {
-        let mut session = Session::new(1, "root", None, Limits::default());
+        let mut session = Session::new(Control::detached(1), "root", None, Limits::default());
         assert_eq!(
             session.variable("sql_mode").as_deref(),
             Some("STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION")
@@ -318,7 +355,7 @@ mod tests {
 
     #[test]
     fn autocommit_reads_back_the_live_value_not_a_recorded_one() {
-        let mut session = Session::new(1, "root", None, Limits::default());
+        let mut session = Session::new(Control::detached(1), "root", None, Limits::default());
         assert_eq!(session.variable("autocommit").as_deref(), Some("1"));
         session.autocommit = false;
         assert_eq!(session.variable("autocommit").as_deref(), Some("0"));
@@ -327,7 +364,7 @@ mod tests {
     #[test]
     fn an_unknown_variable_has_no_answer() {
         assert_eq!(
-            Session::new(1, "root", None, Limits::default()).variable("wibble"),
+            Session::new(Control::detached(1), "root", None, Limits::default()).variable("wibble"),
             None
         );
     }
@@ -341,13 +378,14 @@ mod tests {
     #[test]
     fn the_reported_limits_are_the_ones_the_server_was_given() {
         let session = Session::new(
-            1,
+            Control::detached_with_timeout(1, 250),
             "root",
             None,
             Limits {
                 max_connections: 7,
                 read_timeout_secs: 11,
                 write_timeout_secs: 13,
+                max_execution_time_ms: 250,
             },
         );
         assert_eq!(session.variable("max_connections").as_deref(), Some("7"));
@@ -378,14 +416,14 @@ mod tests {
     /// The two claims a security-minded client might actually read.
     #[test]
     fn the_server_does_not_claim_to_have_tls_or_foreign_keys() {
-        let session = Session::new(1, "root", None, Limits::default());
+        let session = Session::new(Control::detached(1), "root", None, Limits::default());
         assert_eq!(session.variable("have_ssl").as_deref(), Some("DISABLED"));
         assert_eq!(session.variable("foreign_key_checks").as_deref(), Some("0"));
     }
 
     #[test]
     fn status_flags_track_autocommit_and_transactions() {
-        let mut session = Session::new(1, "root", None, Limits::default());
+        let mut session = Session::new(Control::detached(1), "root", None, Limits::default());
         assert_eq!(
             session.status_flags(),
             crate::protocol::SERVER_STATUS_AUTOCOMMIT
@@ -404,7 +442,7 @@ mod tests {
 
     #[test]
     fn show_variables_includes_client_set_ones() {
-        let mut session = Session::new(1, "root", None, Limits::default());
+        let mut session = Session::new(Control::detached(1), "root", None, Limits::default());
         session.set_variable("wibble", "7");
         let all = session.all_variables();
         assert!(all.iter().any(|(n, v)| n == "wibble" && v == "7"));

@@ -202,6 +202,36 @@ pub fn from_engine(error: &Error) -> MysqlError {
         Error::Memory(message) => {
             MysqlError::new(1038, "HY001", format!("Out of memory: {message}"))
         }
+
+        // Two codes for two conditions, because a client acts on them
+        // differently and MySQL already taught it how.
+        //
+        // `ER_QUERY_TIMEOUT` (3024) is what `max_execution_time` raises, and
+        // its SQLSTATE `HY000` is what a driver maps to a retryable
+        // resource condition rather than a bad statement — the same statement
+        // with a `LIMIT`, or on a quieter server, succeeds.
+        //
+        // `ER_QUERY_INTERRUPTED` (1317, SQLSTATE `70100`) is what `KILL`
+        // raises. A pool that sees it knows the connection is still good and
+        // that a human made a decision, so retrying immediately is exactly
+        // what it must not do.
+        Error::Cancelled(inlaysql::Stopped::Timeout) => MysqlError::new(
+            3024,
+            "HY000",
+            format!(
+                "Query execution was interrupted, maximum statement execution time exceeded \
+                 (InlaySQL: {})",
+                inlaysql::Stopped::Timeout.message()
+            ),
+        ),
+        Error::Cancelled(inlaysql::Stopped::Killed) => MysqlError::new(
+            1317,
+            "70100",
+            format!(
+                "Query execution was interrupted (InlaySQL: {})",
+                inlaysql::Stopped::Killed.message()
+            ),
+        ),
     }
 }
 

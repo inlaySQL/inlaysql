@@ -95,6 +95,7 @@ socket, and the message does not say which half of the credential was wrong.
 | `--reset-superuser` | off | Set `--user`'s password from these flags and make it a superuser, on a database that already has accounts. The way back in after a lost password. |
 | `--max-connections <n>` | `64` | Beyond this, clients get `1040`. |
 | `--wait-timeout <n>` | `28800` | Seconds a connection may be silent before the server closes it. |
+| `--max-execution-time <ms>` | `0` (off) | Milliseconds one statement may run before the server stops it. A session may change its own with `SET max_execution_time`. **Read the section below.** |
 | `--page-reuse` | off | Reclaim superseded pages instead of growing the file for ever. **Read the section below before using it.** |
 | `--paged-vectors` | off | Keep vector indexes in the file instead of in each connection's memory. Recall is identical; latency and foreign-commit cost are not. **Read the section below before using it.** |
 
@@ -304,6 +305,7 @@ applies, because a client tunes against them — a pool sizes itself on
 | `max_connections` | `--max-connections`, the cap the accept loop enforces. |
 | `wait_timeout`, `interactive_timeout`, `net_read_timeout` | `--wait-timeout`, set on the connection as the socket read timeout. |
 | `net_write_timeout` | `60`, set on the connection as the socket write timeout. |
+| `max_execution_time`, `max_statement_time` | `--max-execution-time`, or whatever this session last `SET` it to. Read off the same field the engine reads, so the reported number *is* the enforced one. |
 
 All three read timeouts report one number because one `SO_RCVTIMEO` is what
 enforces them: the same timer covers waiting for the next command and reading
@@ -319,10 +321,70 @@ at startup rather than clamped — there is no honest number to report for
 "never", so a caller that genuinely wants no idle timeout asks for a large one
 (`31536000`, MySQL's own maximum).
 
-There is still **no statement timeout and no `KILL`**: a query that is running
-runs to completion, and `COM_PROCESS_KILL` is not implemented (a client sending
-it gets `1047`). Cancelling mid-statement needs cancellation inside the
-executor, which does not exist yet; nothing here pretends otherwise.
+### Stopping a statement: `--max-execution-time` and `KILL`
+
+Until this existed, a statement that ran long could not be stopped by anyone —
+not the client, not the operator, not a timeout — so one `SELECT` over a cross
+join held a connection slot until the process was restarted. There are now two
+ways to end one, and they are the same mechanism with two triggers.
+
+**`--max-execution-time <ms>`** is a deadline every statement gets. `0`, the
+default, is no limit — MySQL's own default, and off here for the same reason: a
+database cannot know what a legitimate statement costs on somebody else's data,
+and a timeout that fires on a nightly report is worse than none. A statement
+past it is refused with `3024` (`ER_QUERY_TIMEOUT`).
+
+**`KILL [CONNECTION | QUERY] <id>`**, and `COM_PROCESS_KILL`, end somebody
+else's. `KILL QUERY` stops the statement and leaves the connection standing;
+`KILL CONNECTION` (the default) stops the statement *and* closes the
+connection, shutting its socket down so that an **idle** connection goes at once
+rather than at its `wait_timeout` — up to eight hours away. Either raises
+`1317` (`ER_QUERY_INTERRUPTED`) on the connection being killed, which is a
+different code from the timeout on purpose: a client has to be able to tell
+"somebody stopped this" from "this ran too long", because the first is a
+decision and the second is a limit.
+
+You may always kill your own connections and your own account's; killing
+another account's needs the superuser (`1095`), and an id nobody is using is
+`1094`. The id is what `CONNECTION_ID()` hands a client. The argument must be a
+plain decimal literal: `KILL QUERY (SELECT ...)` is refused rather than
+evaluated, because getting it wrong ends the wrong connection.
+
+**What a stopped statement leaves behind: nothing.** The engine notices
+cancellation only while a statement is producing or collecting rows, never
+while it is making them durable, so a stopped write leaves through the same
+statement-atomicity path a `CHECK` violation on the last row of a multi-row
+`INSERT` already took — the buffered rows are discarded, the handle is
+reloaded, and the connection takes the next statement.
+`a_timed_out_update_leaves_the_table_exactly_as_it_was` in `wire.rs` sweeps the
+deadline from one millisecond upward and checks the table after every stop.
+
+Four things to know before setting the timeout:
+
+* **It applies to every statement, not only to `SELECT`.** MySQL's
+  `max_execution_time` covers read-only `SELECT` alone, because interrupting a
+  write there is expensive. Here a statement is atomic and a cancelled one is
+  already undone as a unit, so the more useful reading is available and this
+  takes it. That is a deliberate divergence, and this is where it is written
+  down.
+* **It is per statement, not per transaction.** Ten statements inside one
+  `BEGIN` each get the full budget. A statement stopped *inside* an explicit
+  transaction follows the same rule any failed statement inside one follows:
+  the transaction is in an indeterminate state and `ROLLBACK` is how to leave
+  it. There are no savepoints here to roll back to (see "What is deliberately
+  left out"), so this is not something the server can hide.
+* **It is a ceiling, not a promise of promptness.** The engine asks whether to
+  stop once per few thousand rows of work, so a statement overruns its deadline
+  by at most that much.
+* **One thing is not interruptible: a single retrieval-index walk.** A
+  `bm25_score` or `vector_score` with no `WHERE` for the engine to push into the
+  search runs the index's own walk to completion, because
+  `FullTextIndex::search` and `VectorIndex::search` are traits a third-party
+  backend implements and neither takes a cancellation signal. A *filtered*
+  retrieval query is interruptible, because the filter the engine pushes into
+  the walk is called once per candidate and is where the check lives. Closing
+  the unfiltered case means widening those two traits, which is a change to
+  everybody's backend, not to this server.
 
 ### `--page-reuse`: what it fixes, and what it costs
 
@@ -567,7 +629,7 @@ unchanged, which is what the `determinism` CI job polices.
 | `COM_STMT_EXECUTE` | yes, binary parameters and binary result sets |
 | `COM_STMT_CLOSE` / `COM_STMT_RESET` | yes |
 | `COM_FIELD_LIST` | refused with `1047` — use `SHOW COLUMNS` |
-| `COM_PROCESS_KILL` | no, refused with `1047` — there is no way to cancel a running statement, and no statement timeout either |
+| `COM_PROCESS_KILL` | yes — the same operation as `KILL CONNECTION`, through the same registry and the same privilege check |
 | TLS | no, and not advertised |
 | Multi-statement / multi-result | no, and not advertised |
 | `LOAD DATA LOCAL INFILE` | no, and not advertised |
@@ -665,7 +727,10 @@ Answered from `Catalog` and session state, never sent to the engine:
 
 - `SET NAMES`, `SET CHARACTER SET`, `SET TRANSACTION`, and session/global/user
   variable assignment. Recorded and readable back; inert otherwise — **except
-  `autocommit`, which really does change when work commits.**
+  `autocommit`, which really does change when work commits, and
+  `max_execution_time`, which really does bound how long a statement may run.**
+  Those two are read back off the live value rather than out of the recorded
+  map, so what a client is told is what is applied.
 - `SELECT VERSION()`, `DATABASE()`, `SCHEMA()`, `LAST_INSERT_ID()`,
   `CONNECTION_ID()`, `USER()`, `CURRENT_USER()`, `@@variables` in every
   spelling (`@@x`, `@@session.x`, `@@global.x`, `SESSION x`), `@user_variables`.
@@ -682,6 +747,9 @@ Answered from `Catalog` and session state, never sent to the engine:
   the comparison — they are never spliced into SQL text, so there is no
   injection path through the shim's own parsing.
 - `USE`, `BEGIN`, `START TRANSACTION`, `COMMIT`, `ROLLBACK`, `DO`.
+- `KILL [CONNECTION | QUERY] <id>` — answered against the live-connection
+  registry the accept loop owns, not the engine. See
+  [Stopping a statement](#stopping-a-statement---max-execution-time-and-kill).
 - `CREATE USER`, `ALTER USER`, `DROP USER`, `GRANT`, `REVOKE`, `SHOW GRANTS` —
   answered against the account store rather than the engine, which has no
   syntax for any of them. See

@@ -82,9 +82,9 @@ pub use inlaysql_core::embedding;
 pub use inlaysql_core::hnsw::HnswIndex;
 pub use inlaysql_core::TreeStorage;
 pub use inlaysql_core::{
-    is_reserved_table_name, Catalog, Change, ChangeKind, Changes, Collation, Column, ColumnInfo,
-    DataType, Error, Index, IndexKind, Outcome, Result, ResultSet, Table, TableAccess, Value,
-    RESERVED_TABLE_PREFIX,
+    is_reserved_table_name, Cancel, Catalog, Change, ChangeKind, Changes, Collation, Column,
+    ColumnInfo, DataType, Error, Index, IndexKind, Outcome, Result, ResultSet, Stopped, Table,
+    TableAccess, Value, RESERVED_TABLE_PREFIX,
 };
 pub use statement::Statement;
 pub use storage::RedbStorage;
@@ -428,6 +428,24 @@ impl Database {
     /// committed data, so skipping this call costs time and never correctness.
     pub fn checkpoint(&mut self) -> Result<()> {
         self.engine.checkpoint()
+    }
+
+    /// Install the signal this handle's long loops ask before carrying on.
+    ///
+    /// Without one there is no statement timeout and no way to stop a running
+    /// statement — the engine core is `no_std` and can neither read a clock nor
+    /// be interrupted by a thread, so both have to be supplied. See
+    /// [`Cancel`], and [`inlaysql_core::Engine::set_cancel`] for what the core
+    /// promises about a statement that is stopped: nothing was written, and
+    /// this handle stays usable.
+    ///
+    /// The MySQL-wire server installs one per connection, which is what
+    /// `--max-execution-time` and `KILL` are built on. An embedded caller that
+    /// wants a cancel button — a desktop application, a request handler with a
+    /// deadline — implements the trait over an `AtomicBool` it can set from
+    /// wherever the button is.
+    pub fn set_cancel(&mut self, cancel: Box<dyn Cancel>) {
+        self.engine.set_cancel(cancel);
     }
 
     /// Start an explicit transaction.

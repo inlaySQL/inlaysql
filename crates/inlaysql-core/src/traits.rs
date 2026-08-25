@@ -307,6 +307,9 @@ pub struct RowScan<'a> {
     size: usize,
     /// Set once a short batch (or an error) has proved there is nothing more.
     finished: bool,
+    /// Where a cancelled statement is noticed. `None` for a scan nobody can
+    /// cancel — [`RowScan::new`], which is what an external caller has.
+    interrupt: Option<&'a Interrupt>,
 }
 
 impl<'a> RowScan<'a> {
@@ -319,6 +322,23 @@ impl<'a> RowScan<'a> {
             batch: Vec::new().into_iter(),
             size: FIRST_SCAN_BATCH,
             finished: false,
+            interrupt: None,
+        }
+    }
+
+    /// The same scan, cancellable.
+    ///
+    /// This is the single point that makes "stop this statement" reach a table
+    /// scan at all: every sequential read in the engine — a `SELECT`'s access
+    /// path, an `UPDATE`'s candidate list, a hash-join build, a `UNIQUE`
+    /// re-check, an index rebuild — is one of these, so a check here covers
+    /// all of them without each one carrying its own. The check is spent per
+    /// *batch* rather than per row, against a countdown measured in rows, so a
+    /// scan that reads 512 rows in one call spends 512 rows of the interval.
+    pub fn watched(storage: &'a dyn Storage, table: &str, interrupt: &'a Interrupt) -> Self {
+        Self {
+            interrupt: Some(interrupt),
+            ..Self::new(storage, table)
         }
     }
 }
@@ -334,6 +354,15 @@ impl Iterator for RowScan<'_> {
             }
             if self.finished {
                 return None;
+            }
+            // Before the read, not after it: a cancelled scan should stop
+            // costing tree descents the moment it is cancelled, not one batch
+            // later.
+            if let Some(interrupt) = self.interrupt {
+                if let Err(error) = interrupt.check_rows(self.size) {
+                    self.finished = true;
+                    return Some(Err(error));
+                }
             }
             let batch = match self.storage.scan_batch(&self.table, self.after, self.size) {
                 Ok(batch) => batch,
@@ -366,6 +395,15 @@ impl Iterator for RowScan<'_> {
 /// form, which is for readers.
 pub fn scan_all(storage: &dyn Storage, table: &str) -> Result<Vec<(RowId, RowBuf)>> {
     RowScan::new(storage, table).collect()
+}
+
+/// [`scan_all`], cancellable. See [`RowScan::watched`].
+pub fn scan_all_watched(
+    storage: &dyn Storage,
+    table: &str,
+    interrupt: &Interrupt,
+) -> Result<Vec<(RowId, RowBuf)>> {
+    RowScan::watched(storage, table, interrupt).collect()
 }
 
 /// A BM25-ranked full-text index over one text column.
@@ -553,6 +591,186 @@ pub trait IndexFactory {
 pub trait Clock {
     /// Microseconds since an implementation-defined epoch, monotonic.
     fn now_micros(&self) -> i64;
+}
+
+/// Why a statement was stopped before it finished.
+///
+/// A closed set rather than a message, because the two mean different things
+/// to a client and get different MySQL error codes: a timeout is a limit the
+/// server chose and the same statement over fewer rows would have succeeded,
+/// while a kill is somebody's decision about this statement specifically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    /// The statement outlived the deadline the host gave it.
+    Timeout,
+    /// Something outside asked for it to stop — a `KILL`, an operator, an
+    /// application's own cancel handle.
+    Killed,
+}
+
+impl Stopped {
+    /// What to say when this ends a statement. Written here rather than at the
+    /// error site so both variants read the same way wherever they surface.
+    pub fn message(self) -> &'static str {
+        match self {
+            Stopped::Timeout => {
+                "statement cancelled: it ran past the deadline it was given. Nothing was \
+                 written — a statement is undone as a unit, so the database is exactly as \
+                 an un-run statement would have left it, and this handle is still usable."
+            }
+            Stopped::Killed => {
+                "statement cancelled: something asked for it to stop. Nothing was written — \
+                 a statement is undone as a unit, so the database is exactly as an un-run \
+                 statement would have left it, and this handle is still usable."
+            }
+        }
+    }
+}
+
+/// The only way the core can be told to abandon the statement in flight.
+///
+/// The same seam as [`Clock`], and for the same reason: `inlaysql-core` is
+/// `no_std`, so it can neither read a clock nor own a thread that would
+/// interrupt one — it cannot time a statement out and it cannot hear a `KILL`.
+/// What it *can* do is ask, from inside the loops that run long, and let
+/// whoever installed the signal decide. A host that installs nothing pays a
+/// null check per few thousand rows and nothing else.
+///
+/// # What a cancelled statement is allowed to leave behind
+///
+/// Nothing. The core only asks this question while a statement is *producing
+/// or collecting* rows — never while it is making them durable — so a refusal
+/// travels out as an ordinary `Err` and takes the same statement-atomicity
+/// path a `CHECK` violation or a type error takes
+/// (`Engine::discard_failed_statement`): the buffered writes are dropped and
+/// the handle is reloaded. Checking inside the commit would be the one place
+/// that could half-apply a write, which is exactly why it is not checked
+/// there.
+///
+/// # Implementing one
+///
+/// [`Cancel::stop`] is called from hot loops, so it must be cheap: an atomic
+/// load, or a clock read the core has already amortised down to one per few
+/// thousand rows. It must not block, allocate or take a lock that a `KILL`
+/// arriving on another thread also wants.
+pub trait Cancel {
+    /// A new statement is beginning; arm whatever this signal measures.
+    ///
+    /// Called once per statement from the same place the engine takes its one
+    /// clock reading, so a deadline covers exactly one statement and a `KILL
+    /// QUERY` that arrived between two of them does not fall on the wrong one.
+    /// The default does nothing, for a signal that is not time-based.
+    fn statement_began(&self) {}
+
+    /// Why the statement in flight must stop, or `None` to carry on.
+    fn stop(&self) -> Option<Stopped>;
+}
+
+/// How many rows of work the core does between two [`Cancel::stop`] calls.
+///
+/// The number trades responsiveness against per-row cost. A row costs tens to
+/// hundreds of nanoseconds here, so a thousand of them is tens to hundreds of
+/// microseconds between checks — far below any timeout worth configuring, and
+/// far above the cost of the check itself.
+const CANCEL_STRIDE: u32 = 1024;
+
+/// The amortised cancellation check every long loop in the core goes through.
+///
+/// One object per [`crate::Engine`], holding the injected signal and the
+/// countdown that keeps a per-row check from costing a virtual call per row.
+/// Two things about its shape are deliberate:
+///
+/// * **No signal is a single predictable branch.** An embedded caller that
+///   never installs one — every caller before this existed, and the benchmark
+///   harness — pays one null test per row and no call at all, which is why the
+///   point-read path did not move.
+/// * **Work is counted in rows, not in calls.** [`Interrupt::check_rows`] lets
+///   a loop that advances a whole batch at a time (a scan reading 512 rows in
+///   one [`Storage::scan_batch`]) spend the batch against the same countdown a
+///   per-row loop spends one row against, so the interval between two checks is
+///   a fixed amount of *work* wherever it is measured from.
+pub struct Interrupt {
+    signal: Option<alloc::boxed::Box<dyn Cancel>>,
+    /// Rows of work left before the next [`Cancel::stop`] call.
+    countdown: core::cell::Cell<u32>,
+}
+
+impl Interrupt {
+    /// An interrupt nothing can trip, which is what an engine has until a host
+    /// installs a signal.
+    pub fn none() -> Self {
+        Self {
+            signal: None,
+            countdown: core::cell::Cell::new(CANCEL_STRIDE),
+        }
+    }
+
+    /// Install `signal` as the thing every long loop asks.
+    pub fn with(signal: alloc::boxed::Box<dyn Cancel>) -> Self {
+        Self {
+            signal: Some(signal),
+            countdown: core::cell::Cell::new(CANCEL_STRIDE),
+        }
+    }
+
+    /// Whether a host has installed a signal at all.
+    pub fn is_armed(&self) -> bool {
+        self.signal.is_some()
+    }
+
+    /// Arm the signal for a statement that is about to run.
+    ///
+    /// The countdown is reset too, so the first rows of a statement are checked
+    /// on the same schedule as the last rows of the one before did not.
+    pub fn begin_statement(&self) {
+        if let Some(signal) = &self.signal {
+            self.countdown.set(CANCEL_STRIDE);
+            signal.statement_began();
+        }
+    }
+
+    /// Ask, having done one row of work since the last time.
+    #[inline]
+    pub fn check(&self) -> Result<()> {
+        self.check_rows(1)
+    }
+
+    /// Ask, having done `rows` rows of work since the last time.
+    #[inline]
+    pub fn check_rows(&self, rows: usize) -> Result<()> {
+        // The whole cost of cancellation on a handle that never installed a
+        // signal: one load and one predictable branch, no call.
+        let Some(signal) = &self.signal else {
+            return Ok(());
+        };
+        let spent = u32::try_from(rows).unwrap_or(u32::MAX);
+        let left = self.countdown.get();
+        if left > spent {
+            self.countdown.set(left - spent);
+            return Ok(());
+        }
+        self.countdown.set(CANCEL_STRIDE);
+        match signal.stop() {
+            Some(reason) => Err(crate::error::Error::Cancelled(reason)),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Default for Interrupt {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+/// Only the countdown is observable state, and it is a cache of "how long since
+/// we last asked" rather than anything a reader needs to see.
+impl core::fmt::Debug for Interrupt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Interrupt")
+            .field("armed", &self.signal.is_some())
+            .finish()
+    }
 }
 
 /// The only way the core can obtain randomness.

@@ -94,6 +94,19 @@ SERVE --mysql OPTIONS:
                        keeps serving. PER STATEMENT: --max-connections
                        clients can each hold this much. 0 removes the
                        ceiling. Not a spill threshold; there is no spilling.
+    --max-execution-time <ms>
+                       Milliseconds one statement may run before the server
+                       stops it (default 0, no limit — MySQL's own default).
+                       Without it a statement that runs long cannot be
+                       stopped by anyone and holds its connection slot until
+                       the process is restarted. A stopped statement wrote
+                       nothing and leaves its connection usable, so this is
+                       safe to set on writes too — and unlike MySQL's, it
+                       does apply to them, not only to SELECT. Per statement,
+                       not per transaction. A session may change its own with
+                       `SET max_execution_time = <ms>`, and
+                       @@max_execution_time reports what is in force. `KILL
+                       [QUERY|CONNECTION] <id>` is the manual form.
 
     SECURITY: the MySQL protocol is served in PLAINTEXT. This version has no
     TLS, so every statement, every result and every credential crosses the
@@ -242,6 +255,9 @@ fn serve_mysql(args: &[String]) -> Result<(), String> {
             "--paged-vectors" => options.paged_vector_indexes = true,
             "--reset-superuser" => options.reset_superuser = true,
             "--query-memory" => options.query_memory_bytes = number(rest.next(), "--query-memory")?,
+            "--max-execution-time" => {
+                options.max_execution_time_ms = number(rest.next(), "--max-execution-time")? as u64
+            }
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
     }

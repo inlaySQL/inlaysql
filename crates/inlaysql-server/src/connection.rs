@@ -13,11 +13,13 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 
 use inlaysql::{Database, Error, Outcome, ResultSet, Value};
 
 use crate::acl;
 use crate::auth;
+use crate::control::{Asker, Control, KillScope, Registry};
 use crate::errors::{from_engine, MysqlError};
 use crate::packet::{put_lenenc_bytes, put_lenenc_int, Malformed, Reader, Stream};
 use crate::protocol::{
@@ -62,6 +64,12 @@ pub struct Connection<S: Read + Write> {
     /// account model on a database that has never had an account created in
     /// it, and is ignored entirely on one that has — see [`acl::install`].
     bootstrap: acl::Bootstrap,
+    /// This connection's cancellation state. Shared with the engine (which
+    /// reads it from inside its scan loops) and with the accept loop's
+    /// registry (which is how another connection's `KILL` reaches it).
+    control: Arc<Control>,
+    /// Every live connection, so a `KILL` here can reach one of them.
+    registry: Arc<Registry>,
 }
 
 impl<S: Read + Write> Connection<S> {
@@ -70,18 +78,21 @@ impl<S: Read + Write> Connection<S> {
         read_half: S,
         write_half: S,
         db: Database,
-        connection_id: u32,
+        control: Arc<Control>,
         limits: Limits,
         bootstrap: acl::Bootstrap,
+        registry: Arc<Registry>,
     ) -> Self {
         Self {
             stream: Stream::new(read_half, write_half),
             db,
-            session: Session::new(connection_id, "", None, limits),
+            session: Session::new(Arc::clone(&control), "", None, limits),
             statements: HashMap::new(),
             next_statement_id: 1,
             limits,
             bootstrap,
+            control,
+            registry,
         }
     }
 
@@ -95,6 +106,16 @@ impl<S: Read + Write> Connection<S> {
                 return Ok(());
             };
             if !self.dispatch(&message)? {
+                return Ok(());
+            }
+            // A `KILL CONNECTION` that landed while this connection was running
+            // a statement has been answered — the client got its error packet —
+            // and now the connection itself goes. Checked after the reply
+            // rather than before it so the client is told why, instead of
+            // seeing a socket close with nothing on it. (A `KILL` that lands
+            // while this connection is *idle* does not wait for this: it shuts
+            // the socket down, and the `read_message` above returns.)
+            if self.control.is_closing() {
                 return Ok(());
             }
         }
@@ -227,11 +248,15 @@ impl<S: Read + Write> Connection<S> {
         }
 
         self.session = Session::new(
-            self.session.connection_id,
+            Arc::clone(&self.control),
             &response.username,
             response.database.clone(),
             self.limits,
         );
+        // Recorded on the shared control, not only in the session: `KILL` runs
+        // on somebody else's thread and has to be able to ask whose connection
+        // this is without touching state this thread owns.
+        self.control.set_user(&response.username);
         if let Some(name) = &response.database {
             if let Err(error) = check_database(name) {
                 self.fail(&error)?;
@@ -426,6 +451,21 @@ impl<S: Read + Write> Connection<S> {
                     "Unknown prepared statement handler given to mysqld_stmt_reset",
                 ))?,
             },
+            // `mysqladmin kill`, and older drivers. Same operation as the
+            // `KILL` statement, same authorisation, same registry — only the
+            // spelling differs, so it goes through the same function.
+            Command::ProcessKill => {
+                let target = Reader::new(body).u32();
+                match target {
+                    Ok(target) => match self.kill(target, KillScope::Connection) {
+                        Ok(()) => self.ok(0, 0)?,
+                        Err(error) => self.fail(&error)?,
+                    },
+                    Err(_) => self.fail(&MysqlError::unknown(
+                        "malformed COM_PROCESS_KILL packet: it carries a four-byte connection id",
+                    ))?,
+                }
+            }
             // Superseded by `SHOW COLUMNS` two decades ago, and its reply is a
             // result set with no header, which nothing here would gain from.
             Command::FieldList => self.fail(&MysqlError::unsupported(
@@ -545,8 +585,42 @@ impl<S: Read + Write> Connection<S> {
                 self.session.autocommit = on;
                 Ok(Answer::ok())
             }
+            Intercepted::Kill {
+                connection_id,
+                scope,
+            } => {
+                self.kill(connection_id, scope)?;
+                Ok(Answer::ok())
+            }
             Intercepted::PassThrough => self.run_on_engine(sql, params),
         }
+    }
+
+    /// `KILL`, from either the statement or `COM_PROCESS_KILL`.
+    ///
+    /// The privilege check lives in [`Registry::kill`] so both spellings get
+    /// the same one; what this adds is *who is asking*, which is read fresh
+    /// from the account store rather than from anything cached at login — so a
+    /// superuser whose grant was revoked mid-session cannot still kill other
+    /// people's connections, for the same reason every other statement
+    /// re-reads it.
+    ///
+    /// Killing your own connection is allowed, and a `KILL CONNECTION` on
+    /// yourself takes the socket out from under the OK packet this would have
+    /// answered with — the shutdown happens inside the registry, before there
+    /// is a reply to write. The client sees a closed connection, which is what
+    /// it asked for and what MySQL gives it; the failed write ends this
+    /// connection's loop. `KILL QUERY` on yourself is the harmless case: there
+    /// is no statement running but this one, so it stops nothing and the OK
+    /// goes out normally.
+    fn kill(&mut self, target: u32, scope: KillScope) -> Result<(), MysqlError> {
+        let account = self.account()?;
+        let asker = Asker {
+            connection_id: self.session.connection_id,
+            user: self.session.user.clone(),
+            superuser: account.is_superuser(),
+        };
+        self.registry.kill(target, scope, &asker)
     }
 
     /// Run one statement the engine owns.

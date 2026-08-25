@@ -80,6 +80,21 @@ pub enum Error {
     /// Nothing was written; a read cannot have written anything, and this is
     /// raised while the input is being collected, before any fold or sort.
     Memory(String),
+    /// The statement was stopped before it finished — a deadline, or a `KILL`.
+    ///
+    /// See [`crate::traits::Cancel`]. The core cannot time a statement out or
+    /// hear a `KILL` on its own; this is what comes back when the host that
+    /// can says so.
+    ///
+    /// **Nothing was written.** Cancellation is only ever noticed while a
+    /// statement is producing or collecting rows, never while it is making
+    /// them durable, so this leaves through the same statement-atomicity path
+    /// every other failed write leaves through: the buffered writes are
+    /// discarded and the handle is reloaded. Inside an explicit transaction the
+    /// rule is the one that already applies to any failed statement — the
+    /// transaction is in an indeterminate state and `ROLLBACK` is how to leave
+    /// it.
+    Cancelled(crate::traits::Stopped),
 }
 
 impl fmt::Display for Error {
@@ -103,6 +118,7 @@ impl fmt::Display for Error {
             Error::FormatVersion(m) => write!(f, "format version mismatch: {m}"),
             Error::TooBig(m) => write!(f, "string or blob too big: {m}"),
             Error::Memory(m) => write!(f, "query memory limit exceeded: {m}"),
+            Error::Cancelled(reason) => write!(f, "{}", reason.message()),
         }
     }
 }

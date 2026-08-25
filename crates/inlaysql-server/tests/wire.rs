@@ -622,6 +622,17 @@ impl Client {
         self.command(0x01, &[]);
     }
 
+    /// Whether the server is still there, asked with a `COM_PING`.
+    ///
+    /// Every other command here `expect`s its I/O, which is right when the
+    /// subject is the answer; this is for the tests whose subject is the
+    /// connection *ending*, where a killed connection answers nothing at all
+    /// because its socket has been shut down under it.
+    fn still_connected(&mut self) -> bool {
+        self.sequence = 0;
+        self.write_packet(&[0x0e]).is_ok() && self.read_packet().is_ok()
+    }
+
     fn prepare(&mut self, sql: &str) -> Result<Prepared, ServerError> {
         self.command(0x16, sql.as_bytes());
         let packet = self.read_packet().expect("prepare reply");
@@ -5308,4 +5319,399 @@ fn an_account_statement_is_not_undone_by_a_rollback() {
     assert_eq!(error.code, 1142);
     reader.quit();
     root.quit();
+}
+
+// =====================================================================
+// statement timeout and KILL (docs/enterprise-readiness.md, blocker 8)
+//
+// The other half of blocker 8. Streaming and the blocking-operator ceiling
+// bounded how much *memory* one statement could take; nothing bounded how much
+// *time* it could take, and nothing could end one that was already running. On
+// a shared server that meant one statement could hold a connection slot
+// indefinitely and the only remedy was restarting the process.
+//
+// The correctness bar these tests exist for is not "the statement stops". It
+// is that a stopped statement leaves the database in the state an un-run one
+// would, and leaves its connection able to take the next statement — the same
+// bar `a_commit_refused_for_size_leaves_a_usable_handle` set for a refused
+// commit, and the same class of bug.
+// =====================================================================
+
+/// A server, a client, and a table big enough that a self-join over it takes
+/// far longer than any timeout these tests set.
+///
+/// `rows` squared is the number of pairs the join below evaluates, so it is
+/// what decides how long "long" is: the point is that the statement is still
+/// running when the deadline arrives, on a fast machine and a slow one.
+fn timeout_fixture(name: &str, rows: i64, timeout_ms: u64) -> (TestServer, Client) {
+    let server = TestServer::start_tuned(name, "s3cret", |options| {
+        options.max_execution_time_ms = timeout_ms;
+    });
+    let mut client = server.client();
+    seed_pairs(&mut client, rows);
+    (server, client)
+}
+
+/// Rows enough that [`SLOW`] runs for seconds rather than milliseconds, in a
+/// debug build and in a release one. It is squared, so this is 25 million
+/// pairs; the timeouts these tests set are hundreds of milliseconds, and the
+/// gap between the two is what keeps them from being a race.
+const SLOW_ROWS: i64 = 5000;
+
+/// `rows` rows of `(id, n, body)`, in batches small enough to stay well inside
+/// one transaction's size ceiling.
+fn seed_pairs(client: &mut Client, rows: i64) {
+    client.ok_query("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, body TEXT)");
+    for start in (1..=rows).step_by(500) {
+        let end = (start + 499).min(rows);
+        let mut sql = String::from("INSERT INTO t (id, n, body) VALUES ");
+        for id in start..=end {
+            if id > start {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("({id}, {id}, 'body-{id}')"));
+        }
+        client.ok_query(&sql);
+    }
+}
+
+/// A statement with no end in sight. Not an equality, so the inner side is
+/// materialised and replayed for every outer row: `rows` squared comparisons,
+/// and a single row of output, so nothing here is a test of how fast a socket
+/// is.
+const SLOW: &str = "SELECT COUNT(*) FROM t a JOIN t b ON a.n > b.n";
+
+/// The headline: a statement past its deadline is stopped, with MySQL's own
+/// code for it, and the connection that ran it is immediately usable again.
+#[test]
+fn a_statement_past_max_execution_time_is_stopped_and_the_connection_survives() {
+    let (_server, mut client) = timeout_fixture("timeout-select", SLOW_ROWS, 500);
+
+    let started = std::time::Instant::now();
+    let error = client.query(SLOW).expect_err("the deadline must stop it");
+    let elapsed = started.elapsed();
+
+    // `ER_QUERY_TIMEOUT`, which is what `max_execution_time` raises in MySQL —
+    // a driver classifies it as a resource condition rather than a bad
+    // statement, which decides whether an ORM reports or retries.
+    assert_eq!(error.code, 3024, "{error:?}");
+    assert_eq!(error.sqlstate, "HY000");
+    assert!(
+        error
+            .message
+            .contains("maximum statement execution time exceeded"),
+        "{error:?}"
+    );
+    // It says what happened to the data, because that is the first thing
+    // anybody who sees this asks.
+    assert!(error.message.contains("Nothing was written"), "{error:?}");
+
+    // Stopped rather than merely reported after the fact. The bound is loose
+    // on purpose — the engine asks once per few thousand rows, and this runs
+    // in a debug build beside whatever else is on the machine — but it is far
+    // below what the whole join would take.
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "the statement ran for {elapsed:?}, which is not a timeout"
+    );
+
+    // And the connection is not poisoned: the same connection answers the next
+    // statement, including one that reads the table the stopped statement was
+    // walking.
+    assert_eq!(value(&mut client, "1 + 1"), "2");
+    assert_eq!(
+        client.ok_query("SELECT COUNT(*) FROM t").rows().cell(0, 0),
+        SLOW_ROWS.to_string()
+    );
+    client.quit();
+}
+
+/// The correctness bar, at the wire level and on the statement that can break
+/// it: an `UPDATE` stopped part-way must leave every row as it was.
+///
+/// The deadline is swept from very short to long enough to finish, so this
+/// covers a stop during the candidate scan *and* a stop in the middle of the
+/// write loop — the second of which is the one that would strand a
+/// half-applied statement.
+#[test]
+fn a_timed_out_update_leaves_the_table_exactly_as_it_was() {
+    // Seeded with no timeout — the sweep below sets its own per statement,
+    // which is also what proves `SET max_execution_time` reaches the engine.
+    let server = TestServer::start("timeout-update");
+    let mut client = server.client();
+    seed_pairs(&mut client, 4000);
+
+    let before = client
+        .ok_query("SELECT COUNT(*) FROM t WHERE body LIKE 'body-%'")
+        .rows()
+        .cell(0, 0);
+    assert_eq!(before, "4000");
+
+    let mut stopped = 0;
+    for millis in [1u64, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 4096, 30_000] {
+        client.ok_query(&format!("SET max_execution_time = {millis}"));
+        match client.query("UPDATE t SET n = n + 1000, body = 'rewritten'") {
+            Err(error) => {
+                assert_eq!(error.code, 3024, "at {millis}ms: {error:?}");
+                stopped += 1;
+                // Nothing was written — checked by counting the rows that
+                // still carry their original body, which a half-applied
+                // update would have rewritten.
+                client.ok_query("SET max_execution_time = 0");
+                assert_eq!(
+                    client
+                        .ok_query("SELECT COUNT(*) FROM t WHERE body LIKE 'body-%'")
+                        .rows()
+                        .cell(0, 0),
+                    "4000",
+                    "a statement stopped at {millis}ms left a write behind"
+                );
+            }
+            Ok(reply) => {
+                assert_eq!(reply.ok().0, 4000, "at {millis}ms");
+                assert!(
+                    stopped > 0,
+                    "the sweep never stopped the update, so it proves nothing"
+                );
+                client.ok_query("SET max_execution_time = 0");
+                assert_eq!(
+                    client
+                        .ok_query("SELECT COUNT(*) FROM t WHERE body = 'rewritten'")
+                        .rows()
+                        .cell(0, 0),
+                    "4000"
+                );
+                client.quit();
+                return;
+            }
+        }
+    }
+    panic!("the update never completed; the sweep is too short");
+}
+
+/// Every number this server reports has to be one it applies — the rule
+/// `Limits` exists for, after `wait_timeout` and the `net_*_timeout`s spent a
+/// version being reported and never enforced.
+///
+/// So this checks the *pair*: `@@max_execution_time` and `SHOW VARIABLES` both
+/// report the configured value, and a statement really is stopped at it; then
+/// `SET max_execution_time = 0` and both report zero, and the same statement
+/// really does run to completion.
+#[test]
+fn the_reported_max_execution_time_is_the_one_that_is_enforced() {
+    // A table small enough that [`SLOW`] over it finishes in about a second,
+    // which is what the "no longer enforced" half below has to wait for. The
+    // configured 30 seconds is never reached by anything here — that the
+    // *server's* number is enforced is what
+    // `a_statement_past_max_execution_time_is_stopped_and_the_connection_survives`
+    // establishes; this test is about the report matching, and about the
+    // session's own number.
+    let (_server, mut client) = timeout_fixture("timeout-reported", 700, 30_000);
+
+    assert_eq!(value(&mut client, "@@max_execution_time"), "30000");
+    let shown = client
+        .ok_query("SHOW VARIABLES LIKE 'max_execution_time'")
+        .rows();
+    assert_eq!(shown.cell(0, 1), "30000");
+
+    // Turned off by the session, reported as off, and no longer enforced.
+    client.ok_query("SET max_execution_time = 0");
+    assert_eq!(value(&mut client, "@@max_execution_time"), "0");
+    assert_eq!(
+        client
+            .ok_query("SHOW VARIABLES LIKE 'max_execution_time'")
+            .rows()
+            .cell(0, 1),
+        "0"
+    );
+    client.ok_query(SLOW);
+
+    // Turned back on by the session, at a value the server was not started
+    // with, and enforced at *that* — the same statement that just ran to
+    // completion is now stopped.
+    client.ok_query("SET SESSION max_execution_time = 1");
+    assert_eq!(value(&mut client, "@@max_execution_time"), "1");
+    assert_eq!(client.query(SLOW).expect_err("enforced at 1ms").code, 3024);
+
+    // A value that is not a number is refused rather than recorded, because a
+    // recorded one would be read back as if it had taken effect.
+    let error = client
+        .query("SET max_execution_time = 'soon'")
+        .expect_err("not a number");
+    assert_eq!(error.code, 1232, "{error:?}");
+    assert_eq!(value(&mut client, "@@max_execution_time"), "1");
+    client.quit();
+}
+
+/// The default is off, and off is reported as off. A server that shipped a
+/// default timeout would break somebody's nightly report the day they
+/// upgraded, which is why this one is a decision an operator makes.
+#[test]
+fn the_statement_timeout_is_off_unless_it_is_asked_for() {
+    assert_eq!(ServerOptions::default().max_execution_time_ms, 0);
+    let server = TestServer::start("timeout-default");
+    let mut client = server.client();
+    assert_eq!(value(&mut client, "@@max_execution_time"), "0");
+    client.quit();
+}
+
+/// `KILL QUERY` stops the statement and leaves the connection standing — which
+/// is the whole difference between it and `KILL CONNECTION`, and the reason a
+/// pool can use it.
+#[test]
+fn kill_query_stops_a_running_statement_and_leaves_the_connection_usable() {
+    let (server, mut victim) = timeout_fixture("kill-query", SLOW_ROWS, 0);
+    let id: u32 = value(&mut victim, "CONNECTION_ID()").parse().expect("id");
+
+    let running = std::thread::spawn(move || {
+        let outcome = victim.query(SLOW);
+        (victim, outcome)
+    });
+
+    // Long enough that the statement is certainly inside the join rather than
+    // still being planned, so this tests interrupting work rather than racing
+    // the statement's own start.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut killer = server.client();
+    killer.ok_query(&format!("KILL QUERY {id}"));
+
+    let (mut victim, outcome) = running.join().expect("the victim thread");
+    let error = outcome.expect_err("the statement must have been stopped");
+    // `ER_QUERY_INTERRUPTED`, not the timeout code: a client must be able to
+    // tell "somebody stopped this" from "this ran too long", because the first
+    // is a decision and the second is a limit.
+    assert_eq!(error.code, 1317, "{error:?}");
+    assert_eq!(error.sqlstate, "70100");
+    assert!(error.message.contains("Nothing was written"), "{error:?}");
+
+    // The connection is still there, and the kill does not carry over to the
+    // next statement it is sent.
+    assert_eq!(value(&mut victim, "1 + 1"), "2");
+    assert_eq!(
+        victim.ok_query("SELECT COUNT(*) FROM t").rows().cell(0, 0),
+        SLOW_ROWS.to_string()
+    );
+    victim.quit();
+    killer.quit();
+}
+
+/// A `KILL` of an idle connection has nothing to interrupt, so the flag alone
+/// would not be noticed until the client sent something — up to `wait_timeout`,
+/// which is eight hours. The socket is shut down instead, which is what makes
+/// `KILL CONNECTION` mean the same thing to an idle connection as to a busy
+/// one.
+#[test]
+fn kill_connection_ends_an_idle_connection_at_once() {
+    let server = TestServer::start("kill-idle");
+    let mut victim = server.client();
+    let id: u32 = value(&mut victim, "CONNECTION_ID()").parse().expect("id");
+
+    let mut killer = server.client();
+    killer.ok_query(&format!("KILL CONNECTION {id}"));
+
+    // Give the killed thread a moment to unwind; the shutdown is what makes
+    // this a wait of milliseconds rather than of `wait_timeout`.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !victim.still_connected(),
+        "a killed connection answered a ping"
+    );
+    // The rest of the server is untouched.
+    assert_eq!(value(&mut killer, "1 + 1"), "2");
+    killer.quit();
+}
+
+/// `COM_PROCESS_KILL` is the same operation with an older spelling —
+/// `mysqladmin kill` and several drivers still send it — so it goes through
+/// the same registry and the same privilege check.
+#[test]
+fn com_process_kill_ends_a_connection_like_the_statement_does() {
+    let server = TestServer::start("kill-command");
+    let mut victim = server.client();
+    let id: u32 = value(&mut victim, "CONNECTION_ID()").parse().expect("id");
+
+    let mut killer = server.client();
+    killer.command(0x0c, &id.to_le_bytes());
+    killer.read_reply(false).expect("COM_PROCESS_KILL").ok();
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !victim.still_connected(),
+        "a connection killed by COM_PROCESS_KILL answered a ping"
+    );
+    killer.quit();
+}
+
+/// The refusals. A `KILL` is one connection reaching into another, so the two
+/// answers that matter are "there is no such connection" and "that one is not
+/// yours" — and the second must hold for an ordinary account against another
+/// account's connection, while a superuser may.
+#[test]
+fn killing_another_account_needs_the_superuser() {
+    let server = TestServer::start("kill-privileges");
+    let mut root = server.client();
+    root.ok_query("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+    root.ok_query("CREATE USER 'alice' IDENTIFIED BY 'a-pass'");
+    root.ok_query("CREATE USER 'bob' IDENTIFIED BY 'b-pass'");
+    root.ok_query("GRANT SELECT ON t TO 'alice'");
+    root.ok_query("GRANT SELECT ON t TO 'bob'");
+
+    let mut alice = server.client_as("alice", "a-pass");
+    let mut bob = server.client_as("bob", "b-pass");
+    let alice_id: u32 = value(&mut alice, "CONNECTION_ID()").parse().expect("id");
+    let bob_id: u32 = value(&mut bob, "CONNECTION_ID()").parse().expect("id");
+
+    // An id nobody is using: `ER_NO_SUCH_THREAD`.
+    let error = bob
+        .query("KILL QUERY 999999")
+        .expect_err("no such connection");
+    assert_eq!(error.code, 1094, "{error:?}");
+
+    // Somebody else's, without the superuser: `ER_KILL_DENIED_ERROR`, and
+    // alice is untouched.
+    let error = bob
+        .query(&format!("KILL QUERY {alice_id}"))
+        .expect_err("not bob's connection");
+    assert_eq!(error.code, 1095, "{error:?}");
+    assert_eq!(value(&mut alice, "1 + 1"), "2");
+
+    // Bob's own is always allowed — `KILL QUERY` on an idle connection stops
+    // nothing, so the connection is still there afterwards.
+    bob.ok_query(&format!("KILL QUERY {bob_id}"));
+    assert_eq!(value(&mut bob, "1 + 1"), "2");
+
+    // A superuser may kill anybody's.
+    root.ok_query(&format!("KILL CONNECTION {alice_id}"));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!alice.still_connected(), "the superuser's kill did nothing");
+
+    // And an argument that is not a plain id is refused rather than guessed
+    // at, because guessing here ends the wrong connection.
+    let error = root
+        .query("KILL QUERY (SELECT CONNECTION_ID())")
+        .expect_err("not a plain id");
+    assert_eq!(error.code, 1235, "{error:?}");
+
+    bob.quit();
+    root.quit();
+}
+
+/// A `KILL QUERY` that lands while the connection is idle applies to no
+/// statement at all — it must not fall on whatever the client sends next.
+/// Without this a killed connection would refuse every statement it was ever
+/// sent again, which is a worse outcome than not honouring the kill.
+#[test]
+fn a_kill_query_does_not_fall_on_the_next_statement() {
+    let server = TestServer::start("kill-not-next");
+    let mut victim = server.client();
+    let id: u32 = value(&mut victim, "CONNECTION_ID()").parse().expect("id");
+
+    let mut killer = server.client();
+    killer.ok_query(&format!("KILL QUERY {id}"));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    assert_eq!(value(&mut victim, "1 + 1"), "2");
+    assert_eq!(value(&mut victim, "2 + 2"), "4");
+    victim.quit();
+    killer.quit();
 }

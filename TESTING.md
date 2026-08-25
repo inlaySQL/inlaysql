@@ -18,6 +18,7 @@ cargo test --workspace          # everything below except the sweeps and the fuz
 | Online backup beside live writers, another process, and page reuse | `crates/inlaysql/tests/backup.rs` | every push |
 | A churn workload stops growing the file once reuse is on (opt-in, AHL-481) | `crates/inlaysql/tests/free_list_growth.rs` | every push |
 | The streaming executor stops early only when that is still the right answer | `crates/inlaysql-core/tests/streaming.rs` | every push |
+| A cancelled statement leaves nothing behind, at every point it can be stopped | `crates/inlaysql-core/tests/cancellation.rs` | every push |
 | SQL Logic Test subset | `crates/inlaysql/tests/sqllogictest/` | every push — **1094/1094** |
 | Metamorphic logic-bug tests (SQLancer-style) | `crates/inlaysql-core/tests/logic_bugs.rs` | every push |
 | Comparison is a genuine total order over every storage class, every collation | `eval.rs`, `engine.rs` | every push |

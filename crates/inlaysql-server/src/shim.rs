@@ -66,6 +66,14 @@ pub enum Intercepted {
     Rollback,
     /// Turn autocommit on or off.
     SetAutocommit(bool),
+    /// `KILL [CONNECTION|QUERY] <id>`. Parsed here and carried out in
+    /// [`crate::connection`], which is where the live-connection registry is.
+    Kill {
+        /// The connection to stop.
+        connection_id: u32,
+        /// Whether to stop the statement or the whole connection.
+        scope: crate::control::KillScope,
+    },
     /// Select a default schema.
     UseDatabase(String),
     /// Recognised, but this server cannot do it.
@@ -95,7 +103,7 @@ pub fn handles(sql: &str) -> bool {
     }
     match first_word(&sql).as_str() {
         "SET" | "SHOW" | "USE" | "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT"
-        | "RELEASE" | "DO" => true,
+        | "RELEASE" | "DO" | "KILL" => true,
         // `DESCRIBE <table>` is a column listing, answered here from the
         // catalog. `DESCRIBE <statement>` is MySQL's other spelling of
         // `EXPLAIN`, which the engine now has — so it belongs to the engine,
@@ -359,6 +367,7 @@ pub fn intercept(
         "DESCRIBE" | "DESC" => handle_describe(&sql, catalog, session),
         // `DO expr` evaluates and discards. Nothing observable, so nothing to do.
         "DO" => Intercepted::Ok,
+        "KILL" => handle_kill(&sql),
         "SELECT" => handle_select(&sql, params, catalog, session),
         // Everything else runs on the engine — the shim only translates it out
         // of MySQL's dialect first. See [`crate::mysqlddl`] for the DDL clauses
@@ -433,6 +442,45 @@ fn handle_engine_statement(sql: &str, catalog: &Catalog) -> Intercepted {
     }
 }
 
+// ----------------------------------------------------------------- KILL
+
+/// `KILL [CONNECTION | QUERY] <id>`.
+///
+/// Deliberately narrow. MySQL also accepts an expression for the id and a
+/// `KILL` with no argument in some clients; both are refused here rather than
+/// guessed at, because the failure mode of guessing is ending the wrong
+/// connection. The id must be a plain decimal literal, which is what
+/// `CONNECTION_ID()` hands a client and what every tool that issues a `KILL`
+/// substitutes.
+fn handle_kill(sql: &str) -> Intercepted {
+    use crate::control::KillScope;
+
+    let Some(rest) = strip_keyword(sql, "KILL") else {
+        return Intercepted::PassThrough;
+    };
+    let (scope, rest) = match (
+        strip_keyword(rest, "CONNECTION"),
+        strip_keyword(rest, "QUERY"),
+    ) {
+        (Some(rest), _) => (KillScope::Connection, rest),
+        (_, Some(rest)) => (KillScope::Query, rest),
+        // MySQL's default when neither word is given.
+        _ => (KillScope::Connection, rest),
+    };
+    let argument = rest.trim().trim_end_matches(';').trim();
+    match argument.parse::<u32>() {
+        Ok(connection_id) => Intercepted::Kill {
+            connection_id,
+            scope,
+        },
+        Err(_) => Intercepted::Failed(MysqlError::unsupported(format!(
+            "KILL needs a plain connection id, and `{argument}` is not one; this server \
+             does not evaluate an expression there, because getting it wrong would end \
+             somebody else's connection"
+        ))),
+    }
+}
+
 // ------------------------------------------------------------------ SET
 
 fn handle_set(sql: &str, session: &mut Session) -> Intercepted {
@@ -497,6 +545,29 @@ fn handle_set(sql: &str, session: &mut Session) -> Intercepted {
             continue;
         }
         let name = system_variable_name(&lhs);
+        // Applied, not recorded. Every other unknown variable here is written
+        // into the session's map and read back unchanged, which is honest for
+        // a setting this server does not model — but this one it *does*: the
+        // engine enforces it, `@@max_execution_time` reports it, and a
+        // recorded copy would be a number a client could set and read back
+        // while a different one was applied. That is the exact failure
+        // `Limits` was introduced to stop making.
+        if name.eq_ignore_ascii_case("max_execution_time")
+            || name.eq_ignore_ascii_case("max_statement_time")
+        {
+            let Ok(millis) = value.trim().parse::<u64>() else {
+                return Intercepted::Failed(MysqlError::new(
+                    1232,
+                    "42000",
+                    format!(
+                        "Incorrect argument type to variable '{name}': expected whole \
+                         milliseconds, got '{value}' (0 means no limit)"
+                    ),
+                ));
+            };
+            session.control.set_timeout_ms(millis);
+            continue;
+        }
         if name.eq_ignore_ascii_case("autocommit") {
             match parse_bool(&value) {
                 Some(on) => autocommit = Some(on),
@@ -1478,7 +1549,7 @@ mod tests {
 
     fn session() -> Session {
         Session::new(
-            1,
+            crate::control::Control::detached(1),
             "root",
             Some("app".to_string()),
             crate::session::Limits::default(),
@@ -1778,9 +1849,59 @@ mod tests {
         );
     }
 
+    /// The three spellings, and the refusal. `KILL <id>` with no keyword means
+    /// `CONNECTION` in MySQL, which is the dangerous default of the two — so it
+    /// is the one worth pinning, since reading it as `QUERY` would silently
+    /// leave a connection somebody meant to close.
+    #[test]
+    fn kill_is_parsed_by_shape_and_refused_when_it_is_not_one() {
+        use crate::control::KillScope;
+        let kill = |sql: &str| intercept(sql, &[], &catalog(), &mut session());
+        assert!(handles("KILL 7"));
+        assert!(matches!(
+            kill("KILL 7"),
+            Intercepted::Kill {
+                connection_id: 7,
+                scope: KillScope::Connection
+            }
+        ));
+        assert!(matches!(
+            kill("kill connection 7"),
+            Intercepted::Kill {
+                connection_id: 7,
+                scope: KillScope::Connection
+            }
+        ));
+        assert!(matches!(
+            kill("KILL QUERY 7;"),
+            Intercepted::Kill {
+                connection_id: 7,
+                scope: KillScope::Query
+            }
+        ));
+        // Not a plain id: refused rather than evaluated. Guessing here ends
+        // the wrong connection.
+        for sql in [
+            "KILL",
+            "KILL me",
+            "KILL (SELECT CONNECTION_ID())",
+            "KILL -1",
+        ] {
+            assert!(
+                matches!(kill(sql), Intercepted::Failed(_)),
+                "`{sql}` should be refused"
+            );
+        }
+    }
+
     #[test]
     fn database_is_null_when_no_schema_is_selected() {
-        let mut session = Session::new(1, "root", None, crate::session::Limits::default());
+        let mut session = Session::new(
+            crate::control::Control::detached(1),
+            "root",
+            None,
+            crate::session::Limits::default(),
+        );
         match intercept("SELECT DATABASE()", &[], &catalog(), &mut session) {
             Intercepted::Rows(rows) => assert_eq!(rows.rows[0][0], Value::Null),
             other => panic!("{other:?}"),

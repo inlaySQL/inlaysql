@@ -66,5 +66,7 @@ pub use plan::{ColumnInfo, TableAccess};
 pub use shared::SharedStorage;
 pub use statement::Statement;
 pub use storage::TreeStorage;
-pub use traits::{Clock, FullTextIndex, IndexFactory, Rng, RowId, Scored, Storage, VectorIndex};
+pub use traits::{
+    Cancel, Clock, FullTextIndex, IndexFactory, Rng, RowId, Scored, Stopped, Storage, VectorIndex,
+};
 pub use value::{DataType, Value};

@@ -856,6 +856,14 @@ pub fn shim_requirement(sql: &str, session: &Session) -> Requirement {
         "" => Requirement::Authenticated,
         "SET" | "SHOW" | "USE" | "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT"
         | "RELEASE" | "DO" | "DESCRIBE" | "DESC" | "SELECT" => Requirement::Authenticated,
+        // `KILL` needs a login and nothing more *here*, because the check it
+        // actually needs cannot be written as a privilege: whether one
+        // connection may stop another depends on who owns the target, which
+        // this function cannot see. It is made in `Registry::kill` instead —
+        // your own connections always, anybody's with the superuser, and
+        // `ER_KILL_DENIED_ERROR` otherwise — so answering `Authenticated` here
+        // is deferral to a stricter check, not an absence of one.
+        "KILL" => Requirement::Authenticated,
         other => Requirement::Undetermined(format!(
             "`{other}` is answered by this server rather than by the engine, and there is no \
              privilege defined for it"
@@ -1958,7 +1966,12 @@ mod tests {
     use crate::session::Limits;
 
     fn session() -> Session {
-        Session::new(1, "root", None, Limits::default())
+        Session::new(
+            crate::control::Control::detached(1),
+            "root",
+            None,
+            Limits::default(),
+        )
     }
 
     fn parsed(sql: &str) -> AclStatement {

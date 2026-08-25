@@ -40,7 +40,7 @@ use crate::eval::{self, Computed, Env};
 use crate::index::KeyRange;
 use crate::plan::{Expr, JoinKind};
 use crate::row::{decode_row_masked, decode_row_ref_masked, ColumnMask, RowBuf};
-use crate::traits::{RowId, RowScan, Storage};
+use crate::traits::{Interrupt, RowId, RowScan, Storage};
 use crate::value::{DataType, Value, ValueRef};
 
 /// A decoded candidate row on its way to a result set: its row id, its
@@ -117,13 +117,26 @@ impl ExecRow {
 /// what the fold, sort or projection downstream will allocate on top: this
 /// bounds the dominant term, and pretending to a precision it does not have
 /// would make the number harder to choose rather than safer.
-pub(crate) fn collect_bounded(stream: RowStream<'_>, budget: usize) -> Result<Vec<ExecRow>> {
+pub(crate) fn collect_bounded(
+    stream: RowStream<'_>,
+    budget: usize,
+    interrupt: &Interrupt,
+) -> Result<Vec<ExecRow>> {
     if budget == 0 {
-        return stream.collect();
+        // Still checked, even with the ceiling removed: an unbounded collect is
+        // precisely the shape that runs longest, so the caller that opted out
+        // of the memory limit is the one that most needs the time limit.
+        let mut rows: Vec<ExecRow> = Vec::new();
+        for row in stream {
+            interrupt.check()?;
+            rows.push(row?);
+        }
+        return Ok(rows);
     }
     let mut rows: Vec<ExecRow> = Vec::new();
     let mut held = 0usize;
     for row in stream {
+        interrupt.check()?;
         let row = row?;
         held = held.saturating_add(row.resident_bytes());
         if held > budget {
@@ -174,6 +187,10 @@ pub(crate) enum RowBytes<'a> {
         storage: &'a dyn Storage,
         table: alloc::string::String,
         ids: alloc::vec::IntoIter<RowId>,
+        /// Where a cancelled statement is noticed. A wide range is one tree
+        /// descent per surviving id, so this loop can run as long as a table
+        /// scan can and needs the same check [`RowScan::watched`] gives one.
+        interrupt: &'a Interrupt,
     },
 }
 
@@ -184,11 +201,17 @@ impl<'a> RowBytes<'a> {
     /// that outlives its row would be a maintenance bug, and the scan path
     /// would not have seen the row either, so skipping keeps the two paths
     /// answering the same thing.
-    pub fn indexed(storage: &'a dyn Storage, table: &str, ids: Vec<RowId>) -> Self {
+    pub fn indexed(
+        storage: &'a dyn Storage,
+        table: &str,
+        ids: Vec<RowId>,
+        interrupt: &'a Interrupt,
+    ) -> Self {
         RowBytes::Indexed {
             storage,
             table: alloc::string::String::from(table),
             ids: ids.into_iter(),
+            interrupt,
         }
     }
 }
@@ -204,8 +227,13 @@ impl Iterator for RowBytes<'_> {
                 storage,
                 table,
                 ids,
+                interrupt,
             } => loop {
                 let id = ids.next()?;
+                if let Err(error) = interrupt.check() {
+                    *ids = Vec::new().into_iter();
+                    return Some(Err(error));
+                }
                 match storage.get_row(table, id) {
                     Ok(Some(bytes)) => return Some(Ok((id, bytes))),
                     Ok(None) => continue,
@@ -542,6 +570,9 @@ pub(crate) struct IndexProbe<'a> {
     fallback: Option<Vec<Vec<Value>>>,
     /// Whether the outer row being paired is on the fallback.
     scanning: bool,
+    /// Where a cancelled statement is noticed: the fallback below is a full
+    /// table scan, and a probe of a low-selectivity index is a descent per id.
+    interrupt: &'a Interrupt,
 }
 
 impl<'a> IndexProbe<'a> {
@@ -557,6 +588,7 @@ impl<'a> IndexProbe<'a> {
         ty: DataType,
         collation: Collation,
         kind: ProbeKind,
+        interrupt: &'a Interrupt,
     ) -> Self {
         Self {
             storage,
@@ -570,6 +602,7 @@ impl<'a> IndexProbe<'a> {
             matched: Vec::new(),
             fallback: None,
             scanning: false,
+            interrupt,
         }
     }
 
@@ -613,6 +646,7 @@ impl<'a> IndexProbe<'a> {
                 // keeps the two answers identical row for row.
                 ids.sort_unstable();
                 for id in ids {
+                    self.interrupt.check()?;
                     self.fetch(id)?;
                 }
             }
@@ -639,7 +673,7 @@ impl<'a> IndexProbe<'a> {
         self.scanning = true;
         if self.fallback.is_none() {
             let mut rows = Vec::new();
-            for row in RowScan::new(self.storage, &self.table) {
+            for row in RowScan::watched(self.storage, &self.table, self.interrupt) {
                 rows.push(decode_row_masked(&row?.1, &self.mask)?);
             }
             self.fallback = Some(rows);
@@ -742,9 +776,10 @@ impl HashJoin {
         mask: ColumnMask,
         inner_key: usize,
         width: usize,
+        interrupt: &Interrupt,
     ) -> Result<Rc<HashJoinTable>> {
         let mut rows: Vec<Vec<Value>> = Vec::new();
-        for row in RowScan::new(storage, table) {
+        for row in RowScan::watched(storage, table, interrupt) {
             rows.push(decode_row_masked(&row?.1, &mask)?);
         }
         let buckets_len = rows.len().next_power_of_two().max(16);
@@ -970,6 +1005,14 @@ pub(crate) struct NestedLoopJoin<'a> {
     current: Option<OuterRow>,
     /// Set once the join has failed, so it yields exactly one error.
     failed: bool,
+    /// Where a cancelled statement is noticed.
+    ///
+    /// The outer side is a checked stream already, so this is here for the
+    /// *inner* loop: one outer row against a large materialised or hash inner
+    /// side runs for as many pairs as that side has rows without ever pulling
+    /// from the outer stream, and a cross join is that shape squared. The
+    /// check has to be where the pairs are, not where the rows come in.
+    interrupt: &'a Interrupt,
 }
 
 impl<'a> NestedLoopJoin<'a> {
@@ -981,6 +1024,7 @@ impl<'a> NestedLoopJoin<'a> {
         kind: JoinKind,
         on: Option<&'a Expr>,
         env: &'a Env<'a>,
+        interrupt: &'a Interrupt,
     ) -> Self {
         Self {
             outer,
@@ -990,6 +1034,7 @@ impl<'a> NestedLoopJoin<'a> {
             env,
             current: None,
             failed: false,
+            interrupt,
         }
     }
 
@@ -1033,6 +1078,7 @@ impl<'a> NestedLoopJoin<'a> {
             let mut matched = false;
 
             for index in 0..self.inner.rows().len() {
+                self.interrupt.check()?;
                 joined.truncate(outer_width);
                 self.inner.append_row_into(index, &mut joined);
                 let keep = match (hash_key_is_full_on, self.on) {
@@ -1083,6 +1129,7 @@ impl<'a> NestedLoopJoin<'a> {
             let score = row.score;
             let mut matched = false;
             for index in 0..self.inner.rows().len() {
+                self.interrupt.check()?;
                 if !self
                     .inner
                     .hash_candidate_matches(index, &row.values)
@@ -1130,6 +1177,10 @@ impl Iterator for NestedLoopJoin<'_> {
             let count = self.inner.rows().len();
             let outer = self.current.as_mut()?;
             while outer.next < count {
+                if let Err(error) = self.interrupt.check() {
+                    self.failed = true;
+                    return Some(Err(error));
+                }
                 let index = outer.next;
                 outer.next += 1;
                 // Truncate rather than reallocate: the outer half is already
