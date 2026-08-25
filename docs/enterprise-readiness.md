@@ -21,7 +21,31 @@ Nothing here is a promise about when it changes. Some of it is deliberate — se
 
 ## Blockers
 
-### 1. A foreign commit may force a full retrieval-index rebuild — *reported*
+### 1. A foreign commit forced a full retrieval-index rebuild — *fixed, verified*
+
+**Confirmed and fixed.** It was real, and measured: a foreign single-row insert
+into a table with *no retrieval index at all* cost another handle 40 re-indexed
+documents — the whole table.
+
+`catch_up_indexes` now replays the change log for the versions it missed and
+reconciles only the rows the log names, declining to the old full rebuild
+whenever it cannot prove that is safe (the catalog also moved, the log no
+longer reaches back far enough, a record is missing, or a vector backend is
+self-persisting).
+
+Establishing that fix's precondition surfaced a worse bug, now also fixed: when
+a transaction is rebased onto a concurrent commit at `COMMIT`, the handle ended
+up holding the winner's root without `Storage::refresh` ever reporting a move —
+so the winner's rows were committed underneath this handle's full-text index
+and `bm25_score` **silently returned nothing for a committed, visible row**.
+That is the stale-index-returns-wrong-answers failure mode, and it was
+reachable without any of the above.
+
+Both pinned by `crates/inlaysql-core/tests/foreign_commit_indexes.rs` and
+`concurrent_writers.rs`, asserted as call counts rather than timings.
+
+<details>
+<summary>What the gap was, as originally reported</summary>
 
 `Engine::refresh_snapshot` runs before every statement, and when another handle
 has bumped the write version, `adopt_committed_state` clears the text and
@@ -31,11 +55,14 @@ current write version, and otherwise re-scans every row of every table. The
 blob is saved every `INDEX_PERSIST_INTERVAL` (1024) mutations, so the
 mismatched case is the ordinary one.
 
-If that reading holds, a mixed read/write server with a BM25 or vector index
-pays a full re-index on every connection after every other connection's commit,
-which is the difference between "concurrent" and "unusable". `docs/indexes.md`
-says skipping a save "costs a rebuild on the next open and nothing else", which
-would be contradicted by it.
+A mixed read/write server with a BM25 or vector index paid a full re-index on
+every connection after every other connection's commit, which is the difference
+between "concurrent" and "unusable". `docs/indexes.md` said skipping a save
+"costs a rebuild on the next open and nothing else", and separately that
+incremental catch-up "would need a change log the engine does not keep" — both
+were wrong and both are corrected.
+
+</details>
 
 ### 2. No backup, restore or point-in-time recovery — *verified*
 
@@ -61,13 +88,25 @@ That is a sound design for what it is — cache and search-index invalidation,
 schema events, no consumer-managed retention. The only consumer surface opens
 the database read-write, so it is locked out while the server runs.
 
-### 4. Unbounded file growth in server mode — *reported*
+### 4. Unbounded file growth in server mode — *fixed, verified*
 
-`EngineOptions::page_reuse` defaults to false, and `ServerOptions` has no way
-to turn it on. Space is therefore reclaimed only by stopping the server and
-running `vacuum`. Note that page reuse is itself documented as unsound with
-cross-process read-only handles (`docs/recovery.md`), so this is a real
-trade-off rather than a switch someone forgot to wire up.
+**Confirmed and fixed**, and the naive fix would have made it worse. There is
+now a `ServerOptions::page_reuse` and a `--page-reuse` flag, default off,
+threaded to every connection.
+
+Turning the flag on alone was not enough: reclamation only offers pages freed
+before the reader watermark, and every read-write handle pins that watermark at
+the sequence it last read. The server's keeper handle read once at startup and
+never again, pinning it for the process lifetime — so nothing freed afterwards
+was reclaimable while free-list rows accumulated as overhead. Measured at the
+SQL level: **64 MB** with reuse off, **4.5 MB** with reuse on, **109 MB** with
+reuse on and a `Database` keeper. The keeper is now a bare `FileDevice`, which
+holds the same lock but opens no tree and registers no reader.
+
+It stays off by default and is not presented as free: page reuse is unsound
+with cross-process read-only handles (`docs/recovery.md`), so the flag's
+documentation and a startup warning name the concrete thing it forbids —
+`inlaysql serve --mcp` against the same file.
 
 ### 5. A hard transaction and statement ceiling near 1 MiB — *reported*
 
@@ -107,13 +146,23 @@ differential rounds. Listed here because it is the shape of bug this document
 is for: silent, plausible, and aimed squarely at Snowflake ids and epoch
 nanoseconds.
 
-### 8. No statement timeout, no cancellation, unbounded materialisation — *reported*
+### 8. No statement timeout or cancellation; unbounded materialisation — *partly fixed*
 
-Sort and aggregate materialise with no spill and no memory budget, and the
-server materialises an entire result set before writing a byte. There is no
-statement timeout, no `KILL`, and no socket read or write timeout. One
-`SELECT *` against a large table takes the process down and nothing can stop
-it.
+**Still open, and the worst part is unchanged.** Sort and aggregate materialise
+with no spill and no memory budget, and the server materialises an entire
+result set before writing a byte. One `SELECT *` against a large table still
+takes the process down and nothing can stop it. Statement timeouts and `KILL`
+need executor-level cancellation and are a separate project; `docs/server.md`
+now says so in the protocol table rather than leaving it to be discovered.
+
+**Fixed:** the server no longer reports limits it does not enforce. It used to
+advertise `wait_timeout=28800` and `net_*_timeout=60` while never setting a
+socket timeout, and `max_connections=0` against a real cap of 64 — a reported
+timeout that is not honoured is worse than none, because a client tunes against
+it. The reported numbers are now the enforced ones, socket read and write
+timeouts really are set (`--wait-timeout`), and a zero timeout is refused at
+bind rather than quietly clamped. That also closes the idle-connection hole,
+where 64 idle clients could hold all 64 slots forever.
 
 ### 9. No TLS, one user, no grants — *verified*
 
@@ -164,8 +213,6 @@ than none, because a client tunes against it.
   process is refused cleanly. The lock is advisory, so a process that does not
   ask can still write the file, and it is unreliable on NFS and SMB. There is
   no read replica and no scale-out; the deployment is one box, one process.
-- **No idle-connection timeout against a 64-slot cap** — *reported*. Sixty-four
-  idle clients exhaust the server permanently.
 - **The SQL Logic Test figure is a subset** — *verified*. The published
   pass rate is over a self-curated subset, and is a regression gate rather than
   a compatibility score. `README.md` says so; it is repeated here because the
