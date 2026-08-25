@@ -44,11 +44,17 @@
 //! written back on [`Database::checkpoint`] and restored on open, stamped with
 //! the write version they describe so a stale one is rebuilt rather than
 //! trusted.
+//!
+//! Because the tree is copy-on-write, a committed root is an immutable
+//! snapshot — so [`Database::backup_to`] copies one out to another file while
+//! writers keep committing, and [`vacuum`] compacts one by rebuilding it. The
+//! two are not the same operation: see [`backup`] for which is which.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod asyncio;
+mod backup;
 mod device;
 pub mod sqllogictest;
 mod statement;
@@ -65,6 +71,7 @@ use inlaysql_core::{Clock, Engine, FullTextIndex, IndexFactory, VectorIndex};
 pub use inlaysql_core::EngineOptions;
 
 pub use asyncio::{block_on, AsyncDatabase, Task};
+pub use backup::{backup, BackupOutcome, BackupSummary, SourceAccess};
 pub use device::FileDevice;
 pub use inlaysql_core::bm25::Bm25Index;
 /// The stand-in embedder lives in the core because every build has to agree on

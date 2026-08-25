@@ -22,6 +22,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
+use crate::btree::BackupSummary;
 use crate::catalog::{
     auto_index_name, auto_unique_index_name, Catalog, Index, IndexKind, Table, CATALOG_KEY,
 };
@@ -507,7 +508,7 @@ impl Engine {
     /// so they cannot hold one. A subquery in any of those statements is
     /// refused in the planner (`sql::reject_write_subqueries`) rather than
     /// reaching an environment that could not run it.
-    fn read_env<'a>(&'a self, params: &'a [Value]) -> Env<'a> {
+    pub(crate) fn read_env<'a>(&'a self, params: &'a [Value]) -> Env<'a> {
         Env::new(params, self.statement_now.get(), Rc::clone(&self.rng)).with_subqueries(self)
     }
 
@@ -606,6 +607,12 @@ impl Engine {
             Plan::SetOperation(set_op) => Ok(Outcome::Rows(self.select_set_op(set_op, params)?)),
             Plan::Update(update) => self.update(update, params),
             Plan::Delete(delete) => self.delete(delete, params),
+            // Deliberately does not run `inner`, and deliberately reads no
+            // rows: every decision `EXPLAIN` reports is made from the plan,
+            // the catalog and the bound parameters. See [`crate::explain`].
+            Plan::Explain(inner) => {
+                Ok(Outcome::Rows(crate::explain::explain(self, inner, params)?))
+            }
             Plan::Begin => self.begin().map(|()| Outcome::Ddl),
             Plan::Commit => self.commit().map(|()| Outcome::Ddl),
             Plan::Rollback => self.rollback().map(|()| Outcome::Ddl),
@@ -2189,6 +2196,45 @@ impl Engine {
         }
     }
 
+    /// Write a consistent copy of the committed database to `dest`, while
+    /// other handles keep committing to the source.
+    ///
+    /// The copy is one committed snapshot — never a mix of two commits, and
+    /// never one table read at an older snapshot than another, which is the
+    /// failure a statement-at-a-time SQL dump has to work to avoid and this
+    /// gets for free from the copy-on-write tree. See
+    /// [`crate::btree::backup`] for the argument and for the one configuration
+    /// it refuses to guess at.
+    ///
+    /// Refused inside an explicit transaction, for the same reason
+    /// [`Engine::checkpoint`] is: a backup is of *committed* state, and this
+    /// handle's buffered writes are not that. Rolling them silently out of the
+    /// copy would be defensible; doing it without saying so, while the caller
+    /// believes the transaction is part of the database, is not.
+    ///
+    /// The snapshot is stepped forward first, so a handle that has been idle
+    /// between statements copies what the file holds now rather than what it
+    /// held when it last ran one.
+    ///
+    /// # What the copy does *not* carry forward verbatim
+    ///
+    /// Nothing that matters, but worth stating: the retrieval index blobs the
+    /// engine persists into the tree are copied like any other row, so the
+    /// backup opens with whatever was last saved. Those blobs are a cache
+    /// stamped with the write version they describe — a stale one is discarded
+    /// and rebuilt on open (`crate::traits`, "Persisting an index"), so the
+    /// worst a backup taken between saves costs is a rebuild, never a wrong
+    /// answer. [`Engine::checkpoint`] first if that rebuild matters.
+    pub fn backup_to(&mut self, dest: &mut dyn crate::btree::Device) -> Result<BackupSummary> {
+        if self.in_transaction {
+            return Err(Error::Transaction(
+                "cannot back up inside a transaction; commit or roll back first".to_string(),
+            ));
+        }
+        self.refresh_snapshot()?;
+        self.storage.backup_to(dest)
+    }
+
     /// Save the indexes into the database now, whatever the batching policy
     /// would have decided.
     ///
@@ -2948,21 +2994,27 @@ impl Engine {
         self.candidate_bytes(table, filter, params)?.collect()
     }
 
-    /// The rows a scalar B-tree index narrows a filter down to, or `None` when
-    /// no index applies and the caller has to scan.
+    /// Which scalar B-tree index answers a filter, and over what range — or
+    /// `None` when no index applies and the caller has to scan.
     ///
     /// This is a **rule, not a cost model** (`docs/architecture.md`, D6): the most
     /// constrained applicable index wins, and if that turns out to be a bad
     /// choice it is still a correct one, because the caller re-evaluates the
-    /// whole `WHERE` over every row this returns. An index here can only
+    /// whole `WHERE` over every row it reads. An index here can only
     /// change *how many rows are read*, never which ones match — the same
     /// contract [`pinned_rowid`] has always had.
-    fn indexed_candidates(
-        &self,
+    ///
+    /// Split out of [`Engine::indexed_candidates`] so that
+    /// [`crate::explain`] reports the index this returns rather than deciding
+    /// again from the same inputs. Two implementations of one rule would
+    /// drift, and the way they would drift is the worst one available: an
+    /// `EXPLAIN` claiming an index for a query that actually scans.
+    pub(crate) fn choose_index<'a>(
+        &'a self,
         table: &Table,
         filter: Option<&crate::plan::Expr>,
         params: &[Value],
-    ) -> Result<Option<Vec<RowId>>> {
+    ) -> Result<Option<(&'a Index, IndexRange)>> {
         let filter = match filter {
             Some(filter) => filter,
             None => return Ok(None),
@@ -2985,20 +3037,34 @@ impl Engine {
             return Ok(None);
         }
 
-        let mut best: Option<(usize, crate::index::KeyRange)> = None;
+        let mut best: Option<(&Index, IndexRange)> = None;
         for index in candidates {
-            let Some((bound_columns, range)) = index_probe(table, index, &terms)? else {
+            let Some(probe) = index_probe(table, index, &terms)? else {
                 continue;
             };
             // More bound columns is a narrower scan; ties keep the first,
             // which is index-name order and therefore deterministic.
-            if best.as_ref().is_none_or(|(best, _)| bound_columns > *best) {
-                best = Some((bound_columns, range));
+            if best
+                .as_ref()
+                .is_none_or(|(_, best)| probe.bound() > best.bound())
+            {
+                best = Some((index, probe));
             }
         }
-        let Some((_, range)) = best else {
+        Ok(best)
+    }
+
+    /// The rows [`Engine::choose_index`]'s range names, in row-id order.
+    fn indexed_candidates(
+        &self,
+        table: &Table,
+        filter: Option<&crate::plan::Expr>,
+        params: &[Value],
+    ) -> Result<Option<Vec<RowId>>> {
+        let Some((_, probe)) = self.choose_index(table, filter, params)? else {
             return Ok(None);
         };
+        let range = probe.range;
 
         // `scan_index_row_ids` (`AHL-479`) rather than `scan_index_range` plus
         // a decode of each key by hand: every one of these entries is read
@@ -3491,41 +3557,19 @@ impl Engine {
         let driving = &plan.from[0];
         let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
 
-        // `LIMIT` and `OFFSET` may be bound parameters, so they are numbers
-        // only now. A retrieval query has to fetch enough candidates to cover
-        // both, or an `OFFSET` would page past the end of what was ranked.
-        let limit = match (row_count(plan.limit.as_ref(), env)?, cap) {
-            (Some(limit), Some(cap)) => Some(limit.min(cap)),
-            (limit, cap) => limit.or(cap),
-        };
-        let offset = row_count(plan.offset.as_ref(), env)?.unwrap_or(0);
-        let fetch = limit.map(|limit| limit.saturating_add(offset));
+        let ScanShape {
+            limit,
+            offset,
+            fetch,
+            stop_after,
+            full_scan,
+        } = scan_shape(plan, env, cap)?;
 
         // Which columns any of this can observe. Everything else is walked past
         // rather than turned into a `String` or a `Vec` on the heap.
         let mask = needed_columns(plan);
         let driving_mask = mask.slice(0, driving.table.columns.len());
 
-        // Whether `LIMIT` may end the scan rather than truncate the answer.
-        //
-        // Only when nothing downstream can reorder or fold the rows. A sort
-        // chooses *which* rows survive, an aggregate collapses them and a
-        // `DISTINCT` drops duplicates, so in all three cases the first `n` rows
-        // off the scan are not the first `n` rows of the answer. A retrieval
-        // query is excluded for the same reason: its rows arrive in score
-        // order and are re-sorted by row id.
-        //
-        // When it does apply, the scan already yields row-id ascending — and a
-        // join preserves that, because it emits its outer rows in order and
-        // `sort_rows` breaks ties stably — so taking the first `n` is exactly
-        // what sorting and then truncating would have produced.
-        let stop_after = match (
-            plan.order.is_empty() && !is_aggregate && !plan.distinct && plan.score.is_none(),
-            fetch,
-        ) {
-            (true, Some(fetch)) => Some(fetch),
-            _ => None,
-        };
         let non_blocking = !is_aggregate
             && plan.windows.is_empty()
             && !plan.distinct
@@ -3538,19 +3582,6 @@ impl Engine {
         // fetch — see [`Engine::retrieve_filtered`] — because a fixed candidate
         // budget filtered afterwards under-fills a restrictive `WHERE`.
         let params = env.params();
-
-        // A join's inner side is chosen here rather than per row. A hash join
-        // pays an up-front O(inner) scan to build its table, then O(1) per
-        // outer row; an index probe pays a B-tree descent per outer row with no
-        // build. The hash join therefore wins only when the outer side is
-        // scanned in full — a `LIMIT` (or an `EXISTS` cap, which `fetch`
-        // already reflects) would have stopped after a few outer rows and made
-        // the probe cheaper, and a `WHERE` that pins the primary key makes the
-        // outer side a single row. Score queries are excluded because their
-        // driving side is a bounded candidate set, not a scan of the table.
-        let driving_is_a_point_lookup =
-            pinned_rowid(&driving.table, plan.filter.as_ref(), params).is_some();
-        let full_scan = fetch.is_none() && plan.score.is_none() && !driving_is_a_point_lookup;
 
         // One ordinary join can stay borrowed all the way into a row callback:
         // no iterator item ever has to own the joined row, and one projection
@@ -4101,7 +4132,7 @@ impl Engine {
     ///
     /// Choosing badly here is slow, never wrong: the probe narrows which rows
     /// are *read*, and the `ON` still decides which pairs survive.
-    fn join_probe(
+    pub(crate) fn join_probe(
         &self,
         inner: &Table,
         offset_of: usize,
@@ -4482,7 +4513,11 @@ impl Engine {
     /// the same index. `bm25_score(body, ?)`, the single-column call this has
     /// always accepted, finds the single-column index over `body` by the same
     /// rule — a set of one, matched the same way it always was.
-    fn resolve_full_text_index(&self, table: &Table, columns: &[usize]) -> Result<&Index> {
+    pub(crate) fn resolve_full_text_index(
+        &self,
+        table: &Table,
+        columns: &[usize],
+    ) -> Result<&Index> {
         let mut names: Vec<String> = Vec::with_capacity(columns.len());
         for &ordinal in columns {
             let column = table
@@ -4524,6 +4559,30 @@ impl Engine {
         self.vector_indexes
             .get(&key)
             .map(|index| index.as_ref())
+            .ok_or_else(|| {
+                Error::Index(alloc::format!("no vector index on `{}`", key.1.join(", ")))
+            })
+    }
+
+    /// The *declared* `Vector` index over one column, for [`crate::explain`],
+    /// which needs the index's name rather than its backend.
+    ///
+    /// Matched on the same `(table, [column])` key [`index_key`] builds and
+    /// [`Engine::open_one_index`] registers the backend under, so an index
+    /// named here is the one [`Engine::vector_index`] would find. It is still
+    /// a separate lookup — the catalog holds the name, the backend map does
+    /// not — and it fails with the same message when there is no such index,
+    /// because a query `EXPLAIN` cannot describe is a query that would not
+    /// have run either.
+    pub(crate) fn resolve_vector_index(&self, table: &Table, column: usize) -> Result<&Index> {
+        let key = index_key(table, column)?;
+        self.catalog
+            .indexes_for(&table.name)
+            .into_iter()
+            .find(|index| {
+                index.kind == IndexKind::Vector
+                    && retrieval_key(&index.table, &index.columns) == key
+            })
             .ok_or_else(|| {
                 Error::Index(alloc::format!("no vector index on `{}`", key.1.join(", ")))
             })
@@ -4584,6 +4643,93 @@ fn encode_table_row(table: &Table, row: &[Value]) -> Vec<u8> {
     encode_typed_row(row, &types)
 }
 
+/// The decisions a `SELECT`'s `LIMIT`, `OFFSET` and driving-table filter make
+/// before a single row is read.
+///
+/// Split out of [`Engine::run_select_to`] so [`crate::explain`] can report
+/// them instead of deciding again from the same inputs. The two shapes that
+/// look identical from outside and are not — a hash join and an index nested
+/// loop — are chosen from `full_scan` alone, so an `EXPLAIN` that recomputed
+/// it and got it wrong would be worse than no `EXPLAIN`.
+pub(crate) struct ScanShape {
+    /// `LIMIT`, resolved (a `?` is a number only now), narrowed by the
+    /// caller's own row budget.
+    pub limit: Option<usize>,
+    /// `OFFSET`, resolved; zero when the query has none.
+    pub offset: usize,
+    /// How many rows the row source has to produce to satisfy both.
+    pub fetch: Option<usize>,
+    /// `Some(n)` when `LIMIT` may end the scan rather than truncate the
+    /// answer.
+    pub stop_after: Option<usize>,
+    /// Whether the driving side really is read end to end.
+    pub full_scan: bool,
+}
+
+/// Resolve one `SELECT`'s [`ScanShape`] against the bound parameters.
+///
+/// `cap` is the caller's own row budget — `EXISTS` and a scalar subquery want
+/// one row — and it folds into `limit` exactly as a written `LIMIT` does.
+pub(crate) fn scan_shape(
+    plan: &SelectPlan,
+    env: &Env<'_>,
+    cap: Option<usize>,
+) -> Result<ScanShape> {
+    let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
+
+    // `LIMIT` and `OFFSET` may be bound parameters, so they are numbers
+    // only now. A retrieval query has to fetch enough candidates to cover
+    // both, or an `OFFSET` would page past the end of what was ranked.
+    let limit = match (row_count(plan.limit.as_ref(), env)?, cap) {
+        (Some(limit), Some(cap)) => Some(limit.min(cap)),
+        (limit, cap) => limit.or(cap),
+    };
+    let offset = row_count(plan.offset.as_ref(), env)?.unwrap_or(0);
+    let fetch = limit.map(|limit| limit.saturating_add(offset));
+
+    // Whether `LIMIT` may end the scan rather than truncate the answer.
+    //
+    // Only when nothing downstream can reorder or fold the rows. A sort
+    // chooses *which* rows survive, an aggregate collapses them and a
+    // `DISTINCT` drops duplicates, so in all three cases the first `n` rows
+    // off the scan are not the first `n` rows of the answer. A retrieval
+    // query is excluded for the same reason: its rows arrive in score
+    // order and are re-sorted by row id.
+    //
+    // When it does apply, the scan already yields row-id ascending — and a
+    // join preserves that, because it emits its outer rows in order and
+    // `sort_rows` breaks ties stably — so taking the first `n` is exactly
+    // what sorting and then truncating would have produced.
+    let stop_after = match (
+        plan.order.is_empty() && !is_aggregate && !plan.distinct && plan.score.is_none(),
+        fetch,
+    ) {
+        (true, Some(fetch)) => Some(fetch),
+        _ => None,
+    };
+
+    // A join's inner side is chosen from this rather than per row. A hash join
+    // pays an up-front O(inner) scan to build its table, then O(1) per
+    // outer row; an index probe pays a B-tree descent per outer row with no
+    // build. The hash join therefore wins only when the outer side is
+    // scanned in full — a `LIMIT` (or an `EXISTS` cap, which `fetch`
+    // already reflects) would have stopped after a few outer rows and made
+    // the probe cheaper, and a `WHERE` that pins the primary key makes the
+    // outer side a single row. Score queries are excluded because their
+    // driving side is a bounded candidate set, not a scan of the table.
+    let driving_is_a_point_lookup =
+        pinned_rowid(&plan.from[0].table, plan.filter.as_ref(), env.params()).is_some();
+    let full_scan = fetch.is_none() && plan.score.is_none() && !driving_is_a_point_lookup;
+
+    Ok(ScanShape {
+        limit,
+        offset,
+        fetch,
+        stop_after,
+        full_scan,
+    })
+}
+
 /// The row id a `WHERE` filter pins down, if it pins one.
 ///
 /// This is the whole of the engine's index selection today, and it is
@@ -4595,7 +4741,7 @@ fn encode_table_row(table: &Table, row: &[Value]) -> Vec<u8> {
 ///
 /// The key may be a `?`, which is the whole point of a prepared point read:
 /// `WHERE id = ?` plans once and still descends the tree once per execution.
-fn pinned_rowid(
+pub(crate) fn pinned_rowid(
     table: &Table,
     filter: Option<&crate::plan::Expr>,
     params: &[Value],
@@ -4890,17 +5036,17 @@ fn collect_join_keys(
 
 /// One `outer_column = inner_column` equality a join's `ON` offers as a probe
 /// key, and the collating sequence that equality resolved.
-struct JoinKey {
+pub(crate) struct JoinKey {
     /// Joined-row ordinal of the outer column the key is read from.
-    outer: usize,
+    pub outer: usize,
     /// Ordinal of the inner column within the inner table.
-    inner: usize,
+    pub inner: usize,
     /// What the `ON`'s `=` compares under. An index may only answer this key if
     /// it is keyed under the same collation, for the reason [`Term::collation`]
     /// gives — and here the stakes are the same: a probe that missed rows the
     /// materialising path finds would make the join's answer depend on whether
     /// an index happened to exist.
-    collation: Collation,
+    pub collation: Collation,
 }
 
 /// The join key a hash join can build on, or `None` when none qualifies.
@@ -4914,7 +5060,7 @@ struct JoinKey {
 /// candidates still compare their keys (and residual predicates still run),
 /// but one that splits equal keys apart is wrong — which is what both
 /// conditions rule out.
-fn hash_join_key(
+pub(crate) fn hash_join_key(
     from: &[FromItem],
     inner_index: usize,
     offset_of: usize,
@@ -5003,8 +5149,34 @@ pub(crate) fn indexable_probe(ty: DataType, value: &Value) -> bool {
     }
 }
 
-/// The narrowest range of one index the collected terms justify, and how many
-/// of its columns that range binds.
+/// The narrowest range of one index the collected terms justify, and the shape
+/// of the key that produced it.
+///
+/// The shape is carried alongside the bytes rather than being re-derived,
+/// because [`crate::explain`] renders it (`docs_author (author=? AND year>?)`)
+/// and the executor walks it: one value, so what `EXPLAIN` prints is by
+/// construction the probe that runs.
+pub(crate) struct IndexRange {
+    /// How many leading columns an equality bound.
+    pub equalities: usize,
+    /// Whether the column after them was narrowed from below (`>` or `>=`).
+    pub lower: bool,
+    /// Whether that same column was narrowed from above (`<` or `<=`).
+    pub upper: bool,
+    /// The run of entries to walk.
+    pub range: crate::index::KeyRange,
+}
+
+impl IndexRange {
+    /// How many of the index's columns this range binds — what
+    /// [`Engine::choose_index`] ranks candidates by, since a longer bound
+    /// prefix is a shorter walk.
+    pub fn bound(&self) -> usize {
+        self.equalities + usize::from(self.lower || self.upper)
+    }
+}
+
+/// The narrowest range of one index the collected terms justify.
 ///
 /// The rule is the standard one: equalities down the leading columns, then at
 /// most one range predicate on the column after them. Nothing is bound beyond
@@ -5014,11 +5186,7 @@ pub(crate) fn indexable_probe(ty: DataType, value: &Value) -> bool {
 /// **A term is only usable when its collation is the one the index is keyed
 /// under**, which is SQLite's rule and is what stops this from being an
 /// optimisation that changes answers. See [`Term::collation`].
-fn index_probe(
-    table: &Table,
-    index: &Index,
-    terms: &[Term],
-) -> Result<Option<(usize, crate::index::KeyRange)>> {
+fn index_probe(table: &Table, index: &Index, terms: &[Term]) -> Result<Option<IndexRange>> {
     use crate::plan::BinaryOp;
 
     let ordinals = index_ordinals(table, index)?;
@@ -5040,11 +5208,11 @@ fn index_probe(
     }
 
     let mut range = crate::index::KeyRange::equality(&index.name, &equalities, &index.collations)?;
-    let mut bound = equalities.len();
+    let mut lower = false;
+    let mut upper = false;
     if equalities.len() < ordinals.len() {
         let position = equalities.len();
         let ordinal = ordinals[position];
-        let mut narrowed = false;
         for term in terms.iter().filter(|term| usable(term, ordinal, position)) {
             // Both edges are widened to include the whole group of entries
             // that encode equal to the bound, even for a strict `<` or `>`.
@@ -5059,7 +5227,7 @@ fn index_probe(
                         &index.collations,
                         &term.value,
                     )?;
-                    narrowed = true;
+                    lower = true;
                 }
                 BinaryOp::Lt | BinaryOp::LtEq => {
                     range = range.with_upper(
@@ -5068,19 +5236,22 @@ fn index_probe(
                         &index.collations,
                         &term.value,
                     )?;
-                    narrowed = true;
+                    upper = true;
                 }
                 _ => {}
             }
         }
-        if narrowed {
-            bound += 1;
-        }
     }
-    if bound == 0 {
+    let probe = IndexRange {
+        equalities: equalities.len(),
+        lower,
+        upper,
+        range,
+    };
+    if probe.bound() == 0 {
         return Ok(None);
     }
-    Ok(Some((bound, range)))
+    Ok(Some(probe))
 }
 
 /// The ordinals one index's columns have in `table`.
@@ -5924,7 +6095,7 @@ fn compare_values(left: &Value, right: &Value, collation: Collation) -> core::cm
 /// SQLite reads whatever it is given as an integer, treats a `NULL` or a
 /// negative number as "no limit", and clamps a negative `OFFSET` to zero — so
 /// none of those is an error here either.
-fn row_count(expr: Option<&crate::plan::Expr>, env: &Env<'_>) -> Result<Option<usize>> {
+pub(crate) fn row_count(expr: Option<&crate::plan::Expr>, env: &Env<'_>) -> Result<Option<usize>> {
     let Some(expr) = expr else {
         return Ok(None);
     };

@@ -458,3 +458,38 @@ crash-recovery surface, so it needed none of the DST proof above and carries
 none of the page-reuse version-gate concern either: it never enables
 `page_reuse` itself, and the file it produces is byte-for-byte an ordinary
 one any build understands.
+
+## Online backup, and the one place it meets page reuse
+
+`CowBTree::backup_to` (`crates/inlaysql-core/src/btree/backup.rs`,
+`Database::backup_to`, `inlaysql backup`) copies a committed snapshot out to
+another device while writers keep committing. It needs no recovery of its own
+and adds none: the copy is written with an empty log and a state block already
+naming the root, so opening it replays nothing — which is why it is written
+here rather than folded into the protocol above.
+
+It does, however, depend directly on the reader watermark this section
+introduced, and reading it as a *second* consumer of that mechanism is the
+clearest way to see what the watermark is for. A backup taken through a handle
+that registered one holds `min_reader_seq` at its own committed sequence for
+the length of the copy (`&self`; `commit`/`refresh`/`checkpoint` all take
+`&mut self`), and a page reachable from the root at sequence `S` cannot have
+been superseded by any commit up to `S` — so it can only be freed later, and
+`refill_free_candidates`'s strict `freed_at < min(commit_point.seq,
+min_reader_seq)` declines it. That is a proof, not a race that is usually won:
+**a read-write backup is sound with `page_reuse` on.**
+
+And it fails in exactly the place "The cross-process answer, stated plainly"
+above says it must. `FileDevice::open_read_only` registers nothing, so a
+backup through it cannot be pinned and a writer elsewhere with reuse on could
+recycle a page mid-copy — silently, since a data page carries no checksum of
+its own. `backup_to` refuses there when the snapshot contains free-list rows,
+which exist if and only if some handle has committed with reuse on; an empty
+free list is not proof that reuse is off, so that refusal is a net rather than
+the missing proof, and the constraint stands: do not take an unpinned backup
+of a file a writer has reuse enabled for.
+
+Coverage is `crates/inlaysql-core/tests/backup_dst.rs` — the same seeded
+`Simulator`/`FaultSchedule` the sweeps above use, asserting each copy equals
+the exact map its workload committed, including one taken from a database that
+has just recovered from whatever fault the schedule drew.

@@ -159,6 +159,30 @@ Turning it on also gates off the shared raw-page read cache described in D2
 below, one-way and for every handle on the file: that cache is keyed by page id
 and is sound only while a page id is never reissued.
 
+### Backing up a running server
+
+`inlaysql backup <database> <destination>` takes a consistent copy while the
+server keeps serving. This is the one thing `vacuum` cannot do — it needs the
+exclusive lock the server holds for its lifetime — and it works because the
+copy never writes to the source and takes no lock of its own: a committed root
+in the copy-on-write tree is already an immutable snapshot, so the copy pins
+one and walks the pages it reaches. The result is an ordinary database file, so
+restoring is opening it or moving it back; there is no restore command and
+nothing for one to do. `crates/inlaysql-core/src/btree/backup.rs` has the full
+argument.
+
+**`--page-reuse` constrains this too, and in the same way it constrains
+`serve --mcp`.** With the server holding the file, the backup falls back to a
+lock-free read-only handle (it prints which mode it used), and a lock-free
+reader is invisible to the reclaim proof above — so a page it is copying could
+be recycled underneath it. It refuses outright once the source records any
+reclaimable page, which catches a server that has actually freed something, but
+an empty free list is not proof that reuse is off. **Do not back up a
+`--page-reuse` server from outside its process.** Either run without the flag,
+or take the backup from inside the writing process through
+`Database::backup_to` on a connection's own handle, which registers a reader
+watermark and is sound with reuse on.
+
 ---
 
 ## How it is built
@@ -351,7 +375,9 @@ Answered from `Catalog` and session state, never sent to the engine:
   `CONNECTION_ID()`, `USER()`, `CURRENT_USER()`, `@@variables` in every
   spelling (`@@x`, `@@session.x`, `@@global.x`, `SESSION x`), `@user_variables`.
 - `SHOW TABLES`, `SHOW FULL TABLES`, `SHOW COLUMNS` / `FIELDS`, `SHOW FULL
-  COLUMNS`, `DESCRIBE` / `DESC`, `SHOW KEYS` / `INDEX`, `SHOW VARIABLES`,
+  COLUMNS`, `DESCRIBE <table>` / `DESC <table>` (but **not**
+  `DESCRIBE <statement>`, which is `EXPLAIN` and goes to the engine),
+  `SHOW KEYS` / `INDEX`, `SHOW VARIABLES`,
   `SHOW STATUS`, `SHOW WARNINGS` / `ERRORS`, `SHOW DATABASES`, `SHOW ENGINES`,
   `SHOW TABLE STATUS`, `SHOW CREATE TABLE`, `SHOW CREATE DATABASE` — all with
   `LIKE` patterns, including escaped wildcards.

@@ -33,7 +33,10 @@ extension bolted on the side.
 >   planner.
 >
 > Use it for experiments, prototypes, and anything you can rebuild from source
-> data. Keep a backup you can restore from something else. If you find a bug,
+> data. `inlaysql backup <database> <destination>` now takes a consistent copy
+> of a live database without stopping the writer, and `Database::backup_to`
+> does the same from code — but there is still no point-in-time recovery, so
+> "restore" means "go back to whenever you last took one". If you find a bug,
 > it is genuinely useful to us — please open an issue.
 
 **Where it began.** This started as a walking skeleton assembled from existing
@@ -317,6 +320,32 @@ inlaysql changes app.inlay --from 41
 A record says *what* changed, not what it became — read the row for its current
 contents. A consumer that has fallen outside the retention window is told so
 (`lost`) rather than handed a silently short list.
+
+### Online backup
+
+```sh
+inlaysql backup app.inlay app-2026-08-25.inlay
+```
+
+Takes a consistent copy while the database is being written to — including by
+`inlaysql serve --mysql` in another process, which `inlaysql vacuum` cannot do
+because it needs the exclusive lock the server holds. The copy is one committed
+snapshot: never a mix of two commits, and never two tables read at two
+different moments the way a statement-at-a-time dump can be. From code it is
+`db.backup_to("app-2026-08-25.inlay")?`.
+
+The result is an ordinary database file, so restoring is opening it or moving
+it back — there is no restore command because there is nothing for one to do.
+It refuses to overwrite an existing destination, and a failure leaves no file
+at all, so a backup that exists is one that finished.
+
+Nothing about this is compaction: page numbers are preserved, so a file that
+grew large from deletes copies at its *live* size (holes, stored sparsely) but
+reports its old size. Use `inlaysql vacuum` to actually shrink one. One
+constraint, and it is real: a backup taken from outside the writing process
+cannot be pinned against page reclamation, so do not take one of a database a
+writer has `--page-reuse` on for — see
+[`docs/server.md`](docs/server.md#backing-up-a-running-server).
 
 ## The SQL surface
 
@@ -964,6 +993,13 @@ useful one.
   node to be a replica of. Multi-node deployment (read replicas over the
   existing CDC log; durable storage/compute separation for corpora too large
   to ship as an asset) is later-stage work — see [Next](#next).
+- **No point-in-time recovery.** [Online backup](#online-backup) takes a full
+  consistent copy of a live database, which is a different thing: the states
+  you can restore to are the ones you took a copy at, not any instant in
+  between. Rolling forward from one needs a log carrying row payloads, and the
+  CDC log deliberately carries none — see
+  [`docs/enterprise-readiness.md`](docs/enterprise-readiness.md). Incremental
+  backup is not implemented either.
 - **Full Postgres parity is not a goal**, now or later.
 
 ## Licence

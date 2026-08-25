@@ -14,6 +14,8 @@ cargo test --workspace          # everything below except the sweeps and the fuz
 | Deterministic simulation (crash / torn write) | `crates/inlaysql-core/tests/dst_sweep.rs` | 10,000 seeds on `main`, on tags, and on a PR labelled `full-ci` |
 | Index recovery under the same faults | `crates/inlaysql/tests/index_recovery_dst.rs` | 10,000 schedules (2,500 seeds × 4 index shapes), in the same job |
 | Free list page reuse under the same faults (opt-in, AHL-481) | `crates/inlaysql-core/tests/free_list_reuse_dst.rs` | 300 seeds every push; 5,000 in the same `sweep` job as the other two (`ci.yml`'s "Sweep page reuse") |
+| Online backup is exactly the snapshot it was taken from, under the same faults | `crates/inlaysql-core/tests/backup_dst.rs` | 200 seeds every push; 5,000 in the same `sweep` job (`ci.yml`'s "Sweep online backup") |
+| Online backup beside live writers, another process, and page reuse | `crates/inlaysql/tests/backup.rs` | every push |
 | A churn workload stops growing the file once reuse is on (opt-in, AHL-481) | `crates/inlaysql/tests/free_list_growth.rs` | every push |
 | The streaming executor stops early only when that is still the right answer | `crates/inlaysql-core/tests/streaming.rs` | every push |
 | SQL Logic Test subset | `crates/inlaysql/tests/sqllogictest/` | every push — **1094/1094** |
@@ -73,6 +75,7 @@ derived from a seed.
 cargo test --release -p inlaysql-core --test dst_sweep -- --ignored          # 10,000 seeds
 cargo test --release -p inlaysql --test index_recovery_dst -- --ignored      # 10,000 schedules (2,500 seeds × 4 shapes)
 cargo test --release -p inlaysql-core --test free_list_reuse_dst -- --ignored # 5,000 seeds
+cargo test --release -p inlaysql-core --test backup_dst -- --ignored          # 5,000 seeds
 ```
 
 `free_list_reuse_dst.rs` (AHL-481) is the same assertion over a fourth
@@ -107,7 +110,29 @@ churn shape through ordinary `CREATE TABLE`/`INSERT ... ON CONFLICT DO UPDATE`/`
 rather than `CowBTree::put`/`delete`. `crates/inlaysql/tests/vacuum.rs` covers
 whole-file compaction (`inlaysql vacuum <path>`) the same way: a real schema
 covering every reconstruction shape survives with its data, its constraints
-and its query behaviour intact, and the file measurably shrinks. See
+and its query behaviour intact, and the file measurably shrinks.
+
+`backup_dst.rs` is the fourth sweep, and it asserts something the other three
+cannot: not "the recovered state is *some* committed snapshot" but "the copy is
+*exactly* the snapshot it was taken from". A backup is allowed no latitude —
+it is taken from a root the handle is holding, and `&self` is what stops that
+root moving — so the assertion is equality with the map the workload committed
+at that instant, mid-workload after every fourth commit and once more after the
+schedule's crash has been recovered from with `CowBTree::open`. That last one
+is the composition nobody would write on its own: backing up a database that
+has just come back from a crash. The failure this is really for is a *missed*
+page — a subtree or a link in an overflow chain the walk did not follow — which
+does not fail loudly: the copy opens and answers a query with a hole in it.
+Removing either the overflow-chain walk or the leftmost-child push makes this
+sweep fail on its first seed, which is how the assertion was checked for teeth.
+`crates/inlaysql/tests/backup.rs` covers what a simulated disk cannot: a bank
+transfer whose committed states are enumerable in closed form, copied while
+another handle commits on another thread, while another *process* holds the
+write lock (the live-server case, and the only path through
+`inlaysql::backup`'s lock-free fallback), and while a writer with page reuse on
+is demonstrably recycling pages — the last of which fails if the reader
+watermark stops pinning, which is the whole of why backup is sound beside
+reclamation. See
 [the free list in `docs/recovery.md`](docs/recovery.md#the-free-list-and-page-reuse-phase-2-item-6-ahl-481)
 for the design these hold to, and what remains true even now that the option
 is public: reclamation can only prove liveness for readers this process's

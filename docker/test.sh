@@ -129,15 +129,17 @@ determinism_job='
 
 # `ci.yml`'s `sweep` job: thousands of randomised crash/torn-write schedules.
 #
-# All three steps, in the same order CI runs them. The page-reuse sweep is the
+# All four steps, in the same order CI runs them. The page-reuse sweep is the
 # one that recycles page ids — the other two answer "unknown, so never reclaim"
 # to the free list and so never exercise reuse at all — which makes it the only
 # place AHL-406's failure mode is under fault injection. Leaving it out here
-# meant this script did not reproduce the job it claims to.
+# meant this script did not reproduce the job it claims to; the backup sweep is
+# here from the day it was written for the same reason.
 sweep_job='
     cargo test --release -p inlaysql-core --test dst_sweep -- --ignored
     cargo test --release -p inlaysql --test index_recovery_dst -- --ignored
     cargo test --release -p inlaysql-core --test free_list_reuse_dst -- --ignored
+    cargo test --release -p inlaysql-core --test backup_dst -- --ignored
 '
 
 mode="${1:-gate}"

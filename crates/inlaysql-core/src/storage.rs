@@ -9,7 +9,9 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::btree::{CommitOutcome, CowBTree, Device, DEFAULT_PAGE_CACHE_BYTES, DEFAULT_PAGE_SIZE};
+use crate::btree::{
+    BackupSummary, CommitOutcome, CowBTree, Device, DEFAULT_PAGE_CACHE_BYTES, DEFAULT_PAGE_SIZE,
+};
 use crate::error::{Error, Result};
 use crate::row::RowBuf;
 use crate::traits::{RowId, Storage};
@@ -314,6 +316,13 @@ impl<D: Device> Storage for TreeStorage<D> {
     /// happens.
     fn transaction_is_nearly_full(&self) -> bool {
         self.tree.pending_record_len() * 2 >= self.tree.log_capacity()
+    }
+
+    /// The one backend that can answer this: a committed root already *is* an
+    /// immutable snapshot, so a backup is a page copy rather than a rebuild.
+    /// See [`CowBTree::backup_to`] and [`crate::btree::backup`].
+    fn backup_to(&self, dest: &mut dyn Device) -> Result<BackupSummary> {
+        self.tree.backup_to(dest)
     }
 }
 

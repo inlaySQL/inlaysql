@@ -16,11 +16,13 @@
 //! real file *and* on the deterministic, fault-injecting simulation harness in
 //! [`crate::sim`].
 
+pub mod backup;
 pub mod cache;
 pub mod device;
 pub mod page;
 pub mod tree;
 
+pub use backup::BackupSummary;
 pub use cache::{PageCache, DEFAULT_PAGE_CACHE_BYTES};
 pub use device::{CommitPoint, Device};
 pub use page::{PageId, DEFAULT_PAGE_SIZE, MIN_PAGE_SIZE};

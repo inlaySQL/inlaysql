@@ -371,6 +371,20 @@ pub fn encode_overflow(page_size: usize, next: PageId, data: &[u8]) -> Result<Ve
 
 /// Decode one overflow page into its `(next page, payload)` pair.
 pub fn decode_overflow(page_size: usize, bytes: &[u8]) -> Result<(PageId, Vec<u8>)> {
+    Ok((
+        overflow_next(page_size, bytes)?,
+        bytes[OVERFLOW_HEADER_SIZE..].to_vec(),
+    ))
+}
+
+/// The next page of an overflow chain, without copying the payload out of it.
+///
+/// Split out of [`decode_overflow`] for a caller that only wants the chain's
+/// *shape*: [`super::backup`] walks every chain in a snapshot to learn which
+/// pages to copy and never looks at a single payload byte, so paying a
+/// page-sized `Vec` per link would allocate the whole database twice over on
+/// the way to copying it once.
+pub fn overflow_next(page_size: usize, bytes: &[u8]) -> Result<PageId> {
     if bytes.len() != page_size {
         return Err(Error::Corrupt(alloc::format!(
             "overflow page is {} bytes, expected {page_size}",
@@ -380,8 +394,7 @@ pub fn decode_overflow(page_size: usize, bytes: &[u8]) -> Result<(PageId, Vec<u8
     if bytes[OFF_KIND] != KIND_OVERFLOW {
         return Err(Error::Corrupt("expected an overflow page".to_string()));
     }
-    let next = get_u64(bytes, OFF_OVERFLOW_NEXT)?;
-    Ok((next, bytes[OVERFLOW_HEADER_SIZE..].to_vec()))
+    get_u64(bytes, OFF_OVERFLOW_NEXT)
 }
 
 fn encode_leaf_cell(source: &[u8], entry: &Entry) -> Result<Vec<u8>> {

@@ -181,3 +181,12 @@ jobs:
       # gate.
       - name: Sweep page reuse
         run: cargo test --release -p inlaysql-core --test free_list_reuse_dst -- --ignored
+
+      # A backup is a page walk over a snapshot, and the way to be wrong about
+      # it is to miss a page: the copy still opens, and answers a query with a
+      # hole in it. So this sweep asserts equality with the exact map its
+      # workload committed, mid-workload and again after the schedule's crash
+      # has been recovered from — the composition nobody would write on its
+      # own, backing up a database that has just come back from a crash.
+      - name: Sweep online backup
+        run: cargo test --release -p inlaysql-core --test backup_dst -- --ignored

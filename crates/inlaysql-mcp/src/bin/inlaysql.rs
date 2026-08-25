@@ -4,13 +4,14 @@
 //! inlaysql serve --mcp app.inlay [--allow-writes] [--max-rows N] [--max-bytes N]
 //! inlaysql serve --mysql app.inlay [--port N] [--bind ADDR] [--user U]
 //! inlaysql changes app.inlay [--from N]
+//! inlaysql backup app.inlay app-2026-08-25.inlay
 //! inlaysql vacuum app.inlay
 //! ```
 
 use std::io::{self, BufReader};
 use std::process::ExitCode;
 
-use inlaysql::Database;
+use inlaysql::{Database, SourceAccess};
 use inlaysql_mcp::{Limits, Server};
 use inlaysql_server::{Server as MysqlServer, ServerOptions};
 
@@ -21,6 +22,7 @@ USAGE:
     inlaysql serve --mcp <database> [OPTIONS]
     inlaysql serve --mysql <database> [OPTIONS]
     inlaysql changes <database> [--from <version>]
+    inlaysql backup <database> <destination>
     inlaysql vacuum <database>
 
 SERVE --mcp OPTIONS:
@@ -74,6 +76,27 @@ CHANGES OPTIONS:
     --from <version>   Start after this version. 0 (the default) means the whole
                        retained log.
 
+BACKUP:
+    Copies a consistent snapshot of <database> to <destination>, while
+    whatever is writing to it keeps writing. The destination is an ordinary
+    database file — open it, or move it back over the original to restore;
+    there is no restore command because there is nothing for one to do.
+
+    Refuses to overwrite an existing <destination>. A failure leaves no file
+    behind at all, so a backup that exists is a backup that finished.
+
+    Opens the source read-write when it can, and read-only when a server
+    already holds it — it says which. Those are not equally strong: a
+    read-write backup pins its snapshot against page reclamation and is sound
+    even under `serve --mysql --page-reuse`, while a read-only one takes no
+    lock and cannot be seen by the writer that would do the reclaiming. It
+    refuses outright if it finds the source recording reclaimable pages, but
+    do not take a read-only backup of a file a writer has --page-reuse on for.
+
+    Not a compaction: page numbers are preserved, so a file that grew large
+    from deletes produces a copy with holes in it (sparse — its live size on
+    disk, its old size on paper). Use vacuum for that.
+
 VACUUM:
     Compacts the database file in place: copies every table, constraint and
     index into a fresh file, then atomically replaces the original with it.
@@ -103,6 +126,7 @@ fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("serve") => serve(&args[1..]),
         Some("changes") => changes(&args[1..]),
+        Some("backup") => backup(&args[1..]),
         Some("vacuum") => vacuum(&args[1..]),
         Some("--help") | Some("-h") | None => {
             print!("{USAGE}");
@@ -237,6 +261,46 @@ fn serve_mcp(args: &[String]) -> Result<(), String> {
     server
         .serve(BufReader::new(io::stdin()), io::stdout())
         .map_err(|error| error.to_string())
+}
+
+fn backup(args: &[String]) -> Result<(), String> {
+    let mut positional = Vec::new();
+
+    for arg in args {
+        match arg.as_str() {
+            other if !other.starts_with("--") => positional.push(other.to_string()),
+            other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
+        }
+    }
+
+    let [source, destination] = positional.as_slice() else {
+        return Err(format!(
+            "backup needs a database and a destination\n\n{USAGE}"
+        ));
+    };
+
+    let outcome = inlaysql::backup(source, destination).map_err(|e| e.to_string())?;
+
+    // stderr, so `inlaysql backup` composes in a pipeline the same way every
+    // other diagnostic in this file does.
+    //
+    // The access mode is reported rather than left implicit because it is the
+    // one thing that decides how much the copy is worth, and the operator is
+    // the only one who can act on it — see BACKUP in the usage text.
+    match outcome.access {
+        SourceAccess::Exclusive => eprintln!(
+            "inlaysql: backed up {source} to {destination} \
+             (snapshot {}, {} pages, exclusive)",
+            outcome.summary.seq, outcome.summary.pages,
+        ),
+        SourceAccess::LockFree => eprintln!(
+            "inlaysql: backed up {source} to {destination} \
+             (snapshot {}, {} pages, read-only — another process holds the file \
+             for writing; sound unless that writer has page reuse on)",
+            outcome.summary.seq, outcome.summary.pages,
+        ),
+    }
+    Ok(())
 }
 
 fn vacuum(args: &[String]) -> Result<(), String> {

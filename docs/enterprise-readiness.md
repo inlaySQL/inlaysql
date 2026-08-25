@@ -64,7 +64,54 @@ were wrong and both are corrected.
 
 </details>
 
-### 2. No backup, restore or point-in-time recovery — *verified*
+### 2. No backup or restore — *fixed, verified* (point-in-time recovery is item 3, and still open)
+
+**The backup half is fixed.** `Database::backup_to(path)`, `inlaysql::backup`
+and `inlaysql backup <database> <destination>` produce a consistent copy of a
+live database without stopping or locking out the writer.
+
+It is a physical page copy, not a dump, and that is the whole reason it is
+small enough to trust: a committed root in the copy-on-write tree *is* an
+immutable, consistent snapshot — the property `docs/architecture.md` (D4) and
+`docs/recovery.md` describe and MVCC readers already rest on — so a backup pins
+one and copies the pages it reaches. The copy is therefore never a mix of two
+commits however many land while it runs, and never the subtler mix a
+statement-at-a-time dump has to work to avoid, where two tables come from two
+different snapshots because `refresh_snapshot` ran between them.
+`crates/inlaysql-core/src/btree/backup.rs` carries the argument in full.
+
+**What was actually hard about it** is the interaction with page reuse, and it
+is worth recording because getting it wrong produces a silently corrupt backup,
+which is worse than no backup: a reclaimed page is overwritten in place and a
+page carries no checksum of its own, so a copy that walked one mid-recycle
+would decode cleanly and be wrong. The answer is the reader watermark the free
+list already maintains for exactly this question. A backup taken through a
+read-write handle holds `Device::min_reader_seq` at its own committed sequence
+for the whole copy — `&self` is what stops the root moving, since `commit`,
+`refresh` and `checkpoint` all take `&mut self` — and a page reachable from
+that root can only have been freed at a later sequence, which
+`refill_free_candidates` declines. **So a read-write backup is sound even with
+`page_reuse` on.** The one handle that cannot pin is
+`Database::open_read_only`, which takes no lock by design and is invisible to
+that proof in this process or any other; a backup through it *refuses* when the
+source records reclaimable pages (free-list rows exist if and only if some
+handle committed with reuse on), and is documented as unsound beside a writer
+that has reuse enabled but has not freed anything yet.
+
+Verified by `crates/inlaysql-core/tests/backup_dst.rs` (seeded fault schedules;
+each copy must equal the exact map its workload committed, including after
+crash recovery) and `crates/inlaysql/tests/backup.rs` — a bank-transfer
+workload whose committed states are enumerable in closed form, backed up while
+another handle commits on another thread, while another *process* holds the
+write lock, and while a writer with page reuse on is demonstrably recycling
+pages.
+
+**Restore is deliberately not a command.** The file this produces is an
+ordinary database: open it, or move it back. A `restore` subcommand whose body
+is `fs::rename` would imply it knows something about the file that it does not.
+
+<details>
+<summary>What the gap was, as originally reported</summary>
 
 There is no backup, dump or snapshot API anywhere in the engine or the CLI.
 `README.md` says the quiet part out loud: "Keep a backup you can restore from
@@ -76,6 +123,13 @@ against a live server, which holds a keeper handle for its lifetime.
 `mysqldump` does not work either: `LOCK TABLES`, `FLUSH TABLES` and
 `SHOW MASTER STATUS` are not in the wire shim's intercept set and reach the
 core, which refuses them.
+
+</details>
+
+**Point-in-time recovery is still absent**, and nothing above moves it: a full
+copy is a full copy. Restoring to an arbitrary instant needs a log with row
+payloads in it, which is blocker 3 — and `mysqldump` still does not work, for
+the reasons above.
 
 ### 3. The change log cannot become replication or PITR as built — *reported*
 
@@ -182,9 +236,16 @@ clear error rather than faked.
 
 No metrics, no counters, no exporter, no `log` or `tracing` dependency. No
 query log or slow-query log, deliberately — the server logs accept failures and
-connection errors and "never the statement". No `EXPLAIN`. No
-`SHOW PROCESSLIST`, no `KILL`. `information_schema` covers nine relations and
-refuses joins and subqueries.
+connection errors and "never the statement". No `SHOW PROCESSLIST`, no
+`KILL`. `information_schema` covers nine relations and refuses joins and
+subqueries.
+
+`EXPLAIN` now exists (`EXPLAIN`/`EXPLAIN QUERY PLAN`/`DESCRIBE <statement>`,
+over the wire as well as in the engine) and reports which access path the
+executor chose — scan, row-id point lookup, index range, hash join, index
+nested loop, or which retrieval index answered a `bm25_score`/`vector_score`/
+`fuse`. It reports no row counts, costs or selectivity, because there is no
+statistics system here to draw them from; see `crates/inlaysql-core/src/explain.rs`.
 
 Some reported session variables are fiction: `wait_timeout` and the
 `net_*_timeout`s are reported but never enforced, and `max_connections` reports

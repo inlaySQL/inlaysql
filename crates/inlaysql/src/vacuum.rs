@@ -65,7 +65,7 @@ pub fn vacuum(path: impl AsRef<Path>) -> Result<()> {
     // the load-bearing part of this function's safety, not a formality.
     let mut source = Database::open(path)?;
 
-    let tmp_path = temp_path_beside(path)?;
+    let tmp_path = temp_path_beside(path, "vacuum")?;
     let result = (|| -> Result<()> {
         let mut dest = Database::open(&tmp_path)?;
         copy_schema_and_data(&mut source, &mut dest)?;
@@ -87,19 +87,23 @@ pub fn vacuum(path: impl AsRef<Path>) -> Result<()> {
 /// yet — a leftover from a previous crashed attempt at the same PID would
 /// otherwise be reopened as if it already held a copy in progress rather
 /// than started fresh.
-fn temp_path_beside(path: &Path) -> Result<PathBuf> {
+///
+/// `kind` names the operation in the temporary file's name, so an
+/// interrupted `vacuum` and an interrupted `backup` leave distinguishable
+/// debris and can never collide with each other on the same directory.
+pub(crate) fn temp_path_beside(path: &Path, kind: &str) -> Result<PathBuf> {
     let file_name = path
         .file_name()
         .ok_or_else(|| Error::Storage(format!("{} has no file name", path.display())))?
         .to_string_lossy()
         .into_owned();
     let mut tmp = path.to_path_buf();
-    tmp.set_file_name(format!(".{file_name}.vacuum-{}.tmp", std::process::id()));
+    tmp.set_file_name(format!(".{file_name}.{kind}-{}.tmp", std::process::id()));
     let _ = fs::remove_file(&tmp);
     Ok(tmp)
 }
 
-fn io_error(error: std::io::Error) -> Error {
+pub(crate) fn io_error(error: std::io::Error) -> Error {
     Error::Storage(error.to_string())
 }
 

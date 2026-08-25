@@ -40,6 +40,7 @@ use crate::error::{Error, Result};
 use crate::row::RowBuf;
 use crate::traits::RowId;
 
+use super::backup::{self, BackupSummary};
 use super::cache::{self, PageCache, DEFAULT_PAGE_CACHE_BYTES};
 use super::device::{CommitPoint, Device};
 use super::page::{self, Entry, Key, Node, PageId, Separator, ValueRef};
@@ -1195,6 +1196,83 @@ impl<D: Device> CowBTree<D> {
             self.seen_generation = generation;
         }
         result
+    }
+
+    /// Write a consistent copy of this handle's committed snapshot to `dest`,
+    /// without stopping or locking out any writer on the source.
+    ///
+    /// The copy opens as exactly the snapshot this handle holds: same pages,
+    /// same page ids, same page size and format version, an empty write-ahead
+    /// log and a state block already naming the root, so nothing is replayed
+    /// and nothing is recovered. An open transaction on this handle is not in
+    /// it — a backup is of committed state by definition, and the pending
+    /// pages have never reached the device to be copied.
+    ///
+    /// Read [`super::backup`]'s module doc before relying on this: it carries
+    /// the whole argument for why a copy taken while other handles commit is
+    /// never a mix of two commits, and the one configuration
+    /// (`EngineOptions::page_reuse` beside an unpinned, lock-free read-only
+    /// handle) where that argument does not hold and this refuses instead.
+    ///
+    /// `dest` is a [`Device`] rather than a file so the deterministic
+    /// simulation harness can back up into a [`crate::sim::SimDisk`] and open
+    /// the result, which is what lets a backup be tested under the same
+    /// seeded fault schedules as recovery.
+    pub fn backup_to(&self, dest: &mut dyn Device) -> Result<BackupSummary> {
+        if !self.snapshot_is_pinned() && self.free_list_has_rows()? {
+            return Err(Error::Storage(alloc::string::String::from(
+                "refusing to back up: this database records reclaimable pages, so a \
+                 writer has page reuse enabled for it, and this handle registered no \
+                 reader watermark to stop one of the pages being copied from being \
+                 recycled underneath the copy. Take the backup through a read-write \
+                 handle on the same file, or stop the writer",
+            )));
+        }
+        // `self.next_seq - 1`, not `self.checkpoint_seq`: a commit advances
+        // `next_seq` and leaves `checkpoint_seq` where the last checkpoint put
+        // it, so the sequence that actually names `self.root` is this one. Both
+        // agree at open and after a checkpoint or refresh; only between a commit
+        // and the next checkpoint do they differ, which is most of the time.
+        backup::copy_snapshot(
+            &self.device,
+            dest,
+            self.page_size,
+            self.format_version,
+            self.root,
+            self.next_page_id,
+            self.next_seq.saturating_sub(1),
+        )
+    }
+
+    /// Whether a page reachable from this handle's committed root is provably
+    /// safe from being reclaimed and overwritten while it is read.
+    ///
+    /// Two ways to be safe, and they are different claims. A registered reader
+    /// watermark ([`Device::register_reader`]) *pins*: this handle's entry in
+    /// the device's reader registry holds `min_reader_seq` at its own committed
+    /// sequence for as long as the handle lives, and `refill_free_candidates`
+    /// declines every page freed at or after it. A device that is not read-only
+    /// but registers no reader (the simulated disk, the WASM device) is safe for
+    /// the other reason: `min_reader_seq` answers `None` there, reclamation
+    /// treats `None` as unprovable and never fires, and no writer outside this
+    /// device's own handles exists to fire it.
+    ///
+    /// What is left is exactly `FileDevice::open_read_only` — no lock, no
+    /// registration, and a writer in another process that can reclaim without
+    /// ever seeing this reader. See [`super::backup`]'s module doc.
+    fn snapshot_is_pinned(&self) -> bool {
+        self.reader_token.is_some() || !self.device.is_read_only()
+    }
+
+    /// Whether the snapshot records any page as reclaimable.
+    ///
+    /// A free-list row exists if and only if some handle has committed to this
+    /// file with page reuse on — [`CowBTree::supersede`] writes nothing at all
+    /// with it off — so this is the one signal a reader can take from the file
+    /// itself about a setting that lives in another process's options. Bounded
+    /// to one row: whether the list is empty is the whole question.
+    fn free_list_has_rows(&self) -> Result<bool> {
+        Ok(!self.scan_prefix_from(FREE_LIST_PREFIX, None, 1)?.is_empty())
     }
 
     /// Read every `(key, value)` pair in the tree, in key order, including the
@@ -3001,8 +3079,11 @@ fn encode_header(page_size: usize) -> Vec<u8> {
 }
 
 /// Encode a header stamped with an explicit version, for the format-version
-/// mismatch tests.
-fn encode_header_with_version(page_size: usize, version: u32) -> Vec<u8> {
+/// mismatch tests and for [`super::backup`], which stamps a copy with the
+/// *source's* version rather than this build's: the region count, and so every
+/// data-area offset, is derived from it, and a v3 or v4 database has to back up
+/// as a v3 or v4 database.
+pub(super) fn encode_header_with_version(page_size: usize, version: u32) -> Vec<u8> {
     let mut buf = vec![0u8; HEADER_LEN];
     buf[..8].copy_from_slice(MAGIC);
     buf[H_PAGE_SIZE..H_PAGE_SIZE + 4].copy_from_slice(&(page_size as u32).to_le_bytes());
@@ -3060,7 +3141,7 @@ pub fn parse_header(bytes: &[u8]) -> Result<(usize, u32)> {
     Ok((page_size, version))
 }
 
-fn encode_state(root: PageId, next: PageId, checkpoint_seq: u64) -> Vec<u8> {
+pub(super) fn encode_state(root: PageId, next: PageId, checkpoint_seq: u64) -> Vec<u8> {
     let mut buf = vec![0u8; STATE_LEN];
     buf[S_ROOT..S_ROOT + 8].copy_from_slice(&root.to_le_bytes());
     buf[S_NEXT..S_NEXT + 8].copy_from_slice(&next.to_le_bytes());

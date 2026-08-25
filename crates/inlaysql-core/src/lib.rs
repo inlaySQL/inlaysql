@@ -36,6 +36,7 @@ pub mod engine;
 pub mod error;
 mod eval;
 mod exec;
+pub mod explain;
 pub mod fusion;
 pub mod hnsw;
 pub mod hnsw_paged;

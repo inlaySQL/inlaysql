@@ -40,6 +40,7 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
+use crate::btree::{BackupSummary, Device};
 use crate::error::Result;
 use crate::row::RowBuf;
 use crate::traits::{RowId, Storage};
@@ -146,6 +147,15 @@ impl Storage for SharedStorage {
 
     fn transaction_is_nearly_full(&self) -> bool {
         self.inner.borrow().transaction_is_nearly_full()
+    }
+
+    /// The `RefCell` borrow is what keeps the copied snapshot pinned across
+    /// every holder of this handle, not only the caller: the paged ANN index
+    /// writes through its own clone of this `SharedStorage`, and a shared
+    /// borrow held for the whole copy is exactly what stops it (or anything
+    /// else) taking the `borrow_mut` a commit would need part-way through.
+    fn backup_to(&self, dest: &mut dyn Device) -> Result<BackupSummary> {
+        self.inner.borrow().backup_to(dest)
     }
 }
 

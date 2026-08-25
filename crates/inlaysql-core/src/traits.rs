@@ -21,6 +21,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use crate::btree::{BackupSummary, Device};
 use crate::error::Result;
 use crate::row::RowBuf;
 
@@ -244,6 +245,31 @@ pub trait Storage {
     /// interrupt anyone.
     fn transaction_is_nearly_full(&self) -> bool {
         false
+    }
+
+    /// Write a consistent copy of this backend's committed state to `dest`,
+    /// without stopping any writer on the source.
+    ///
+    /// `&self`, deliberately: a backup must not be able to move the snapshot it
+    /// is copying, and taking a shared reference is what makes that a
+    /// compile-time fact rather than a convention — every method that advances
+    /// the committed state (`commit`, `refresh`, `rollback`) takes `&mut self`.
+    ///
+    /// `dest` is a [`Device`] because the only backend that can answer this is
+    /// the copy-on-write tree, and for it a backup is a page copy: an already
+    /// committed root is an immutable, consistent snapshot, so the copy is
+    /// never a mix of two commits however many land while it runs. See
+    /// [`crate::btree::backup`] for the whole argument, including the one
+    /// configuration it refuses.
+    ///
+    /// **The default refuses**, and the message says which backend could not.
+    /// An in-memory backend has no device to copy and no file to produce; a
+    /// caller asking for a backup of one has asked for something that does not
+    /// exist, and inventing a plausible-looking answer (dumping rows into a
+    /// fresh tree, say) would be a different operation wearing this name.
+    fn backup_to(&self, dest: &mut dyn Device) -> Result<BackupSummary> {
+        let _ = dest;
+        Err(unsupported_backup())
     }
 }
 
@@ -472,6 +498,13 @@ pub trait VectorIndex {
         let _ = bytes;
         Err(unsupported_load())
     }
+}
+
+fn unsupported_backup() -> crate::error::Error {
+    crate::error::Error::Unsupported(alloc::string::String::from(
+        "this storage backend has no durable device to copy, so it cannot produce a \
+         backup; only a file-backed database can",
+    ))
 }
 
 fn unsupported_index() -> crate::error::Error {
