@@ -3913,3 +3913,139 @@ fn a_function_name_inside_a_value_is_stored_not_evaluated() {
         .rows();
     assert_eq!(rows.cell(0, 0), "LI");
 }
+
+// =====================================================================
+// EXPLAIN
+// =====================================================================
+
+/// `EXPLAIN` over the wire: the engine's, passed straight through, with the
+/// three columns it declares and the access path it chose.
+///
+/// The pair — indexed and unindexed, same query text — is the assertion worth
+/// having here as well as in the engine's own tests: this is where a client
+/// actually reads it, and an `EXPLAIN` that always says the same thing would
+/// pass either half alone.
+#[test]
+fn explain_reports_the_access_path_over_the_wire() {
+    let server = TestServer::start("explain");
+    let mut client = server.client();
+
+    client.ok_query("CREATE TABLE posts (id INTEGER PRIMARY KEY, author TEXT, year INTEGER)");
+    client.ok_query("CREATE INDEX posts_year ON posts (year)");
+    client.ok_query("INSERT INTO posts (id, author, year) VALUES (1, 'ada', 1843)");
+
+    let rows = client
+        .ok_query("EXPLAIN SELECT author FROM posts WHERE year = 1843")
+        .rows();
+    assert_eq!(
+        rows.columns,
+        vec!["id", "parent", "detail"],
+        "EXPLAIN reports SQLite's node/parent/detail shape, not MySQL's column set"
+    );
+    assert_eq!(rows.types[0], 0x08, "id should be MYSQL_TYPE_LONGLONG");
+    assert_eq!(
+        rows.types[2], 0xfd,
+        "detail should be MYSQL_TYPE_VAR_STRING"
+    );
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.cell(0, 0), "1");
+    assert_eq!(rows.cell(0, 1), "0");
+    assert_eq!(
+        rows.cell(0, 2),
+        "SEARCH posts USING INDEX posts_year (year=?)"
+    );
+
+    // The column with no index is the control: same shape of query, and it
+    // has to come back as a scan.
+    let rows = client
+        .ok_query("EXPLAIN SELECT year FROM posts WHERE author = 'ada'")
+        .rows();
+    assert_eq!(rows.cell(0, 2), "SCAN posts");
+
+    client.quit();
+}
+
+/// MySQL spells `EXPLAIN <statement>` `DESCRIBE <statement>` too, and this
+/// server used to refuse that outright. `DESCRIBE <table>` is still the shim's
+/// column listing — the two must not have collapsed into one another.
+#[test]
+fn describe_answers_a_statement_with_a_plan_and_a_table_with_its_columns() {
+    let server = TestServer::start("describe-explain");
+    let mut client = server.client();
+
+    client.ok_query("CREATE TABLE posts (id INTEGER PRIMARY KEY, body TEXT)");
+
+    let plan = client.ok_query("DESCRIBE SELECT body FROM posts").rows();
+    assert_eq!(plan.columns, vec!["id", "parent", "detail"]);
+    assert_eq!(plan.cell(0, 2), "SCAN posts");
+
+    let columns = client.ok_query("DESCRIBE posts").rows();
+    assert_eq!(columns.column("Field"), vec!["id", "body"]);
+
+    client.quit();
+}
+
+/// A prepared `EXPLAIN` has to describe its own result set at
+/// `COM_STMT_PREPARE`, before it runs — and running it must still not touch
+/// the rows.
+#[test]
+fn a_prepared_explain_reports_its_columns_and_writes_nothing() {
+    let server = TestServer::start("explain-prepared");
+    let mut client = server.client();
+
+    client.ok_query("CREATE TABLE posts (id INTEGER PRIMARY KEY, body TEXT)");
+    client.ok_query("INSERT INTO posts (id, body) VALUES (1, 'one')");
+
+    let stmt = client
+        .prepare("EXPLAIN DELETE FROM posts WHERE id = ?")
+        .expect("prepare EXPLAIN");
+    assert_eq!(stmt.param_count, 1);
+    assert_eq!(
+        stmt.columns
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "parent", "detail"],
+    );
+
+    let rows = client
+        .execute(&stmt, &[Param::Int(1)])
+        .expect("execute EXPLAIN")
+        .rows();
+    assert_eq!(rows.cell(0, 2), "DELETE FROM posts");
+    assert_eq!(
+        rows.cell(1, 2),
+        "SEARCH posts USING INTEGER PRIMARY KEY (rowid=?)"
+    );
+
+    // The row it described is still there: EXPLAIN never ran the DELETE.
+    let remaining = client.ok_query("SELECT body FROM posts").rows();
+    assert_eq!(remaining.rows.len(), 1);
+    assert_eq!(remaining.cell(0, 0), "one");
+
+    client.quit();
+}
+
+/// `EXPLAIN ANALYZE` would have to run the statement to answer. Refused by
+/// name rather than answered with an ordinary plan.
+#[test]
+fn explain_analyze_is_refused_over_the_wire() {
+    let server = TestServer::start("explain-analyze");
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE posts (id INTEGER PRIMARY KEY)");
+
+    let error = client
+        .query("EXPLAIN ANALYZE SELECT id FROM posts")
+        .expect_err("EXPLAIN ANALYZE must be refused");
+    assert!(
+        error.message.contains("ANALYZE"),
+        "the refusal must name the clause, got: {}",
+        error.message
+    );
+
+    // And the connection is still usable.
+    let rows = client.ok_query("EXPLAIN SELECT id FROM posts").rows();
+    assert_eq!(rows.cell(0, 2), "SCAN posts");
+
+    client.quit();
+}

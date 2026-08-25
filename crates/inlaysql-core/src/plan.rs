@@ -49,6 +49,16 @@ pub enum Plan {
     Update(UpdatePlan),
     /// `DELETE`.
     Delete(DeletePlan),
+    /// `EXPLAIN <statement>` — describe the plan inside without running it.
+    ///
+    /// The inner plan is the whole of what `EXPLAIN` reports on: there is no
+    /// second, parallel representation of a query for reporting purposes, so
+    /// nothing here can describe a plan the executor would not run. What the
+    /// plan alone does *not* hold is the access-path choices — which index,
+    /// hash or probe — because those are made at execution against the bound
+    /// parameters and the catalog. [`crate::explain`] asks the executor's own
+    /// chooser for them rather than re-deriving them.
+    Explain(Box<Plan>),
     /// `BEGIN` / `BEGIN TRANSACTION`.
     Begin,
     /// `COMMIT` / `END`.
@@ -95,6 +105,11 @@ impl Plan {
             Plan::Update(update) => alloc::vec![update.table.as_str()],
             Plan::Delete(delete) => alloc::vec![delete.table.as_str()],
             Plan::CreateIndex(create) => alloc::vec![create.table.as_str()],
+            // The same tables the statement itself depends on, and for the
+            // same reason: `EXPLAIN` reads the inner plan's column ordinals to
+            // name the columns an index is probed on, so an `ALTER TABLE` that
+            // moved them has to make this stale too.
+            Plan::Explain(inner) => inner.tables(),
             Plan::CreateTable(_)
             | Plan::DropTable(_)
             | Plan::AlterTable(_)
@@ -114,12 +129,19 @@ impl Plan {
     /// and the statements *inside* a transaction are each judged on their own.
     /// A read-only handle can therefore take a consistent snapshot across
     /// several `SELECT`s, which is exactly what a transaction is for.
+    ///
+    /// `EXPLAIN` is read-only *whatever it wraps*, and that is load-bearing
+    /// rather than a nicety: it is what stops `EXPLAIN DELETE FROM t` from
+    /// taking the write path, being counted against a transaction's size
+    /// budget, or being rolled back as a failed write. It never runs the
+    /// statement inside it — see [`crate::explain`].
     pub fn is_read_only(&self) -> bool {
         matches!(
             self,
             Plan::Select(_)
                 | Plan::Scalar(_)
                 | Plan::SetOperation(_)
+                | Plan::Explain(_)
                 | Plan::Begin
                 | Plan::Commit
                 | Plan::Rollback
@@ -169,6 +191,9 @@ impl Plan {
                 (Some(items), Some(table)) => select_item_columns(items, &[table]),
                 _ => Vec::new(),
             },
+            // Fixed, whatever the inner statement is: `EXPLAIN` projects its
+            // own three columns, never the wrapped statement's.
+            Plan::Explain(_) => crate::explain::columns(),
             Plan::CreateTable(_)
             | Plan::DropTable(_)
             | Plan::AlterTable(_)

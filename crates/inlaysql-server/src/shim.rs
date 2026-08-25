@@ -84,10 +84,37 @@ pub fn handles(sql: &str) -> bool {
     }
     match first_word(&sql).as_str() {
         "SET" | "SHOW" | "USE" | "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT"
-        | "RELEASE" | "DESCRIBE" | "DESC" | "DO" => true,
+        | "RELEASE" | "DO" => true,
+        // `DESCRIBE <table>` is a column listing, answered here from the
+        // catalog. `DESCRIBE <statement>` is MySQL's other spelling of
+        // `EXPLAIN`, which the engine now has — so it belongs to the engine,
+        // and classifying it here would cost it its real column metadata at
+        // `COM_STMT_PREPARE`.
+        "DESCRIBE" | "DESC" => !describes_a_statement(&sql),
         "SELECT" => !matches!(select_target(&sql), SelectTarget::Engine),
         _ => false,
     }
+}
+
+/// Whether a `DESCRIBE`/`DESC` names a statement rather than a table.
+///
+/// By leading keyword, which is the only thing that distinguishes the two
+/// forms — MySQL's own rule. Every word here is reserved, so no unquoted
+/// table can be called one of them and no existing `DESCRIBE <table>` changes
+/// meaning; a table that *is* called `select` has to be backquoted to be
+/// described, exactly as in MySQL.
+///
+/// Deliberately narrower than MySQL's list: `DESCRIBE TABLE t` and
+/// `DESCRIBE VALUES ...` are left out because the engine has neither
+/// statement, so recognising them here would turn a working column listing
+/// into a parse error rather than into a plan.
+fn describes_a_statement(sql: &str) -> bool {
+    let Some(rest) = strip_keyword(sql, "DESCRIBE").or_else(|| strip_keyword(sql, "DESC")) else {
+        return false;
+    };
+    ["SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE", "WITH"]
+        .iter()
+        .any(|keyword| starts_with_keyword(rest.trim(), keyword))
 }
 
 /// Whether a statement *reads* the warning list rather than replacing it.
@@ -830,11 +857,12 @@ fn handle_describe(sql: &str, catalog: &Catalog, _session: &Session) -> Intercep
         .or_else(|| strip_keyword(sql, "DESC"))
         .unwrap_or("")
         .trim();
-    // `DESCRIBE SELECT ...` is EXPLAIN, which is a different feature.
-    if starts_with_keyword(rest, "SELECT") {
-        return Intercepted::Failed(MysqlError::unsupported(
-            "DESCRIBE <statement> (EXPLAIN) is not supported",
-        ));
+    // `DESCRIBE SELECT ...` is MySQL's other spelling of `EXPLAIN`, and the
+    // engine's own parser reads `DESCRIBE`/`DESC` as that keyword — so the
+    // statement goes through untouched rather than being answered or refused
+    // here. Nothing about the plan is this shim's to decide.
+    if describes_a_statement(sql) {
+        return Intercepted::PassThrough;
     }
     let mut parts = rest.splitn(2, char::is_whitespace);
     let name = last_name_part(parts.next().unwrap_or(""));
@@ -1586,6 +1614,31 @@ mod tests {
             result("SHOW COLUMNS FROM docs").columns
         );
         assert_eq!(column(&result("DESC docs"), "Field").len(), 4);
+    }
+
+    /// `DESCRIBE <statement>` is MySQL's other spelling of `EXPLAIN`, so it
+    /// belongs to the engine. The two forms are one keyword apart, and
+    /// `handles` has to classify them the same way `intercept` answers them —
+    /// otherwise a prepared `DESCRIBE SELECT ...` would lose its column
+    /// metadata.
+    #[test]
+    fn describe_hands_a_statement_to_the_engine_and_keeps_a_table_for_itself() {
+        for sql in [
+            "DESCRIBE SELECT id FROM docs",
+            "DESC SELECT id FROM docs",
+            "describe delete from docs",
+            "DESCRIBE WITH x AS (SELECT 1) SELECT * FROM x",
+        ] {
+            assert!(!handles(sql), "`{sql}` should reach the engine");
+            assert!(
+                matches!(run(sql), Intercepted::PassThrough),
+                "`{sql}` should be passed through"
+            );
+        }
+        for sql in ["DESCRIBE docs", "DESC docs", "DESCRIBE `docs`"] {
+            assert!(handles(sql), "`{sql}` is the shim's column listing");
+            assert!(matches!(run(sql), Intercepted::Rows(_)), "`{sql}`");
+        }
     }
 
     #[test]

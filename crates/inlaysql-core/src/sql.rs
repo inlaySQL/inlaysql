@@ -224,7 +224,20 @@ pub fn prepare(sql: &str, catalog: &Catalog) -> Result<Prepared> {
     }
 
     let mut binder = Binder::new(catalog);
-    let plan = match statements.remove(0) {
+    let plan = plan_statement(statements.remove(0), catalog, &mut binder)?;
+    reject_write_subqueries(&plan)?;
+
+    Ok(Prepared::new(sql, plan, binder.count, catalog))
+}
+
+/// Resolve one parsed statement into a [`Plan`].
+///
+/// Separate from [`prepare`] because `EXPLAIN <statement>` has to resolve the
+/// statement inside it through exactly this match — an `EXPLAIN` that
+/// described a statement the engine would refuse, or refused one it accepts,
+/// would be a second front end.
+fn plan_statement(statement: Statement, catalog: &Catalog, binder: &mut Binder) -> Result<Plan> {
+    match statement {
         Statement::CreateTable(create) => plan_create_table(create),
         Statement::CreateIndex(create) => plan_create_index(create, catalog),
         Statement::AlterTable(alter) => plan_alter_table(alter, catalog),
@@ -251,10 +264,41 @@ pub fn prepare(sql: &str, catalog: &Catalog) -> Result<Prepared> {
             }
             plan_drop_table(names, if_exists)
         }
-        Statement::Insert(insert) => plan_insert(insert, catalog, &mut binder),
-        Statement::Query(query) => plan_select(*query, catalog, &mut binder),
-        Statement::Update(update) => plan_update(update, catalog, &mut binder),
-        Statement::Delete(delete) => plan_delete(delete, catalog, &mut binder),
+        Statement::Insert(insert) => plan_insert(insert, catalog, binder),
+        Statement::Query(query) => plan_select(*query, catalog, binder),
+        Statement::Update(update) => plan_update(update, catalog, binder),
+        Statement::Delete(delete) => plan_delete(delete, catalog, binder),
+        Statement::Explain {
+            describe_alias,
+            analyze,
+            verbose,
+            query_plan,
+            estimate,
+            statement,
+            format,
+            options,
+        } => plan_explain(
+            ExplainModifiers {
+                describe_alias,
+                analyze,
+                verbose,
+                query_plan,
+                estimate,
+                format,
+                options,
+            },
+            *statement,
+            catalog,
+            binder,
+        ),
+        // MySQL's `EXPLAIN <table>` / `DESCRIBE <table>`, which is a column
+        // listing rather than a plan. Named rather than swept into the
+        // catch-all below, because the two spellings are one keyword apart
+        // and the message has to say which one this engine has.
+        Statement::ExplainTable { .. } => Err(Error::Unsupported(
+            "EXPLAIN <table> is not supported; EXPLAIN <statement> reports a query plan"
+                .to_string(),
+        )),
         statement @ (Statement::StartTransaction { .. }
         | Statement::Commit { .. }
         | Statement::Rollback { .. }) => plan_transaction(&statement),
@@ -268,10 +312,97 @@ pub fn prepare(sql: &str, catalog: &Catalog) -> Result<Prepared> {
         other => Err(Error::Unsupported(alloc::format!(
             "statement not supported in this stage: {other}"
         ))),
-    }?;
-    reject_write_subqueries(&plan)?;
+    }
+}
 
-    Ok(Prepared::new(sql, plan, binder.count, catalog))
+/// Everything written between `EXPLAIN` and the statement it describes.
+///
+/// Grouped so [`plan_explain`] refuses them one by one and by name: each is a
+/// different feature wearing the same keyword, and accepting one silently
+/// would mean answering a question nobody asked.
+struct ExplainModifiers {
+    describe_alias: sqlparser::ast::DescribeAlias,
+    analyze: bool,
+    verbose: bool,
+    query_plan: bool,
+    estimate: bool,
+    format: Option<sqlparser::ast::AnalyzeFormatKind>,
+    options: Option<Vec<sqlparser::ast::UtilityOption>>,
+}
+
+/// `EXPLAIN <statement>`: plan the statement, and wrap the plan rather than
+/// running it.
+///
+/// # What `EXPLAIN` means here
+///
+/// sqlite3's bare `EXPLAIN` dumps VDBE bytecode and its `EXPLAIN QUERY PLAN`
+/// reports the access path. There is no bytecode in this engine — the
+/// executor walks a [`Plan`] directly — so the first of those is not merely
+/// unimplemented, it has nothing to describe. `EXPLAIN <statement>` therefore
+/// means the query plan, which is also what MySQL's `EXPLAIN` means and what
+/// anyone typing it into a MySQL client expects. `EXPLAIN QUERY PLAN` is
+/// accepted as sqlite3's spelling of the same request rather than as a
+/// second, different one.
+///
+/// # What it refuses
+///
+/// * `EXPLAIN ANALYZE` runs the statement and reports what actually happened.
+///   This never runs the statement — that is the whole point of it being safe
+///   to `EXPLAIN` a `DELETE` — so accepting the keyword and reporting a plan
+///   would answer a different question than the one asked.
+/// * `VERBOSE`, `ESTIMATE`, `FORMAT ...` and Postgres's parenthesised options
+///   each select an output this engine does not produce. Reporting the
+///   ordinary plan under them would be the same silent substitution.
+/// * DDL and transaction control have no access path to report. sqlite3
+///   answers those with an empty `EXPLAIN QUERY PLAN`, which reads as "this
+///   query does nothing"; naming what cannot be described is the honest
+///   version, and is this repository's rule everywhere else.
+fn plan_explain(
+    modifiers: ExplainModifiers,
+    statement: Statement,
+    catalog: &Catalog,
+    binder: &mut Binder,
+) -> Result<Plan> {
+    let alias = modifiers.describe_alias;
+    for (present, what) in [
+        (modifiers.analyze, "ANALYZE"),
+        (modifiers.verbose, "VERBOSE"),
+        (modifiers.estimate, "ESTIMATE"),
+        (modifiers.format.is_some(), "FORMAT"),
+        (modifiers.options.is_some(), "(...)"),
+    ] {
+        if present {
+            return Err(Error::Unsupported(alloc::format!(
+                "{alias} {what} is not supported; {alias} <statement> reports the plan the \
+                 executor would choose and never runs the statement"
+            )));
+        }
+    }
+    // `query_plan` is sqlite3's `EXPLAIN QUERY PLAN`, and is deliberately not
+    // in the refusal list above: it asks for exactly what this produces.
+    let _ = modifiers.query_plan;
+
+    let inner = plan_statement(statement, catalog, binder)?;
+    match &inner {
+        Plan::Select(_)
+        | Plan::Scalar(_)
+        | Plan::SetOperation(_)
+        | Plan::Insert(_)
+        | Plan::Update(_)
+        | Plan::Delete(_) => Ok(Plan::Explain(Box::new(inner))),
+        Plan::CreateTable(_)
+        | Plan::DropTable(_)
+        | Plan::AlterTable(_)
+        | Plan::CreateIndex(_)
+        | Plan::CreateUniqueIndex(_)
+        | Plan::DropIndex(_)
+        | Plan::Begin
+        | Plan::Commit
+        | Plan::Rollback
+        | Plan::Explain(_) => Err(Error::Unsupported(alloc::format!(
+            "{alias} describes a query plan; this statement has none"
+        ))),
+    }
 }
 
 /// Parse and resolve one statement, checking it against `params`.
@@ -2744,6 +2875,10 @@ fn reject_write_subqueries(plan: &Plan) -> Result<()> {
             }
             returning("DELETE ... RETURNING", delete.returning.as_ref())
         }
+        // The same check, on the statement inside. `EXPLAIN` must refuse
+        // exactly what running would refuse: describing a plan the engine
+        // would not accept is a promise the next statement cannot keep.
+        Plan::Explain(inner) => reject_write_subqueries(inner),
         _ => Ok(()),
     }
 }
