@@ -15,11 +15,14 @@
 //! allocator and reports live heap growth for:
 //!
 //! * `Bm25Index` — bytes per document, at four corpus sizes.
+//! * `PagedBm25Index` over a real file, at the same sizes and on the same
+//!   documents, which is what makes the two numbers comparable rather than
+//!   merely both printed.
 //! * `HnswIndex` — bytes per vector, exact and int8, at three corpus sizes.
 //! * A whole file-backed `Database` handle over the same corpus, which is the
 //!   quantity blocker 6 is actually about: what *one connection* holds.
-//! * The same handle opened with `Database::open_paged`, which is the only
-//!   lever that exists today.
+//! * The same handle with each paging lever on — `paged_vector_indexes`,
+//!   `paged_text_indexes`, and both.
 //! * Several handles on one file at once, because "per connection" is a
 //!   multiplier and a multiplier has to be shown multiplying.
 //!
@@ -51,7 +54,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use inlaysql::{Bm25Index, Database, HnswIndex, Value};
+use inlaysql::{
+    Bm25Index, Database, EngineOptions, FileDevice, HnswIndex, PagedBm25Index, TreeStorage, Value,
+};
 use inlaysql_core::{FullTextIndex, VectorIndex};
 
 // =====================================================================
@@ -221,6 +226,17 @@ fn what_a_resident_retrieval_index_costs_per_connection() {
     a_whole_connection();
 }
 
+/// A scratch directory of this process's own.
+fn workspace(name: &str) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(format!(
+        "inlaysql-index-memory-cost-{name}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    directory
+}
+
 /// BM25's resident cost, and where inside the structure it goes.
 ///
 /// Reported per document at four sizes rather than at one, because the
@@ -230,7 +246,7 @@ fn what_a_resident_retrieval_index_costs_per_connection() {
 /// tell those apart; four can.
 fn bm25_bytes_per_document() {
     println!();
-    println!("=== BM25 (`Bm25Index`), fully resident, no paged variant exists ===");
+    println!("=== BM25 (`Bm25Index`), fully resident ===");
     println!(
         "{:>10}  {:>12}  {:>14}  {:>12}  {:>16}",
         "documents", "held", "bytes/doc", "vocabulary", "10M docs would be"
@@ -262,14 +278,130 @@ fn bm25_bytes_per_document() {
         drop(index);
     }
 
+    println!("Every byte above is in the connection's own heap, paid once per open handle.");
+    paged_bm25_bytes_per_document();
+}
+
+/// The same corpora through `PagedBm25Index`, on a real file.
+///
+/// On a file and not `MemStorage`, because a memory-backed store would move
+/// the postings from one heap allocation to another and report a saving that
+/// does not exist. What is measured is the same quantity as above — live heap
+/// after the builder's scratch is freed — so the two tables are directly
+/// comparable, which is the only reason either number is worth printing.
+///
+/// The cache is left at its default: a ceiling is not a reservation, and the
+/// interesting number is what a built index settles at, not what it could hold.
+///
+/// # Why the file size is in this table too
+///
+/// Because it is the price, and a memory table that omitted it would be an
+/// advertisement. An inverted index update touches one page per distinct term
+/// of the document, copy-on-write copies every one of them, and a bulk load has
+/// to commit each time the write-ahead-log region fills — every half megabyte
+/// of dirty pages. Every superseded page is then abandoned rather than
+/// reclaimed, because `page_reuse` is off by default
+/// (`docs/enterprise-readiness.md` blocker 4), so the file grows by *hundreds
+/// of kilobytes per document*. That column is the whole cost of this backend
+/// and nobody should have to discover it from a full disk.
+///
+/// Reuse is left off here rather than turned on, for a reason that is a finding
+/// in its own right: **with `page_reuse` on, this build is refused for size.**
+/// `Storage::transaction_is_nearly_full` answers from the dirty set as it
+/// stands, and committing with reuse on then writes free-list entries of its
+/// own — so a batch that was under the ceiling when it was last asked is over
+/// it by the time the record is built (measured: refused at 1,076,352 bytes
+/// against a 1,048,576-byte region, having last been asked at 524,288). That
+/// is blocker 4's flag meeting blocker 5's ceiling, it is not specific to this
+/// index, and any batched writer that trusts that method is exposed to it.
+///
+/// # Why this stops at 8,000 where the resident table goes to 128,000
+///
+/// The resident table's number *falls* with corpus size — its dictionary is
+/// still saturating — so it needs four sizes to show where it flattens. This
+/// one holds nothing per document at all, so two sizes are enough to show that
+/// it does not move, and a third would cost several gigabytes of file and an
+/// hour of `fsync`s to print the same figure again.
+fn paged_bm25_bytes_per_document() {
+    let directory = workspace("bm25");
+    println!();
+    println!("=== BM25 (`PagedBm25Index`), postings in the file ===");
+    // No "10M docs would be" column here, unlike the table above, and the
+    // absence is the point: that column multiplies a *slope* by ten million,
+    // and this backend has no slope to multiply. Extrapolating a fixed cost
+    // that way would print 77 GiB for a figure that does not move.
     println!(
-        "Every byte above is in the connection's own heap: `Bm25Index` has no \
-         paged backend at all,"
+        "{:>10}  {:>12}  {:>14}  {:>8}  {:>12}",
+        "documents", "held", "bytes/doc", "cached", "file"
+    );
+
+    for documents in [2_000usize, 8_000] {
+        let path = directory.join(format!("{documents}.inlay"));
+        let (index, bytes) = held(|| {
+            let storage = TreeStorage::open_on(FileDevice::open(&path).unwrap()).unwrap();
+            let mut index = PagedBm25Index::new(storage, "\u{1}fts:docs\u{1}body\u{1}");
+            let mut rng = Rng::new(0x243f_6a88_85a3_08d3);
+            let mut body = String::new();
+            let mut scratch = String::new();
+            for id in 1..=documents as u64 {
+                document(&mut rng, &mut body, &mut scratch);
+                index.insert(id, &body).unwrap();
+            }
+            index.commit().unwrap();
+            index
+        });
+
+        let per_document = bytes as f64 / documents as f64;
+        let file = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        println!(
+            "{documents:>10}  {:>10.1} MiB  {per_document:>14.0}  {:>8}  {:>8.1} MiB",
+            mib(bytes),
+            index.cache_len(),
+            mib(file as usize),
+        );
+        // Prove the thing answers, so the measurement is of a working index
+        // rather than of an empty one that costs nothing by doing nothing.
+        assert!(!index.is_empty(), "the index held no documents");
+        let mut body = String::new();
+        let mut scratch = String::new();
+        document(
+            &mut Rng::new(0x243f_6a88_85a3_08d3),
+            &mut body,
+            &mut scratch,
+        );
+        assert!(
+            !index.search(&body, 10, None).unwrap().is_empty(),
+            "the index answered nothing"
+        );
+        drop(index);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    println!(
+        "Held here is the bounded entry cache plus this handle's 8 MiB page cache — not the \
+         corpus — which"
     );
     println!(
-        "so this is paid once per open handle and is not reduced by \
-         `Database::open_paged`."
+        "is why the figure is the *same* at both sizes while the resident one is still falling. \
+         Read the"
     );
+    println!(
+        "bytes/doc column as that fixed cost divided by the corpus, not as a per-document price: \
+         there is"
+    );
+    println!(
+        "none. The two tables are not quite like for like, and in this one's favour — a \
+         `Bm25Index` has"
+    );
+    println!(
+        "no storage handle to carry, so ~8 MiB of what is held here is a page cache the other \
+         never had."
+    );
+    println!(
+        "The file column is the price, and it is paid once for the database rather than once \
+         per connection."
+    );
+    let _ = std::fs::remove_dir_all(&directory);
 }
 
 /// How many distinct terms the index currently holds, counted the only way a
@@ -354,29 +486,28 @@ fn a_whole_connection() {
     const ROWS: usize = 8_000;
     const HANDLES: usize = 4;
 
-    let directory =
-        std::env::temp_dir().join(format!("inlaysql-index-memory-cost-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
+    let directory = workspace("connection");
 
     println!();
     println!("=== one connection's handle on a {ROWS}-row corpus (dim {DIM}) ===");
     println!(
-        "{:>10}  {:>14}  {:>11}  {:>17}  {:>15}",
+        "{:>16}  {:>14}  {:>11}  {:>17}  {:>15}",
         "opened as", "held on open", "bytes/row", "each +1 handle", "of that, ANN"
     );
 
-    for paged in [false, true] {
-        let path = directory.join(if paged {
-            "paged.inlay"
-        } else {
-            "resident.inlay"
-        });
+    for (label, options) in [
+        ("neither", paging(false, false)),
+        ("vectors", paging(true, false)),
+        ("text", paging(false, true)),
+        ("both", paging(true, true)),
+    ] {
+        let path = directory.join(format!("{label}.inlay"));
         let _ = std::fs::remove_file(&path);
-        build(&path, ROWS, paged);
+        build(&path, ROWS, options);
 
         // A fresh handle on a file that already holds the corpus: this is
         // exactly what `serve_connection` does when a client connects.
-        let (first, first_bytes) = held(|| open_and_query(&path, paged));
+        let (first, first_bytes) = held(|| open_and_query(&path, options));
         // And the rest, on the same file in the same process, which is what
         // "per connection" means. Measured as a group and divided, so the
         // one-time allocations the first handle drags in with it — the parsed
@@ -384,7 +515,7 @@ fn a_whole_connection() {
         let (rest, rest_bytes) = held(|| {
             let mut handles = Vec::with_capacity(HANDLES - 1);
             for _ in 1..HANDLES {
-                handles.push(open_and_query(&path, paged));
+                handles.push(open_and_query(&path, options));
             }
             handles
         });
@@ -395,8 +526,7 @@ fn a_whole_connection() {
             .vector_index_resident_bytes("docs", "embedding")
             .unwrap_or(0);
         println!(
-            "{:>10}  {:>10.1} MiB  {:>11.0}  {:>13.1} MiB  {:>11.1} MiB",
-            if paged { "open_paged" } else { "open" },
+            "{label:>16}  {:>10.1} MiB  {:>11.0}  {:>13.1} MiB  {:>11.1} MiB",
             mib(first_bytes),
             first_bytes as f64 / ROWS as f64,
             mib(rest_bytes) / (HANDLES - 1) as f64,
@@ -408,21 +538,30 @@ fn a_whole_connection() {
     }
 
     println!(
-        "`open_paged` moves the ANN graph into the file and leaves a bounded node cache \
-         behind."
+        "`paged_vector_indexes` moves the ANN graph into the file and leaves a bounded node \
+         cache behind;"
     );
     println!(
-        "It does not touch BM25, which has no paged backend — so whatever the two rows \
-         still share"
+        "`paged_text_indexes` does the same for the postings. What the `both` row still holds \
+         is the"
     );
-    println!("is what a paged vector index cannot reach.");
+    println!("page caches, the catalog and the engine — none of which grows with the corpus.");
 
     let _ = std::fs::remove_dir_all(&directory);
 }
 
+/// The two paging levers, as engine options.
+fn paging(vectors: bool, text: bool) -> EngineOptions {
+    EngineOptions {
+        paged_vector_indexes: vectors,
+        paged_text_indexes: text,
+        ..EngineOptions::default()
+    }
+}
+
 /// Load `rows` documents-with-embeddings into a fresh file.
-fn build(path: &Path, rows: usize, paged: bool) {
-    let mut db = open(path, paged);
+fn build(path: &Path, rows: usize, options: EngineOptions) {
+    let mut db = open(path, options);
     db.execute(
         &format!("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT, embedding VECTOR({DIM}))"),
         &[],
@@ -466,18 +605,14 @@ fn build(path: &Path, rows: usize, paged: bool) {
     db.checkpoint().unwrap();
 }
 
-fn open(path: &Path, paged: bool) -> Database {
-    if paged {
-        Database::open_paged(path).unwrap()
-    } else {
-        Database::open(path).unwrap()
-    }
+fn open(path: &Path, options: EngineOptions) -> Database {
+    Database::open_on_with_options(FileDevice::open(path).unwrap(), options).unwrap()
 }
 
 /// Open a handle and run one hybrid query on it, so what is measured is a
 /// connection that has been used rather than one that has only been opened.
-fn open_and_query(path: &Path, paged: bool) -> Database {
-    let mut db = open(path, paged);
+fn open_and_query(path: &Path, options: EngineOptions) -> Database {
+    let mut db = open(path, options);
     let mut rng = Rng::new(7);
     let mut query = Vec::with_capacity(DIM);
     vector(&mut rng, &mut query);

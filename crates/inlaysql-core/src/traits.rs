@@ -438,6 +438,53 @@ pub trait FullTextIndex {
         let _ = bytes;
         Err(unsupported_load())
     }
+
+    /// Whether this backend stores its own structure inside the database,
+    /// rather than being serialised into a blob by the engine.
+    ///
+    /// The full-text twin of [`VectorIndex::is_self_persisting`], with the
+    /// same four consequences for the engine — see that method, and
+    /// [`crate::bm25_paged::PagedBm25Index`], which is the one backend here
+    /// that answers `true`.
+    ///
+    /// **Every method under this heading is defaulted**, deliberately: a
+    /// full-text backend outside this repository implements `insert`,
+    /// `remove`, `commit` and `search` and gets the pre-existing behaviour
+    /// unchanged, because the defaults spell out exactly what the engine
+    /// assumed before any of them existed. Widening the trait was the whole
+    /// design cost of a paged BM25 index, and this is the smallest form it
+    /// could take.
+    fn is_self_persisting(&self) -> bool {
+        false
+    }
+
+    /// Throw the index away and start empty.
+    ///
+    /// Called before a rebuild, so that a self-persisting backend does not add
+    /// a second copy of every document on top of the copy it just restored. A
+    /// backend the engine holds only in memory has nothing to do here.
+    fn reset(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Tell a self-persisting backend what the commit it is about to do means.
+    ///
+    /// Identical in meaning to [`VectorIndex::prepare_commit`]: `write_version`
+    /// is the version of the committed rows the index will describe once it
+    /// finishes, and `may_commit` is whether the backend is allowed to make
+    /// its own writes durable — false whenever the engine is inside a caller's
+    /// transaction.
+    fn prepare_commit(&mut self, write_version: u64, may_commit: bool) {
+        let _ = (write_version, may_commit);
+    }
+
+    /// The write version the structure this backend restored from the database
+    /// describes, or `None` when there is nothing current to restore —
+    /// including a structure a crash left half-written, since a backend stamps
+    /// the version only on the commit that completes it.
+    fn stored_write_version(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// A nearest-neighbour index over one vector column.

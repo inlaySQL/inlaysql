@@ -30,11 +30,11 @@ each is closed with evidence. It is a scoreboard, not a claim.
 | 3 | Change log cannot become replication or PITR | open |
 | 4 | Unbounded file growth in server mode | **closed** |
 | 5 | ~1 MiB transaction and statement ceiling | measured; **open by choice** — see the entry |
-| 6 | Fully resident retrieval indexes, per connection | measured; **vector half has a lever**, BM25 half open |
+| 6 | Fully resident retrieval indexes, per connection | measured; **both halves now have a lever**, and both are trades — see the entry |
 | 7 | Integer comparison through `f64` above 2^53 | **closed** |
 | 8 | No statement timeout; unbounded materialisation | **closed** — with two loops deliberately not interruptible, named in the entry |
 | 9 | No TLS, one user, no grants | **accounts and privileges closed**, TLS open |
-| 10 | Effectively no observability | **`EXPLAIN` closed**, metrics/processlist open |
+| 10 | Effectively no observability | **closed** — `EXPLAIN`, `SHOW PROCESSLIST`, `SHOW STATUS` and an opt-in slow-query log; no histograms and no audit log, named in the entry |
 
 Closed means: reproduced first, fixed, and pinned by a test that fails against
 the old code — not "a commit mentions it". Blocker 5 is the one deliberately
@@ -337,20 +337,42 @@ the dictionary saturates:
 | 128,000 | 1,859 B | 199,952 |
 
 It falls as the dictionary saturates and then flattens near 1,800 B/document,
-so **10M documents is roughly 17 GiB** — resident, per connection, with no
-paged backend to move it into.
+so **10M documents is roughly 17 GiB** — resident, per connection.
+
+**The same corpora through `PagedBm25Index`**, which now exists (see below).
+The figure to read is not the slope, it is that there is no slope:
+
+| documents | held | of that, corpus | file on disk |
+| --- | --- | --- | --- |
+| 2,000 | 15.9 MiB | none | 1,260 MiB |
+| 8,000 | 15.9 MiB | none | 3,255 MiB |
+
+Identical at both sizes, because what is held is a bounded entry cache plus
+this handle's 8 MiB page cache and nothing per document at all. The two tables
+are not quite like for like and the difference favours the paged one — a
+`Bm25Index` carries no storage handle, so ~8 MiB of the 15.9 is a page cache
+the other never had. The file column is the price, and it is discussed under
+"what it costs" below.
 
 **Per connection, end to end.** 8,000 rows at dimension 384 with both indexes,
 opened the way `serve_connection` opens one:
 
-| opened as | first handle | each additional handle | of that, ANN payload |
+| paged | first handle | each additional handle | of that, ANN payload |
 | --- | --- | --- | --- |
-| `Database::open` | 64.8 MiB | 56.5 MiB | 23.4 MiB |
-| `Database::open_paged` | 43.2 MiB | 35.0 MiB | 3.7 MiB |
+| neither (the default) | 64.8 MiB | 56.5 MiB | 23.4 MiB |
+| vectors | 43.2 MiB | 35.0 MiB | 3.7 MiB |
+| text | 43.6 MiB | 35.5 MiB | 23.4 MiB |
+| **both** | **20.9 MiB** | **12.8 MiB** | 3.7 MiB |
 
-**What is fixed.** The server can now be told to use the paged vector index:
-`ServerOptions::paged_vector_indexes` / `inlaysql serve --mysql
---paged-vectors`, off by default and documented as a trade in `docs/server.md`.
+Each lever is worth about 21 MiB per connection here and they compose: a second
+connection costs 56.5 MiB by default and 12.8 MiB with both on, a factor of 4.4.
+The number that matters is not the factor, though — it is that what remains does
+not grow with the corpus. 12.8 MiB is two page caches, a catalog and an engine.
+
+**What is fixed — the vector half.** The server can now be told to use the
+paged vector index: `ServerOptions::paged_vector_indexes` / `inlaysql serve
+--mysql --paged-vectors`, off by default and documented as a trade in
+`docs/server.md`.
 
 Turning it on was not a matter of setting the flag. `catch_up_indexes` declined
 outright whenever any vector backend kept itself in the database, and declining
@@ -371,19 +393,96 @@ to the indexes that actually need it. Both halves are pinned by tests that fail
 against the old code, and the answers — scores, not merely ranking — are
 compared against a handle opened fresh from the file.
 
+**What is fixed — the BM25 half.** `PagedBm25Index`
+(`EngineOptions::paged_text_indexes`, default off) puts the term dictionary,
+the postings and the per-document term lists in the file and reads them through
+a bounded cache, the way `PagedHnswIndex` already did for the graph. The layout
+and the argument are in `docs/indexes.md`; three things about it belong here —
+what it gets right, what it costs, and what building it found in the backend
+that was already shipped.
+
+**The scores are identical, bit for bit, and that is the whole difficulty.**
+BM25's `idf` and its length normalisation are corpus-relative, so a backend
+whose statistics differ in the last place does not fail — it returns a
+plausible ranking with two hits transposed, or the same ranking with different
+numbers, and the number is what `fuse()` and a user's `ORDER BY
+bm25_score(...)` consume. The four arithmetic steps are therefore *called* by
+both backends rather than transcribed twice (floating-point is not
+associative), and the corpus statistics move on exactly the events they move on
+in the in-memory index. Asserted rather than argued:
+`crates/inlaysql-core/tests/bm25_paged_agreement.rs` compares whole result sets
+— ids and score **bits** — against a freshly built `Bm25Index` over six corpus
+shapes, every query shape, six limits and two filters, and
+`crates/inlaysql/tests/paged_full_text.rs` does the same through the whole SQL
+path on the `f64` that comes back from `bm25_score`. A crash sweep stops the
+build after every *n*th storage write and requires that a stamped index is
+always a complete one, and that whatever survived rebuilds to the right answer.
+
+**What it costs is writes, and the bill is large.** An inverted index update
+touches one chunk per *distinct* term of the document — around a hundred for a
+120-token chunk of English — and the first time each term is seen it costs a
+dictionary bucket and a term record as well. Those land on different leaf pages
+because the terms are scattered across the key space, so under copy-on-write one
+document dirties a few hundred pages. Consequences, in order of how much they
+hurt:
+
+* **The file grows by hundreds of kilobytes per document on a bulk load** —
+  measured at 1,260 MiB for 2,000 documents and 3,255 MiB for 8,000 — because
+  every superseded page is abandoned rather than reclaimed with `page_reuse`
+  off, which is the default (blocker 4). This is the number that decides
+  whether the trade is worth taking, and it is not small.
+* **With `page_reuse` on, the build is refused for size**, which is a finding
+  in its own right and is *not* specific to this index.
+  `Storage::transaction_is_nearly_full` answers from the dirty set as it
+  stands; committing with reuse on then writes free-list entries of its own, so
+  a batch that was under the ceiling when it was last asked is over it by the
+  time the record is built. Measured: refused at 1,076,352 bytes against a
+  1,048,576-byte region, having last been asked at 524,288. **Any batched
+  writer that trusts that method is exposed to this** — the index-save path in
+  `persist_indexes` asks the same question for the same reason.
+* **A read inside an open transaction, after many documents, can be refused.**
+  Index commits are deferred to the first read that needs them, and that read
+  is normally outside any transaction, where the backend commits itself in
+  batches — so the ordinary path is fine. Inside one it may not commit, so the
+  whole batch has to fit one record.
+
+So this closes the *memory* half of the entry and opens a file-size and
+write-amplification question in its place. The real answer to that is the
+segment-and-merge design every production full-text engine uses — postings
+written once as immutable runs and merged in the background, instead of
+read-modify-written in place — and it is a project of its own.
+
+**What building it found in `PagedHnswIndex` — *reported*, not fixed.** Two
+`Database` handles on one database hold two objects over the *same* structure
+in the file. When one of them rebuilds — which is what any handle does on
+opening to a stamp that is not current — it rewrites that structure and
+reassigns its internal indices underneath the other, **without changing a
+row**, so nothing moves the `write_version` `adopt_committed_state` watches and
+the other handle never notices. For BM25 that showed up as an arithmetic
+underflow on the live document count and, worse and silently, as two handles
+handing the same term ordinal to two different words;
+`PagedBm25Index::adopt_stored_statistics` closes it by re-reading the header on
+every commit and every search instead of remembering it, and
+`a_rebuild_by_another_handle_is_adopted_rather_than_overwritten` fails against
+the code without it. **`PagedHnswIndex` has the same exposure and does not do
+this** — a rebuild reassigns node indices exactly the way a BM25 rebuild
+reassigns term ordinals. It is written down rather than fixed alongside,
+because changing that backend's protocol needs its own crash tests.
+
 **What is not fixed, and what the measurement says about it.**
 
 * Re-opening the graph is O(nodes) per foreign commit. Bounded by the graph
-  rather than by a rebuild of every index on the table, but not free.
-* **`Bm25Index` still has no paged variant**, and once the vector index is
-  paged it is the whole bill. At 10M documents that is ~17 GiB per connection
-  whatever else is done, so a paged BM25 — the term dictionary and the postings
-  lists in the file, read through a bounded cache, the way `PagedHnswIndex`
-  already does it — is what closes this entry. It is a project of its own and
-  is not attempted here.
+  rather than by a rebuild of every index on the table, but not free. The BM25
+  side does not have this problem: re-opening a paged BM25 index reads its
+  header and nothing else, because it keeps no resident row-id map, so
+  adopting another handle's commit is O(1).
+* The paged BM25 index is reachable from `EngineOptions` and from
+  `Database::open_on_with_options`, and **is not yet wired to a server flag**
+  the way `--paged-vectors` is; `crates/inlaysql-server` was being changed
+  concurrently and was left alone.
 * Each connection still carries its own 8 MiB decoded page cache
   (`DEFAULT_PAGE_CACHE_BYTES`), on top of the 8 MiB raw-page cache shared per
-  file.
+  file. With both indexes paged this is most of what a connection holds.
 
 **Why "share one immutable index between connections" is not the answer**, even
 though it looks like the obvious one. Four things stand in the way, and only
@@ -424,10 +523,19 @@ directionally right and quantitatively wrong:
   reachable. With `--paged-vectors`, the resident cost is the node cache plus
   the page caches, on the order of tens of MiB per connection whatever the
   corpus size. **Reachable.**
-* 10M vectors **and** 10M documents — the hybrid case that is the whole claim —
-  ~17 GiB per connection from BM25 alone, which no vector-side change reduces.
-  **Not reachable**, and the reason is now a specific missing piece rather than
-  a general one.
+* 10M vectors **and** 10M documents — the hybrid case that is the whole claim.
+  By default this is ~33 GiB plus ~17 GiB per connection and is not reachable.
+  With both indexes paged, **memory is no longer what stops it**: the resident
+  cost is two bounded caches and does not move with the corpus, measured flat
+  at both corpus sizes it was measured at.
+
+  That is a real change and it should not be overstated. What now stands in the
+  way is the file and the write path, not the heap: this backend's bulk load
+  grew the file by hundreds of kilobytes per document, so 10M documents is a
+  question about terabytes of write amplification rather than about gigabytes
+  of RAM. The claim "vector + BM25 + SQL in one file at scale" has a memory
+  answer for the first time; it does not yet have an ingest answer, and the
+  honest state is that the ceiling moved rather than went away.
 
 ### 7. Integer comparison through `f64` above 2^53 — *fixed, verified*
 
@@ -592,27 +700,92 @@ comparison is constant-time, the scramble comes from OS entropy and fails
 rather than falling back to something guessable, and the RSA public-key
 exchange is refused with a clear error rather than faked.
 
-### 10. Effectively no observability — *reported*
+### 10. Effectively no observability — *fixed, verified*
 
-No metrics, no counters, no exporter, no `log` or `tracing` dependency. No
-query log or slow-query log, deliberately — the server logs accept failures and
-connection errors and "never the statement". No `SHOW PROCESSLIST` — though
-the registry one would read now exists, since `KILL` needed it (blocker 8).
-`information_schema` covers nine relations and refuses joins and subqueries.
+**It was real.** No metrics, no counters, no exporter, no `log` or `tracing`
+dependency, no `SHOW PROCESSLIST`, no slow-query log. An operator could not
+answer either of the two questions anyone has about a running database — what
+is it doing right now, and what has it been doing.
 
-`EXPLAIN` now exists (`EXPLAIN`/`EXPLAIN QUERY PLAN`/`DESCRIBE <statement>`,
-over the wire as well as in the engine) and reports which access path the
-executor chose — scan, row-id point lookup, index range, hash join, index
-nested loop, or which retrieval index answered a `bm25_score`/`vector_score`/
-`fuse`. It reports no row counts, costs or selectivity, because there is no
-statistics system here to draw them from; see `crates/inlaysql-core/src/explain.rs`.
+`EXPLAIN` closed the first half earlier (`EXPLAIN`/`EXPLAIN QUERY PLAN`/
+`DESCRIBE <statement>`, over the wire as well as in the engine): it reports
+which access path the executor chose — scan, row-id point lookup, index range,
+hash join, index nested loop, or which retrieval index answered a
+`bm25_score`/`vector_score`/`fuse`. It reports no row counts, costs or
+selectivity, because there is no statistics system here to draw them from; see
+`crates/inlaysql-core/src/explain.rs`.
 
-Some reported session variables were fiction: `wait_timeout` and the
-`net_*_timeout`s were reported but never enforced, and `max_connections`
-reported `0` while the real cap was 64. That is closed under blocker 8 — every
-number the server reports is now read from the thing that applies it, which is
-why `max_execution_time` was wired the same way rather than recorded in the
-session's variable map like every setting this server does not model.
+**What is fixed.** Three things, all over the MySQL protocol and none of them a
+new dependency — `crates/inlaysql-server/src/metrics.rs` is `std::sync::atomic`
+and nothing else, and the process list reads the `KILL` registry that already
+existed rather than a second list beside it.
+
+* **`SHOW [FULL] PROCESSLIST`.** MySQL's eight columns for every live
+  connection: id, user, host, db, command, time, state, info. **The privilege
+  rule is `KILL`'s, character for character** — your own connections and your
+  own account's always, anybody else's only with the superuser, and a
+  connection still handshaking belongs to nobody so only a superuser sees it.
+  One rule on purpose: an id in the list is always an id the viewer could act
+  on. It does not widen the documented metadata gap (`docs/server.md`, "What is
+  deliberately left out"), which is about table and column *names* being
+  readable by every account; this is filtered by account.
+* **`SHOW [SESSION | GLOBAL] STATUS`.** Statements by kind, wire commands,
+  bytes in and out, errors bucketed by what an operator would do about them
+  (access denied, syntax, unsupported, constraint, write conflict, timeout,
+  interrupted, no such object), connections accepted, aborted, refused at the
+  cap, the high-water mark, uptime, and the two thread counts. Session and
+  global are two different numbers, as they are in MySQL. `Threads_connected`
+  and `Threads_running` are not counted at all — they are derived from the same
+  registry the process list reads, so the list and the count cannot disagree.
+* **A slow-query log**, `--slow-query-log <ms>`, off by default, one stderr
+  line per statement over the threshold, counted as `Slow_queries` and reported
+  as `slow_query_log`/`long_query_time`.
+
+**The statement-text policy was changed explicitly, not by accident.** This
+server logs and holds no statement anywhere, and that is stated from the second
+paragraph of `docs/server.md`. `SHOW PROCESSLIST`'s `Info` and a useful
+slow-query log both want the statement, so there is now one flag —
+`--statement-text`, **off by default** — that turns statement retention on for
+both, warns at startup when it is on, and is reported as
+`@@inlaysql_statement_text` so it is checkable from a client. With it off no
+statement text is stored in the process at all and `Info` is `NULL`. Nothing
+changed about passwords or verifiers: those are never logged under any flag.
+
+**Every number is maintained, or it is not reported.** Some session variables
+used to be fiction — `wait_timeout` and the `net_*_timeout`s were reported and
+never enforced, `max_connections` reported `0` against a real cap of 64 — and
+that is closed under blocker 8: every number the server reports is read from
+the thing that applies it. The counters follow the same rule, and so does the
+naming: a counter whose meaning is MySQL's carries MySQL's name, and one this
+server invented is prefixed `Inlaysql_` so nobody's dashboard can mistake it
+for a variable it already understands. Pinned by
+`every_reported_status_name_is_mysqls_or_marked_as_this_servers` and
+`a_name_this_server_invented_is_prefixed`.
+
+**What it costs.** Two clock reads and two relaxed stores per command for
+`Command` and `Time`, a handful of relaxed `fetch_add`s, and an
+allocation-free scan of the leading keyword. Bytes are accumulated in plain
+`u64`s in the packet framer and pushed into the shared counters once per
+command, so a ten-million-row result set costs the same two adds as a `PING`.
+Measured over a real socket, 200,000 prepared point reads by primary key, five
+alternating runs per arm: **28,410 ns/op before, 28,486 ns/op after** — 0.3%,
+against a run-to-run spread several times larger. (The published `points`
+benchmark cannot see this change at all: `inlaysql-bench` links `inlaysql` and
+`inlaysql-core` and not `inlaysql-server`.)
+
+**What is still missing**, and named rather than left to be discovered: no
+histograms or percentiles — these are counters, and a counter cannot describe a
+latency distribution. No per-table or per-index statistics. No audit log;
+`Inlaysql_com_account` counts privilege statements but nothing records which.
+No `information_schema.processlist` (refused with `1235` naming the spelling
+that works), no `performance_schema`, and no HTTP exporter — deliberately: this
+workspace ships no HTTP server, and `SHOW STATUS` is what every agent that
+scrapes MySQL already speaks.
+
+Verified over a real socket in `crates/inlaysql-server/tests/wire.rs`, including
+that a non-superuser sees only its own connections
+(`a_non_superuser_sees_only_its_own_connections`) and that every id it was shown
+is one it may `KILL`.
 
 ---
 

@@ -27,6 +27,7 @@ extern crate std;
 mod checksum;
 
 pub mod bm25;
+pub mod bm25_paged;
 pub mod btree;
 pub mod catalog;
 pub mod cdc;

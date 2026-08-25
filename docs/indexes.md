@@ -264,10 +264,17 @@ being a trait.
 
 ## Backends that persist themselves
 
-`PagedHnswIndex` is neither of the above: it keeps its graph *in the database*,
-as ordinary rows under a namespace no table can name (`\u{1}ann:table.column`).
-It answers `true` to `VectorIndex::is_self_persisting`, and the engine treats it
-differently in five places.
+`PagedHnswIndex` and `PagedBm25Index` are neither of the above: they keep their
+structure *in the database*, as ordinary rows under namespaces no table can
+name (`\u{1}ann:table.column` and `\u{1}fts:table\u{1}column\u{1}`). They
+answer `true` to `VectorIndex::is_self_persisting` /
+`FullTextIndex::is_self_persisting`, and the engine treats them differently in
+five places.
+
+Both are opt-in and both default to off: `EngineOptions::paged_vector_indexes`
+and `EngineOptions::paged_text_indexes`. The in-memory backends are faster, and
+what paging buys is a memory bound rather than speed — see
+[The paged BM25 index](#the-paged-bm25-index) for what it costs.
 
 **It writes through the engine's transaction.** The engine's storage is a
 `SharedStorage` — one `Rc<RefCell<_>>` handle the index holds a clone of — so
@@ -331,3 +338,185 @@ describes them is rebuilt rather than believed. The difference is only that this
 backend can usually prove it — which is why opening a paged index costs nothing,
 and why `index_recovery_dst.rs` sweeps it under the same fault schedules as
 everything else.
+
+## The paged BM25 index
+
+`PagedBm25Index` (`EngineOptions::paged_text_indexes`, default off) is the
+full-text half of the same idea, and it exists for a measured reason: the
+in-memory `Bm25Index` costs ~1,800 bytes per document once the dictionary
+saturates, so ten million documents is ~17 GiB **per connection** with nowhere
+to put it (`docs/enterprise-readiness.md` blocker 6,
+`crates/inlaysql/tests/index_memory_cost.rs`). It follows every rule above —
+self-persisting, stamped, reset before a rebuild, adopted by re-opening — so
+what is worth writing down separately is the layout, the one property that is
+harder here than for a graph, and what it costs.
+
+### What is in the file
+
+Row keys are `(namespace, u64)`, so each structure is a `u64`-keyed table under
+a namespace no SQL identifier can spell. Four of them, from one base
+(`\u{1}fts:<table>\u{1}<column>\u{1}…`):
+
+```
+<base>          documents,  key = row id
+    doc     := u32 length, u32 term_count, u32 * term_count   (term ordinals)
+<base>\u{1}d  dictionary, key = FNV-1a 64 of the term
+    bucket  := u32 count, (string term, u32 ordinal)*
+<base>\u{1}x  term records, key = term ordinal
+    term    := string term, u32 document_frequency, u32 max_frequency,
+               u32 min_length, u32 next_slot, u32 chunk_count, chunk*
+    chunk   := u32 slot, u64 greatest row id in that chunk
+<base>\u{1}p  postings chunks, key = (term ordinal << 32) | slot
+    chunk   := u32 count, posting*
+    posting := u64 row id, u32 frequency, u32 document length
+```
+
+Four things in there are decisions rather than details.
+
+- **Documents are row ids, not dense ordinals.** The in-memory index assigns
+  ordinals so a length or a row id is an array index. On disk there are no
+  arrays, so an ordinal buys nothing and costs a resident `RowId -> ordinal`
+  map that grows with the corpus — the very thing being removed. Walk order
+  becomes row-id order as a result, which cannot change the answer: the answer
+  is the top `k` under a total order on `(score, row id)`, so it is a function
+  of the *set* of documents scored and never of the order they were reached in.
+- **A posting carries its document's length.** Otherwise scoring costs a second
+  keyed read per document reached, which is the dominant cost of a query. Four
+  bytes per posting on disk, nothing in memory, and it cannot go stale because
+  re-indexing a document rewrites every posting it has.
+- **A term's chunks are found through a directory, not by scanning.** The
+  directory is a skip list: a MaxScore cursor that has been demoted and is
+  thousands of postings behind advances over whole chunks without reading them.
+  It is also what makes a mid-list write cheap — a re-indexed document rewrites
+  the one chunk holding its row id, not the list.
+- **The dictionary is hashed, not sorted.** A sorted dictionary would need a
+  resident block index that grows with the vocabulary; a hash bucket is one
+  point read and nothing resident at all.
+
+What stays in memory: the header scalars, the documents buffered since the last
+commit, and a bounded LRU of decoded entries (`DEFAULT_CACHE_ENTRIES`). Not the
+dictionary, not the postings, not the per-document term lists. The one entry
+that is not `O(1)` in bytes is a very common term's record, which carries that
+term's chunk directory.
+
+### The hard part is not the layout, it is that the scores must be identical
+
+BM25 is corpus-relative in a way an ANN graph is not. `idf` is a function of the
+live document count and a term's document frequency; the length normalisation
+divides by the mean document length. A backend that computed any of those
+slightly differently would not fail — it would return a plausible ranking with
+two hits transposed, or the same ranking with scores differing in the last
+place. The second is worse, because `fuse()` and a user's
+`ORDER BY bm25_score(...)` both consume the number rather than the rank.
+
+So the arithmetic is **not transcribed twice**: `bm25::idf`,
+`bm25::average_length`, `bm25::length_normalisation` and `bm25::contribution`
+are called by both backends, because floating-point arithmetic is not
+associative and a second copy that grouped a multiplication differently would
+agree to a printed decimal and disagree as bits. The corpus statistics move on
+exactly the events they move on in the in-memory index. A document's
+contributions are summed in query order in both.
+
+Skipping is the one place the two are allowed to differ, and it cannot change
+the answer: MaxScore only declines to visit a document whose *entire* possible
+score is strictly below the `k`-th best already held, so a different-but-valid
+bound prunes a different amount of work and the same set of results.
+
+`crates/inlaysql-core/tests/bm25_paged_agreement.rs` asserts this rather than
+arguing it — whole result sets, ids and score *bits*, against a freshly built
+`Bm25Index`, over six corpus shapes (inside one chunk, across many, sparse row
+ids, a wide vocabulary, degenerate documents, and churn), every query shape, six
+limits and two filters. `crates/inlaysql/tests/paged_full_text.rs` does the same
+through the whole SQL path, comparing the `f64` bits that come back from
+`bm25_score`.
+
+### What it costs
+
+**Writes, and the bill is large.** An inverted index update touches one chunk
+per *distinct term* of the document — around a hundred for a 120-token chunk of
+English — and the first time each term is seen it also costs a dictionary bucket
+and a term record. Those land on different leaf pages, because the terms are
+scattered across the whole key space, so under copy-on-write one document can
+dirty a few hundred pages. A commit record carries every page it copied and must
+fit one write-ahead-log region, which is 1 MiB (blocker 5). Three consequences,
+and only the first is comfortable:
+
+- **The ordinary path is fine.** Index commits are deferred to the first read
+  that needs them (`refresh_indexes`), and that read is normally outside any
+  explicit transaction, so the batch is applied with `may_commit` true and the
+  index commits itself as `Storage::transaction_is_nearly_full` says so. That
+  check runs after **every row write** rather than per document: a hundred new
+  terms is already past the ceiling, so checking per document is checking after
+  the damage.
+- **A read *inside* an open transaction, after many documents, is not.** There
+  `may_commit` is false — committing would make the caller's buffered rows
+  durable at a moment it did not choose — so the whole batch has to fit one
+  commit record, and with a wide vocabulary it may not. The statement is
+  refused rather than half-applied, which is the same answer blocker 5 gives
+  everywhere else, but it is a shape the in-memory backend would have taken.
+- **The file grows fast**, because each of those superseded pages is abandoned
+  unless `page_reuse` is on: measured at tens of kilobytes *per document* on a
+  bulk load with reuse off (`index_memory_cost.rs` prints the file size beside
+  the memory figure for exactly this reason). Blocker 4's flag is not optional
+  company for this one.
+
+A batch is applied **term-major** — all pending edits grouped by term, so a term
+fifty of the documents mention is rewritten once rather than fifty times — which
+blunts the bulk-load case without removing the per-transaction ceiling. The real
+fix is the segment-and-merge design every production full-text engine uses, and
+it is a project of its own.
+
+**Reads** cost a tree descent per postings chunk instead of a pointer chase. The
+directory keeps a demoted MaxScore cursor from paying for the postings it skips.
+
+One thing is *cheaper* than the vector half: re-opening a paged BM25 index reads
+its header and nothing else, because there is no resident row-id map to rebuild.
+So adopting another handle's commit is `O(1)` here where
+`adopt_self_persisting_vector_indexes` is `O(nodes)`.
+
+### Two handles, one structure — the hazard this design introduces
+
+Sharing through the file is what makes a paged index cheap and it is also the
+one thing about it that is genuinely harder than an in-memory backend. Two
+`Database` handles on one database hold two `PagedBm25Index` objects over the
+*same* namespaces. When one of them rebuilds — which is what any handle does on
+opening to a stamp that is not current — it rewrites the document records and
+reassigns every term ordinal underneath the other, **without changing a row**,
+so nothing moves the `write_version` the engine watches on the other handle's
+behalf and `adopt_committed_state` returns early.
+
+What the second handle then holds is wrong in two ways, and the quiet one is
+worse:
+
+- `live` and `total_length` are what `idf` and the length normalisation are
+  computed from, so a stale pair rescores the whole corpus. Its only visible
+  symptom is that the retire step tries to subtract a document that handle
+  never counted — which is how this was found.
+- **Term ordinals come from a counter in the header.** Two handles that both
+  believe the next ordinal is 5 give it to two different terms, and each then
+  reads the other's postings under it. A wrong answer, with no error anywhere.
+
+`PagedBm25Index::adopt_stored_statistics` closes it: the statistics and the
+ordinal counter are re-read from the header on every commit and every search
+rather than remembered, and the decoded cache is dropped whenever they moved.
+One metadata read per commit and per search, and always consistent with the
+document records that handle can see, because both are written into the same
+transaction and the header is written last.
+`a_rebuild_by_another_handle_is_adopted_rather_than_overwritten` pins it and
+fails against the code without it.
+
+**`PagedHnswIndex` has the same exposure and does not do this.** A rebuild
+reassigns node indices exactly the way a BM25 rebuild reassigns term ordinals,
+and a handle holding a stale `node_count` and `live` map would read the new
+graph through the old indices. It is written down here rather than fixed
+alongside, because it needs its own crash tests and its own pass.
+
+### The trait change
+
+Making this work needed four methods on `FullTextIndex` —
+`is_self_persisting`, `reset`, `prepare_commit`, `stored_write_version` — the
+same four `VectorIndex` already had. **All four are defaulted**, so a full-text
+backend outside this repository implements `insert`, `remove`, `commit` and
+`search` exactly as before and gets the pre-existing behaviour, because each
+default spells out what the engine assumed before the method existed. That is
+the smallest form the change could take; nothing else about the trait moved.

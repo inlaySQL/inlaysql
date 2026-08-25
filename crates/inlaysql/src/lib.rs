@@ -74,6 +74,7 @@ pub use asyncio::{block_on, AsyncDatabase, Task};
 pub use backup::{backup, BackupOutcome, BackupSummary, SourceAccess};
 pub use device::FileDevice;
 pub use inlaysql_core::bm25::Bm25Index;
+pub use inlaysql_core::bm25_paged::PagedBm25Index;
 /// The stand-in embedder lives in the core because every build has to agree on
 /// it byte for byte — the WASM module in a browser tab has to bucket trigrams
 /// exactly as the CLI that seeded the file did. Re-exported here so

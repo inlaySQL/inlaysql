@@ -22,6 +22,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
+use crate::bm25_paged::PagedBm25Index;
 use crate::btree::BackupSummary;
 use crate::catalog::{
     auto_index_name, auto_unique_index_name, Catalog, Index, IndexKind, Table, CATALOG_KEY,
@@ -182,6 +183,36 @@ pub struct EngineOptions {
     /// not have to be rebuilt or reloaded on open, but every search that misses
     /// the cache is a read from the file rather than a pointer chase.
     pub paged_vector_indexes: bool,
+    /// Keep full-text indexes in the database instead of in memory.
+    ///
+    /// The in-memory [`crate::bm25::Bm25Index`] holds the term dictionary,
+    /// every postings list and a per-document term list in RAM — measured at
+    /// ~1,800 bytes per document once the dictionary saturates, so ten million
+    /// documents is ~17 GiB *per connection*
+    /// (`crates/inlaysql/tests/index_memory_cost.rs`).
+    /// [`crate::bm25_paged::PagedBm25Index`] puts the postings in the database
+    /// file and a bounded cache in memory instead, writing through the
+    /// engine's own transaction so the index commits with the rows it
+    /// describes.
+    ///
+    /// **The trade is writes.** An inverted index update touches one chunk per
+    /// distinct term of the document — around a hundred for a 120-token chunk
+    /// of English — and each is a page the commit record has to carry. The
+    /// ordinary path absorbs that, because index commits are deferred to the
+    /// first read that needs them and that read is normally outside any
+    /// transaction, where the backend may commit in batches; a read *inside*
+    /// an open transaction after many documents may be refused for size. The
+    /// file also grows far faster than it does with the in-memory backend
+    /// unless [`EngineOptions::page_reuse`] is on.
+    ///
+    /// The scores are identical either way, bit for bit, and that is asserted
+    /// rather than argued
+    /// (`crates/inlaysql-core/tests/bm25_paged_agreement.rs`, and through the
+    /// whole SQL path in `crates/inlaysql/tests/paged_full_text.rs`).
+    ///
+    /// Off by default: the in-memory index is faster, and this trade has to be
+    /// explicit.
+    pub paged_text_indexes: bool,
     /// How much memory the storage engine may hold decoded database pages in.
     ///
     /// Without a cache every level of every tree descent reads its page from
@@ -263,6 +294,7 @@ impl Default for EngineOptions {
         Self {
             implicit_indexes: false,
             paged_vector_indexes: false,
+            paged_text_indexes: false,
             page_cache_bytes: crate::btree::DEFAULT_PAGE_CACHE_BYTES,
             hash_join_cache_bytes: DEFAULT_HASH_JOIN_CACHE_BYTES,
             query_memory_bytes: DEFAULT_QUERY_MEMORY_BYTES,
@@ -1199,6 +1231,9 @@ impl Engine {
         if !self.adopt_self_persisting_vector_indexes()? {
             return Ok(false);
         }
+        if !self.adopt_self_persisting_text_indexes()? {
+            return Ok(false);
+        }
 
         // Deduplicated per table: the reconcile below is idempotent, so a row
         // touched by ten of the replayed statements is still one unit of work.
@@ -1299,11 +1334,68 @@ impl Engine {
 
     /// Whether `index`'s backend keeps its own structure inside the database.
     fn index_is_self_persisting(&self, index: &Index) -> bool {
-        index.kind == IndexKind::Vector
-            && self
+        let key = retrieval_key(&index.table, &index.columns);
+        match index.kind {
+            IndexKind::Vector => self
                 .vector_indexes
-                .get(&retrieval_key(&index.table, &index.columns))
-                .is_some_and(|backend| backend.is_self_persisting())
+                .get(&key)
+                .is_some_and(|backend| backend.is_self_persisting()),
+            IndexKind::FullText => self
+                .text_indexes
+                .get(&key)
+                .is_some_and(|backend| backend.is_self_persisting()),
+            IndexKind::BTree => false,
+        }
+    }
+
+    /// The `FullText` index declaration a retrieval key names, if the catalog
+    /// still names one. The text twin of [`Engine::declared_vector_index`].
+    fn declared_text_index(&self, key: &(String, Vec<String>)) -> Option<Index> {
+        let table = self.catalog.table(&key.0)?;
+        self.catalog
+            .indexes_for(&table.name)
+            .into_iter()
+            .find(|index| {
+                index.kind == IndexKind::FullText
+                    && retrieval_key(&index.table, &index.columns) == *key
+            })
+            .cloned()
+    }
+
+    /// Re-read every full-text backend that keeps its structure in the
+    /// database, for exactly the reasons
+    /// [`Engine::adopt_self_persisting_vector_indexes`] gives — the writer
+    /// already applied its rows to the postings in the file, so replaying them
+    /// here would apply them twice, as writes from a handle that only read.
+    ///
+    /// Cheaper than the vector half, and worth saying so: re-opening a paged
+    /// BM25 index reads its header and nothing else, because it keeps no
+    /// resident `RowId -> ordinal` map to rebuild. So this is `O(1)` per index
+    /// where the ANN side is `O(nodes)`.
+    fn adopt_self_persisting_text_indexes(&mut self) -> Result<bool> {
+        let stale: Vec<(String, Vec<String>)> = self
+            .text_indexes
+            .iter()
+            .filter(|(_, backend)| backend.is_self_persisting())
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale {
+            let (Some(index), Some(table)) = (
+                self.declared_text_index(&key),
+                self.catalog.table(&key.0).cloned(),
+            ) else {
+                return Ok(false);
+            };
+            self.open_one_index(&table, &index)?;
+            let current = self
+                .text_indexes
+                .get(&key)
+                .is_some_and(|backend| backend.stored_write_version() == Some(self.write_version));
+            if !current {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Re-read every vector backend that keeps its structure in the database,
@@ -1780,7 +1872,11 @@ impl Engine {
                 // purposes only — neither shipped `IndexFactory` reads it —
                 // so a multi-column index just passes its first; nothing
                 // downstream keys on this value, `key` above does that.
-                let backend = self.factory.full_text(&index.table, index.column())?;
+                let backend = if self.options.paged_text_indexes {
+                    self.open_paged_text_index(&index.table, &index.columns)?
+                } else {
+                    self.factory.full_text(&index.table, index.column())?
+                };
                 self.text_indexes.insert(key, backend);
             }
             IndexKind::BTree => unreachable!("returned above"),
@@ -1806,6 +1902,26 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Open the paged BM25 backend for one index, restoring whatever postings
+    /// the database already holds for it.
+    ///
+    /// Like the paged ANN backend it shares the engine's storage handle and
+    /// does not commit: its writes join whatever transaction the engine has
+    /// open, so the postings and the rows they describe reach the log
+    /// together.
+    fn open_paged_text_index(
+        &self,
+        table: &str,
+        columns: &[String],
+    ) -> Result<Box<dyn FullTextIndex>> {
+        let index = PagedBm25Index::open(
+            self.storage.clone(),
+            full_text_index_namespace(table, columns),
+        )?
+        .joined_to_caller_transaction();
+        Ok(Box::new(index))
     }
 
     /// Open the paged ANN backend for one column, restoring whatever graph the
@@ -2206,7 +2322,7 @@ impl Engine {
         self.refresh_indexes()
     }
 
-    /// Empty the vector indexes of `table` that keep themselves in the
+    /// Empty the retrieval indexes of `table` that keep themselves in the
     /// database, ahead of a rebuild from the rows.
     fn reset_self_persisting_indexes(&mut self, table: &Table) -> Result<()> {
         let declared: Vec<Index> = self
@@ -2216,14 +2332,23 @@ impl Engine {
             .cloned()
             .collect();
         for index in declared {
-            if index.kind != IndexKind::Vector {
-                continue;
-            }
             let key = retrieval_key(&index.table, &index.columns);
-            if let Some(backend) = self.vector_indexes.get_mut(&key) {
-                if backend.is_self_persisting() {
-                    backend.reset()?;
+            match index.kind {
+                IndexKind::Vector => {
+                    if let Some(backend) = self.vector_indexes.get_mut(&key) {
+                        if backend.is_self_persisting() {
+                            backend.reset()?;
+                        }
+                    }
                 }
+                IndexKind::FullText => {
+                    if let Some(backend) = self.text_indexes.get_mut(&key) {
+                        if backend.is_self_persisting() {
+                            backend.reset()?;
+                        }
+                    }
+                }
+                IndexKind::BTree => {}
             }
         }
         Ok(())
@@ -2257,16 +2382,25 @@ impl Engine {
             // it was opened; there is no blob to read. It is held to the same
             // standard all the same — the stamp it carries has to describe the
             // committed rows, or it is stale and the table is rebuilt.
-            if let Some(backend) = self
-                .vector_indexes
-                .get(&retrieval_key(&index.table, &index.columns))
-            {
-                if backend.is_self_persisting() {
-                    if backend.stored_write_version() == Some(self.write_version) {
-                        continue;
-                    }
-                    return Ok(false);
+            let key = retrieval_key(&index.table, &index.columns);
+            let stamp = match index.kind {
+                IndexKind::Vector => self
+                    .vector_indexes
+                    .get(&key)
+                    .filter(|backend| backend.is_self_persisting())
+                    .map(|backend| backend.stored_write_version()),
+                IndexKind::FullText => self
+                    .text_indexes
+                    .get(&key)
+                    .filter(|backend| backend.is_self_persisting())
+                    .map(|backend| backend.stored_write_version()),
+                IndexKind::BTree => unreachable!("filtered out above"),
+            };
+            if let Some(stamp) = stamp {
+                if stamp == Some(self.write_version) {
+                    continue;
                 }
+                return Ok(false);
             }
             let Some(payload) = self.read_saved_index(&index.table, &index.columns)? else {
                 return Ok(false);
@@ -2640,16 +2774,20 @@ impl Engine {
         if !self.indexes_dirty {
             return Ok(());
         }
-        for index in self.text_indexes.values_mut() {
-            index.commit()?;
-        }
         // A self-persisting index is told two things before it commits: which
-        // write version its graph will describe, and whether it may make its
-        // own writes durable. It may not inside a caller's transaction — the
-        // caller's rows are buffered in the same one.
+        // write version its structure will describe, and whether it may make
+        // its own writes durable. It may not inside a caller's transaction —
+        // the caller's rows are buffered in the same one.
         let write_version = self.write_version;
         let may_commit = !self.in_transaction;
         let mut wrote_to_storage = false;
+        for index in self.text_indexes.values_mut() {
+            if index.is_self_persisting() {
+                index.prepare_commit(write_version, may_commit);
+                wrote_to_storage = true;
+            }
+            index.commit()?;
+        }
         for index in self.vector_indexes.values_mut() {
             if index.is_self_persisting() {
                 index.prepare_commit(write_version, may_commit);
@@ -5738,6 +5876,36 @@ fn vector_index_namespace(table: &str, column: &str) -> String {
         table.to_ascii_lowercase(),
         column.to_ascii_lowercase()
     )
+}
+
+/// The base namespace a paged BM25 index keeps its structures under.
+///
+/// The leading `\u{1}` does the same job it does for
+/// [`vector_index_namespace`]: a SQL identifier cannot begin with a control
+/// character and engine metadata keys begin with `\0`, so nothing else in the
+/// tree can produce this prefix.
+///
+/// Two further details are load-bearing rather than cosmetic, both because
+/// this is the one namespace built from a *list* of columns.
+///
+/// * **Every column is `\u{1}`-terminated**, so `(ab, c)` and `(a, bc)` do not
+///   spell the same namespace. A separator a column name could contain — a
+///   dot, as the vector namespace uses for its single column — would let two
+///   different indexes share one set of postings, which is a silent wrong
+///   answer rather than an error.
+/// * **The base therefore never contains `\u{1}\u{1}`**, because a column name
+///   is never empty. [`PagedBm25Index`] derives its dictionary, term and
+///   postings namespaces by appending `\u{1}d`, `\u{1}x` and `\u{1}p`, so
+///   every derived name does contain it — which is what makes a derived name
+///   unable to collide with another index's base no matter what the columns
+///   are called.
+fn full_text_index_namespace(table: &str, columns: &[String]) -> String {
+    let mut namespace = alloc::format!("\u{1}fts:{}\u{1}", table.to_ascii_lowercase());
+    for column in columns {
+        namespace.push_str(&column.to_ascii_lowercase());
+        namespace.push('\u{1}');
+    }
+    namespace
 }
 
 /// What the entry at a saved index's base key holds: which write version the

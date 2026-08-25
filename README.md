@@ -978,6 +978,25 @@ useful one.
   every cache miss during a search is a read from the file. The file format is
   the same either way, so one database can be opened both ways.
   `bench/README.md` reports the measured memory bound.
+- **The in-memory BM25 index is still the default, and holds the whole
+  corpus too.** `Bm25Index` keeps the term dictionary, every postings list and
+  a per-document term list in RAM — measured at ~1,800 bytes per document once
+  the dictionary saturates, so ten million documents is ~17 GiB per connection
+  (`crates/inlaysql/tests/index_memory_cost.rs`).
+  `EngineOptions::paged_text_indexes` opens
+  `inlaysql_core::bm25_paged::PagedBm25Index` instead, which puts all three in
+  the file and reads them through a bounded cache, on the same protocol as the
+  paged ANN index: written inside the engine's transaction, stamped with the
+  write version it describes, rebuilt rather than trusted when that stamp goes
+  stale. **The scores are identical to the in-memory backend, bit for bit**,
+  which is the hard part rather than a detail — BM25's `idf` and length
+  normalisation are corpus-relative, so a backend whose statistics differ in
+  the last place silently reranks. It is asserted against a freshly built
+  index over six corpus shapes, and again through the whole SQL path. It is not
+  the default because the trade is real and it is not the ANN one: writes cost
+  a page per distinct term of the document, so a bulk load grows the file by
+  hundreds of kilobytes per document. `docs/indexes.md` has the layout and the
+  full cost; there is no server flag for it yet.
 - **A paged index stores exact `f32` vectors even for an int8 column.**
   `VECTOR(n, INT8)` shrinks the row and the in-memory graph; the paged graph's
   node records do not quantise yet, so on an int8 column the paged index trades

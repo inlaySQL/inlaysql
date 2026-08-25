@@ -73,6 +73,47 @@ const B: f32 = 0.75;
 /// a mismatch makes the engine rebuild rather than misread.
 const FORMAT_VERSION: u8 = 1;
 
+// ---------------------------------------------------------------- the scalars
+//
+// The four arithmetic steps of Okapi BM25, written once and called from both
+// backends. `crate::bm25_paged` has to return *byte-identical* `Vec<Scored>`,
+// and floating-point arithmetic is not associative, so "the same formula" is
+// not enough — a second transcription that grouped one multiplication
+// differently would produce scores that are equal to a printed decimal and
+// unequal as bits, and would silently rerank hits whose scores differ in the
+// last place. Sharing the expressions is what makes the agreement structural
+// instead of a coincidence that holds until somebody edits one copy.
+
+/// The average document length a query normalises against.
+///
+/// Corpus-relative, which is why a paged backend has to track exactly the same
+/// `live` count and `total_length` sum the in-memory one does: an average that
+/// differs in the last bit changes every score in the answer.
+pub(crate) fn average_length(total_length: u64, live: usize) -> f32 {
+    if live == 0 {
+        return 0.0;
+    }
+    total_length as f32 / live as f32
+}
+
+/// Inverse document frequency of a term appearing in `document_frequency` of
+/// `doc_count` documents.
+pub(crate) fn idf(doc_count: usize, document_frequency: usize) -> f32 {
+    let document_frequency = document_frequency as f32;
+    libm::logf(1.0 + (doc_count as f32 - document_frequency + 0.5) / (document_frequency + 0.5))
+}
+
+/// The length-normalisation denominator term for one document.
+pub(crate) fn length_normalisation(length: u32, average_length: f32) -> f32 {
+    K1 * (1.0 - B + B * length as f32 / average_length.max(f32::EPSILON))
+}
+
+/// One query term's contribution to one document's score.
+pub(crate) fn contribution(idf: f32, frequency: u32, normalisation: f32) -> f32 {
+    let frequency = frequency as f32;
+    idf * (frequency * (K1 + 1.0)) / (frequency + normalisation)
+}
+
 /// Split text into lowercase alphanumeric terms.
 ///
 /// Deliberately crude: no stemming, no stop words. It only has to be
@@ -95,10 +136,15 @@ struct Posting {
 }
 
 /// The extremes of one term's postings, for bounding its contribution.
+///
+/// Shared with [`crate::bm25_paged`], which keeps the same pair per term in
+/// its on-disk term record: a bound computed a different way would prune a
+/// different set of documents, and the whole point of the paged backend is
+/// that it cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Impact {
-    max_frequency: u32,
-    min_length: u32,
+pub(crate) struct Impact {
+    pub(crate) max_frequency: u32,
+    pub(crate) min_length: u32,
 }
 
 impl Default for Impact {
@@ -113,24 +159,26 @@ impl Default for Impact {
 }
 
 impl Impact {
-    fn widen(&mut self, frequency: u32, length: u32) {
+    pub(crate) fn widen(&mut self, frequency: u32, length: u32) {
         self.max_frequency = self.max_frequency.max(frequency);
         self.min_length = self.min_length.min(length);
     }
 
     /// The largest score a document in this term's postings could take.
-    fn ceiling(&self, idf: f32, average_length: f32) -> f32 {
+    pub(crate) fn ceiling(&self, idf: f32, average_length: f32) -> f32 {
         if self.max_frequency == 0 {
             return 0.0;
         }
         let length = if self.min_length == u32::MAX {
-            0.0
+            0
         } else {
-            self.min_length as f32
+            self.min_length
         };
-        let normalisation = K1 * (1.0 - B + B * length / average_length.max(f32::EPSILON));
-        let frequency = self.max_frequency as f32;
-        idf * (frequency * (K1 + 1.0)) / (frequency + normalisation)
+        contribution(
+            idf,
+            self.max_frequency,
+            length_normalisation(length, average_length),
+        )
     }
 }
 
@@ -191,7 +239,7 @@ impl TermWalk<'_> {
 /// descending, row id ascending on a tie — so the `k` this keeps are the `k` a
 /// full sort of everything would have put in front.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Weakest(Scored);
+pub(crate) struct Weakest(pub(crate) Scored);
 
 impl Eq for Weakest {}
 
@@ -217,13 +265,13 @@ impl PartialOrd for Weakest {
 /// This exists for the threshold as much as for the bound on memory: MaxScore
 /// can only skip a document once it knows what score it has to beat, and that
 /// score is this heap's weakest entry.
-struct TopK {
+pub(crate) struct TopK {
     k: usize,
     hits: BinaryHeap<Weakest>,
 }
 
 impl TopK {
-    fn new(k: usize) -> Self {
+    pub(crate) fn new(k: usize) -> Self {
         // Not `with_capacity(k)`: `k` comes from a `LIMIT` and may be any
         // number a user can type, while the heap only ever needs room for as
         // many documents as actually match.
@@ -233,7 +281,7 @@ impl TopK {
         }
     }
 
-    fn offer(&mut self, hit: Scored) {
+    pub(crate) fn offer(&mut self, hit: Scored) {
         if self.hits.len() < self.k {
             self.hits.push(Weakest(hit));
             return;
@@ -249,14 +297,14 @@ impl TopK {
 
     /// The score a document now has to beat, or `None` while there is still
     /// room — until `k` hits are held, nothing can be ruled out.
-    fn threshold(&self) -> Option<f32> {
+    pub(crate) fn threshold(&self) -> Option<f32> {
         if self.hits.len() < self.k {
             return None;
         }
         self.hits.peek().map(|weakest| weakest.0.score)
     }
 
-    fn into_ranked(self) -> Vec<Scored> {
+    pub(crate) fn into_ranked(self) -> Vec<Scored> {
         let mut hits: Vec<Scored> = self.hits.into_iter().map(|weakest| weakest.0).collect();
         sort_by_score_desc(&mut hits);
         hits
@@ -329,10 +377,7 @@ impl Bm25Index {
     }
 
     fn average_length(&self) -> f32 {
-        if self.live == 0 {
-            return 0.0;
-        }
-        self.total_length as f32 / self.live as f32
+        average_length(self.total_length, self.live)
     }
 
     /// The ordinal for `id`, allocating one if this is a new document.
@@ -561,10 +606,7 @@ impl FullTextIndex for Bm25Index {
                 continue;
             };
             let postings = &self.postings[*ordinal as usize];
-            let document_frequency = postings.len() as f32;
-            let idf = libm::logf(
-                1.0 + (doc_count as f32 - document_frequency + 0.5) / (document_frequency + 0.5),
-            );
+            let idf = idf(doc_count, postings.len());
             cursors.push(TermWalk {
                 postings: postings.as_slice(),
                 idf,
@@ -630,8 +672,7 @@ impl FullTextIndex for Bm25Index {
                 None => true,
             };
 
-            let length = self.lengths[next as usize] as f32;
-            let normalisation = K1 * (1.0 - B + B * length / average_length.max(f32::EPSILON));
+            let normalisation = length_normalisation(self.lengths[next as usize], average_length);
             let mut score = 0.0f32;
             // Query order, not `order`: floating-point addition is
             // order-dependent and the published score is the query-order sum.
@@ -640,9 +681,7 @@ impl FullTextIndex for Bm25Index {
             for cursor in &mut cursors {
                 if let Some(frequency) = cursor.seek(next) {
                     if admitted {
-                        let frequency = frequency as f32;
-                        score +=
-                            cursor.idf * (frequency * (K1 + 1.0)) / (frequency + normalisation);
+                        score += contribution(cursor.idf, frequency, normalisation);
                     }
                 }
             }
