@@ -17,6 +17,34 @@ its **verification status**, because they were not all established the same way:
 Nothing here is a promise about when it changes. Some of it is deliberate — see
 `README.md`'s "What this is not" — and stays.
 
+## Where it stands
+
+"Enterprise grade" is not a thing anyone can declare about their own database,
+so this is the nearest checkable substitute: the blockers below, and whether
+each is closed with evidence. It is a scoreboard, not a claim.
+
+| # | Blocker | State |
+| --- | --- | --- |
+| 1 | Foreign commit forced a full retrieval-index rebuild | **closed** |
+| 2 | No backup, restore or PITR | **backup closed**, PITR open (see 3) |
+| 3 | Change log cannot become replication or PITR | open |
+| 4 | Unbounded file growth in server mode | **closed** |
+| 5 | ~1 MiB transaction and statement ceiling | measured; **open by choice** — see the entry |
+| 6 | Fully resident retrieval indexes, per connection | open |
+| 7 | Integer comparison through `f64` above 2^53 | **closed** |
+| 8 | No statement timeout; unbounded materialisation | **materialisation closed**, timeouts/`KILL` open |
+| 9 | No TLS, one user, no grants | open |
+| 10 | Effectively no observability | **`EXPLAIN` closed**, metrics/processlist open |
+
+Closed means: reproduced first, fixed, and pinned by a test that fails against
+the old code — not "a commit mentions it". Blocker 5 is the one deliberately
+left open: the fix that would close it trades atomicity for capacity, and a
+`DELETE FROM t` that half-applies after a crash is worse than one that refuses.
+
+None of this says the engine is ready. It says which of the known reasons it
+was not are gone, and it is the only version of that question this repository
+can answer about itself.
+
 ---
 
 ## Blockers
