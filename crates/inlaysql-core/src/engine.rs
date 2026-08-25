@@ -31,8 +31,8 @@ use crate::collation::Collation;
 use crate::error::{Error, Result};
 use crate::eval::{self, Computed, Env, SharedRng, SubqueryRunner};
 use crate::exec::{
-    Decode, DecodeFilter, ExecRow, Filter, HashJoin, HashJoinTable, IndexProbe, JoinInner,
-    NestedLoopJoin, ProbeKind, RowBytes, RowStream,
+    collect_bounded, Decode, DecodeFilter, ExecRow, Filter, HashJoin, HashJoinTable, IndexProbe,
+    JoinInner, NestedLoopJoin, ProbeKind, RowBytes, RowStream,
 };
 use crate::fusion::{reciprocal_rank_fusion, sort_by_score_desc};
 use crate::hnsw_paged::PagedHnswIndex;
@@ -108,6 +108,16 @@ const DEFAULT_CANDIDATES: usize = 64;
 /// payload rather than multiplying per entry. Set
 /// [`EngineOptions::hash_join_cache_bytes`] to zero to disable it.
 const DEFAULT_HASH_JOIN_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default ceiling for one statement's blocking working set.
+///
+/// Chosen to be far above any sane query and far below any machine this runs
+/// on: a `GROUP BY` over a million ordinary rows costs tens of megabytes, so
+/// nothing legitimate meets this, while a runaway sort over an unbounded scan
+/// meets it long before the operating system starts choosing which process to
+/// kill. It is per statement — see [`EngineOptions::query_memory_bytes`], which
+/// is also how to change it or remove it.
+const DEFAULT_QUERY_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 
 /// Multiplier applied to `LIMIT` when sizing each retriever's candidate list.
 ///
@@ -198,6 +208,31 @@ pub struct EngineOptions {
     /// bypass it. At most one build is held, and a build larger than this
     /// ceiling runs normally without being retained. Set to `0` to disable.
     pub hash_join_cache_bytes: usize,
+    /// Most bytes one statement may hold in a blocking operator's input.
+    ///
+    /// `ORDER BY`, `GROUP BY`, `DISTINCT` and window functions cannot emit
+    /// their first row before they have seen their last input row, so each
+    /// holds its whole input at once — see [`crate::exec`]'s module docs for
+    /// why that is inherent rather than a gap. Without a ceiling the only thing
+    /// that ends such a query is the operating system's out-of-memory killer,
+    /// and that does not end the query, it ends the process. On an embedded
+    /// handle that is one application; on the MySQL-wire server it is every
+    /// other connection as well. This is the number that turns "the process
+    /// died" into [`crate::Error::Memory`] on the one statement responsible,
+    /// with nothing written and the handle still usable.
+    ///
+    /// It is a **per-statement** ceiling, not a per-process one: `n`
+    /// concurrent connections can each be holding this much. Size it against
+    /// the machine divided by the connections it serves.
+    ///
+    /// It bounds the collected input, which is the dominant term, and not what
+    /// the sort, fold or projection then allocate on top of it. Set to `0` to
+    /// remove the ceiling entirely, which is what every caller had before this
+    /// option existed.
+    ///
+    /// Not a spill-to-disk threshold. A query past this is refused, not slowed:
+    /// a refused statement is recoverable and a dead process is not.
+    pub query_memory_bytes: usize,
     /// Let this handle draw on the free list instead of always growing the
     /// file (Phase 2 item 6, `CowBTree::set_page_reuse`).
     ///
@@ -229,6 +264,7 @@ impl Default for EngineOptions {
             paged_vector_indexes: false,
             page_cache_bytes: crate::btree::DEFAULT_PAGE_CACHE_BYTES,
             hash_join_cache_bytes: DEFAULT_HASH_JOIN_CACHE_BYTES,
+            query_memory_bytes: DEFAULT_QUERY_MEMORY_BYTES,
             page_reuse: false,
         }
     }
@@ -557,6 +593,24 @@ impl Engine {
         sql::prepare(sql, &self.catalog)
     }
 
+    /// [`Engine::prepare`] against the committed state as it is *now*, which is
+    /// what [`Engine::execute`] does before it parses and [`Engine::prepare`]
+    /// deliberately does not.
+    ///
+    /// The refresh has to happen *before* the parse or planning reads a catalog
+    /// another handle has already moved on from: a table a second connection
+    /// created a moment ago is "no such table" here, permanently, rather than a
+    /// plan that merely needs re-validating. That is the failure a one-shot
+    /// caller hits — a statement it will plan once, run once and throw away —
+    /// and it is the reason this exists beside `prepare`: a caller that wants
+    /// the plan *and* the pre-parse refresh would otherwise have to reach for
+    /// `execute`, which also runs the statement and hands back a materialised
+    /// [`ResultSet`].
+    pub fn prepare_fresh(&mut self, sql: &str) -> Result<Statement> {
+        self.refresh_snapshot()?;
+        self.prepare(sql)
+    }
+
     /// How many statements this engine has parsed since it was opened.
     ///
     /// Prepared statements exist to keep this number down: `N` executions of
@@ -766,13 +820,50 @@ impl Engine {
     ///
     /// A lost race surfaces as [`Error::Conflict`], exactly as for a
     /// single-statement write: the engine reloads the winner's state and the
-    /// handle stays usable. On a success or a conflict the transaction is over.
+    /// handle stays usable. **Any** failure ends the transaction — the SQL
+    /// contract for a commit that returns an error is that the transaction is
+    /// over and nothing in it happened — so a failure that is not a conflict
+    /// has to discard the buffered writes too.
+    ///
+    /// It did not until this was fixed, and the transaction that exposed it is
+    /// one this whole item is about: a `COMMIT` refused because the write set
+    /// does not fit one WAL region. `in_transaction` went false while the
+    /// storage backend kept the entire write set buffered, which left the
+    /// handle in a state no API could clear —
+    /// [`Engine::rollback`] answers "rollback with no transaction open"
+    /// precisely because the transaction is already over — and left the next
+    /// autocommit statement to commit the abandoned writes along with its own.
+    /// That is the silent-durability failure
+    /// [`Engine::discard_failed_statement`](Self::discard_failed_statement)
+    /// exists to prevent, and the explicit-`COMMIT` path did not reach it:
+    /// [`Plan::is_read_only`](crate::plan::Plan::is_read_only) answers `true`
+    /// for `Plan::Commit`, which is the right answer for the read-only
+    /// connection guard that question is really asked for, and the wrong proxy
+    /// for "this statement left nothing to clean up".
+    ///
+    /// Here it happens to be self-limiting — the write set only ever grows, so
+    /// the next statement fails the same way and *its* discard finally clears
+    /// it — but only because this particular error is permanent. A transient
+    /// one would have made those writes durable at a moment nobody chose.
     pub fn commit(&mut self) -> Result<()> {
         self.require_transaction("commit")?;
         self.bump_write_version()?;
         let result = self.commit_storage();
         self.in_transaction = false;
-        result
+        match result {
+            // A conflict has already done both halves: the storage layer threw
+            // the transaction away and `commit_storage` reloaded this handle
+            // from the winner. Repeating it would only cost a second reload.
+            Ok(()) | Err(Error::Conflict) => result,
+            Err(error) => {
+                // Same two steps, and the same reasoning, as
+                // `discard_failed_statement`: neither can fail for a reason the
+                // error being returned has not already reported.
+                let _ = self.storage.rollback();
+                let _ = self.reload();
+                Err(error)
+            }
+        }
     }
 
     /// Discard every write since [`Engine::begin`], leaving the database
@@ -3744,7 +3835,11 @@ impl Engine {
             };
         }
 
-        let mut rows: Vec<ExecRow> = stream.collect::<Result<Vec<_>>>()?;
+        // Past this point the query is blocking: it has to hold every input row
+        // before it can produce a single output row, so this is where one
+        // statement can take the process down and where the per-statement
+        // ceiling is applied. See [`collect_bounded`].
+        let mut rows: Vec<ExecRow> = collect_bounded(stream, self.options.query_memory_bytes)?;
 
         if is_aggregate {
             rows = self.aggregate(plan, rows, env)?;

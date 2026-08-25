@@ -266,6 +266,91 @@ interleaves four writers across all WAL regions, including real conflicts, and
 asserts recovery always lands on a state produced by some committed
 interleaving. Both run in CI.
 
+## What lifting the one-region ceiling would take
+
+"Each region is bounded; a transaction whose record does not fit one region is
+rejected with an error" is one sentence in *Checkpointing* above, and it is the
+whole of `docs/enterprise-readiness.md` blocker 5: `DELETE FROM t` on a large
+table, a bulk `INSERT ... SELECT` and a wide `UPDATE` are hard errors rather
+than slow paths. `crates/inlaysql/tests/large_statements.rs` pins where each
+one breaks. This section records what the fix costs, because two of the three
+obvious answers are wrong in ways that are only obvious once written down.
+
+**Why the constant is load-bearing.** `WAL_BLOCKS` is not a tuning knob. The
+data area begins at `(region_count × WAL_BLOCKS + 1) × page_size`
+(`wal::data_offset_for`), so the region's size is baked into the address of
+every page in the file: changing it relocates the entire database. That alone
+makes it a format change, before anything about the protocol is touched.
+
+**Why the record copies the pages.** Not redundancy for its own sake. Under the
+torn-write model above, the record is written last and is the only thing
+guaranteed to have a surviving prefix; the data-area pages it describes may be
+gone. A record that cannot rebuild its own pages is not a commit. So the record
+is O(bytes the commit wrote) by construction, and the ceiling follows.
+
+**What does not work.**
+
+* *Spilling one commit into the other three regions.* Ceiling 1 MiB → 4 MiB,
+  paid for with the per-writer region ownership that keeps the reservation gate
+  short: a writer would have to take three more regions' append reservations
+  under the gate, and `Device::commit_point(region)` — the cached answer AHL-468
+  exists to provide — would have to survive a foreign writer having moved a
+  region it does not own. Recovery would need multi-part records that are
+  accepted only when every part is present. All of that for 4×, which does not
+  change the answer to "can I delete this table".
+* *Committing a large statement in several durable batches.* This makes
+  `DELETE FROM t` "succeed" by making it non-atomic: a crash halfway leaves it
+  half-applied. A statement that reports success having done part of itself is
+  strictly worse than one that refuses, and it is what architecture rule 5
+  forbids. The engine does batch internally — `purge_index_entries`, the index
+  save — but only where it owns the transaction and the thing being written is
+  derived state it can rebuild. That argument does not reach a user's `DELETE`.
+* *Spilling the pending write set out of memory.* The bound is not memory.
+  `CowBTree::pending_record_len` is computed from the same `dirty` map that is
+  the resident buffer, so the two are the same quantity and the WAL record
+  refuses first.
+
+**What would work.** Stop the record's size tracking the commit's size. The
+page bytes in the record are, in the no-fault case, an exact duplicate of what
+step 2 already wrote to the data area at *fresh, never-before-used* ids. Two
+shapes follow from that:
+
+1. **Spill the payload, name it from the record.** Write the page bytes to a
+   run of fresh data pages with their own length and checksum, and append a
+   small record naming `(page id, len, checksum)` per chunk. Recovery validates
+   every chunk before accepting the commit; any chunk that fails makes the
+   record not a commit, exactly as a torn record is not a commit today — and
+   rejecting is safe for the same reason step 2's writes are safe, because
+   nothing reachable from the previous committed root lives at those ids. The
+   record shrinks to roughly 20 bytes per 4 KiB of commit, so one region covers
+   a few hundred MiB. Cost: the spilled pages are consumed permanently (never
+   recorded in the free list, reclaimed only by `vacuum`), and it is a new
+   record kind — format version 6.
+2. **Give every data page a checksum and name pages instead of copying them.**
+   Strictly better where it applies — no spill pages, ~340× smaller records —
+   and it retires the "a data page carries no checksum of its own" caveat that
+   both `btree/backup.rs`'s argument and the page-reuse liveness proof above
+   currently have to work around. Cost: the page header changes, so
+   `page::decode` and every page ever written change with it, and recovery
+   grows a validate-don't-replay path beside the existing replay path, because
+   v5 records still carry bytes.
+
+Either is a format version 6 change to the on-disk record layout **and** the
+recovery protocol, so per architecture constraint 3 it needs a deterministic
+simulation pass of its own — and specifically a sweep that asserts it actually
+exercised the spilled path, the way `free_list_reuse_dst.rs` asserts
+`pages_reused()` is nonzero. A sweep whose workloads are all small enough to fit
+one region would pass without testing anything. The failure mode being guarded
+against is recovery accepting a commit that is missing pages, which is silent.
+
+One thing neither shape fixes: a whole-table `DELETE`'s record is dominated by
+the change log, not by the rows. `cdc.rs` writes one entry per changed row,
+repeating the table's name in each, so `DELETE FROM t` is bounded near tens of
+thousands of rows however large the record may become. That needs a summary
+form in the change log — and per `cdc.rs`'s own reasoning it must be an honest
+one, since a silently truncated list is indistinguishable to a consumer from
+nothing having happened.
+
 ## Known limitations
 
 * **Reordered sync during a checkpoint truncation.** A reordered sync that

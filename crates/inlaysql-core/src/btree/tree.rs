@@ -547,10 +547,22 @@ impl<D: Device> CowBTree<D> {
     /// large amount of data can use it, against [`CowBTree::log_capacity`], to
     /// decide when to commit — which it has to do, because a transaction
     /// larger than the log region cannot be committed at all.
+    ///
+    /// The header therefore has to follow the file's format, and until AHL-482
+    /// it did not: this returned the v2–v4 header for every file, so on a v5
+    /// database it under-reported by the sixteen bytes of `prev_seq`/`prev_root`
+    /// the multi-region chain added. Nothing broke, because every caller
+    /// compares against *half* the region — but "exact" was untrue, and a
+    /// caller that believed the doc comment and budgeted against the whole
+    /// region would have been handed a record that did not fit.
     pub fn pending_record_len(&self) -> usize {
-        // Length prefix, seq, root, next, page count, and the trailing
-        // checksum — then each page with its id and length.
-        let header = 4 + 8 + 8 + 8 + 4 + 8;
+        // Length prefix, seq, the v5 predecessor link, root, next, page count,
+        // and the trailing checksum — then each page with its id and length.
+        let header = if self.format_version >= crate::wal::MULTI_REGION_FORMAT_VERSION {
+            4 + 8 + 8 + 8 + 8 + 8 + 4 + 8
+        } else {
+            4 + 8 + 8 + 8 + 4 + 8
+        };
         header
             + self
                 .dirty
@@ -3607,6 +3619,45 @@ mod tests {
         db.put(b"k", b"v").unwrap();
         db.commit().unwrap();
         assert_eq!(db.get(b"k").unwrap(), Some(RowBuf::Owned(b"v".to_vec())));
+    }
+
+    /// [`CowBTree::pending_record_len`] says "exact, not an estimate", and a
+    /// caller sizing a bulk load against [`CowBTree::log_capacity`] is trusting
+    /// that word — a short answer hands back a record the log will refuse.
+    /// So it is checked against the encoder rather than against a constant,
+    /// which is what would have caught it returning the v2–v4 header for a v5
+    /// file (AHL-482).
+    #[test]
+    fn the_pending_record_length_is_exactly_what_the_encoder_produces() {
+        let mut db = CowBTree::create(disk(), PAGE).unwrap();
+        assert_eq!(db.format_version(), FORMAT_VERSION);
+        // An empty transaction, one page, and enough pages to split the tree —
+        // the size has to track the dirty set, not just the fixed header.
+        for keys in [0usize, 1, 200] {
+            for key in 0..keys {
+                db.put(&format!("k{key:04}").into_bytes(), &[7u8; 32])
+                    .unwrap();
+            }
+            let record = crate::wal::WalRecord {
+                seq: db.next_seq,
+                prev_seq: db.checkpoint_seq,
+                prev_root: db.root,
+                root: db.pending_root,
+                next: db.pending_next,
+                pages: db
+                    .dirty
+                    .iter()
+                    .map(|(&id, bytes)| (id, bytes.clone()))
+                    .collect(),
+            };
+            assert_eq!(
+                db.pending_record_len(),
+                crate::wal::encode_record(&record).len(),
+                "{keys} keys, {} dirty pages",
+                db.dirty.len()
+            );
+            db.commit().unwrap();
+        }
     }
 
     #[test]
