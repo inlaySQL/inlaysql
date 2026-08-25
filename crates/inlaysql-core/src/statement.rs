@@ -106,6 +106,17 @@ impl Statement {
         self.plan.is_read_only()
     }
 
+    /// Every name this statement touches, and what it does to each — see
+    /// [`Plan::table_access`], which this forwards to unchanged.
+    ///
+    /// Exposed on the statement because that is what a caller holds *before*
+    /// running anything: a wire server authorises a plan it has prepared and
+    /// not yet executed, which is the only order in which a refusal can still
+    /// prevent the access.
+    pub fn table_access(&self) -> Vec<(&str, crate::plan::TableAccess)> {
+        self.plan.table_access()
+    }
+
     /// Check that `params` and `catalog` are what this plan was built for.
     ///
     /// Run before every execution. Both failures are the same kind of bug —

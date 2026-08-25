@@ -55,12 +55,14 @@ pub mod traits;
 pub mod value;
 pub mod wal;
 
-pub use catalog::{Catalog, Column, Index, IndexKind, Table};
+pub use catalog::{
+    is_reserved_table_name, Catalog, Column, Index, IndexKind, Table, RESERVED_TABLE_PREFIX,
+};
 pub use cdc::{Change, ChangeKind, Changes};
 pub use collation::Collation;
 pub use engine::{Engine, EngineOptions, Outcome, ResultSet};
 pub use error::{Error, Result};
-pub use plan::ColumnInfo;
+pub use plan::{ColumnInfo, TableAccess};
 pub use shared::SharedStorage;
 pub use statement::Statement;
 pub use storage::TreeStorage;

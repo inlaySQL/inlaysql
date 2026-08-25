@@ -148,6 +148,153 @@ impl Plan {
         )
     }
 
+    /// Every name this plan touches, and what it does to each.
+    ///
+    /// **Written for authorisation, and only sound because it is derived from
+    /// the resolved plan rather than from the statement's text.** A caller
+    /// deciding whether a user may run `SELECT (SELECT secret FROM vault) FROM
+    /// public` has to see *both* tables; a keyword scan over the text that
+    /// finds only the first one is a privilege bypass, not a cosmetic miss.
+    /// The MySQL-wire server's per-table grants are checked against exactly
+    /// this list — see `crates/inlaysql-server/src/acl.rs`.
+    ///
+    /// Deliberately *not* [`Plan::tables`], which exists for a different job:
+    /// that one lists the tables whose *shape* a plan's ordinals depend on, so
+    /// it leaves out `DROP TABLE`/`ALTER TABLE`'s own target (nothing to go
+    /// stale) and misses the tables an `UPDATE`'s or `DELETE`'s subqueries
+    /// read. Both omissions would be holes here.
+    ///
+    /// The name in each pair is a **table** name except for
+    /// [`TableAccess::DropIndex`], where it is an *index* name — SQLite's
+    /// `DROP INDEX` names no table at all, so a caller that needs one has to
+    /// resolve it through the catalog. Keeping that case in its own variant is
+    /// what stops an index name being read as a table name.
+    ///
+    /// The match below has no wildcard arm on purpose: a new [`Plan`] variant
+    /// must fail to compile here rather than default to "touches nothing",
+    /// which an authorisation caller would read as "anyone may run it".
+    pub fn table_access(&self) -> Vec<(&str, TableAccess)> {
+        let mut out = Vec::new();
+        let mut reads: Vec<&str> = Vec::new();
+
+        match self {
+            // The table does not exist yet, so there is nothing to read; the
+            // name is still the one a per-table grant would be written for.
+            Plan::CreateTable(create) => {
+                out.push((create.table.name.as_str(), TableAccess::Create))
+            }
+            Plan::DropTable(drop) => out.push((drop.name.as_str(), TableAccess::Drop)),
+            Plan::AlterTable(alter) => out.push((alter.table.as_str(), TableAccess::Alter)),
+            // Building an index reads every row of the table to fill it, and
+            // changes what the table costs to write for ever after. Both
+            // spellings name their target, so both are attributable.
+            Plan::CreateIndex(create) => {
+                out.push((create.table.as_str(), TableAccess::Create));
+                out.push((create.table.as_str(), TableAccess::Read));
+            }
+            Plan::CreateUniqueIndex(create) => {
+                out.push((create.table.as_str(), TableAccess::Create));
+                out.push((create.table.as_str(), TableAccess::Read));
+            }
+            Plan::DropIndex(drop) => out.push((drop.name.as_str(), TableAccess::DropIndex)),
+            Plan::Insert(insert) => {
+                let target = insert.table.as_str();
+                out.push((target, TableAccess::Insert));
+                // The conflict policy can do more to the target than an insert
+                // does, and each extra thing is a different privilege: `INSERT
+                // OR REPLACE`/`REPLACE INTO` deletes the rows it collides
+                // with, and `ON CONFLICT ... DO UPDATE` reads and rewrites
+                // them. MySQL draws the same two lines.
+                match &insert.on_conflict.action {
+                    ConflictAction::Replace => out.push((target, TableAccess::Delete)),
+                    ConflictAction::Update(update) => {
+                        out.push((target, TableAccess::Update));
+                        out.push((target, TableAccess::Read));
+                        for (_, expr) in &update.assignments {
+                            expr.tables_read(&mut reads);
+                        }
+                        if let Some(filter) = &update.filter {
+                            filter.tables_read(&mut reads);
+                        }
+                    }
+                    ConflictAction::Abort | ConflictAction::Ignore => {}
+                }
+                match &insert.source {
+                    InsertSource::Values(rows) => {
+                        for row in rows {
+                            for cell in row.iter().flatten() {
+                                cell.tables_read(&mut reads);
+                            }
+                        }
+                    }
+                    InsertSource::Select { query, .. } => query.tables_read(&mut reads),
+                }
+                if let Some(items) = &insert.returning {
+                    out.push((target, TableAccess::Read));
+                    select_items_tables_read(items, &mut reads);
+                }
+            }
+            Plan::Update(update) => {
+                let target = update.table.as_str();
+                out.push((target, TableAccess::Update));
+                // An `UPDATE` that picks its rows with a `WHERE`, computes a
+                // new value from the old one, or projects a `RETURNING` is
+                // reading the table as well as writing it, and MySQL wants
+                // SELECT for exactly that. A blind `UPDATE t SET x = 1` reads
+                // nothing and needs nothing extra.
+                let mut reads_target = update.filter.is_some() || update.returning.is_some();
+                for (_, expr) in &update.assignments {
+                    if !matches!(expr, Expr::Literal(_) | Expr::Param(_)) {
+                        reads_target = true;
+                    }
+                    expr.tables_read(&mut reads);
+                }
+                if let Some(filter) = &update.filter {
+                    filter.tables_read(&mut reads);
+                }
+                if let Some(items) = &update.returning {
+                    select_items_tables_read(items, &mut reads);
+                }
+                if reads_target {
+                    out.push((target, TableAccess::Read));
+                }
+            }
+            Plan::Delete(delete) => {
+                let target = delete.table.as_str();
+                out.push((target, TableAccess::Delete));
+                if delete.filter.is_some() || delete.returning.is_some() {
+                    out.push((target, TableAccess::Read));
+                }
+                if let Some(filter) = &delete.filter {
+                    filter.tables_read(&mut reads);
+                }
+                if let Some(items) = &delete.returning {
+                    select_items_tables_read(items, &mut reads);
+                }
+            }
+            Plan::Select(select) => select.tables_read(&mut reads),
+            Plan::SetOperation(plan) => plan.tables_read(&mut reads),
+            // No `FROM`, but a scalar subquery in the projection still reads
+            // whatever it names: `SELECT (SELECT secret FROM vault)`.
+            Plan::Scalar(scalar) => {
+                for item in &scalar.items {
+                    item.expr.tables_read(&mut reads);
+                }
+            }
+            // `EXPLAIN` never runs the statement inside it, but it does
+            // describe it — which index answers which predicate is a fact
+            // about the data. It carries the wrapped statement's requirements
+            // unchanged rather than being free to run.
+            Plan::Explain(inner) => return inner.table_access(),
+            // These write nothing and name nothing. Transaction control is a
+            // session-level act, not a table-level one.
+            Plan::Begin | Plan::Commit | Plan::Rollback => {}
+        }
+
+        out.extend(reads.into_iter().map(|table| (table, TableAccess::Read)));
+        out
+    }
+
     /// This statement's output columns, in projection order — empty for a
     /// statement that produces no rows (a `CREATE TABLE`, an `INSERT` with no
     /// `RETURNING`, `BEGIN`, and so on).
@@ -203,6 +350,50 @@ impl Plan {
             | Plan::Begin
             | Plan::Commit
             | Plan::Rollback => Vec::new(),
+        }
+    }
+}
+
+/// What a statement does to one name it touches.
+///
+/// See [`Plan::table_access`], which is the only thing that produces these and
+/// which explains why they are derived from the plan rather than from the
+/// statement's text.
+///
+/// The engine itself enforces none of this — it has no notion of a user. This
+/// is a *description*, for a layer that does: the MySQL-wire server maps each
+/// variant onto the MySQL privilege of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableAccess {
+    /// Rows are read from the named table.
+    Read,
+    /// Rows are added to it.
+    Insert,
+    /// Stored rows are rewritten in it.
+    Update,
+    /// Stored rows are removed from it.
+    Delete,
+    /// It is created, or an index over it is.
+    Create,
+    /// It is dropped.
+    Drop,
+    /// Its definition is changed.
+    Alter,
+    /// The named **index** is dropped. The name is an index name, not a table
+    /// name: `DROP INDEX` names no table, so a caller that wants to check a
+    /// per-table grant has to resolve the index through the catalog first.
+    DropIndex,
+}
+
+/// Record every stored table a `RETURNING` list reads.
+///
+/// The same walk [`SelectPlan::tables_read`] does over its own projection, and
+/// for the same reason: a projected item may be a scalar subquery over a table
+/// nothing else in the statement names.
+fn select_items_tables_read<'a>(items: &'a [SelectItem], out: &mut Vec<&'a str>) {
+    for item in items {
+        if let SelectItem::Expr { expr, .. } = item {
+            expr.tables_read(out);
         }
     }
 }

@@ -11,9 +11,16 @@
 //! caching_sha2_password:  SHA256(password) XOR SHA256(SHA256(SHA256(password)) || scramble)
 //! ```
 //!
-//! and the server, which knows the password, recomputes the same value and
-//! compares. That the scramble is *unpredictable* is what stops a recorded
-//! login being replayed later, which is why [`scramble`] insists on real
+//! and the server checks it. **The server does not know the password**, and
+//! since AHL-497 it does not store one either: what it keeps per account is
+//! the plugin's stage-two digest — `SHA1(SHA1(password))` or
+//! `SHA256(SHA256(password))` — which is enough to *check* a token and not
+//! enough to *make* one, since making one needs a preimage of that digest.
+//! Both verifications below therefore run backwards: strip the scramble mask
+//! off the client's token, recover the `SHA1(password)`/`SHA256(password)` it
+//! claims, and hash that once more to see whether it lands on the digest on
+//! disk. That the scramble is *unpredictable* is what stops a recorded login
+//! being replayed later, which is why [`scramble`] insists on real
 //! operating-system entropy.
 //!
 //! `caching_sha2_password`'s concatenation order — the stage-two digest
@@ -29,10 +36,10 @@
 //! authentication over a secure channel, so that a later connection's fast
 //! scramble can be checked against the cache without asking for the password
 //! again — the "caching" the plugin is named for. This server has no such
-//! cache and needs none: it already holds the plaintext password (v1's single
-//! user/password, from `--password`/`--password-env`), so the fast scramble
-//! above is *always* checkable directly, without ever needing what MySQL
-//! calls a cache hit.
+//! cache and needs none: [`sha2_verifier`] is precisely the value that cache
+//! would hold, and it is on disk from the moment the account is created, so
+//! the fast scramble above is *always* checkable and there is no cache-miss
+//! case to fall back from.
 //!
 //! What still needs handling is a client that does not attempt the fast
 //! scramble — an empty first response, asking the server what to do. This
@@ -41,6 +48,10 @@
 //! paper: v1 is documented plaintext-localhost (`docs/server.md`), so a
 //! cleartext password crossing an already-plaintext connection reveals
 //! nothing a network observer could not already read directly off the wire.
+//! **A hash-only store did not cost this path**, which was the open question
+//! when the store was designed: hashing what the client just sent and
+//! comparing digests is the same check the fast path makes, so nothing had to
+//! be weakened to keep it (see [`verify_caching_sha2_cleartext`]).
 //! The RSA public-key exchange real MySQL falls back to on an *unencrypted*
 //! connection without a cached hash is refused with a clear error instead of
 //! implemented, in `connection.rs`'s authentication path.
@@ -147,45 +158,104 @@ pub fn sha1(message: &[u8]) -> [u8; 20] {
     out
 }
 
-/// The token a client is expected to send for `password` against `challenge`.
+/// Compare two secrets without leaking where they first differ.
 ///
-/// An empty password has an empty token: the client sends no bytes at all
-/// rather than a hash of the empty string, which is the protocol's way of
-/// saying "there is no password".
-pub fn expected_token(password: &str, challenge: &[u8]) -> Vec<u8> {
-    if password.is_empty() {
-        return Vec::new();
-    }
-    let stage1 = sha1(password.as_bytes());
-    let stage2 = sha1(&stage1);
-
-    let mut salted = Vec::with_capacity(challenge.len() + stage2.len());
-    salted.extend_from_slice(challenge);
-    salted.extend_from_slice(&stage2);
-    let scrambled = sha1(&salted);
-
-    stage1
-        .iter()
-        .zip(scrambled.iter())
-        .map(|(a, b)| a ^ b)
-        .collect()
-}
-
-/// Whether `response` proves knowledge of `password`, under
-/// `mysql_native_password`'s scramble.
-///
-/// The comparison is constant-time in the bytes compared: a caller cannot learn
-/// how much of a guess was right by timing the rejection.
-pub fn verify(password: &str, challenge: &[u8], response: &[u8]) -> bool {
-    let expected = expected_token(password, challenge);
-    if expected.len() != response.len() {
+/// The length is compared first and in the clear, which is not a leak worth
+/// closing here: every secret this module compares is a fixed-width digest, so
+/// a wrong length means a malformed packet rather than a nearly-right guess.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
         return false;
     }
     let mut difference = 0u8;
-    for (a, b) in expected.iter().zip(response.iter()) {
-        difference |= a ^ b;
+    for (x, y) in a.iter().zip(b.iter()) {
+        difference |= x ^ y;
     }
     difference == 0
+}
+
+/// What a stored `mysql_native_password` verifier says.
+enum NativeVerifier {
+    /// The account has no password: the client is expected to send no token.
+    Empty,
+    /// `SHA1(SHA1(password))`, the only thing the server needs to know.
+    Stage2([u8; 20]),
+    /// Not a verifier this server wrote. Never authenticates — a store that
+    /// has been damaged or hand-edited must lock the account out, not open it.
+    Malformed,
+}
+
+/// The `mysql_native_password` verifier for `password`, in MySQL's own
+/// `mysql.user.authentication_string` spelling: `*` followed by the uppercase
+/// hex of `SHA1(SHA1(password))`, or the empty string for an empty password.
+///
+/// **This is the whole of what is stored, and it is not the password.** The
+/// protocol's fast path is checkable from the stage-two digest alone (see
+/// [`verify_native`]), which is why a hash-only account store can still
+/// complete every exchange this server implements. What it is *not* is a
+/// password hash in the sense a login form's would be: it is unsalted and two
+/// fast SHA-1s deep, because the plugin's own definition fixes it. See
+/// `docs/server.md`, "Where users live", for the trade that makes and why the
+/// alternative (a salted, iterated digest) would force every connection
+/// through a cleartext exchange instead.
+pub fn native_verifier(password: &str) -> String {
+    if password.is_empty() {
+        return String::new();
+    }
+    let stage2 = sha1(&sha1(password.as_bytes()));
+    let mut out = String::with_capacity(1 + stage2.len() * 2);
+    out.push('*');
+    out.push_str(&hex(&stage2));
+    out
+}
+
+fn native_verifier_of(verifier: &str) -> NativeVerifier {
+    if verifier.is_empty() {
+        return NativeVerifier::Empty;
+    }
+    let Some(digits) = verifier.strip_prefix('*') else {
+        return NativeVerifier::Malformed;
+    };
+    match unhex::<20>(digits) {
+        Some(stage2) => NativeVerifier::Stage2(stage2),
+        None => NativeVerifier::Malformed,
+    }
+}
+
+/// Whether `response` proves knowledge of the password behind `verifier`,
+/// under `mysql_native_password`'s scramble.
+///
+/// The client sends `SHA1(password) XOR SHA1(challenge || stage2)`. The server
+/// knows `stage2`, so it can strip the mask off, recover the client's claimed
+/// `SHA1(password)`, and hash it once more: the result must be `stage2` again.
+/// **That is why the password itself never has to be stored** — recovering
+/// `stage2` from a token needs the password, and forging a token from `stage2`
+/// alone needs a SHA-1 preimage.
+///
+/// The final comparison is constant-time: a caller cannot learn how much of a
+/// guess was right by timing the rejection.
+pub fn verify_native(verifier: &str, challenge: &[u8], response: &[u8]) -> bool {
+    match native_verifier_of(verifier) {
+        // The protocol's way of saying "there is no password" is to send no
+        // bytes at all, not a hash of the empty string.
+        NativeVerifier::Empty => response.is_empty(),
+        NativeVerifier::Malformed => false,
+        NativeVerifier::Stage2(stage2) => {
+            if response.len() != 20 {
+                return false;
+            }
+            let mut salted = Vec::with_capacity(challenge.len() + stage2.len());
+            salted.extend_from_slice(challenge);
+            salted.extend_from_slice(&stage2);
+            let mask = sha1(&salted);
+
+            let mut claimed = [0u8; 20];
+            for (slot, (token, mask)) in claimed.iter_mut().zip(response.iter().zip(mask.iter())) {
+                *slot = token ^ mask;
+            }
+            constant_time_eq(&sha1(&claimed), &stage2)
+        }
+    }
 }
 
 // ---------------------------------------------------------------- SHA-256
@@ -332,57 +402,114 @@ pub fn sha256(message: &[u8]) -> [u8; 32] {
     out
 }
 
-/// `caching_sha2_password`'s fast-authentication scramble:
-/// `XOR(SHA256(password), SHA256(SHA256(SHA256(password)) || scramble))` —
-/// see the module docs for why the concatenation order is what it is.
+/// The `caching_sha2_password` verifier for `password`: the uppercase hex of
+/// `SHA256(SHA256(password))`.
 ///
-/// Unlike [`expected_token`], there is no empty-password special case: the
-/// plugin never skips the hash, so `SHA256("")` is scrambled like any other
+/// **This is deliberately not MySQL's own `$A$005$...` spelling**, which is a
+/// salted, 5000-round SHA-256-crypt digest. That form is only usable on
+/// MySQL's *full*-authentication path, where the client has already sent the
+/// cleartext password — over TLS, or after an RSA exchange. This server has
+/// neither, so storing it would mean every connection completing full
+/// authentication over a plaintext link, which is strictly worse than what is
+/// here. What is stored instead is exactly the value real MySQL keeps in its
+/// in-memory *cache* (the "caching" the plugin is named for), which is what
+/// the fast scramble is checked against — see [`verify_caching_sha2`], and
+/// `docs/server.md` for the whole argument.
+///
+/// Unlike [`native_verifier`] there is no empty-password special case: the
+/// plugin never skips the hash, so `SHA256("")` is hashed like any other
 /// password would be.
-pub fn caching_sha2_token(password: &str, scramble: &[u8]) -> [u8; 32] {
-    let stage1 = sha256(password.as_bytes());
-    let stage2 = sha256(&stage1);
-
-    let mut salted = Vec::with_capacity(stage2.len() + scramble.len());
-    salted.extend_from_slice(&stage2);
-    salted.extend_from_slice(scramble);
-    let stage3 = sha256(&salted);
-
-    let mut token = [0u8; 32];
-    for (slot, (a, b)) in token.iter_mut().zip(stage1.iter().zip(stage3.iter())) {
-        *slot = a ^ b;
-    }
-    token
+pub fn sha2_verifier(password: &str) -> String {
+    hex(&sha256(&sha256(password.as_bytes())))
 }
 
-/// Whether `response` proves knowledge of `password`, under
-/// `caching_sha2_password`'s fast-authentication scramble. `false` for
-/// anything that is not exactly 32 bytes — the caller decides from that
-/// whether this was a fast-auth attempt at all, but this function does not
-/// take it on faith.
-pub fn caching_sha2_verify(password: &str, scramble: &[u8], response: &[u8]) -> bool {
+/// `SHA256(SHA256(password))` back out of a stored verifier, or `None` if the
+/// verifier is not one this server wrote — in which case the account never
+/// authenticates, rather than authenticating anything.
+fn sha2_stage2(verifier: &str) -> Option<[u8; 32]> {
+    unhex::<32>(verifier)
+}
+
+/// Whether `response` proves knowledge of the password behind `verifier`,
+/// under `caching_sha2_password`'s fast-authentication scramble.
+///
+/// The client sends
+/// `XOR(SHA256(password), SHA256(SHA256(SHA256(password)) || scramble))` — see
+/// the module docs for why the concatenation order is what it is, and the
+/// opposite of `mysql_native_password`'s. As in [`verify_native`], the server
+/// strips the mask (which it can build from `stage2` and the scramble),
+/// recovers the claimed `SHA256(password)` and hashes it once more.
+///
+/// `false` for anything that is not exactly 32 bytes — the caller decides from
+/// the length whether this was a fast-auth attempt at all, but this function
+/// does not take it on faith.
+pub fn verify_caching_sha2(verifier: &str, scramble: &[u8], response: &[u8]) -> bool {
     if response.len() != 32 {
         return false;
     }
-    let expected = caching_sha2_token(password, scramble);
-    let mut difference = 0u8;
-    for (a, b) in expected.iter().zip(response.iter()) {
-        difference |= a ^ b;
+    let Some(stage2) = sha2_stage2(verifier) else {
+        return false;
+    };
+    let mut salted = Vec::with_capacity(stage2.len() + scramble.len());
+    salted.extend_from_slice(&stage2);
+    salted.extend_from_slice(scramble);
+    let mask = sha256(&salted);
+
+    let mut claimed = [0u8; 32];
+    for (slot, (token, mask)) in claimed.iter_mut().zip(response.iter().zip(mask.iter())) {
+        *slot = token ^ mask;
     }
-    difference == 0
+    constant_time_eq(&sha256(&claimed), &stage2)
 }
 
-/// Whether `payload` — the bytes a client sends after `perform_full_
-/// authentication` — is `password`, NUL-terminated per the protocol or not
-/// (the terminator is a framing convention, not part of the secret).
+/// Whether `payload` — the bytes a client sends after
+/// `perform_full_authentication` — is the password behind `verifier`,
+/// NUL-terminated per the protocol or not (the terminator is a framing
+/// convention, not part of the secret).
 ///
-/// Not constant-time, unlike [`verify`]/[`caching_sha2_verify`]: the secret
-/// being compared here already crossed this plaintext connection in the
-/// clear, immediately before this call, so a timing difference tells an
-/// eavesdropper nothing they could not already read straight off the wire.
-pub fn caching_sha2_full_auth_verify(password: &str, payload: &[u8]) -> bool {
-    let trimmed = payload.strip_suffix(&[0u8]).unwrap_or(payload);
-    trimmed == password.as_bytes()
+/// **This path survives the move to a hash-only store**, which was not
+/// obvious: it used to compare the cleartext against a cleartext password held
+/// in memory, and there is no longer one. It does not need one — the server
+/// can hash what the client sent and compare *that* to the stored verifier,
+/// which is the same check the fast path makes and needs nothing extra on
+/// disk. The comparison is constant-time now too, which the cleartext one was
+/// not; that is a free improvement rather than a fix for a live leak, since
+/// the secret being compared here crossed this plaintext connection in the
+/// clear immediately before the call.
+pub fn verify_caching_sha2_cleartext(verifier: &str, payload: &[u8]) -> bool {
+    let Some(stage2) = sha2_stage2(verifier) else {
+        return false;
+    };
+    let cleartext = payload.strip_suffix(&[0u8]).unwrap_or(payload);
+    constant_time_eq(&sha256(&sha256(cleartext)), &stage2)
+}
+
+// ------------------------------------------------------------------- hex
+
+/// Uppercase hex, the spelling MySQL's own `authentication_string` uses.
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from_digit((byte >> 4) as u32, 16).unwrap_or('0'));
+        out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap_or('0'));
+    }
+    out.to_ascii_uppercase()
+}
+
+/// Exactly `N` bytes of hex, or `None`. Strict about the length on purpose: a
+/// short verifier decoded leniently would compare equal to a short digest.
+fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    if text.len() != N * 2 {
+        return None;
+    }
+    let mut out = [0u8; N];
+    let bytes = text.as_bytes();
+    for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        *slot = ((high << 4) | low) as u8;
+    }
+    Some(out)
 }
 
 /// A fresh challenge, from operating-system entropy.
@@ -411,6 +538,38 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// What a `mysql_native_password` *client* sends. Written out here rather
+    /// than called from the library on purpose: the library no longer has a
+    /// forward direction to call — it only ever checks — so a test that built
+    /// its token with the server's own code would be testing nothing.
+    fn native_token(password: &str, challenge: &[u8]) -> Vec<u8> {
+        if password.is_empty() {
+            return Vec::new();
+        }
+        let stage1 = sha1(password.as_bytes());
+        let stage2 = sha1(&stage1);
+        let mut salted = challenge.to_vec();
+        salted.extend_from_slice(&stage2);
+        let mask = sha1(&salted);
+        stage1.iter().zip(mask.iter()).map(|(a, b)| a ^ b).collect()
+    }
+
+    /// What a `caching_sha2_password` client sends on the fast path. Note the
+    /// concatenation order: the stage-two digest *before* the scramble, the
+    /// opposite of `mysql_native_password`'s own.
+    fn caching_sha2_token(password: &str, scramble: &[u8]) -> [u8; 32] {
+        let stage1 = sha256(password.as_bytes());
+        let stage2 = sha256(&stage1);
+        let mut salted = stage2.to_vec();
+        salted.extend_from_slice(scramble);
+        let mask = sha256(&salted);
+        let mut token = [0u8; 32];
+        for (slot, (a, b)) in token.iter_mut().zip(stage1.iter().zip(mask.iter())) {
+            *slot = a ^ b;
+        }
+        token
     }
 
     /// The published RFC 3174 / FIPS 180-1 vectors. These are the whole reason
@@ -452,17 +611,25 @@ mod tests {
     #[test]
     fn a_correct_token_verifies() {
         let challenge = [7u8; SCRAMBLE_LEN];
-        let token = expected_token("hunter2", &challenge);
+        let token = native_token("hunter2", &challenge);
         assert_eq!(token.len(), 20);
-        assert!(verify("hunter2", &challenge, &token));
+        assert!(verify_native(
+            &native_verifier("hunter2"),
+            &challenge,
+            &token
+        ));
     }
 
     #[test]
     fn a_wrong_password_is_refused() {
         let challenge = [7u8; SCRAMBLE_LEN];
-        let token = expected_token("hunter2", &challenge);
-        assert!(!verify("hunter3", &challenge, &token));
-        assert!(!verify("", &challenge, &token));
+        let token = native_token("hunter2", &challenge);
+        assert!(!verify_native(
+            &native_verifier("hunter3"),
+            &challenge,
+            &token
+        ));
+        assert!(!verify_native(&native_verifier(""), &challenge, &token));
     }
 
     /// The property the challenge exists for: the same password produces a
@@ -470,17 +637,60 @@ mod tests {
     /// be replayed against the next one.
     #[test]
     fn a_token_does_not_transfer_between_challenges() {
-        let token = expected_token("hunter2", &[7u8; SCRAMBLE_LEN]);
-        assert!(!verify("hunter2", &[8u8; SCRAMBLE_LEN], &token));
+        let token = native_token("hunter2", &[7u8; SCRAMBLE_LEN]);
+        assert!(!verify_native(
+            &native_verifier("hunter2"),
+            &[8u8; SCRAMBLE_LEN],
+            &token
+        ));
     }
 
     #[test]
     fn an_empty_password_expects_an_empty_token() {
         let challenge = [7u8; SCRAMBLE_LEN];
-        assert!(verify("", &challenge, &[]));
-        assert!(!verify("", &challenge, &[0u8; 20]));
+        let empty = native_verifier("");
+        assert!(empty.is_empty(), "an empty password stores no digest");
+        assert!(verify_native(&empty, &challenge, &[]));
+        assert!(!verify_native(&empty, &challenge, &[0u8; 20]));
         // And a real password is never satisfied by sending nothing.
-        assert!(!verify("hunter2", &challenge, &[]));
+        assert!(!verify_native(&native_verifier("hunter2"), &challenge, &[]));
+    }
+
+    /// The stored verifier is MySQL's own `authentication_string` spelling, so
+    /// an operator can recognise it — and, more to the point, so that what is
+    /// on disk is visibly a digest rather than a password. Checked against a
+    /// value MySQL itself produces for this password.
+    #[test]
+    fn the_native_verifier_is_mysqls_own_spelling() {
+        let verifier = native_verifier("hunter2");
+        assert_eq!(verifier.len(), 41);
+        assert!(verifier.starts_with('*'));
+        assert_eq!(verifier, "*58815970BE77B3720276F63DB198B1FA42E5CC02");
+        assert!(!verifier.contains("hunter2"));
+    }
+
+    /// A store that has been damaged or hand-edited must lock the account out
+    /// rather than open it: every malformed verifier below refuses every
+    /// token, including the empty one an unset password would accept.
+    #[test]
+    fn a_malformed_verifier_never_authenticates() {
+        let challenge = [7u8; SCRAMBLE_LEN];
+        for verifier in [
+            "*",
+            "*zz",
+            "hunter2",
+            "*58815970BE77B3720276F63DB198B1FA42E5CC0",
+        ] {
+            assert!(!verify_native(verifier, &challenge, &[]));
+            assert!(!verify_native(verifier, &challenge, &[0u8; 20]));
+            assert!(!verify_native(
+                verifier,
+                &challenge,
+                &native_token("hunter2", &challenge)
+            ));
+        }
+        assert!(!verify_caching_sha2("", &challenge, &[0u8; 32]));
+        assert!(!verify_caching_sha2_cleartext("", b"hunter2"));
     }
 
     // -------------------------------------------------------------- SHA-256
@@ -523,15 +733,23 @@ mod tests {
         let scramble = [7u8; SCRAMBLE_LEN];
         let token = caching_sha2_token("hunter2", &scramble);
         assert_eq!(token.len(), 32);
-        assert!(caching_sha2_verify("hunter2", &scramble, &token));
+        assert!(verify_caching_sha2(
+            &sha2_verifier("hunter2"),
+            &scramble,
+            &token
+        ));
     }
 
     #[test]
     fn a_wrong_password_is_refused_under_caching_sha2_too() {
         let scramble = [7u8; SCRAMBLE_LEN];
         let token = caching_sha2_token("hunter2", &scramble);
-        assert!(!caching_sha2_verify("hunter3", &scramble, &token));
-        assert!(!caching_sha2_verify("", &scramble, &token));
+        assert!(!verify_caching_sha2(
+            &sha2_verifier("hunter3"),
+            &scramble,
+            &token
+        ));
+        assert!(!verify_caching_sha2(&sha2_verifier(""), &scramble, &token));
     }
 
     /// Same property `a_token_does_not_transfer_between_challenges` pins for
@@ -540,29 +758,36 @@ mod tests {
     #[test]
     fn a_caching_sha2_token_does_not_transfer_between_scrambles() {
         let token = caching_sha2_token("hunter2", &[7u8; SCRAMBLE_LEN]);
-        assert!(!caching_sha2_verify(
-            "hunter2",
+        assert!(!verify_caching_sha2(
+            &sha2_verifier("hunter2"),
             &[8u8; SCRAMBLE_LEN],
             &token
         ));
     }
 
     /// Unlike `mysql_native_password`, an empty password has no special
-    /// empty-token case — the plugin always sends the full 32-byte scramble.
+    /// empty-token case — the plugin always sends the full 32-byte scramble,
+    /// so the verifier for an empty password is a real digest rather than an
+    /// empty string.
     #[test]
     fn an_empty_password_still_produces_a_real_caching_sha2_token() {
         let scramble = [7u8; SCRAMBLE_LEN];
         let token = caching_sha2_token("", &scramble);
         assert_eq!(token.len(), 32);
-        assert!(caching_sha2_verify("", &scramble, &token));
-        assert!(!caching_sha2_verify("hunter2", &scramble, &token));
+        assert_eq!(sha2_verifier("").len(), 64);
+        assert!(verify_caching_sha2(&sha2_verifier(""), &scramble, &token));
+        assert!(!verify_caching_sha2(
+            &sha2_verifier("hunter2"),
+            &scramble,
+            &token
+        ));
     }
 
     /// Cross-checked against an independent implementation (Python's
     /// `hashlib`, applying the same formula the module docs describe) rather
     /// than only against itself — a wrong concatenation order would still
-    /// pass every test above, since encoding and decoding would agree with
-    /// each other regardless.
+    /// pass every test above, since the token this test builds and the
+    /// verification it feeds would agree with each other regardless.
     #[test]
     fn a_caching_sha2_token_matches_an_independent_implementation() {
         let token = caching_sha2_token("hunter2", b"01234567890123456789");
@@ -570,24 +795,55 @@ mod tests {
             hex(&token),
             "3b4b79ce45e83d74679f78492419a76633c10b5a033ec15503568e463dd3712e"
         );
+        // And the stored verifier is the double digest, independently checked
+        // the same way: it must not be, or contain, the password.
+        assert_eq!(
+            sha2_verifier("hunter2"),
+            "A3E27AB2948B680E60D429860FDD62B24763CD0E02518B9CDC90D1387247495B"
+        );
     }
 
     #[test]
     fn a_response_of_the_wrong_length_is_never_a_caching_sha2_match() {
         let scramble = [7u8; SCRAMBLE_LEN];
-        assert!(!caching_sha2_verify("", &scramble, &[]));
-        assert!(!caching_sha2_verify("hunter2", &scramble, &[0u8; 31]));
-        assert!(!caching_sha2_verify("hunter2", &scramble, &[0u8; 33]));
+        assert!(!verify_caching_sha2(&sha2_verifier(""), &scramble, &[]));
+        assert!(!verify_caching_sha2(
+            &sha2_verifier("hunter2"),
+            &scramble,
+            &[0u8; 31]
+        ));
+        assert!(!verify_caching_sha2(
+            &sha2_verifier("hunter2"),
+            &scramble,
+            &[0u8; 33]
+        ));
+    }
+
+    /// The path the hash-only store might have cost and did not: the client
+    /// sends cleartext, the server hashes it and compares digests.
+    #[test]
+    fn full_authentication_accepts_the_cleartext_password_either_way() {
+        let hunter2 = sha2_verifier("hunter2");
+        let empty = sha2_verifier("");
+        assert!(verify_caching_sha2_cleartext(&hunter2, b"hunter2"));
+        assert!(verify_caching_sha2_cleartext(&hunter2, b"hunter2\0"));
+        assert!(!verify_caching_sha2_cleartext(&hunter2, b"hunter3"));
+        assert!(verify_caching_sha2_cleartext(&empty, b""));
+        assert!(verify_caching_sha2_cleartext(&empty, b"\0"));
+        assert!(!verify_caching_sha2_cleartext(&empty, b"anything"));
     }
 
     #[test]
-    fn full_authentication_accepts_the_cleartext_password_either_way() {
-        assert!(caching_sha2_full_auth_verify("hunter2", b"hunter2"));
-        assert!(caching_sha2_full_auth_verify("hunter2", b"hunter2\0"));
-        assert!(!caching_sha2_full_auth_verify("hunter2", b"hunter3"));
-        assert!(caching_sha2_full_auth_verify("", b""));
-        assert!(caching_sha2_full_auth_verify("", b"\0"));
-        assert!(!caching_sha2_full_auth_verify("", b"anything"));
+    fn hex_round_trips_and_refuses_the_wrong_length() {
+        // `super::hex`, not the lowercase helper this test module defines for
+        // reading published vectors: the stored spelling is uppercase.
+        let bytes = [0x00u8, 0x0f, 0xa5, 0xff];
+        assert_eq!(super::hex(&bytes), "000FA5FF");
+        assert_eq!(unhex::<4>("000FA5FF"), Some(bytes));
+        assert_eq!(unhex::<4>("000fa5ff"), Some(bytes));
+        assert_eq!(unhex::<4>("000FA5F"), None);
+        assert_eq!(unhex::<4>("000FA5FFFF"), None);
+        assert_eq!(unhex::<4>("000FA5FG"), None);
     }
 
     #[test]

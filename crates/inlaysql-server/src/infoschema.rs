@@ -400,8 +400,7 @@ fn build(
 
         Relation::Tables => (
             TABLES_COLUMNS,
-            catalog
-                .tables()
+            crate::shim::visible_tables(catalog)
                 .map(|table| {
                     vec![
                         text("def"),
@@ -434,7 +433,7 @@ fn build(
 
         Relation::Columns => {
             let mut data = Vec::new();
-            for table in catalog.tables() {
+            for table in crate::shim::visible_tables(catalog) {
                 let indexes = catalog.indexes_for(&table.name);
                 for (position, column) in table.columns.iter().enumerate() {
                     let is_text = matches!(
@@ -506,7 +505,7 @@ fn build(
 
         Relation::Statistics => {
             let mut data = Vec::new();
-            for table in catalog.tables() {
+            for table in crate::shim::visible_tables(catalog) {
                 let mut push = |non_unique: i64, name: &str, column: &str, kind: &str| {
                     data.push(vec![
                         text("def"),
@@ -554,7 +553,7 @@ fn build(
 
         Relation::TableConstraints => {
             let mut data = Vec::new();
-            for table in catalog.tables() {
+            for table in crate::shim::visible_tables(catalog) {
                 let mut push = |name: &str, kind: &str, enforced: &str| {
                     data.push(vec![
                         text("def"),
@@ -607,7 +606,7 @@ fn build(
 
         Relation::KeyColumnUsage => {
             let mut data = Vec::new();
-            for table in catalog.tables() {
+            for table in crate::shim::visible_tables(catalog) {
                 let mut push = |name: &str,
                                 column: &str,
                                 ordinal: i64,

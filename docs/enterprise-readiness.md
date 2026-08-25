@@ -30,10 +30,10 @@ each is closed with evidence. It is a scoreboard, not a claim.
 | 3 | Change log cannot become replication or PITR | open |
 | 4 | Unbounded file growth in server mode | **closed** |
 | 5 | ~1 MiB transaction and statement ceiling | measured; **open by choice** — see the entry |
-| 6 | Fully resident retrieval indexes, per connection | open |
+| 6 | Fully resident retrieval indexes, per connection | measured; **vector half has a lever**, BM25 half open |
 | 7 | Integer comparison through `f64` above 2^53 | **closed** |
 | 8 | No statement timeout; unbounded materialisation | **materialisation closed**, timeouts/`KILL` open |
-| 9 | No TLS, one user, no grants | open |
+| 9 | No TLS, one user, no grants | **accounts and privileges closed**, TLS open |
 | 10 | Effectively no observability | **`EXPLAIN` closed**, metrics/processlist open |
 
 Closed means: reproduced first, fixed, and pinned by a test that fails against
@@ -296,17 +296,138 @@ including a sweep that *proves it exercised the new path*, the lesson
 property the engine's recovery story rests on at risk to remove a limit that
 today refuses honestly. It is written down rather than shipped.
 
-### 6. Fully resident retrieval indexes, per connection — *reported*
+### 6. Fully resident retrieval indexes, per connection — *verified and measured; partly fixed*
 
-The in-memory HNSW holds the whole corpus, and BM25 has no paged variant at
-all — `Bm25Index` keeps the term dictionary, every postings list, the per-document
-term lists and the row-id map in RAM. `Database::open_paged` exists but the
-MySQL server never calls it. Each connection also carries its own 8 MiB decoded
-page cache.
+**Confirmed, and worse than this entry used to claim.** It said "roughly 15 GB
+of `f32` per connection" for 10M vectors at 384 dimensions, which is
+`10M × 384 × 4`. That counts one copy of the payload, and one copy of the
+payload is not what the process holds.
 
-A 10M-vector corpus at 384 dimensions is roughly 15 GB of `f32` per connection
-before the graph. `PLAN.md`'s 10M-vector goal is not reachable through the
-server on this path.
+`crates/inlaysql/tests/index_memory_cost.rs` measures it instead of estimating
+it: a counting global allocator, live heap after the builder's scratch is
+freed, at four corpus sizes so the per-unit slope can be told apart from the
+fixed cost. It is `#[ignore]`d, like every instrument here — run it with
+`cargo test --release -p inlaysql --test index_memory_cost -- --nocapture
+--ignored`.
+
+**Per vector, dimension 384** (flat from 2,000 to 32,000 vectors, which is what
+makes it a constant rather than a reading):
+
+| encoding | held per vector | payload alone | 10M vectors |
+| --- | --- | --- | --- |
+| exact `f32` | 3,554 B | 1,536 B | **33.1 GiB** |
+| `VECTOR(n, INT8)` | 1,250 B | 388 B | **11.6 GiB** |
+
+The factor of 2.3 is not overhead in the usual sense. `HnswIndex` holds each
+embedding **twice** — `embeddings` is the source of truth and every committed
+`Node` carries its own normalised copy — and the graph's per-layer adjacency
+(`Vec<Vec<usize>>`) is on top of that. So the honest number for 10M exact
+vectors is 33 GiB per connection, not 15.
+
+**Per document, BM25.** The old entry did not put a number on this half at all.
+For 120-token chunks drawn Zipf-ian from a 200,000-word vocabulary — stated
+because the cost is dominated by *distinct* terms per document, and by how fast
+the dictionary saturates:
+
+| documents | held per document | distinct terms |
+| --- | --- | --- |
+| 2,000 | 4,474 B | 54,875 |
+| 8,000 | 3,126 B | 121,212 |
+| 32,000 | 2,270 B | 186,781 |
+| 128,000 | 1,859 B | 199,952 |
+
+It falls as the dictionary saturates and then flattens near 1,800 B/document,
+so **10M documents is roughly 17 GiB** — resident, per connection, with no
+paged backend to move it into.
+
+**Per connection, end to end.** 8,000 rows at dimension 384 with both indexes,
+opened the way `serve_connection` opens one:
+
+| opened as | first handle | each additional handle | of that, ANN payload |
+| --- | --- | --- | --- |
+| `Database::open` | 64.8 MiB | 56.5 MiB | 23.4 MiB |
+| `Database::open_paged` | 43.2 MiB | 35.0 MiB | 3.7 MiB |
+
+**What is fixed.** The server can now be told to use the paged vector index:
+`ServerOptions::paged_vector_indexes` / `inlaysql serve --mysql
+--paged-vectors`, off by default and documented as a trade in `docs/server.md`.
+
+Turning it on was not a matter of setting the flag. `catch_up_indexes` declined
+outright whenever any vector backend kept itself in the database, and declining
+means the whole table is rebuilt from every row — so `--paged-vectors` would
+have reintroduced blocker 1 for the *full-text* index, on every connection, on
+every other connection's commit. Measured, in
+`crates/inlaysql-core/tests/foreign_commit_indexes.rs`: one foreign insert into
+a 40-row table cost **41 re-indexed documents**, and the "reader" wrote **843
+rows** into the shared graph while doing it — which on a `Database::open_read_only`
+handle is not slow, it is an error.
+
+A self-persisting index is not caught up by replaying rows into it: the writer
+already applied them, in the file, so a replay applies them twice and does it
+as writes from a handle that only read. What makes it current is re-opening it.
+`Engine::adopt_self_persisting_vector_indexes` does that, holds the re-opened
+graph to the same stamp test a saved blob gets, and leaves the row-level replay
+to the indexes that actually need it. Both halves are pinned by tests that fail
+against the old code, and the answers — scores, not merely ranking — are
+compared against a handle opened fresh from the file.
+
+**What is not fixed, and what the measurement says about it.**
+
+* Re-opening the graph is O(nodes) per foreign commit. Bounded by the graph
+  rather than by a rebuild of every index on the table, but not free.
+* **`Bm25Index` still has no paged variant**, and once the vector index is
+  paged it is the whole bill. At 10M documents that is ~17 GiB per connection
+  whatever else is done, so a paged BM25 — the term dictionary and the postings
+  lists in the file, read through a bounded cache, the way `PagedHnswIndex`
+  already does it — is what closes this entry. It is a project of its own and
+  is not attempted here.
+* Each connection still carries its own 8 MiB decoded page cache
+  (`DEFAULT_PAGE_CACHE_BYTES`), on top of the 8 MiB raw-page cache shared per
+  file.
+
+**Why "share one immutable index between connections" is not the answer**, even
+though it looks like the obvious one. Four things stand in the way, and only
+the first is a plumbing problem:
+
+1. Nothing in the core is `Send`. `SharedStorage` is an `Rc<RefCell<_>>` by an
+   explicit decision (`crates/inlaysql-core/src/shared.rs`), and no index or
+   storage trait carries a `Send`/`Sync` bound. Adding one pushes it through
+   every trait in the core, which is exactly what the simulation harness (it
+   shares a fault-injecting disk as an `Rc`) and the single-threaded WASM build
+   cannot take.
+2. **An index holds uncommitted rows.** `Engine::index_row_for_index` runs as
+   part of the row write, inside the open transaction, so a shared index would
+   show one connection's uncommitted `INSERT` to every other connection's
+   `bm25_score` — a dirty read through the retrieval path.
+3. **A `ROLLBACK` rebuilds it.** `Engine::rollback` calls `reload`, which clears
+   every retrieval index and re-derives it from the committed rows. On a shared
+   index that is one connection discarding everyone's.
+4. **BM25 scores are corpus-relative**, so sharing is not enough — it would have
+   to be *versioned*. `idf` is a function of the live document count and the
+   normalisation of the mean document length, so a reader on an older snapshot
+   would score its rows against a newer corpus's statistics. Sharing the index
+   without MVCC over it changes answers, not just visibility.
+
+The mechanism this codebase already has for sharing between connections is not
+an `Arc` — it is the file. `FileDevice` keeps one raw-page read cache per file
+(`crates/inlaysql/src/device.rs`), shared by every handle in the process and
+sound with no invalidation protocol at all because the tree is copy-on-write
+and a data-area page id names immutable bytes. That is why the paged ANN index
+gets cross-connection sharing for free: its graph *is* pages. It is also the
+argument for solving the BM25 half the same way rather than by reaching for
+threads.
+
+**Where `PLAN.md`'s 10M-vector goal actually stands**, which the old entry got
+directionally right and quantitatively wrong:
+
+* 10M vectors, **no text index**: 33 GiB per connection by default — not
+  reachable. With `--paged-vectors`, the resident cost is the node cache plus
+  the page caches, on the order of tens of MiB per connection whatever the
+  corpus size. **Reachable.**
+* 10M vectors **and** 10M documents — the hybrid case that is the whole claim —
+  ~17 GiB per connection from BM25 alone, which no vector-side change reduces.
+  **Not reachable**, and the reason is now a specific missing piece rather than
+  a general one.
 
 ### 7. Integer comparison through `f64` above 2^53 — *fixed, verified*
 
@@ -364,19 +485,58 @@ timeouts really are set (`--wait-timeout`), and a zero timeout is refused at
 bind rather than quietly clamped. That also closes the idle-connection hole,
 where 64 idle clients could hold all 64 slots forever.
 
-### 9. No TLS, one user, no grants — *verified*
+### 9. No TLS, one user, no grants — *accounts closed, TLS open*
 
-The MySQL-wire server is plaintext with a single user and password, no user
-table, no grants and no per-table permissions. `docs/server.md` states this
-accurately and bluntly; it is the deployment constraint the rest of the auth
-design is correctly built around, not an oversight. It is still the first thing
-a security review stops at.
+**The accounts half is closed (AHL-497).** The MySQL-wire server has a durable
+account store in the database file, seven privileges grantable globally or per
+table, a superuser, and `CREATE USER` / `ALTER USER` / `DROP USER` / `GRANT` /
+`REVOKE` / `SHOW GRANTS` to manage them. `docs/server.md`'s "Accounts and
+privileges" is the whole model, including the list of what it leaves out.
 
-What *is* there and is sound: `mysql_native_password` and
-`caching_sha2_password` are both real challenge-response, the comparison is
-constant-time, the scramble comes from OS entropy and fails rather than falling
-back to something guessable, and the RSA public-key exchange is refused with a
-clear error rather than faked.
+Four things about it that a security review will want to check, each pinned by
+a test in `crates/inlaysql-server/tests/wire.rs`:
+
+* **A password is never stored.** An account carries the verifier each plugin's
+  challenge-response is defined in terms of, and a login is checked by running
+  the exchange backwards. `accounts_and_grants_survive_reopening_the_database`
+  greps the raw database file for the plaintext and asserts it is not there.
+  The verifiers are unsalted — the plugins' own definitions fix that — so a
+  stolen file is a stolen password list offline; `docs/server.md` argues why
+  the salted alternative would be worse here rather than better.
+* **Authorisation reads the plan, not the statement text.** A table named only
+  inside a subquery, a join, a `UNION` arm or a derived table is checked like
+  any other (`inlaysql::Statement::table_access`;
+  `a_table_reached_only_through_a_subquery_is_still_checked`). A statement
+  whose requirement cannot be determined is refused, not allowed.
+* **A revoke takes effect on the next statement**, including on an
+  already-connected session and on a statement prepared while the grant still
+  held (`a_revoke_takes_effect_on_an_already_connected_session`). The one
+  window left is an explicit transaction, whose snapshot is pinned by design.
+* **The store is not reachable through SQL**, superuser included, and is
+  filtered out of every metadata answer here and in the MCP server
+  (`the_account_store_is_invisible_and_untouchable`).
+
+**What is still open under this heading.**
+
+* **TLS.** Unchanged: the wire is plaintext, `CLIENT_SSL` is never advertised,
+  and a client that asks is told rather than downgraded. Accounts make the
+  server usable by more than one party; they do not make the link safe to run
+  across a network. This is still the first thing a security review stops at.
+* **Metadata is not hidden.** Any authenticated account can `SHOW TABLES` and
+  `DESCRIBE` anything. Real MySQL shows only what you hold a privilege on.
+* **No column-level or row-level privileges, no host-based access control, no
+  roles, no account locking, password expiry, login throttling or audit log.**
+  Each of the first three is *refused* where it can be written down rather than
+  accepted and ignored.
+* **These privileges guard the wire server only.** Anything that can open the
+  file — the embedded API, the CLI, `serve --mcp` — bypasses all of them,
+  because the file is the credential there.
+
+What was already there and remains sound: `mysql_native_password` and
+`caching_sha2_password` are both real challenge-response, every secret
+comparison is constant-time, the scramble comes from OS entropy and fails
+rather than falling back to something guessable, and the RSA public-key
+exchange is refused with a clear error rather than faked.
 
 ### 10. Effectively no observability — *reported*
 

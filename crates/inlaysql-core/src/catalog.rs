@@ -441,6 +441,33 @@ pub(crate) fn auto_unique_index_name(table: &str, columns: &[String], nth: usize
     alloc::format!("__inlaysql_uniq_{}_{}_{}", table, columns.join("_"), nth)
 }
 
+/// The name prefix a layer *above* the engine reserves for its own tables.
+///
+/// The engine itself attaches no meaning to it beyond this constant: it will
+/// create, read and drop such a table like any other, because it has no
+/// concept of a privileged one. What the prefix buys is a single rule that
+/// every layer with something to hide can apply — the MySQL-wire server keeps
+/// its account store here (`crates/inlaysql-server/src/acl.rs`), and both that
+/// server and the MCP server refuse to name one of these tables in an answer
+/// or a statement. Declared once, in the crate both of them depend on, so the
+/// rule cannot be spelled two slightly different ways.
+///
+/// The catalog's own generated unique-index names share the prefix
+/// ([`auto_unique_index_name`]); those are index names, not table names, and
+/// [`is_reserved_table_name`] is only ever asked about the latter.
+pub const RESERVED_TABLE_PREFIX: &str = "__inlaysql_";
+
+/// Whether `name` is a table reserved for a layer above the engine.
+///
+/// Case-insensitively, because table names are: `SELECT * FROM __INLAYSQL_USER`
+/// reaches the same table and has to be caught by the same rule. The bare
+/// prefix with nothing after it is *not* reserved — a rule that matched it
+/// would be a rule with no table behind it.
+pub fn is_reserved_table_name(name: &str) -> bool {
+    name.len() > RESERVED_TABLE_PREFIX.len()
+        && name[..RESERVED_TABLE_PREFIX.len()].eq_ignore_ascii_case(RESERVED_TABLE_PREFIX)
+}
+
 /// All tables and indexes known to a database.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Catalog {

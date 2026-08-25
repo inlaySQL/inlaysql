@@ -108,6 +108,42 @@ impl TestServer {
         Client::connect(self.addr, "root", &self.password, None).expect("connect")
     }
 
+    /// A client for some account other than the bootstrap one.
+    fn client_as(&self, user: &str, password: &str) -> Client {
+        Client::connect(self.addr, user, password, None)
+            .unwrap_or_else(|error| panic!("{user} could not connect: {error:?}"))
+    }
+
+    /// The same, for a test whose subject is the login being refused.
+    fn try_client_as(&self, user: &str, password: &str) -> Result<Client, ServerError> {
+        Client::connect(self.addr, user, password, None)
+    }
+
+    /// A second server on the same database file, as an operator restarting
+    /// one would get.
+    ///
+    /// Every connection opens its own [`Database`] handle (decision D2), so
+    /// this really does re-read the account store off disk rather than sharing
+    /// anything with the first server — which is the whole point of the tests
+    /// that use it. The first server keeps running: there is no shutdown API,
+    /// and it holds this process's advisory lock on the file, which a second
+    /// handle *in the same process* shares by design.
+    fn reopened(&self) -> SocketAddr {
+        let options = ServerOptions {
+            bind: "127.0.0.1".to_string(),
+            port: 0,
+            user: "root".to_string(),
+            password: self.password.clone(),
+            ..ServerOptions::default()
+        };
+        let server = Server::bind(self.path(), &options).expect("re-bind");
+        let addr = server.local_addr().expect("local_addr");
+        std::thread::spawn(move || {
+            let _ = server.run();
+        });
+        addr
+    }
+
     /// A client, retrying while the server still refuses at the connection
     /// cap. For a test whose subject is a slot being *released*: a thread ends
     /// when it ends, and polling for that is honest where sleeping a fixed
@@ -219,6 +255,10 @@ enum Param {
     Null,
 }
 
+/// `Debug` only so that `Result<Client, ServerError>::expect_err` compiles in
+/// the tests whose subject is a login being refused. It prints nothing about
+/// the connection: there is a credential behind every one of these.
+#[derive(Debug)]
 struct Client {
     stream: TcpStream,
     sequence: u8,
@@ -1844,8 +1884,7 @@ fn a_wrong_password_is_refused_with_access_denied() {
     let server = TestServer::start("auth");
 
     let error = Client::connect(server.addr, "root", "wrong", None)
-        .err()
-        .expect("a wrong password must be refused");
+        .expect_err("a wrong password must be refused");
     assert_eq!(error.code, 1045, "ER_ACCESS_DENIED_ERROR");
     assert_eq!(error.sqlstate, "28000");
 
@@ -1853,8 +1892,7 @@ fn a_wrong_password_is_refused_with_access_denied() {
     // MySQL's does, but nothing in either reply says *which* half was wrong —
     // so a guesser cannot use the difference to enumerate valid users.
     let other = Client::connect(server.addr, "nobody", &server.password, None)
-        .err()
-        .expect("a wrong user must be refused");
+        .expect_err("a wrong user must be refused");
     assert_eq!(other.code, 1045);
     assert_eq!(other.sqlstate, error.sqlstate);
     assert_eq!(
@@ -1875,8 +1913,7 @@ fn a_wrong_password_is_refused_with_access_denied() {
 
     // Rubbish in the token field is refused rather than accepted or crashing.
     let error = Client::connect_with_bad_token(server.addr, "root")
-        .err()
-        .expect("a forged token must be refused");
+        .expect_err("a forged token must be refused");
     assert_eq!(error.code, 1045);
 
     // And the right password still works, so the check is not simply "no".
@@ -1933,8 +1970,7 @@ fn the_rsa_exchange_is_refused_with_a_clear_reason() {
     let server = TestServer::start("caching-sha2-rsa");
 
     let error = Client::connect_caching_sha2_requesting_rsa(server.addr, "root")
-        .err()
-        .expect("the RSA request must be refused");
+        .expect_err("the RSA request must be refused");
     assert_eq!(error.code, 1235, "ER_NOT_SUPPORTED_YET");
     let lower = error.message.to_lowercase();
     assert!(
@@ -1972,20 +2008,17 @@ fn a_wrong_password_is_refused_under_every_plugin() {
     let server = TestServer::start("auth-wrong-everywhere");
 
     let fast = Client::connect_caching_sha2(server.addr, "root", "wrong")
-        .err()
-        .expect("a wrong password must be refused over the fast path");
+        .expect_err("a wrong password must be refused over the fast path");
     assert_eq!(fast.code, 1045, "ER_ACCESS_DENIED_ERROR");
     assert_eq!(fast.sqlstate, "28000");
 
     let full = Client::connect_caching_sha2_full_auth(server.addr, "root", "wrong")
-        .err()
-        .expect("a wrong password must be refused over full authentication");
+        .expect_err("a wrong password must be refused over full authentication");
     assert_eq!(full.code, 1045);
     assert_eq!(full.sqlstate, "28000");
 
     let switched = Client::connect_via_auth_switch(server.addr, "root", "wrong")
-        .err()
-        .expect("a wrong password must be refused after switching plugins");
+        .expect_err("a wrong password must be refused after switching plugins");
     assert_eq!(switched.code, 1045);
     assert_eq!(switched.sqlstate, "28000");
 
@@ -2300,8 +2333,7 @@ fn connections_past_the_limit_are_refused_with_a_proper_error() {
     // The cap is one, so the next connection is told so rather than hanging or
     // having the socket closed under it.
     let error = Client::connect(server.addr, "root", &server.password, None)
-        .err()
-        .expect("the second connection must be refused");
+        .expect_err("the second connection must be refused");
     assert_eq!(error.code, 1040, "ER_CON_COUNT_ERROR");
 }
 
@@ -2373,8 +2405,7 @@ fn the_reported_connection_cap_is_the_one_that_is_enforced() {
     let _second = server.client();
     let _third = server.client();
     let error = Client::connect(server.addr, "root", &server.password, None)
-        .err()
-        .expect("the fourth connection must be refused");
+        .expect_err("the fourth connection must be refused");
     assert_eq!(error.code, 1040, "ER_CON_COUNT_ERROR");
 }
 
@@ -2406,8 +2437,7 @@ fn an_idle_connection_loses_its_slot_after_the_wait_timeout_it_reports() {
 
     // The one slot is taken.
     let error = Client::connect(server.addr, "root", &server.password, None)
-        .err()
-        .expect("the second connection must be refused while the first holds the slot");
+        .expect_err("the second connection must be refused while the first holds the slot");
     assert_eq!(error.code, 1040, "ER_CON_COUNT_ERROR");
 
     // Now say nothing. A generous client-side timeout so a server that never
@@ -4598,4 +4628,684 @@ fn a_client_that_hangs_up_mid_result_set_gives_its_slot_back() {
     let mut after = server.client_within(Duration::from_secs(10));
     assert_eq!(after.count_rows("SELECT id, body FROM kv"), ROWS as usize);
     after.quit();
+}
+
+// =====================================================================
+// accounts and privileges (AHL-497)
+// =====================================================================
+//
+// The negative tests are the ones that matter here. A privilege system is
+// only worth the refusals it makes, so every verb below is tested by an
+// account that does *not* hold it being turned away, not only by one that
+// does being let through.
+
+/// A superuser session with a table to hand out privileges on.
+fn accounts_fixture(name: &str) -> (TestServer, Client) {
+    let server = TestServer::start(name);
+    let mut root = server.client();
+    root.ok_query("CREATE TABLE posts (id INTEGER PRIMARY KEY, body TEXT)");
+    root.ok_query("CREATE TABLE vault (id INTEGER PRIMARY KEY, secret TEXT)");
+    root.ok_query("INSERT INTO posts (id, body) VALUES (1, 'hello')");
+    root.ok_query("INSERT INTO vault (id, secret) VALUES (1, 'launch-codes')");
+    (server, root)
+}
+
+/// The whole point: an account holding one privilege on one table is refused
+/// every other verb, on that table and on every other.
+#[test]
+fn a_user_without_a_privilege_is_refused_it_for_every_verb() {
+    let (server, mut root) = accounts_fixture("acl-negative");
+    root.ok_query("CREATE USER 'reader' IDENTIFIED BY 'r-pass'");
+    root.ok_query("GRANT SELECT ON posts TO 'reader'");
+
+    let mut reader = server.client_as("reader", "r-pass");
+    // The one thing it may do.
+    assert_eq!(reader.count_rows("SELECT id, body FROM posts"), 1);
+
+    for (sql, verb) in [
+        ("INSERT INTO posts (id, body) VALUES (2, 'x')", "INSERT"),
+        ("UPDATE posts SET body = 'x' WHERE id = 1", "UPDATE"),
+        ("DELETE FROM posts WHERE id = 1", "DELETE"),
+        ("ALTER TABLE posts ADD COLUMN extra TEXT", "ALTER"),
+        ("DROP TABLE posts", "DROP"),
+        ("CREATE INDEX posts_body ON posts (body)", "CREATE"),
+    ] {
+        let error = reader.query(sql).expect_err(sql);
+        assert_eq!(error.code, 1142, "{sql} should be ER_TABLEACCESS_DENIED");
+        assert_eq!(error.sqlstate, "42000", "{sql}");
+        assert!(
+            error.message.contains(verb) && error.message.contains("reader"),
+            "{sql}: the refusal must name the privilege and the account, said {}",
+            error.message
+        );
+    }
+
+    // A grant on `posts` says nothing about `vault`.
+    let error = reader
+        .query("SELECT secret FROM vault")
+        .expect_err("no grant on vault");
+    assert_eq!(error.code, 1142);
+    assert!(error.message.contains("vault"), "{}", error.message);
+
+    // Nothing above changed the table it was refused on.
+    assert_eq!(reader.count_rows("SELECT id FROM posts"), 1);
+    reader.quit();
+    root.quit();
+}
+
+/// The bypass a text-based privilege check would have: a table named only
+/// inside a subquery. This is why authorisation reads the *plan*.
+#[test]
+fn a_table_reached_only_through_a_subquery_is_still_checked() {
+    let (server, mut root) = accounts_fixture("acl-subquery");
+    root.ok_query("CREATE USER 'reader' IDENTIFIED BY 'r-pass'");
+    root.ok_query("GRANT SELECT ON posts TO 'reader'");
+    let mut reader = server.client_as("reader", "r-pass");
+
+    for sql in [
+        "SELECT (SELECT secret FROM vault) AS leak FROM posts",
+        "SELECT body FROM posts WHERE id IN (SELECT id FROM vault)",
+        "SELECT body FROM posts WHERE EXISTS (SELECT 1 FROM vault)",
+        "SELECT p.body FROM posts p JOIN vault v ON p.id = v.id",
+        "SELECT body FROM posts UNION ALL SELECT secret FROM vault",
+        "SELECT body FROM (SELECT secret AS body FROM vault) AS inner_query",
+    ] {
+        let error = reader.query(sql).expect_err(sql);
+        assert_eq!(error.code, 1142, "{sql} must be refused");
+        assert!(
+            error.message.contains("vault"),
+            "{sql}: the refusal must name the table it could not read, said {}",
+            error.message
+        );
+    }
+    reader.quit();
+    root.quit();
+}
+
+/// A write that also reads needs both privileges, because it really does both.
+#[test]
+fn a_write_that_reads_needs_the_read_privilege_too() {
+    let (server, mut root) = accounts_fixture("acl-read-in-write");
+    root.ok_query("CREATE USER 'writer' IDENTIFIED BY 'w-pass'");
+    root.ok_query("GRANT INSERT, UPDATE, DELETE ON posts TO 'writer'");
+    let mut writer = server.client_as("writer", "w-pass");
+
+    // A blind insert is only an insert.
+    writer.ok_query("INSERT INTO posts (id, body) VALUES (2, 'from writer')");
+
+    // Everything that has to find a row first needs SELECT as well, which is
+    // MySQL's rule and not an approximation of it.
+    for sql in [
+        "UPDATE posts SET body = 'x' WHERE id = 2",
+        "DELETE FROM posts WHERE id = 2",
+        "INSERT INTO posts (id, body) SELECT id, body FROM posts",
+    ] {
+        let error = writer.query(sql).expect_err(sql);
+        assert_eq!(error.code, 1142, "{sql}");
+        assert!(error.message.contains("SELECT"), "{}", error.message);
+    }
+
+    // ...but an unfiltered write, which reads nothing, is allowed on the
+    // privileges it really uses.
+    writer.ok_query("UPDATE posts SET body = 'blanked'");
+    writer.ok_query("DELETE FROM posts");
+    writer.quit();
+    root.quit();
+}
+
+/// Accounts and grants are in the database file, so they outlive the process
+/// that created them — and the password is not in there in any readable form.
+#[test]
+fn accounts_and_grants_survive_reopening_the_database() {
+    let (server, mut root) = accounts_fixture("acl-durable");
+    root.ok_query("CREATE USER 'reader' IDENTIFIED BY 'hunter2'");
+    root.ok_query("GRANT SELECT ON posts TO 'reader'");
+    root.quit();
+
+    // A second server, binding the same file and opening its own handles.
+    let reopened = server.reopened();
+    let mut reader =
+        Client::connect(reopened, "reader", "hunter2", None).expect("the account survived");
+    assert_eq!(reader.count_rows("SELECT id FROM posts"), 1);
+    let error = reader
+        .query("SELECT secret FROM vault")
+        .expect_err("and so did the shape of its grant");
+    assert_eq!(error.code, 1142);
+    // A wrong password is still a wrong password after the reopen.
+    assert_eq!(
+        Client::connect(reopened, "reader", "hunter3", None)
+            .expect_err("wrong password")
+            .code,
+        1045
+    );
+    reader.quit();
+
+    // And what is on disk is a verifier, not a password. Checked over the raw
+    // bytes of the file rather than through any API that could be filtering.
+    let bytes = std::fs::read(server.path()).expect("read the database file");
+    assert!(
+        !bytes.windows(7).any(|window| window == b"hunter2"),
+        "the plaintext password must not appear anywhere in the file"
+    );
+    // What *is* there is the verifier, in MySQL's own `*HEX40` spelling —
+    // `SHA1(SHA1("hunter2"))`, independently computed.
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        text.contains("*58815970BE77B3720276F63DB198B1FA42E5CC02"),
+        "the stored native verifier for `hunter2` should be in the file"
+    );
+}
+
+/// A revoked privilege stops working on the offending session's next
+/// statement — not at its next reconnection, which for a pooled connection
+/// could be never.
+#[test]
+fn a_revoke_takes_effect_on_an_already_connected_session() {
+    let (server, mut root) = accounts_fixture("acl-revoke-live");
+    root.ok_query("CREATE USER 'reader' IDENTIFIED BY 'r-pass'");
+    root.ok_query("GRANT SELECT ON posts TO 'reader'");
+
+    let mut reader = server.client_as("reader", "r-pass");
+    assert_eq!(reader.count_rows("SELECT id FROM posts"), 1);
+
+    // Revoked from another connection entirely, while this one sits idle.
+    root.ok_query("REVOKE SELECT ON posts FROM 'reader'");
+
+    let error = reader
+        .query("SELECT id FROM posts")
+        .expect_err("the very next statement must be refused");
+    assert_eq!(error.code, 1142);
+
+    // And a prepared statement is re-checked at every execution, so one
+    // prepared while the grant held does not outlive it.
+    root.ok_query("GRANT SELECT ON posts TO 'reader'");
+    let stmt = reader.prepare("SELECT id FROM posts").expect("prepare");
+    reader.execute(&stmt, &[]).expect("allowed while granted");
+    root.ok_query("REVOKE SELECT ON posts FROM 'reader'");
+    let error = reader
+        .execute(&stmt, &[])
+        .expect_err("the plan outlived the grant, the permission did not");
+    assert_eq!(error.code, 1142);
+
+    // Dropping the account takes the session with it, on the same terms.
+    root.ok_query("GRANT SELECT ON posts TO 'reader'");
+    assert_eq!(reader.count_rows("SELECT id FROM posts"), 1);
+    root.ok_query("DROP USER 'reader'");
+    let error = reader
+        .query("SELECT id FROM posts")
+        .expect_err("a dropped account may not keep working on an open socket");
+    assert_eq!(error.code, 1045);
+    assert!(error.message.contains("no longer exists"), "{error:?}");
+    root.quit();
+}
+
+/// Administering accounts is the superuser's, and nobody else's.
+#[test]
+fn a_non_superuser_cannot_administer_accounts() {
+    let (server, mut root) = accounts_fixture("acl-admin");
+    root.ok_query("CREATE USER 'reader' IDENTIFIED BY 'r-pass'");
+    root.ok_query("GRANT ALL PRIVILEGES ON *.* TO 'reader'");
+
+    // Every privilege there is, and still not the right to hand them out.
+    let mut reader = server.client_as("reader", "r-pass");
+    reader.ok_query("SELECT id FROM vault");
+    for sql in [
+        "CREATE USER 'sneak' IDENTIFIED BY 'x'",
+        "DROP USER 'root'",
+        "ALTER USER 'root' IDENTIFIED BY 'x'",
+        "GRANT ALL PRIVILEGES ON *.* TO 'reader' WITH GRANT OPTION",
+        "REVOKE SELECT ON posts FROM 'reader'",
+        "SHOW GRANTS FOR 'root'",
+        // The same statements wearing the decoration a real driver sends.
+        // Authorisation and dispatch have to read the *same* text: a leading
+        // comment moves the keyword, and a check that classified this by its
+        // first byte while the dispatcher classified it by its first keyword
+        // would let an ordinary account create itself a superuser.
+        "/* migration 3 */ CREATE USER 'sneak' IDENTIFIED BY 'x'",
+        "-- rotate\nGRANT ALL PRIVILEGES ON *.* TO 'reader' WITH GRANT OPTION",
+        "GRANT ALL PRIVILEGES ON *.* TO 'reader' WITH GRANT OPTION;",
+    ] {
+        let error = reader.query(sql).expect_err(sql);
+        assert_eq!(error.code, 1227, "{sql}");
+    }
+    // Its own grants and its own password are its own business.
+    reader.ok_query("SHOW GRANTS");
+    reader.ok_query("ALTER USER 'reader' IDENTIFIED BY 'r-pass-2'");
+    reader.quit();
+
+    assert_eq!(
+        server
+            .try_client_as("reader", "r-pass")
+            .expect_err("the old password must stop working")
+            .code,
+        1045
+    );
+    server.client_as("reader", "r-pass-2").quit();
+
+    // And `sneak` was never created.
+    assert_eq!(
+        server
+            .try_client_as("sneak", "x")
+            .expect_err("no such account")
+            .code,
+        1045
+    );
+    root.quit();
+}
+
+/// The account store is not a table anybody can reach through SQL, superuser
+/// included — it holds password verifiers, and `SHOW GRANTS` is the supported
+/// way to read what is in it.
+#[test]
+fn the_account_store_is_invisible_and_untouchable() {
+    let (_server, mut root) = accounts_fixture("acl-hidden");
+    root.ok_query("CREATE USER 'reader' IDENTIFIED BY 'r-pass'");
+
+    let tables = root.ok_query("SHOW TABLES").rows();
+    let names = tables.rows.iter().flatten().flatten().collect::<Vec<_>>();
+    assert!(
+        names.iter().all(|name| !name.starts_with("__inlaysql_")),
+        "SHOW TABLES listed the account store: {names:?}"
+    );
+    let schema_tables = root
+        .ok_query("SELECT table_name FROM information_schema.tables")
+        .rows();
+    assert!(
+        schema_tables
+            .column("table_name")
+            .iter()
+            .all(|name| !name.starts_with("__inlaysql_")),
+        "information_schema listed the account store"
+    );
+
+    for sql in [
+        "SELECT * FROM __inlaysql_user",
+        "SELECT * FROM __INLAYSQL_USER",
+        "SELECT native_auth FROM `__inlaysql_user`",
+        "UPDATE __inlaysql_user SET privileges = 255",
+        "DELETE FROM __inlaysql_grant",
+        "DROP TABLE __inlaysql_user",
+        "SELECT 1 FROM posts WHERE id IN (SELECT id FROM __inlaysql_user)",
+    ] {
+        let error = root.query(sql).expect_err(sql);
+        assert_eq!(error.code, 1142, "{sql}");
+        assert!(
+            error.message.contains("account store"),
+            "{sql} should say what it refused and why, said {}",
+            error.message
+        );
+    }
+
+    // `DESCRIBE` does not admit it exists either.
+    let error = root
+        .query("DESCRIBE __inlaysql_user")
+        .expect_err("no such table");
+    assert_eq!(error.code, 1146);
+    root.quit();
+}
+
+/// `SHOW GRANTS` reports what is really held, in MySQL's own spelling.
+#[test]
+fn show_grants_reports_what_is_held() {
+    let (server, mut root) = accounts_fixture("acl-show-grants");
+    root.ok_query("CREATE USER 'reader' IDENTIFIED BY 'r-pass'");
+
+    let mine = root.ok_query("SHOW GRANTS").rows();
+    assert_eq!(mine.columns, vec!["Grants for root@%"]);
+    assert_eq!(
+        mine.cell(0, 0),
+        "GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION"
+    );
+
+    // A brand-new account holds nothing, and MySQL spells that `USAGE`.
+    let theirs = root.ok_query("SHOW GRANTS FOR 'reader'").rows();
+    assert_eq!(theirs.cell(0, 0), "GRANT USAGE ON *.* TO 'reader'@'%'");
+
+    root.ok_query("GRANT SELECT, INSERT ON posts TO 'reader'");
+    root.ok_query("GRANT SELECT ON *.* TO 'reader'");
+    let theirs = root.ok_query("SHOW GRANTS FOR 'reader'").rows();
+    let lines = theirs.column("Grants for reader@%");
+    assert_eq!(lines[0], "GRANT SELECT ON *.* TO 'reader'@'%'");
+    assert_eq!(
+        lines[1],
+        "GRANT SELECT, INSERT ON `inlaysql`.`posts` TO 'reader'@'%'"
+    );
+
+    // A global grant covers a table with no grant of its own.
+    let mut reader = server.client_as("reader", "r-pass");
+    assert_eq!(reader.count_rows("SELECT id FROM vault"), 1);
+    reader.quit();
+    root.quit();
+}
+
+/// Nothing in the account model may leave the database with nobody able to
+/// administer it — there is no way back in over the wire from there.
+#[test]
+fn the_last_superuser_cannot_be_removed() {
+    let (_server, mut root) = accounts_fixture("acl-last-superuser");
+    for sql in [
+        "DROP USER 'root'",
+        "REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'root'",
+    ] {
+        let error = root.query(sql).expect_err(sql);
+        assert_eq!(error.code, 1227, "{sql}");
+        assert!(error.message.contains("--reset-superuser"), "{error:?}");
+    }
+
+    // With a replacement in place, both are allowed.
+    root.ok_query("CREATE USER 'admin2' IDENTIFIED BY 'a'");
+    root.ok_query("GRANT ALL PRIVILEGES ON *.* TO 'admin2' WITH GRANT OPTION");
+    root.ok_query("REVOKE ALL PRIVILEGES, GRANT OPTION FROM 'root'");
+    let error = root
+        .query("CREATE USER 'x' IDENTIFIED BY 'y'")
+        .expect_err("root demoted itself");
+    assert_eq!(error.code, 1227);
+    root.quit();
+}
+
+/// Both authentication plugins still complete for an account created without
+/// a plugin named, which is what stops any existing client breaking. An
+/// account pinned to one plugin is switched onto it instead of being refused.
+#[test]
+fn every_authentication_path_still_completes_against_a_stored_verifier() {
+    let (server, mut root) = accounts_fixture("acl-plugins");
+    root.ok_query("CREATE USER 'both' IDENTIFIED BY 'p'");
+    root.ok_query("CREATE USER 'nativeonly' IDENTIFIED WITH mysql_native_password BY 'p'");
+    root.ok_query("CREATE USER 'sha2only' IDENTIFIED WITH caching_sha2_password BY 'p'");
+    root.ok_query("CREATE USER 'nopass' IDENTIFIED BY ''");
+
+    // The default account completes every exchange this server implements.
+    Client::connect(server.addr, "both", "p", None)
+        .expect("native")
+        .quit();
+    Client::connect_caching_sha2(server.addr, "both", "p")
+        .expect("caching_sha2 fast path")
+        .quit();
+    Client::connect_caching_sha2_full_auth(server.addr, "both", "p")
+        .expect("caching_sha2 full authentication")
+        .quit();
+    Client::connect_via_auth_switch(server.addr, "both", "p")
+        .expect("a third plugin switches to native")
+        .quit();
+
+    // A pinned account is switched onto the plugin it has a verifier for
+    // rather than refused, which is what MySQL does with its own per-account
+    // plugin.
+    Client::connect_via_auth_switch(server.addr, "nativeonly", "p")
+        .expect("switched to native")
+        .quit();
+    Client::connect_caching_sha2(server.addr, "sha2only", "p")
+        .expect("its own plugin, directly")
+        .quit();
+
+    // A wrong password is refused on every one of them, and the message never
+    // says which half was wrong.
+    for outcome in [
+        Client::connect(server.addr, "both", "wrong", None),
+        Client::connect_caching_sha2(server.addr, "both", "wrong"),
+        Client::connect_caching_sha2_full_auth(server.addr, "both", "wrong"),
+        Client::connect(server.addr, "nosuchuser", "p", None),
+    ] {
+        let error = outcome.expect_err("must be refused");
+        assert_eq!(error.code, 1045);
+        assert_eq!(error.sqlstate, "28000");
+        assert!(!error.message.contains("no such"), "{error:?}");
+    }
+
+    // An empty password means an empty password, as it always has.
+    Client::connect(server.addr, "nopass", "", None)
+        .expect("empty password")
+        .quit();
+    assert_eq!(
+        Client::connect(server.addr, "nopass", "anything", None)
+            .expect_err("and nothing else")
+            .code,
+        1045
+    );
+    root.quit();
+}
+
+/// The store is created on the first account statement, not at startup — so a
+/// database nobody creates an account in is byte-for-byte what it was, and the
+/// `--user`/`--password` credential keeps working exactly as before.
+#[test]
+fn the_account_store_appears_only_when_it_is_asked_for() {
+    let server = TestServer::start("acl-lazy");
+    let mut root = server.client();
+    root.ok_query("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)");
+    // The row ids of a database with no accounts are untouched: this is the
+    // whole reason the store is lazy, since every row in this engine draws
+    // its id from one counter shared by every table.
+    assert_eq!(
+        root.ok_query("INSERT INTO kv (body) VALUES ('first')").ok(),
+        (1, 1),
+        "an account store created at startup would have made this row id 2"
+    );
+    assert!(root.ok_query("SHOW TABLES").rows().rows.len() == 1);
+
+    // The bootstrap credential is a superuser, exactly as the single
+    // `--password` user always was.
+    assert_eq!(
+        root.ok_query("SHOW GRANTS").rows().cell(0, 0),
+        "GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION"
+    );
+
+    // Creating an account materialises the store, and `root` survives into it
+    // — otherwise the operator's own credential would stop working halfway
+    // through their first CREATE USER.
+    root.ok_query("CREATE USER 'reader' IDENTIFIED BY 'r-pass'");
+    server.client().quit();
+    server.client_as("reader", "r-pass").quit();
+    root.quit();
+}
+
+/// `--reset-superuser` is the way back in after a lost password, and it is the
+/// only thing that lets the flags overwrite what is in the file.
+#[test]
+fn the_stored_password_wins_over_the_flags_unless_a_reset_is_asked_for() {
+    let server = TestServer::start_with("acl-reset", "original", 16);
+    let mut root = server.client();
+    root.ok_query("CREATE USER 'reader' IDENTIFIED BY 'r-pass'");
+    root.ok_query("ALTER USER 'root' IDENTIFIED BY 'rotated'");
+    root.quit();
+
+    // A restart with the old flag does not reinstate the old password: the
+    // file is the authority once it has accounts.
+    let options = ServerOptions {
+        bind: "127.0.0.1".to_string(),
+        port: 0,
+        user: "root".to_string(),
+        password: "original".to_string(),
+        ..ServerOptions::default()
+    };
+    let restarted = Server::bind(server.path(), &options).expect("re-bind");
+    let addr = restarted.local_addr().expect("addr");
+    assert!(
+        restarted
+            .notices()
+            .iter()
+            .any(|line| line.contains("were NOT used")),
+        "the operator has to be told the flags did nothing: {:?}",
+        restarted.notices()
+    );
+    std::thread::spawn(move || {
+        let _ = restarted.run();
+    });
+    assert_eq!(
+        Client::connect(addr, "root", "original", None)
+            .expect_err("the flag must not override the file")
+            .code,
+        1045
+    );
+    Client::connect(addr, "root", "rotated", None)
+        .expect("the stored password is the password")
+        .quit();
+
+    // ...and the escape hatch, which needs write access to the file and says
+    // what it did.
+    let reset = Server::bind(
+        server.path(),
+        &ServerOptions {
+            port: 0,
+            password: "recovered".to_string(),
+            reset_superuser: true,
+            ..options.clone()
+        },
+    )
+    .expect("re-bind with a reset");
+    let reset_addr = reset.local_addr().expect("addr");
+    assert!(
+        reset
+            .notices()
+            .iter()
+            .any(|line| line.contains("--reset-superuser")),
+        "{:?}",
+        reset.notices()
+    );
+    std::thread::spawn(move || {
+        let _ = reset.run();
+    });
+    let mut recovered =
+        Client::connect(reset_addr, "root", "recovered", None).expect("the reset worked");
+    // The reset changed one account's password and nothing else: `reader` is
+    // still there, untouched.
+    assert_eq!(
+        recovered
+            .ok_query("SHOW GRANTS FOR 'reader'")
+            .rows()
+            .rows
+            .len(),
+        1
+    );
+    recovered.quit();
+}
+
+/// The refusals that keep the model honest, over a real connection. Each of
+/// these looks like something MySQL would accept, and each would mean less
+/// than it says here.
+#[test]
+fn the_grants_this_server_cannot_enforce_are_refused_by_name() {
+    let (_server, mut root) = accounts_fixture("acl-refusals");
+    root.ok_query("CREATE USER 'reader' IDENTIFIED BY 'r-pass'");
+
+    for (sql, expected) in [
+        ("GRANT SELECT (body) ON posts TO 'reader'", "column-level"),
+        (
+            "GRANT SELECT ON posts TO 'reader'@'localhost'",
+            "host-based",
+        ),
+        (
+            "GRANT SELECT ON posts TO 'reader' WITH GRANT OPTION",
+            "delegation",
+        ),
+        ("GRANT SELECT ON otherdb.posts TO 'reader'", "one schema"),
+        ("CREATE USER 'open'", "no password"),
+        ("SET PASSWORD FOR 'reader' = 'x'", "ALTER USER"),
+        ("RENAME USER 'reader' TO 'writer'", "RENAME USER"),
+    ] {
+        let error = root.query(sql).expect_err(sql);
+        assert!(
+            error.message.contains(expected),
+            "{sql} should name `{expected}`, said {}",
+            error.message
+        );
+    }
+
+    // None of them left a trace.
+    assert_eq!(
+        root.ok_query("SHOW GRANTS FOR 'reader'").rows().cell(0, 0),
+        "GRANT USAGE ON *.* TO 'reader'@'%'"
+    );
+    assert_eq!(
+        root.query("SHOW GRANTS FOR 'open'")
+            .expect_err("never created")
+            .code,
+        1133
+    );
+    root.quit();
+}
+
+/// The one statement shape that reaches OK without ever touching the engine —
+/// `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY`, which this server records
+/// nowhere and answers with a warning. It is still authorised, because "it
+/// happens to do nothing" is a property of today's translation rather than a
+/// rule, and a statement that reaches OK with no privilege check is the hole
+/// this whole design exists to close.
+#[test]
+fn even_the_statement_that_does_nothing_is_authorised() {
+    let (server, mut root) = accounts_fixture("acl-noop-ddl");
+    root.ok_query("CREATE USER 'reader' IDENTIFIED BY 'r-pass'");
+    root.ok_query("GRANT ALTER ON posts TO 'reader'");
+    let sql = "ALTER TABLE posts ADD CONSTRAINT fk FOREIGN KEY (id) REFERENCES vault (id)";
+
+    // A per-table grant is deliberately not enough: with nothing planned there
+    // is no table to attribute the statement to, so only a global ALTER will
+    // do — the default-deny direction.
+    let mut reader = server.client_as("reader", "r-pass");
+    let error = reader.query(sql).expect_err("no global ALTER");
+    assert_eq!(error.code, 1227);
+    reader.quit();
+
+    root.ok_query("GRANT ALTER ON *.* TO 'reader'");
+    let mut reader = server.client_as("reader", "r-pass");
+    let reply = reader.ok_query(sql);
+    assert_eq!(reply.warnings(), 1, "and it still says it recorded nothing");
+    reader.quit();
+    root.quit();
+}
+
+/// `DROP INDEX` names an index, not a table, so it is resolved through the
+/// catalog before it is checked — and refused globally when it resolves to
+/// nothing, rather than being waved through for want of a table to name.
+#[test]
+fn dropping_an_index_is_checked_against_the_table_it_belongs_to() {
+    let (server, mut root) = accounts_fixture("acl-drop-index");
+    root.ok_query("CREATE INDEX posts_body ON posts (body)");
+    root.ok_query("CREATE USER 'reader' IDENTIFIED BY 'r-pass'");
+    root.ok_query("GRANT DROP ON vault TO 'reader'");
+
+    // A `DROP` on some *other* table does not reach this index.
+    let mut reader = server.client_as("reader", "r-pass");
+    let error = reader
+        .query("DROP INDEX posts_body")
+        .expect_err("the index belongs to posts");
+    assert_eq!(error.code, 1142);
+    assert!(error.message.contains("posts"), "{}", error.message);
+
+    // An index name the catalog has never heard of cannot be attributed to a
+    // table at all, so only a global DROP will do.
+    let error = reader
+        .query("DROP INDEX nothing_like_this")
+        .expect_err("unattributable");
+    assert_eq!(error.code, 1227);
+    reader.quit();
+
+    root.ok_query("GRANT DROP ON posts TO 'reader'");
+    let mut reader = server.client_as("reader", "r-pass");
+    reader.ok_query("DROP INDEX posts_body");
+    reader.quit();
+    root.quit();
+}
+
+/// An account statement commits what came before it and cannot itself be
+/// rolled back — MySQL's rule for DDL, and load-bearing here: a `REVOKE` a
+/// later `ROLLBACK` could undo is a `REVOKE` that did not happen, after the
+/// client was told it had.
+#[test]
+fn an_account_statement_is_not_undone_by_a_rollback() {
+    let (server, mut root) = accounts_fixture("acl-txn");
+    root.ok_query("CREATE USER 'reader' IDENTIFIED BY 'r-pass'");
+    root.ok_query("GRANT SELECT ON posts TO 'reader'");
+
+    root.ok_query("BEGIN");
+    root.ok_query("REVOKE SELECT ON posts FROM 'reader'");
+    root.ok_query("ROLLBACK");
+
+    let mut reader = server.client_as("reader", "r-pass");
+    let error = reader
+        .query("SELECT id FROM posts")
+        .expect_err("the revoke stands");
+    assert_eq!(error.code, 1142);
+    reader.quit();
+    root.quit();
 }

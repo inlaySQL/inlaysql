@@ -82,8 +82,9 @@ pub use inlaysql_core::embedding;
 pub use inlaysql_core::hnsw::HnswIndex;
 pub use inlaysql_core::TreeStorage;
 pub use inlaysql_core::{
-    Catalog, Change, ChangeKind, Changes, Collation, Column, ColumnInfo, DataType, Error, Index,
-    IndexKind, Outcome, Result, ResultSet, Table, Value,
+    is_reserved_table_name, Catalog, Change, ChangeKind, Changes, Collation, Column, ColumnInfo,
+    DataType, Error, Index, IndexKind, Outcome, Result, ResultSet, Table, TableAccess, Value,
+    RESERVED_TABLE_PREFIX,
 };
 pub use statement::Statement;
 pub use storage::RedbStorage;

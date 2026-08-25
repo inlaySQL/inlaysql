@@ -536,13 +536,18 @@ pub fn handshake(connection_id: u32, scramble: &[u8], server_version: &str) -> V
     out
 }
 
-/// An `AuthSwitchRequest`, asking a client that offered a plugin this server
-/// does not complete to authenticate with `mysql_native_password` instead —
-/// the plugin every driver already falls back to, and the one this was
-/// always spelled in terms of before `caching_sha2_password` existed here.
-pub fn auth_switch_request(scramble: &[u8]) -> Vec<u8> {
+/// An `AuthSwitchRequest`, asking a client to authenticate with `plugin`
+/// instead of whatever it offered.
+///
+/// Two reasons a client is asked to switch, and this packet is the same for
+/// both: it named a plugin this server does not complete at all, or it named
+/// one *this account* has no verifier for (`IDENTIFIED WITH ...` pins an
+/// account to one plugin — see [`crate::acl`]). MySQL answers both the same
+/// way, which is why the plugin is a parameter rather than the constant it
+/// used to be.
+pub fn auth_switch_request(plugin: &str, scramble: &[u8]) -> Vec<u8> {
     let mut out = vec![0xfe];
-    put_nul_str(&mut out, crate::auth::NATIVE_PASSWORD);
+    put_nul_str(&mut out, plugin);
     out.extend_from_slice(scramble);
     out.push(0);
     out
@@ -596,15 +601,20 @@ mod tests {
     }
 
     #[test]
-    fn auth_switch_still_offers_native_password() {
+    fn auth_switch_names_whichever_plugin_it_is_given() {
         let scramble: Vec<u8> = (1..=20).collect();
-        let packet = auth_switch_request(&scramble);
-        let mut reader = Reader::new(&packet);
-        assert_eq!(reader.u8().unwrap(), 0xfe);
-        assert_eq!(reader.nul_str().unwrap(), crate::auth::NATIVE_PASSWORD);
-        assert_eq!(reader.take(20).unwrap(), &scramble[..]);
-        assert_eq!(reader.u8().unwrap(), 0);
-        assert!(reader.is_empty());
+        for plugin in [
+            crate::auth::NATIVE_PASSWORD,
+            crate::auth::CACHING_SHA2_PASSWORD,
+        ] {
+            let packet = auth_switch_request(plugin, &scramble);
+            let mut reader = Reader::new(&packet);
+            assert_eq!(reader.u8().unwrap(), 0xfe);
+            assert_eq!(reader.nul_str().unwrap(), plugin);
+            assert_eq!(reader.take(20).unwrap(), &scramble[..]);
+            assert_eq!(reader.u8().unwrap(), 0);
+            assert!(reader.is_empty());
+        }
     }
 
     #[test]

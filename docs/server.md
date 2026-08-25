@@ -48,10 +48,15 @@ already trust.
 `--bind`, and doing so prints a warning that names the risk. A database server
 that defaults to every interface is a liability.
 
-**There is one user and one password, and no user table.** No grants, no
-per-table permissions, no roles. The password comes from `--password-env`
-(preferred) or `--password` (visible in the machine's process list, and warned
-about). It is never logged, and neither is any statement.
+**There are accounts and privileges now (AHL-497), in the database file.**
+`CREATE USER` / `ALTER USER` / `DROP USER`, `GRANT` / `REVOKE` /
+`SHOW GRANTS`, seven privileges grantable globally or on one table, and a
+superuser. A password is never stored — an account carries the verifier each
+authentication plugin is defined in terms of. `--user`/`--password` are the
+whole account model until the first `CREATE USER`, and are ignored from then
+on. The full model, and the list of what it deliberately leaves out, is
+[Accounts and privileges](#accounts-and-privileges) below. Nothing is logged:
+not a password, not a verifier, not a statement.
 
 **Authentication is `caching_sha2_password` by default, or
 `mysql_native_password` via `AuthSwitchRequest` (AHL-467).** MySQL 8+
@@ -84,15 +89,208 @@ socket, and the message does not say which half of the credential was wrong.
 | --- | --- | --- |
 | `--bind <addr>` | `127.0.0.1` | Address to listen on. Anything else warns. |
 | `--port <n>` | `3306` | `0` asks the OS for a free port and prints it. |
-| `--user <name>` | `root` | The single accepted user. |
-| `--password <pw>` | empty | Visible to `ps`. Prefer the next one. |
+| `--user <name>` | `root` | The bootstrap account. Ignored once the database has accounts of its own. |
+| `--password <pw>` | empty | Its password. Visible to `ps`. Prefer the next one. |
 | `--password-env <VAR>` | — | Read the password from the environment. |
+| `--reset-superuser` | off | Set `--user`'s password from these flags and make it a superuser, on a database that already has accounts. The way back in after a lost password. |
 | `--max-connections <n>` | `64` | Beyond this, clients get `1040`. |
 | `--wait-timeout <n>` | `28800` | Seconds a connection may be silent before the server closes it. |
 | `--page-reuse` | off | Reclaim superseded pages instead of growing the file for ever. **Read the section below before using it.** |
+| `--paged-vectors` | off | Keep vector indexes in the file instead of in each connection's memory. Recall is identical; latency and foreign-commit cost are not. **Read the section below before using it.** |
 
 An empty password means an empty password: any client that can reach the port
 can read and write the database. The server says so at startup.
+
+---
+
+## Accounts and privileges
+
+`crates/inlaysql-server/src/acl.rs`. Before this there was one user, one
+password held in memory, and no notion of a privilege
+(`docs/enterprise-readiness.md`, blocker 9). What follows is the whole of the
+replacement — including, at the end, everything it does not do.
+
+### Where accounts live
+
+In the database file, as two ordinary tables the engine has no idea are
+special. That is decision D1 applied to authentication exactly as it is applied
+to dialect: `inlaysql-core` gains no user concept, no `GRANT` syntax and no
+enforcement, and everything MySQL-shaped is built in the server crate on top of
+storage the engine already had.
+
+Both tables are named with the reserved `__inlaysql_` prefix and are invisible
+and untouchable through SQL. They are filtered out of `SHOW TABLES`,
+`SHOW TABLE STATUS`, `SHOW COLUMNS`, `DESCRIBE` and every `information_schema`
+view, and **any** statement that names one is refused with `1142` — for a
+superuser too, because `SELECT * FROM __inlaysql_user` would otherwise hand
+over every verifier on the machine and `UPDATE __inlaysql_user SET privileges =
+...` would be a second, unaudited `GRANT`. `inlaysql serve --mcp` applies the
+same rule, so an agent pointed at the same file cannot read them either.
+
+**One consequence, stated here rather than left to be discovered: these
+privileges guard this server and nothing else.** Anything that can open the
+file — the embedded API, the `inlaysql` CLI, a `--mcp` server with
+`--allow-writes` — bypasses all of it, because the file *is* the credential
+there. This is the same line SQLite draws, and the same line a MySQL `datadir`
+draws.
+
+### What is stored instead of a password
+
+Never the password. An account carries the *verifier* each plugin's
+challenge-response is defined in terms of — `SHA1(SHA1(password))` for
+`mysql_native_password`, `SHA256(SHA256(password))` for
+`caching_sha2_password` — and a login is checked by running the exchange
+backwards: strip the scramble mask off the client's token, recover the
+`SHA1(password)`/`SHA256(password)` it claims, hash that once more, and compare
+it in constant time against the digest on disk. Checking a token needs only the
+digest; *forging* one needs a preimage of it.
+
+**`caching_sha2_password`'s full-authentication path survives the change**,
+which was the open question when the store was designed: it used to compare the
+cleartext the client sends against a cleartext password held in memory, and
+there no longer is one. It does not need one — hashing what the client just
+sent and comparing digests is the same check the fast path makes. It is now
+constant-time as well, which the cleartext comparison was not.
+
+**An account carries both verifiers by default, and that is a deliberate trade
+rather than an oversight.** A verifier is per-plugin and neither can be derived
+from the other, so one verifier means one plugin, and a client that only speaks
+the other cannot log in at all — which would break every older PDO and `mysql`
+CLI the moment an account was created. `IDENTIFIED WITH <plugin> BY <password>`
+stores one and only one, for an operator who would rather have that; a client
+that then names the other plugin is sent an `AuthSwitchRequest` onto the one
+the account has, which is what MySQL does with its own per-account plugin.
+
+Both verifiers cost the same thing: they are unsalted and only two fast hashes
+deep, because the plugins' own definitions fix them, so **a stolen database
+file is a stolen password list against an offline attack**. The alternative —
+MySQL's salted, 5000-round `$A$005$` digest — cannot answer a fast scramble at
+all, so storing it would force every connection to send its password in
+cleartext over a link this server does not encrypt. Given the choice between
+weakening the file at rest and weakening the wire, this weakens the file, and
+says so here.
+
+### The model
+
+Seven privileges, each grantable globally (`ON *.*`) or on one table
+(`ON db.tbl`):
+
+| Privilege | What it gates |
+| --- | --- |
+| `SELECT` | Reading rows — including rows read to *find* the ones a write changes, and rows a `CREATE INDEX` reads to fill itself. |
+| `INSERT` | Adding rows. |
+| `UPDATE` | Rewriting rows, including the `DO UPDATE` half of an upsert. |
+| `DELETE` | Removing rows, including the rows `INSERT OR REPLACE` collides with. |
+| `CREATE` | `CREATE TABLE`, `CREATE INDEX`, `CREATE UNIQUE INDEX`. |
+| `DROP` | `DROP TABLE`, `DROP INDEX`. |
+| `ALTER` | `ALTER TABLE`. |
+
+`ALL PRIVILEGES` is all seven. `USAGE` is none of them, which is what a
+brand-new account holds. MySQL's `INDEX` privilege is **refused**, and it is
+the one that looks mappable and is not: an index is created and dropped by
+`CREATE`/`DROP` here, so the nearest translation would also hand out the right
+to create and drop *tables*, which `INDEX` does not. Over-granting is not an
+approximation, it is a hole — the error says to write `GRANT CREATE, DROP` if
+that is really what was meant.
+
+**A superuser is exactly `GRANT ALL PRIVILEGES ON *.* TO ... WITH GRANT
+OPTION`, and nothing narrower.** It is the only account that may administer
+accounts. `WITH GRANT OPTION` on anything else is **refused**: one level of
+delegation is implemented, and accepting a narrower grant option would promise
+a partial delegation this server would not then enforce the boundary of.
+`REVOKE ALL PRIVILEGES, GRANT OPTION FROM u` — MySQL's own spelling — takes it
+back.
+
+Nothing may leave the database with nobody able to administer it: a `DROP USER`
+or `REVOKE` that would remove the last superuser is refused, naming
+`--reset-superuser` as the way out. There is no way back in over the wire from
+a database with no superuser.
+
+### Enforcement: one choke point, and the plan rather than the text
+
+Every statement is measured against a `Requirement`, produced by exactly two
+functions and consumed by exactly one. A statement that reaches neither
+producer has no path to the engine at all.
+
+* **A statement the engine runs** is authorised from its **resolved plan**
+  (`inlaysql::Statement::table_access`), never from its text. That is a
+  security property and not a nicety: `SELECT (SELECT secret FROM vault) FROM
+  public` names two tables, and a keyword scan that finds only the first one is
+  a privilege bypass. Joins, `UNION` arms, derived tables, `IN (SELECT ...)`,
+  `EXISTS (...)`, `RETURNING` and the expressions inside an `UPDATE`'s `SET`
+  are all covered, because the plan lists what it reads and the plan is what
+  runs.
+* **A statement this server answers itself** — `SET`, `SHOW`, `USE`,
+  transaction control, `information_schema`, `DESCRIBE` — needs a live account
+  and no more, and account statements need a superuser (except `SHOW GRANTS`
+  for yourself and `ALTER USER` on your own account, which are your own
+  business).
+* **Default deny.** A statement whose requirement cannot be determined is
+  refused with `1227`, not allowed. The one place this is reachable in practice
+  is `DROP INDEX` naming an index the catalog has no record of: there is no
+  table to attribute it to, so only a *global* `DROP` will do, which a
+  per-table grant cannot satisfy.
+
+Privileges are re-read from the file on **every statement**, which costs one
+indexed lookup, and that is what buys the guarantee below.
+
+**When a change takes effect.** A `REVOKE`, an `ALTER USER` or a `DROP USER`
+takes effect on the offending session's *next statement* — not at its next
+reconnection, which for a pooled connection could be never. A prepared
+statement is re-authorised on every execution, so one prepared while a grant
+held does not outlive the grant. The one window left is an **explicit
+transaction**: a handle inside one reads its pinned snapshot, so a grant
+changed by another connection mid-transaction is not visible until that
+transaction ends. That is the engine's isolation working as designed, and it is
+documented rather than worked around.
+
+### Migration: nothing happens until you ask for it
+
+**A database with no account store is left completely alone.** It behaves
+exactly as it did before this existed: `--user`/`--password` are the one
+credential, that credential is a superuser, and not a byte is written. The
+store is created by the first `CREATE USER` or `GRANT`, and the bootstrap
+account is written into it first — so the credential you are holding when you
+run your first `CREATE USER` keeps working through it.
+
+That laziness is not only politeness. Every row in this engine draws its row id
+from **one counter shared by every table** (see [Divergences](#divergences)),
+so seeding an account at startup would have shifted the first application row
+of every fresh database from id 1 to id 2. Creating the store on demand
+confines that to databases whose operator asked for accounts.
+
+**Once a database has accounts, `--user`/`--password` are not consulted.** The
+file is the authority — otherwise a forgotten line in a service file would
+silently reinstate a password that had been rotated. The server prints which of
+the two states it is in at startup, because assuming the wrong one means
+believing you have rotated a password you have not.
+
+`--reset-superuser` is the deliberate escape: it sets `--user`'s password from
+the flags and makes that account a superuser, creating it if it had been
+dropped. It needs write access to the database file, which is already full
+access to it, so it grants nothing new.
+
+### What is deliberately left out
+
+Each of these is **refused wherever it can be written down**, rather than
+accepted and quietly meaning less than it says.
+
+| Not implemented | What happens instead |
+| --- | --- |
+| Column-level privileges (`GRANT SELECT (email) ON ...`) | Refused, `1235`. Nothing here can filter a projection. |
+| Row-level privileges | No syntax to refuse; simply absent. |
+| Host-based access control | `'app'@'%'` is accepted, because `%` means "any host" and that is what this implements. Any other host is refused, `1235` — accepting `'app'@'localhost'` and ignoring it would make the account reachable from everywhere it says it is not. |
+| Roles, `GRANT <role> TO`, `SHOW GRANTS ... USING` | Refused, `1235`. |
+| `PROXY`, routine and tablespace privileges, `RELOAD`/`PROCESS`/`SHUTDOWN` and the rest of MySQL's administrative set | Refused, `1235`, naming the privilege. |
+| Partial delegation (`WITH GRANT OPTION` on less than `ALL ... ON *.*`) | Refused, `1235`. |
+| Schema-level scoping | One file is one schema, so `ON app.*` is a global grant. A qualifier that is neither `*`, `inlaysql`, nor the connection's current database is refused with `1044` rather than quietly treated as this one. |
+| `SET PASSWORD` | Refused, `1235`, pointing at `ALTER USER` — accepting it would have recorded a password change as an inert session variable and changed nothing. |
+| `RENAME USER` | Refused, `1235`. A name is an account's identity here, so renaming would orphan every grant written against the old one. |
+| `CREATE USER` with no `IDENTIFIED BY` | Refused, `1235`. MySQL would create an account with no password; `IDENTIFIED BY ''` says so in as many words if that is really what you want. |
+| `IDENTIFIED ... AS '<hash>'` | Refused, `1235`: a hash pasted in is a hash this server cannot check the plugin of. |
+| Hiding metadata | **Not refused, and the one real gap.** Any authenticated account can run `SHOW TABLES` and `DESCRIBE`. Real MySQL shows only what you hold a privilege on; this does not, so table and column *names* are readable by every account even where their contents are not. |
+| Account locking, password expiry, failed-login lockout, an audit log | Absent. |
+| TLS | Still absent, and still the first thing to know about this server. |
 
 ### The limits a client is told are the limits that are enforced
 
@@ -158,6 +356,50 @@ file. The server prints this at startup when the flag is given. See
 Turning it on also gates off the shared raw-page read cache described in D2
 below, one-way and for every handle on the file: that cache is keyed by page id
 and is sound only while a page id is never reissued.
+
+### `--paged-vectors`: what it fixes, and what it costs
+
+Every connection has its own `Database`, so every connection has its own copy
+of every retrieval index. That is the multiplier behind
+`docs/enterprise-readiness.md` blocker 6, and this flag is the only lever
+against it that exists today. It sets `EngineOptions::paged_vector_indexes`
+for every connection's handle: the ANN graph lives in the database file as
+ordinary rows and each connection holds a bounded node cache
+(`hnsw_paged::DEFAULT_CACHE_NODES`, 4096 nodes — about 6 MiB at dimension 384)
+instead of the whole corpus.
+
+**Measured, not estimated**, by `crates/inlaysql/tests/index_memory_cost.rs`
+(an `#[ignore]`d instrument with a counting global allocator; run it and read
+the table). Over 8,000 rows at dimension 384 with both a BM25 and a vector
+index, one additional connection costs:
+
+| | per extra connection | of which ANN payload |
+| --- | --- | --- |
+| default | 56.5 MiB | 23.4 MiB |
+| `--paged-vectors` | 35.0 MiB | 3.7 MiB |
+
+**Recall is identical**, because the paged graph is the same graph: same
+algorithm, same layer assignment, same distance function, same insert order.
+What changes is where the bytes are.
+
+Three costs, in the order they will bite:
+
+* **A cache miss is a read from the file**, not a pointer chase. Search
+  latency rises; how much depends on how much of the graph the cache holds.
+* **Another connection's commit costs this one an O(nodes) re-open** of the
+  graph, where the in-memory index pays O(rows that commit touched). A
+  self-persisting index cannot be caught up by replaying rows into it — the
+  writer already applied them, in the file — so what makes it current is
+  reading it again, which walks its node records to rebuild the row-id map.
+  See `Engine::adopt_self_persisting_vector_indexes`.
+* **It does nothing for BM25.** `Bm25Index` has no paged backend at all, so
+  the term dictionary, every postings list, the per-document term lists and
+  the row-id map stay resident once per connection. In the table above that is
+  most of the 35 MiB that remains, and on a large text corpus it is the whole
+  bill.
+
+The flag is off by default for the same reason `--page-reuse` is: which way
+the trade falls depends on the corpus, and the operator is the one who knows.
 
 ### Backing up a running server
 
@@ -440,8 +682,17 @@ Answered from `Catalog` and session state, never sent to the engine:
   the comparison — they are never spliced into SQL text, so there is no
   injection path through the shim's own parsing.
 - `USE`, `BEGIN`, `START TRANSACTION`, `COMMIT`, `ROLLBACK`, `DO`.
+- `CREATE USER`, `ALTER USER`, `DROP USER`, `GRANT`, `REVOKE`, `SHOW GRANTS` —
+  answered against the account store rather than the engine, which has no
+  syntax for any of them. See
+  [Accounts and privileges](#accounts-and-privileges).
 - Comments are stripped first, quote-aware, including MySQL's `/*!40101 ... */`
   version gates.
+
+Every one of the metadata answers above has the account store filtered out of
+it: `SHOW TABLES`, `SHOW TABLE STATUS`, `SHOW COLUMNS`, `DESCRIBE` and each
+`information_schema` view list the tables a client may use, and the two
+`__inlaysql_`-prefixed ones are not among them.
 
 Things the shim refuses rather than fakes:
 
@@ -818,6 +1069,18 @@ translated the same way:
 SQLSTATE `22007` as "Invalid datetime format", so an integer/text mismatch was
 reaching users as a date error.
 
+The refusals [Accounts and privileges](#accounts-and-privileges) makes carry
+MySQL's own codes, so a client's error handling recognises the shape:
+
+| Refusal | MySQL | SQLSTATE |
+| --- | --- | --- |
+| Wrong user or password | 1045 `ER_ACCESS_DENIED_ERROR` | 28000 |
+| A privilege this account does not hold on a table | 1142 `ER_TABLEACCESS_DENIED_ERROR` | 42000 |
+| A privilege it does not hold globally, an administrative statement, or a requirement that could not be determined | 1227 `ER_SPECIFIC_ACCESS_DENIED_ERROR` | 42000 |
+| A grant naming a schema this file is not | 1044 `ER_DBACCESS_DENIED_ERROR` | 42000 |
+| `GRANT`/`REVOKE`/`SHOW GRANTS` for an account that does not exist | 1133 `ER_PASSWORD_NO_MATCH` | 42000 |
+| `CREATE`/`ALTER`/`DROP USER` that cannot be carried out | 1396 `ER_CANNOT_USER` | HY000 |
+
 ### Client-side-escaped string literals are rewritten before the engine sees them
 
 Found the same way as the Laravel migration work above — driving
@@ -959,11 +1222,24 @@ consults a collating sequence in this engine, where MySQL's `LOCATE` and
 shim mapped to `NOCASE`, `NULLIF(name,'ADA')` is NULL here as it is in MySQL —
 because `mysql_nullif` is one of the three collation-aware scalars.
 
-### The row id counter always starts at 1
+### The row id counter always starts at 1, and every table shares it
 
 `CREATE TABLE ... AUTO_INCREMENT = 1000` is accepted and the first row still
 gets `1`. The keys are unique and increasing either way; they are simply not
 the numbers that asked for. There is no way to seed the engine's counter today.
+
+**There is one counter for the whole database, not one per table**, which
+MySQL's `AUTO_INCREMENT` is not. Create a table, insert three rows, create a
+second table and insert into it, and that row is id `4`. This is the engine's
+row-id allocation, not the shim's, and it predates the server.
+
+One consequence belongs to [Accounts and privileges](#accounts-and-privileges):
+the account store is two ordinary tables, so its rows draw on that same
+counter. On a database where accounts are used, the first application row is id
+`2` rather than `1`, and every `CREATE USER` and per-table `GRANT` shifts
+subsequent ids by one more. This is why the store is created on the first
+`CREATE USER`/`GRANT` rather than at startup — a database nobody creates an
+account in is completely untouched.
 
 ### The upsert's affected-rows count does not match MySQL's
 

@@ -267,7 +267,7 @@ being a trait.
 `PagedHnswIndex` is neither of the above: it keeps its graph *in the database*,
 as ordinary rows under a namespace no table can name (`\u{1}ann:table.column`).
 It answers `true` to `VectorIndex::is_self_persisting`, and the engine treats it
-differently in four places.
+differently in five places.
 
 **It writes through the engine's transaction.** The engine's storage is a
 `SharedStorage` — one `Rc<RefCell<_>>` handle the index holds a clone of — so
@@ -299,6 +299,27 @@ version, exactly as it compares a saved blob's — same table, same outcomes:
 | equal to the committed version | the graph describes these rows | use it as it is |
 | different | rows changed under it, or another binary wrote them | rebuild |
 | absent | a crash caught it mid-build, or it is new | rebuild |
+
+**Another handle's commit is adopted by re-reading it, not by replaying rows
+into it.** This is the one that is easy to get backwards. For an in-memory
+backend, this handle's copy *is* the index, so `catch_up_indexes` brings it up
+to date by reconciling the rows the change log names. For a self-persisting one
+the index is in the file and the committing handle already updated it there —
+every node record, the entry point, the live set and the stamp. Replaying rows
+on top would apply that change a second time (`remove` tombstoning a node the
+graph still has live, `insert` adding a duplicate) and would do it as *writes*,
+from a handle that only read. `Engine::adopt_self_persisting_vector_indexes`
+re-opens the backend instead, and holds it to the same stamp test a saved blob
+gets: a graph whose stamp is not the committed write version is not a catch-up,
+it is a rebuild.
+
+The cost is honest and worth stating: re-opening walks the graph's node records
+to rebuild the row-id map, so a foreign commit is O(nodes) here where an
+in-memory index pays O(rows that commit touched). That is why `docs/server.md`
+presents `--paged-vectors` as a trade. It replaces something far worse —
+declining rebuilt the *whole table*, which re-tokenised every document into the
+full-text index as well, measured at 41 re-indexed documents for one foreign
+insert into a 40-row table (`tests/foreign_commit_indexes.rs`).
 
 **A rebuild empties it first.** `VectorIndex::reset` deletes the node records.
 Without it, re-indexing every row on top of a graph that just restored itself

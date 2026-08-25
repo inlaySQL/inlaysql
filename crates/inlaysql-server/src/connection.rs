@@ -16,6 +16,7 @@ use std::io::{self, Read, Write};
 
 use inlaysql::{Database, Error, Outcome, ResultSet, Value};
 
+use crate::acl;
 use crate::auth;
 use crate::errors::{from_engine, MysqlError};
 use crate::packet::{put_lenenc_bytes, put_lenenc_int, Malformed, Reader, Stream};
@@ -26,15 +27,6 @@ use crate::protocol::{
 use crate::session::{Limits, Session, Warning, SERVER_VERSION};
 use crate::shim::{self, Intercepted};
 use crate::sqltext;
-
-/// How the server was told to authenticate.
-#[derive(Debug, Clone)]
-pub struct Credentials {
-    /// The single user this server accepts.
-    pub user: String,
-    /// Its password. Empty means no password is required.
-    pub password: String,
-}
 
 /// A statement kept between `COM_STMT_PREPARE` and `COM_STMT_CLOSE`.
 struct Prepared {
@@ -66,6 +58,10 @@ pub struct Connection<S: Read + Write> {
     /// Kept because authentication builds a second [`Session`] once the user
     /// name is known, and both must report the same enforced numbers.
     limits: Limits,
+    /// The `--user`/`--password` credential, as verifiers. It is the whole
+    /// account model on a database that has never had an account created in
+    /// it, and is ignored entirely on one that has — see [`acl::install`].
+    bootstrap: acl::Bootstrap,
 }
 
 impl<S: Read + Write> Connection<S> {
@@ -76,6 +72,7 @@ impl<S: Read + Write> Connection<S> {
         db: Database,
         connection_id: u32,
         limits: Limits,
+        bootstrap: acl::Bootstrap,
     ) -> Self {
         Self {
             stream: Stream::new(read_half, write_half),
@@ -84,12 +81,13 @@ impl<S: Read + Write> Connection<S> {
             statements: HashMap::new(),
             next_statement_id: 1,
             limits,
+            bootstrap,
         }
     }
 
     /// Authenticate, then serve commands until the client disconnects.
-    pub fn serve(&mut self, credentials: &Credentials) -> io::Result<()> {
-        if !self.authenticate(credentials)? {
+    pub fn serve(&mut self) -> io::Result<()> {
+        if !self.authenticate()? {
             return Ok(());
         }
         loop {
@@ -104,7 +102,7 @@ impl<S: Read + Write> Connection<S> {
 
     // ------------------------------------------------------------- auth
 
-    fn authenticate(&mut self, credentials: &Credentials) -> io::Result<bool> {
+    fn authenticate(&mut self) -> io::Result<bool> {
         let challenge = auth::scramble()?;
         self.stream.write_message(&handshake(
             self.session.connection_id,
@@ -137,6 +135,24 @@ impl<S: Read + Write> Connection<S> {
             return Ok(false);
         }
 
+        // The account is read from the file before a byte of the exchange is
+        // checked. A name with no account gets a stand-in that no password
+        // satisfies ([`acl::Account::unknown`]) rather than an early refusal,
+        // so the exchange runs to the same length and fails at the same step:
+        // a guesser must not be able to enumerate accounts by watching how far
+        // a login gets before it is turned away.
+        let account = match acl::account(&mut self.db, &response.username, &self.bootstrap) {
+            Ok(Some(account)) => account,
+            Ok(None) => acl::Account::unknown(&response.username),
+            // The store itself could not be read. That is a broken database,
+            // not a bad password, and saying "access denied" would send an
+            // operator looking for the wrong thing.
+            Err(error) => {
+                self.fail(&error)?;
+                return Ok(false);
+            }
+        };
+
         // A client with no `CLIENT_PLUGIN_AUTH` capability sent no plugin
         // name at all; its token was still computed `mysql_native_password`'s
         // way, the protocol's own default from before plugins existed.
@@ -150,9 +166,9 @@ impl<S: Read + Write> Connection<S> {
         // only the error message's "(using password: YES/NO)", never the
         // comparison itself.
         let (password_ok, with_password) = match plugin {
-            auth::CACHING_SHA2_PASSWORD => {
+            auth::CACHING_SHA2_PASSWORD if account.speaks(auth::CACHING_SHA2_PASSWORD) => {
                 match self.caching_sha2_authenticate(
-                    credentials,
+                    &account,
                     &challenge,
                     &response.auth_response,
                 )? {
@@ -163,26 +179,42 @@ impl<S: Read + Write> Connection<S> {
                     None => return Ok(false),
                 }
             }
-            auth::NATIVE_PASSWORD => (
-                auth::verify(&credentials.password, &challenge, &response.auth_response),
+            auth::NATIVE_PASSWORD if account.speaks(auth::NATIVE_PASSWORD) => (
+                account.verify_native(&challenge, &response.auth_response),
                 !response.auth_response.is_empty(),
             ),
-            // A plugin this server does not speak directly: ask the client
-            // to switch to the one every driver already falls back to.
+            // Either a plugin this server does not speak at all, or one this
+            // account has no verifier for because `IDENTIFIED WITH` pinned it
+            // to the other. Both are answered the way MySQL answers them:
+            // `AuthSwitchRequest` naming a plugin the account can complete.
             _ => {
+                let Some(switch_to) = account.preferred_plugin() else {
+                    // An account with no verifier at all cannot authenticate
+                    // under anything. Refused as a wrong password, not as a
+                    // different condition, so it says nothing new about the
+                    // account.
+                    self.fail(&MysqlError::access_denied(&response.username, false))?;
+                    return Ok(false);
+                };
                 self.stream
-                    .write_message(&auth_switch_request(&challenge))?;
+                    .write_message(&auth_switch_request(switch_to, &challenge))?;
                 self.stream.flush()?;
                 let Some(token) = self.stream.read_message()? else {
                     return Ok(false);
                 };
-                let ok = auth::verify(&credentials.password, &challenge, &token);
-                (ok, !token.is_empty())
+                match switch_to {
+                    auth::CACHING_SHA2_PASSWORD => {
+                        match self.caching_sha2_authenticate(&account, &challenge, &token)? {
+                            Some(outcome) => outcome,
+                            None => return Ok(false),
+                        }
+                    }
+                    _ => (account.verify_native(&challenge, &token), !token.is_empty()),
+                }
             }
         };
 
-        let user_ok = response.username == credentials.user;
-        if !user_ok || !password_ok {
+        if !password_ok {
             // The reply does not distinguish a wrong user from a wrong
             // password, and nothing about the attempt is logged: a rejected
             // login should not tell a guesser which half was right, and a
@@ -222,18 +254,18 @@ impl<S: Read + Write> Connection<S> {
     /// `docs/server.md` and the module docs on [`auth`]).
     fn caching_sha2_authenticate(
         &mut self,
-        credentials: &Credentials,
+        account: &acl::Account,
         challenge: &[u8],
         initial_response: &[u8],
     ) -> io::Result<Option<(bool, bool)>> {
         // A 32-byte response is the plugin's fast-authentication attempt —
         // every real client sends one optimistically, hoping the server has
-        // something to check it against. This one always does: it already
-        // holds the plaintext password (v1's single user/password), so there
-        // is no "cache miss" case to fall back from the way real MySQL's
-        // in-memory hash cache has one.
+        // something to check it against. This one always does: the account
+        // carries exactly the digest real MySQL's in-memory cache would hold,
+        // on disk from the moment it was created, so there is no "cache miss"
+        // case to fall back from.
         if initial_response.len() == 32 {
-            let ok = auth::caching_sha2_verify(&credentials.password, challenge, initial_response);
+            let ok = account.verify_caching_sha2(challenge, initial_response);
             if ok {
                 self.stream
                     .write_message(&auth_more_data(&[auth::CACHING_SHA2_FAST_AUTH_SUCCESS]))?;
@@ -262,8 +294,85 @@ impl<S: Read + Write> Connection<S> {
             return Ok(None);
         }
 
-        let ok = auth::caching_sha2_full_auth_verify(&credentials.password, &payload);
+        let ok = account.verify_caching_sha2_cleartext(&payload);
         Ok(Some((ok, !payload.is_empty())))
+    }
+
+    // --------------------------------------------------- authorisation
+
+    /// This connection's account, as it stands **now**.
+    ///
+    /// Read from the file on every statement rather than captured at login.
+    /// That is what makes a `REVOKE` or a `DROP USER` take effect on an
+    /// already-connected session's *next statement*: a copy taken at
+    /// authentication would keep working for as long as the client held the
+    /// socket, which for a pooled connection is indefinitely.
+    ///
+    /// The one window left is an explicit transaction: a handle inside one
+    /// reads its pinned snapshot, so a grant changed by another connection
+    /// mid-transaction is not visible until it ends. That is the engine's
+    /// isolation working as designed, and it is documented rather than worked
+    /// around — see `docs/server.md`.
+    fn account(&mut self) -> Result<acl::Account, MysqlError> {
+        let user = self.session.user.clone();
+        let bootstrap = self.bootstrap.clone();
+        match acl::account(&mut self.db, &user, &bootstrap)? {
+            Some(account) => Ok(account),
+            // The account was dropped while this session was connected. MySQL
+            // lets such a session run on; this refuses its next statement,
+            // which is the only reading of `DROP USER` that does not leave a
+            // removed account with an open door for as long as it keeps its
+            // socket.
+            None => Err(acl::account_gone(&user)),
+        }
+    }
+
+    /// Authorise a statement **this server** answers.
+    ///
+    /// Statements that reach the engine return `Ok` here and are authorised
+    /// from their plan in [`Self::authorize_plan`] instead — the plan is the
+    /// only thing that knows every table a subquery reaches, and authorising
+    /// from the text would be a bypass rather than an approximation.
+    fn authorize_statement(&mut self, sql: &str) -> Result<(), MysqlError> {
+        if !shim::handles(sql) {
+            return Ok(());
+        }
+        let requirement = acl::shim_requirement(sql, &self.session);
+        let account = self.account()?;
+        acl::enforce(&mut self.db, &account, &requirement)
+    }
+
+    /// Authorise a planned statement, from what the plan says it touches.
+    fn authorize_plan(&mut self, plan: &inlaysql::Statement) -> Result<(), MysqlError> {
+        let requirement = acl::plan_requirement(&plan.table_access(), self.db.catalog());
+        let account = self.account()?;
+        acl::enforce(&mut self.db, &account, &requirement)
+    }
+
+    /// Plan `sql` **and authorise it**.
+    ///
+    /// The only place in this file that turns statement text into a plan the
+    /// engine will run. Everything that executes goes through here or through
+    /// [`Self::authorize_plan`] on a plan that was kept from a previous
+    /// `COM_STMT_PREPARE` — so there is no path to the engine that skipped the
+    /// check, which matters more than where the check is written: the call
+    /// site nobody remembers is the vulnerability.
+    ///
+    /// `fresh` picks between [`Database::prepare_fresh`] and
+    /// [`Database::prepare`] for the same reason the callers always did — see
+    /// [`Self::run_on_engine`].
+    fn prepare_authorized(
+        &mut self,
+        sql: &str,
+        fresh: bool,
+    ) -> Result<inlaysql::Statement, MysqlError> {
+        let plan = if fresh {
+            self.db.prepare_fresh(sql).map_err(|e| from_engine(&e))?
+        } else {
+            self.db.prepare(sql).map_err(|e| from_engine(&e))?
+        };
+        self.authorize_plan(&plan)?;
+        Ok(plan)
     }
 
     // -------------------------------------------------------- dispatch
@@ -352,6 +461,12 @@ impl<S: Read + Write> Connection<S> {
         // syntax on its own.
         let sql = &sqltext::rewrite_backslash_escapes(sql);
 
+        // Before the shim is allowed to *do* anything with it: `handle_set`
+        // mutates the session, `USE` changes the schema, and an account
+        // statement writes to the store. A check after that point would be a
+        // check after the effect.
+        self.authorize_statement(sql)?;
+
         // MySQL's rule: every statement starts with an empty warning list,
         // except the ones whose purpose is to read it.
         if !shim::reads_warnings(sql) {
@@ -380,6 +495,21 @@ impl<S: Read + Write> Connection<S> {
                 rows: *rows,
                 plan: None,
             }),
+            Intercepted::Acl(statement) => {
+                // MySQL commits an open transaction before an account
+                // statement, and so does this — for a sharper reason than
+                // parity: a `REVOKE` that a later `ROLLBACK` could undo is a
+                // `REVOKE` that did not happen, after the client was told it
+                // had.
+                self.commit()?;
+                match acl::execute(&mut self.db, &self.session, &self.bootstrap, &statement)? {
+                    acl::Effect::Done => Ok(Answer::ok()),
+                    acl::Effect::Rows(rows) => Ok(Answer::Rows {
+                        rows: *rows,
+                        plan: None,
+                    }),
+                }
+            }
             Intercepted::Failed(error) => Err(error),
             Intercepted::UseDatabase(name) => {
                 self.session.database = Some(name);
@@ -434,7 +564,7 @@ impl<S: Read + Write> Connection<S> {
     /// refreshing before it parsed.
     fn run_on_engine(&mut self, sql: &str, params: &[Value]) -> Result<Answer, MysqlError> {
         self.begin_implicit()?;
-        let plan = self.db.prepare_fresh(sql).map_err(|e| from_engine(&e))?;
+        let plan = self.prepare_authorized(sql, true)?;
         if streamed_column_defs(&plan).is_some() {
             return Ok(Answer::Streamed(plan));
         }
@@ -449,7 +579,7 @@ impl<S: Read + Write> Connection<S> {
             // window is the whole life of the prepared statement rather than
             // two calls.
             Err(Error::Stale(_)) => {
-                let fresh = self.db.prepare_fresh(sql).map_err(|e| from_engine(&e))?;
+                let fresh = self.prepare_authorized(sql, true)?;
                 let outcome = self
                     .db
                     .execute_prepared(&fresh, params)
@@ -487,7 +617,23 @@ impl<S: Read + Write> Connection<S> {
         // Every operation the translation carried turned into a warning and
         // nothing else (an `ADD CONSTRAINT ... FOREIGN KEY` on its own) — a
         // plain OK, and the engine is not touched at all.
+        //
+        // It is still authorised, because a statement that reaches OK with no
+        // privilege check is exactly the hole this design exists to close, and
+        // "it happens to do nothing" is a property of today's translation
+        // rather than a rule. There is no plan to attribute it to a table, so
+        // the requirement is the global `ALTER` the statement asked for —
+        // default-deny, since a per-table grant cannot satisfy it.
         if statements.is_empty() {
+            let account = self.account()?;
+            acl::enforce(
+                &mut self.db,
+                &account,
+                &acl::Requirement::Needs(vec![acl::Need {
+                    table: None,
+                    privilege: acl::Privileges::ALTER,
+                }]),
+            )?;
             return Ok(Answer::ok());
         }
 
@@ -519,10 +665,21 @@ impl<S: Read + Write> Connection<S> {
             remaining = rest;
 
             let before = self.db.last_insert_row_id();
-            let outcome = self
-                .db
-                .execute(statement, this_statement)
-                .map_err(|error| from_engine(&error))?;
+            // Planned and authorised one at a time rather than handed to
+            // `Database::execute`, which would plan internally and leave this
+            // sequence as the one path to the engine with no privilege check
+            // on it. Each statement is planned *fresh* because the one before
+            // it may have created the table this one indexes.
+            let plan = self.prepare_authorized(statement, true)?;
+            let outcome = match self.db.execute_prepared(&plan, this_statement) {
+                Err(Error::Stale(_)) => {
+                    let fresh = self.prepare_authorized(statement, true)?;
+                    self.db
+                        .execute_prepared(&fresh, this_statement)
+                        .map_err(|error| from_engine(&error))?
+                }
+                other => other.map_err(|error| from_engine(&error))?,
+            };
             answer = self.finish(outcome, before, None);
         }
         Ok(answer)
@@ -600,6 +757,15 @@ impl<S: Read + Write> Connection<S> {
         let sql = &sqltext::rewrite_backslash_escapes(sql);
         let normalized = sqltext::normalize(sql);
 
+        // Authorised here as well as at execution, which is MySQL's own
+        // behaviour and is only ever *earlier* than the check that matters:
+        // `run`/`run_plan` check again when the statement runs, so a privilege
+        // revoked in between is still caught. Preparing something you may not
+        // run should say so at the prepare, not at the first execute.
+        if let Err(error) = self.authorize_statement(&normalized) {
+            return self.fail(&error);
+        }
+
         let prepared = if shim::handles(&normalized) {
             Prepared {
                 param_count: sqltext::count_placeholders(&normalized),
@@ -622,7 +788,7 @@ impl<S: Read + Write> Connection<S> {
                 // once so `columns()` can describe what it actually projects.
                 [only] => {
                     let warnings = shim::translation_warnings(&translation);
-                    match self.db.prepare(only) {
+                    match self.prepare_authorized(only, false) {
                         Ok(plan) => Prepared {
                             param_count: plan.parameter_count(),
                             sql: only.clone(),
@@ -630,7 +796,7 @@ impl<S: Read + Write> Connection<S> {
                             param_types: Vec::new(),
                             warnings,
                         },
-                        Err(error) => return self.fail(&from_engine(&error)),
+                        Err(error) => return self.fail(&error),
                     }
                 }
                 // A MySQL statement that expanded to zero or several engine
@@ -764,6 +930,12 @@ impl<S: Read + Write> Connection<S> {
             Some(plan) => plan,
             None => return Err(MysqlError::unknown("prepared statement vanished")),
         };
+        // Re-authorised on every execution, not once when it was prepared. A
+        // prepared statement outlives the grant that allowed it: a client that
+        // prepares `SELECT * FROM salaries`, has its SELECT revoked, and then
+        // executes must be refused, and a check at prepare time alone would
+        // let it through for the life of the connection.
+        self.authorize_plan(&plan)?;
 
         // A read whose columns the plan can describe up front is answered from
         // the socket outwards; staleness is discovered by the streaming call
@@ -774,7 +946,7 @@ impl<S: Read + Write> Connection<S> {
 
         let outcome = match self.db.execute_prepared(&plan, params) {
             Err(Error::Stale(_)) => {
-                let fresh = self.db.prepare(sql).map_err(|e| from_engine(&e))?;
+                let fresh = self.prepare_authorized(sql, false)?;
                 if let Some(prepared) = self.statements.get_mut(&id) {
                     prepared.plan = Some(fresh.clone());
                 }
@@ -938,9 +1110,9 @@ impl<S: Read + Write> Connection<S> {
             Streamed::NothingWritten(error) => return self.fail(&from_engine(&error)),
         }
 
-        let fresh = match self.db.prepare_fresh(sql) {
+        let fresh = match self.prepare_authorized(sql, true) {
             Ok(fresh) => fresh,
-            Err(error) => return self.fail(&from_engine(&error)),
+            Err(error) => return self.fail(&error),
         };
         if let Some(id) = cached_as {
             if let Some(prepared) = self.statements.get_mut(&id) {

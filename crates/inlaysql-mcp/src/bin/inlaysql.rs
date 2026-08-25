@@ -35,10 +35,22 @@ SERVE --mysql OPTIONS:
     --bind <addr>      Address to listen on (default 127.0.0.1, loopback only).
     --port <n>         Port to listen on (default 3306). 0 asks the OS for a
                        free one and prints what it got.
-    --user <name>      The single accepted user name (default `root`).
+    --user <name>      The bootstrap account name (default `root`).
     --password <pw>    Its password. Visible to `ps` — prefer --password-env.
     --password-env <VAR>
                        Read the password from this environment variable.
+                       --user/--password are the WHOLE account model until the
+                       first CREATE USER, and are IGNORED from then on: the
+                       database file is the authority once it has accounts of
+                       its own, so a stale flag cannot reinstate a rotated
+                       password. The server says which of the two it is doing
+                       at startup.
+    --reset-superuser  Set --user's password from these flags and make it a
+                       superuser, on a database that already has accounts.
+                       The way back in after a lost password, and the only
+                       thing that lets the flags overwrite the file. Needs
+                       write access to the database, which is already full
+                       access to it, so it grants nothing new.
     --max-connections <n>
                        Most connections served at once (default 64).
     --wait-timeout <n> Seconds a connection may be silent before the server
@@ -59,6 +71,18 @@ SERVE --mysql OPTIONS:
                        under steady-state churn grows for ever and the only
                        way back is to stop the server and run `inlaysql
                        vacuum`, which needs the lock the server holds.
+    --paged-vectors    Keep vector indexes in the database file instead of in
+                       each connection's memory. Off by default.
+                       A TRADE, NOT A FREE WIN: the in-memory index holds
+                       every embedding twice plus the graph, once per
+                       connection (~3.5 KB per vector at dim 384); this
+                       replaces that with a bounded ~6 MiB node cache. Recall
+                       is identical — same graph, same algorithm — but a
+                       search that misses the cache reads from the file, and
+                       every other connection's commit costs this one a
+                       re-open of the graph, which is O(nodes). It does
+                       nothing for BM25, which has no paged backend and stays
+                       resident once per connection.
     --query-memory <bytes>
                        Most memory one statement may hold in an ORDER BY,
                        GROUP BY, DISTINCT or window step (default 536870912).
@@ -77,8 +101,15 @@ SERVE --mysql OPTIONS:
     otherwise; binding anywhere else exposes an unencrypted database to the
     network and should only be done across a link you already trust.
 
-    There is one user and one password, given here or in the environment —
-    there is no user table, no grants and no per-table permissions.
+    There ARE accounts and privileges now: CREATE USER / ALTER USER / DROP
+    USER, GRANT / REVOKE / SHOW GRANTS, with SELECT, INSERT, UPDATE, DELETE,
+    CREATE, DROP and ALTER grantable globally or on one table, plus a
+    superuser (GRANT ALL PRIVILEGES ON *.* ... WITH GRANT OPTION). Passwords
+    are stored as the plugins' own verifiers, never in the clear. There is no
+    column-level or row-level privilege and no host-based access control, and
+    each of those is REFUSED where it can be written down rather than accepted
+    and ignored. See docs/server.md for the whole model, including what it
+    deliberately leaves out.
 
     The SQL surface is a subset: a stock ORM's migrations will NOT run yet.
     `docs/server.md` lists exactly what works and what does not.
@@ -208,6 +239,8 @@ fn serve_mysql(args: &[String]) -> Result<(), String> {
                 options.wait_timeout_secs = number(rest.next(), "--wait-timeout")? as u64
             }
             "--page-reuse" => options.page_reuse = true,
+            "--paged-vectors" => options.paged_vector_indexes = true,
+            "--reset-superuser" => options.reset_superuser = true,
             "--query-memory" => options.query_memory_bytes = number(rest.next(), "--query-memory")?,
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
@@ -228,10 +261,13 @@ fn serve_mysql(args: &[String]) -> Result<(), String> {
              inlaysql:          --password-env keeps it out of it."
         );
     }
-    eprintln!(
-        "inlaysql: serving {path} over the MySQL protocol on {address} as user `{}`",
-        options.user
-    );
+    // What happened to the account store, in the server's own words: whether
+    // --user/--password did anything at all is not something to leave an
+    // operator to infer. See `inlaysql_server::Server::notices`.
+    for line in server.notices() {
+        eprintln!("inlaysql: {line}");
+    }
+    eprintln!("inlaysql: serving {path} over the MySQL protocol on {address}");
     eprintln!(
         "inlaysql: the SQL surface is a subset — see docs/server.md for what does not work yet"
     );

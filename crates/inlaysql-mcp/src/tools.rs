@@ -189,6 +189,7 @@ fn schema(db: &Database) -> ToolResult {
     let tables: Vec<Json> = db
         .catalog()
         .tables()
+        .filter(|table| !inlaysql::is_reserved_table_name(&table.name))
         .map(|table| {
             json!({
                 "table": table.name,
@@ -228,13 +229,41 @@ fn query(db: &mut Database, arguments: &Json, limits: &Limits) -> ToolResult {
         )));
     }
 
+    refuse_reserved_tables(db, &sql)?;
     let rows = db.query(&sql, &params)?;
     Ok(render_rows(&rows, limits))
+}
+
+/// Refuse a statement that names a table reserved for a layer above the engine.
+///
+/// The one such table today is the MySQL-wire server's account store
+/// (`crates/inlaysql-server/src/acl.rs`), and it holds password verifiers. A
+/// file served over that protocol and also opened here would otherwise hand
+/// every one of them to a language model on the first `SELECT *`, which is a
+/// different category of data from the application rows this tool exists to
+/// show. Decided from the *plan*, not from the statement's text, so a subquery
+/// cannot smuggle the name past it.
+fn refuse_reserved_tables(db: &Database, sql: &str) -> Result<(), ToolError> {
+    let Ok(plan) = db.prepare(sql) else {
+        // Not plannable: the statement is about to fail on its own terms with
+        // a better message than this could give.
+        return Ok(());
+    };
+    for (name, _) in plan.table_access() {
+        if inlaysql::is_reserved_table_name(name) {
+            return Err(ToolError::ReadOnly(format!(
+                "`{name}` is reserved for InlaySQL itself and is not readable through this \
+                 server — it holds account credentials, not application data"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn execute(db: &mut Database, arguments: &Json) -> ToolResult {
     let sql = required_str(arguments, "sql")?;
     let params = bind_params(arguments)?;
+    refuse_reserved_tables(db, &sql)?;
     let outcome = db.execute(&sql, &params)?;
     Ok(match outcome {
         Outcome::Ddl => json!({ "ok": true, "kind": "ddl" }).to_string(),

@@ -54,6 +54,10 @@ pub enum Intercepted {
     Ok,
     /// Handled; reply with these rows.
     Rows(Box<ResultSet>),
+    /// An account statement — `CREATE USER`, `GRANT`, `SHOW GRANTS` and the
+    /// rest. Parsed here and run in [`crate::connection`], which is where the
+    /// database handle the account store lives in is.
+    Acl(Box<crate::acl::AclStatement>),
     /// Open a transaction.
     Begin,
     /// Commit the open transaction.
@@ -80,6 +84,13 @@ pub const DEFAULT_SCHEMA: &str = "inlaysql";
 pub fn handles(sql: &str) -> bool {
     let sql = normalize(sql);
     if sql.is_empty() {
+        return true;
+    }
+    // Account statements are this server's, not the engine's — it has no
+    // syntax for any of them. Checked before the keyword table below because
+    // three of them (`CREATE`/`DROP`/`ALTER USER`) share a leading word with
+    // statements that really do belong to the engine.
+    if crate::acl::looks_like(&sql) {
         return true;
     }
     match first_word(&sql).as_str() {
@@ -310,6 +321,16 @@ pub fn intercept(
         return Intercepted::Ok;
     }
 
+    // Before the keyword dispatch, and in the same order [`handles`] checks
+    // it, so a statement cannot be an account statement when it is prepared
+    // and a table statement when it runs.
+    if let Some(parsed) = crate::acl::parse(&sql, session) {
+        return match parsed {
+            Ok(statement) => Intercepted::Acl(Box::new(statement)),
+            Err(error) => Intercepted::Failed(error),
+        };
+    }
+
     match first_word(&sql).as_str() {
         "SET" => handle_set(&sql, session),
         "SHOW" => handle_show(&sql, catalog, session),
@@ -444,6 +465,17 @@ fn handle_set(sql: &str, session: &mut Session) -> Intercepted {
     // explicit transaction really does pin its snapshot.
     if strip_keyword(rest, "TRANSACTION").is_some() {
         return Intercepted::Ok;
+    }
+    // `SET PASSWORD [FOR u] = '...'` is an account statement wearing a `SET`,
+    // and the assignment path below would record it as an inert session
+    // variable — a password change that answers OK and changes nothing, which
+    // is the worst possible outcome for this particular statement.
+    if strip_keyword(rest, "PASSWORD").is_some() {
+        return Intercepted::Failed(MysqlError::unsupported(
+            "SET PASSWORD is not supported; use ALTER USER <user> IDENTIFIED BY '<password>', \
+             which this server does implement — accepting it here would record a password \
+             change as a session variable and change nothing",
+        ));
     }
 
     let mut autocommit = None;
@@ -819,7 +851,7 @@ fn show_tables(rest: &str, full: bool, catalog: &Catalog, session: &Session) -> 
     }
     let schema = schema_name(session);
     let mut data = Vec::new();
-    for table in catalog.tables() {
+    for table in visible_tables(catalog) {
         if let Some(pattern) = &tail.like {
             if !like_matches(pattern, &table.name) {
                 continue;
@@ -846,7 +878,7 @@ fn show_columns(rest: &str, full: bool, catalog: &Catalog) -> Intercepted {
         return Intercepted::Failed(MysqlError::parse("SHOW COLUMNS needs FROM <table>"));
     };
     let name = last_name_part(name);
-    let Some(table) = catalog.table(&name) else {
+    let Some(table) = visible_table(catalog, &name) else {
         return Intercepted::Failed(MysqlError::no_such_table(&name));
     };
     columns_result(table, catalog, full, tail.like.as_deref())
@@ -869,7 +901,7 @@ fn handle_describe(sql: &str, catalog: &Catalog, _session: &Session) -> Intercep
     if name.is_empty() {
         return Intercepted::Failed(MysqlError::parse("DESCRIBE needs a table name"));
     }
-    let Some(table) = catalog.table(&name) else {
+    let Some(table) = visible_table(catalog, &name) else {
         return Intercepted::Failed(MysqlError::no_such_table(&name));
     };
     let like = parts
@@ -973,7 +1005,7 @@ fn show_keys(rest: &str, catalog: &Catalog) -> Intercepted {
         return Intercepted::Failed(MysqlError::parse("SHOW KEYS needs FROM <table>"));
     };
     let name = last_name_part(name);
-    let Some(table) = catalog.table(&name) else {
+    let Some(table) = visible_table(catalog, &name) else {
         return Intercepted::Failed(MysqlError::no_such_table(&name));
     };
 
@@ -1089,8 +1121,7 @@ fn show_engines() -> Intercepted {
 fn show_table_status(rest: &str, catalog: &Catalog, session: &Session) -> Intercepted {
     let tail = parse_show_tail(strip_keyword(rest, "STATUS").unwrap_or(rest));
     let schema = schema_name(session);
-    let data = catalog
-        .tables()
+    let data = visible_tables(catalog)
         .filter(|table| {
             tail.like
                 .as_ref()
@@ -1149,7 +1180,7 @@ fn show_table_status(rest: &str, catalog: &Catalog, session: &Session) -> Interc
 
 fn show_create_table(rest: &str, catalog: &Catalog) -> Intercepted {
     let name = last_name_part(rest.trim());
-    let Some(table) = catalog.table(&name) else {
+    let Some(table) = visible_table(catalog, &name) else {
         return Intercepted::Failed(MysqlError::no_such_table(&name));
     };
 
@@ -1373,6 +1404,29 @@ pub fn schema_name(session: &Session) -> String {
 }
 
 /// Build an intercepted result set.
+/// The tables a client is allowed to know about.
+///
+/// [`Catalog::tables`] includes this server's own account store, which is
+/// filtered here rather than at each of the seven places that list tables —
+/// `SHOW TABLES`, `SHOW TABLE STATUS`, `information_schema.TABLES`,
+/// `.COLUMNS`, `.STATISTICS` and the rest. A name that leaks is not itself a
+/// breach, but a metadata answer that names a table every statement then
+/// refuses is a worse answer than not naming it.
+pub fn visible_tables(catalog: &Catalog) -> impl Iterator<Item = &Table> {
+    catalog
+        .tables()
+        .filter(|table| !crate::acl::is_reserved(&table.name))
+}
+
+/// [`Catalog::table`], with this server's own tables absent — so `DESCRIBE
+/// __inlaysql_user` answers "no such table", which is what it is from a
+/// client's side of the wire.
+pub fn visible_table<'a>(catalog: &'a Catalog, name: &str) -> Option<&'a Table> {
+    catalog
+        .table(name)
+        .filter(|table| !crate::acl::is_reserved(&table.name))
+}
+
 pub fn rows(columns: &[&str], data: Vec<Vec<Value>>) -> Intercepted {
     rows_owned(columns.iter().map(|c| c.to_string()).collect(), data)
 }

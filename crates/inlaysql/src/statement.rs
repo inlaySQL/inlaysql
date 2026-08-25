@@ -94,4 +94,31 @@ impl Statement {
     pub fn columns(&self) -> &[inlaysql_core::ColumnInfo] {
         self.inner.columns()
     }
+
+    /// Every name this statement touches, and what it does to each.
+    ///
+    /// This is what an outer layer needs to *authorise* a statement before it
+    /// runs, and it is derived from the resolved plan rather than from the
+    /// statement's text — see
+    /// [`TableAccess`](inlaysql_core::TableAccess) for why that difference is
+    /// a security property and not a nicety. The engine enforces nothing
+    /// itself; the MySQL-wire server's per-table grants are checked against
+    /// exactly this list.
+    ///
+    /// ```
+    /// use inlaysql::{Database, TableAccess};
+    ///
+    /// let mut db = Database::open_in_memory()?;
+    /// db.execute("CREATE TABLE public (id INTEGER PRIMARY KEY)", &[])?;
+    /// db.execute("CREATE TABLE vault (id INTEGER PRIMARY KEY, secret TEXT)", &[])?;
+    ///
+    /// let probe = db.prepare("SELECT (SELECT secret FROM vault) FROM public")?;
+    /// let touched = probe.table_access();
+    /// assert!(touched.contains(&("public", TableAccess::Read)));
+    /// assert!(touched.contains(&("vault", TableAccess::Read)));
+    /// # Ok::<(), inlaysql::Error>(())
+    /// ```
+    pub fn table_access(&self) -> Vec<(&str, inlaysql_core::TableAccess)> {
+        self.inner.table_access()
+    }
 }
