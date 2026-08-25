@@ -70,16 +70,27 @@ impl TestServer {
     }
 
     fn start_with(name: &str, password: &str, max_connections: usize) -> Self {
+        Self::start_tuned(name, password, |options| {
+            options.max_connections = max_connections;
+        })
+    }
+
+    /// A server on loopback and an ephemeral port, with `tune` deciding
+    /// whatever else the test is actually about. Everything not touched there
+    /// is [`ServerOptions::default`], so a test reads as the one option it
+    /// exercises rather than as a full option list.
+    fn start_tuned(name: &str, password: &str, tune: impl FnOnce(&mut ServerOptions)) -> Self {
         let temp = TempDb::new(name);
-        let options = ServerOptions {
+        let mut options = ServerOptions {
             bind: "127.0.0.1".to_string(),
             // Port 0: the OS picks a free one, so nothing here assumes 3306 is
             // available or that this is the only server running.
             port: 0,
             user: "root".to_string(),
             password: password.to_string(),
-            max_connections,
+            ..ServerOptions::default()
         };
+        tune(&mut options);
         let server = Server::bind(&temp.path, &options).expect("bind");
         let addr = server.local_addr().expect("local_addr");
         std::thread::spawn(move || {
@@ -94,6 +105,12 @@ impl TestServer {
 
     fn client(&self) -> Client {
         Client::connect(self.addr, "root", &self.password, None).expect("connect")
+    }
+
+    /// The database file, for a test that asserts on what the server wrote
+    /// rather than on what it answered.
+    fn path(&self) -> &std::path::Path {
+        &self._temp.path
     }
 }
 
@@ -2189,6 +2206,166 @@ fn the_connection_cap_refusal_carries_no_sqlstate_marker_on_the_wire() {
         b"Too many connections",
         "a pre-handshake ERR packet must not carry the 4.1 SQLSTATE marker"
     );
+}
+
+/// The cap a client is *told* is the cap that is enforced.
+///
+/// It used to report `max_connections=0` — no cap at all — while refusing the
+/// connection past 64. A pool reads that number to size itself, so the lie is
+/// not cosmetic: it says "open as many as you like" to something that will
+/// then hit `1040` in production and have no way to have known better.
+#[test]
+fn the_reported_connection_cap_is_the_one_that_is_enforced() {
+    let server = TestServer::start_with("cap-truth", "s3cret", 3);
+    let mut client = server.client();
+
+    assert_eq!(
+        client
+            .ok_query("SELECT @@max_connections")
+            .rows()
+            .cell(0, 0),
+        "3"
+    );
+    let rows = client
+        .ok_query("SHOW VARIABLES LIKE 'max_connections'")
+        .rows();
+    assert_eq!(rows.cell(0, 1), "3");
+
+    // And the number is real: two more fill the cap, the fourth is refused.
+    let _second = server.client();
+    let _third = server.client();
+    let error = Client::connect(server.addr, "root", &server.password, None)
+        .err()
+        .expect("the fourth connection must be refused");
+    assert_eq!(error.code, 1040, "ER_CON_COUNT_ERROR");
+}
+
+/// The reported `wait_timeout` is a socket read timeout that is really set,
+/// and an idle client really does lose its slot.
+///
+/// This is the failure this closes: the cap is 64, so 64 clients that connect
+/// and then say nothing are the entire server — no statement to log, no
+/// credential to revoke, and nothing to do about it short of a restart. The
+/// server named a `wait_timeout` for it and enforced nothing, which is worse
+/// than naming none: a client tunes its idle-connection lifetime against that
+/// number.
+#[test]
+fn an_idle_connection_loses_its_slot_after_the_wait_timeout_it_reports() {
+    let server = TestServer::start_tuned("idle-timeout", "s3cret", |options| {
+        options.max_connections = 1;
+        options.wait_timeout_secs = 1;
+    });
+
+    let mut idle = server.client();
+    // Reported and enforced are the same number, which is the whole point:
+    // `net_read_timeout` reports it too, since one `SO_RCVTIMEO` is what
+    // applies to both waiting for a command and reading one.
+    let rows = idle
+        .ok_query("SELECT @@wait_timeout, @@net_read_timeout")
+        .rows();
+    assert_eq!(rows.cell(0, 0), "1");
+    assert_eq!(rows.cell(0, 1), "1");
+
+    // The one slot is taken.
+    let error = Client::connect(server.addr, "root", &server.password, None)
+        .err()
+        .expect("the second connection must be refused while the first holds the slot");
+    assert_eq!(error.code, 1040, "ER_CON_COUNT_ERROR");
+
+    // Now say nothing. A generous client-side timeout so a server that never
+    // hangs up fails this test as a timeout rather than hanging the suite.
+    idle.stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+        .expect("client read timeout");
+    let mut byte = [0u8; 1];
+    match idle.stream.read(&mut byte) {
+        // A clean FIN: the server closed it, which is what MySQL does on
+        // `wait_timeout` — there is no error packet for "you went quiet".
+        Ok(0) => {}
+        Ok(n) => panic!("the server sent {n} bytes instead of closing an idle connection"),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+        Err(error) => panic!("the idle connection was still open: {error}"),
+    }
+
+    // And the slot came back. Retried briefly: the count is decremented as the
+    // connection's thread unwinds, which is after the socket closes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match Client::connect(server.addr, "root", &server.password, None) {
+            Ok(mut fresh) => {
+                assert_eq!(fresh.ok_query("SELECT 1").rows().cell(0, 0), "1");
+                break;
+            }
+            Err(error) if std::time::Instant::now() < deadline => {
+                assert_eq!(error.code, 1040);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => panic!("the timed-out connection never released its slot: {error:?}"),
+        }
+    }
+}
+
+/// `--page-reuse` reaches every connection's handle, and the file stops
+/// growing without bound under churn that leaves the live data size flat.
+///
+/// The option itself is one field on `EngineOptions`; what this test is
+/// actually for is the server's own structure around it. Reclamation only
+/// offers pages freed before `Device::min_reader_seq`, and every read-write
+/// handle pins that watermark at the sequence it last read — so the process's
+/// lock-keeping handle had to stop being a `Database` (which reads once at
+/// startup and then never again, pinning the watermark for the life of the
+/// server) and become a bare `FileDevice`, which holds the same OS lock and
+/// registers no reader. With a `Database` keeper this same churn produced a
+/// *larger* file with reuse on than with it off, because the free-list rows
+/// accumulate and nothing ever draws them down.
+#[test]
+fn page_reuse_bounds_the_file_the_server_writes() {
+    let off = churn_through_a_server("reuse-off", false);
+    let on = churn_through_a_server("reuse-on", true);
+
+    assert!(
+        off > 0 && on > 0,
+        "both servers should have written real data (off={off}, on={on})"
+    );
+    assert!(
+        on < off * 3 / 4,
+        "page reuse did not bound the file the server wrote: off = {off} bytes, \
+         on = {on} bytes (expected the reuse-on file well below 3/4 of reuse-off)"
+    );
+}
+
+/// Run the same write/delete/rewrite churn over the wire against a server with
+/// page reuse `enabled`, and return the size of the file it wrote.
+fn churn_through_a_server(name: &str, enabled: bool) -> u64 {
+    const ROUNDS: usize = 10;
+    const KEYS: usize = 40;
+
+    let server = TestServer::start_tuned(name, "s3cret", |options| {
+        options.page_reuse = enabled;
+    });
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
+
+    for round in 0..ROUNDS {
+        // Long enough that a row is a real share of a page, so the same pages
+        // are superseded round after round rather than merely grown into.
+        let body = round.to_string().repeat(150);
+        for id in 0..KEYS {
+            client.ok_query(&format!(
+                "INSERT INTO t (id, v) VALUES ({id}, '{body}') \
+                 ON CONFLICT (id) DO UPDATE SET v = excluded.v"
+            ));
+        }
+        // Delete a rotating quarter, so their pages are genuinely freed and
+        // the next round's inserts can draw them again.
+        let start = (round * KEYS / 4) % KEYS;
+        for offset in 0..KEYS / 4 {
+            let id = (start + offset) % KEYS;
+            client.ok_query(&format!("DELETE FROM t WHERE id = {id}"));
+        }
+    }
+
+    std::fs::metadata(server.path()).expect("stat").len()
 }
 
 /// A statement larger than one packet has to be reassembled from its

@@ -39,6 +39,24 @@ SERVE --mysql OPTIONS:
                        Read the password from this environment variable.
     --max-connections <n>
                        Most connections served at once (default 64).
+    --wait-timeout <n> Seconds a connection may be silent before the server
+                       closes it (default 28800, MySQL's own). Reported as
+                       wait_timeout, and now actually enforced — without it,
+                       --max-connections silent sockets hold every slot until
+                       the process is restarted. Must be at least 1; for
+                       effectively none, ask for a large one (31536000).
+    --page-reuse       Reclaim pages a commit stopped using, instead of only
+                       ever growing the file. Off by default.
+                       READ THIS FIRST: a reclaimed page is overwritten in
+                       place, so NOTHING may open this file read-only while
+                       the server runs with it on — including `inlaysql serve
+                       --mcp`, which opens read-only by default. A lock-free
+                       read-only handle takes no lock and cannot be seen, so
+                       it cannot be waited for; this is why the engine
+                       defaults the option off. Without the flag, a database
+                       under steady-state churn grows for ever and the only
+                       way back is to stop the server and run `inlaysql
+                       vacuum`, which needs the lock the server holds.
 
     SECURITY: the MySQL protocol is served in PLAINTEXT. This version has no
     TLS, so every statement, every result and every credential crosses the
@@ -60,7 +78,8 @@ VACUUM:
     Compacts the database file in place: copies every table, constraint and
     index into a fresh file, then atomically replaces the original with it.
     For shrinking a file after a large one-time DELETE — day-to-day growth
-    from ordinary churn is what EngineOptions::page_reuse is for, not this.
+    from ordinary churn is what page reuse is for (`serve --mysql
+    --page-reuse`, or EngineOptions::page_reuse when embedding), not this.
     Needs an exclusive lock (refuses if another handle has the file open for
     writing) and free disk space for a second full copy while it runs.
 
@@ -150,6 +169,10 @@ fn serve_mysql(args: &[String]) -> Result<(), String> {
             "--max-connections" => {
                 options.max_connections = number(rest.next(), "--max-connections")?
             }
+            "--wait-timeout" => {
+                options.wait_timeout_secs = number(rest.next(), "--wait-timeout")? as u64
+            }
+            "--page-reuse" => options.page_reuse = true,
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
     }

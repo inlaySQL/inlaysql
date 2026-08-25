@@ -1395,7 +1395,12 @@ mod tests {
     }
 
     fn session() -> Session {
-        Session::new(1, "root", Some("app".to_string()))
+        Session::new(
+            1,
+            "root",
+            Some("app".to_string()),
+            crate::session::Limits::default(),
+        )
     }
 
     fn run(sql: &str) -> Intercepted {
@@ -1668,7 +1673,7 @@ mod tests {
 
     #[test]
     fn database_is_null_when_no_schema_is_selected() {
-        let mut session = Session::new(1, "root", None);
+        let mut session = Session::new(1, "root", None, crate::session::Limits::default());
         match intercept("SELECT DATABASE()", &[], &catalog(), &mut session) {
             Intercepted::Rows(rows) => assert_eq!(rows.rows[0][0], Value::Null),
             other => panic!("{other:?}"),

@@ -1402,7 +1402,12 @@ mod tests {
     }
 
     fn session() -> Session {
-        Session::new(1, "root", Some("app".to_string()))
+        Session::new(
+            1,
+            "root",
+            Some("app".to_string()),
+            crate::session::Limits::default(),
+        )
     }
 
     fn run(sql: &str, params: &[Value]) -> Intercepted {

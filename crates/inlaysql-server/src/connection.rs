@@ -23,7 +23,7 @@ use crate::protocol::{
     self, auth_more_data, auth_switch_request, eof_packet, err_packet, handshake, ok_packet,
     put_binary_value, text_value, unify_column_type, ColumnDef, Command,
 };
-use crate::session::{Session, Warning, SERVER_VERSION};
+use crate::session::{Limits, Session, Warning, SERVER_VERSION};
 use crate::shim::{self, Intercepted};
 use crate::sqltext;
 
@@ -63,17 +63,27 @@ pub struct Connection<S: Read + Write> {
     session: Session,
     statements: HashMap<u32, Prepared>,
     next_statement_id: u32,
+    /// Kept because authentication builds a second [`Session`] once the user
+    /// name is known, and both must report the same enforced numbers.
+    limits: Limits,
 }
 
 impl<S: Read + Write> Connection<S> {
     /// Wrap an accepted connection.
-    pub fn new(read_half: S, write_half: S, db: Database, connection_id: u32) -> Self {
+    pub fn new(
+        read_half: S,
+        write_half: S,
+        db: Database,
+        connection_id: u32,
+        limits: Limits,
+    ) -> Self {
         Self {
             stream: Stream::new(read_half, write_half),
             db,
-            session: Session::new(connection_id, "", None),
+            session: Session::new(connection_id, "", None, limits),
             statements: HashMap::new(),
             next_statement_id: 1,
+            limits,
         }
     }
 
@@ -188,6 +198,7 @@ impl<S: Read + Write> Connection<S> {
             self.session.connection_id,
             &response.username,
             response.database.clone(),
+            self.limits,
         );
         if let Some(name) = &response.database {
             if let Err(error) = check_database(name) {

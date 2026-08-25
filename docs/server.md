@@ -88,9 +88,76 @@ socket, and the message does not say which half of the credential was wrong.
 | `--password <pw>` | empty | Visible to `ps`. Prefer the next one. |
 | `--password-env <VAR>` | — | Read the password from the environment. |
 | `--max-connections <n>` | `64` | Beyond this, clients get `1040`. |
+| `--wait-timeout <n>` | `28800` | Seconds a connection may be silent before the server closes it. |
+| `--page-reuse` | off | Reclaim superseded pages instead of growing the file for ever. **Read the section below before using it.** |
 
 An empty password means an empty password: any client that can reach the port
 can read and write the database. The server says so at startup.
+
+### The limits a client is told are the limits that are enforced
+
+`SHOW VARIABLES` and `@@name` answer with the numbers this server actually
+applies, because a client tunes against them — a pool sizes itself on
+`max_connections`, and a driver decides how long to keep a connection warm on
+`wait_timeout`. Specifically:
+
+| Variable | Answers with |
+| --- | --- |
+| `max_connections` | `--max-connections`, the cap the accept loop enforces. |
+| `wait_timeout`, `interactive_timeout`, `net_read_timeout` | `--wait-timeout`, set on the connection as the socket read timeout. |
+| `net_write_timeout` | `60`, set on the connection as the socket write timeout. |
+
+All three read timeouts report one number because one `SO_RCVTIMEO` is what
+enforces them: the same timer covers waiting for the next command and reading
+the rest of one already begun, and this server does not distinguish those two
+states. Reporting MySQL's conventionally much shorter `net_read_timeout` would
+name a limit nothing applies.
+
+**Why the idle timeout matters more than it looks.** A client that connects and
+then says nothing holds its slot: `--max-connections` such sockets are the
+entire server, with no statement to log and no way to get the slots back short
+of a restart. The read timeout is what ends them. `--wait-timeout 0` is refused
+at startup rather than clamped — there is no honest number to report for
+"never", so a caller that genuinely wants no idle timeout asks for a large one
+(`31536000`, MySQL's own maximum).
+
+There is still **no statement timeout and no `KILL`**: a query that is running
+runs to completion, and `COM_PROCESS_KILL` is not implemented (a client sending
+it gets `1047`). Cancelling mid-statement needs cancellation inside the
+executor, which does not exist yet; nothing here pretends otherwise.
+
+### `--page-reuse`: what it fixes, and what it costs
+
+Without it a page a commit stops using — because a row or an index entry was
+deleted, or a copy-on-write update superseded it — is never reclaimed. The
+file's high-water mark only ever grows, even under steady-state churn where the
+*live* data size is flat. The only way to get that space back is `inlaysql
+vacuum`, which needs the exclusive lock the running server holds, so it means
+stopping the server.
+
+`--page-reuse` turns on `EngineOptions::page_reuse` for every connection's
+handle, which draws on the free list instead of always growing the file. A
+write/delete/rewrite workload run through the server over the wire leaves a
+4.3 MB file with it on against 13 MB with it off
+(`page_reuse_bounds_the_file_the_server_writes` in
+`crates/inlaysql-server/tests/wire.rs`, which asserts the ratio rather than the
+bytes).
+
+**It is off by default, and turning it on is a decision about the whole file,
+not about this server.** A reclaimed page is physically overwritten with new
+content. `Database::open_read_only` takes no OS lock, by design, so a
+lock-free reader — in this process or any other — could still be looking at a
+page this server has just reused, and reclamation cannot rule one out:
+liveness is provable only for readers this process's reservation gate can see,
+which a read-only handle is not. Concretely, **`--page-reuse` rules out
+`inlaysql serve --mcp` on the same file** (it opens read-only by default, which
+is the whole workflow `docs/mcp.md` describes) and any other live reader of the
+file. The server prints this at startup when the flag is given. See
+`EngineOptions::page_reuse` and `docs/recovery.md` for the full argument.
+
+Turning it on also gates off the shared raw-page read cache described in D2
+below, one-way and for every handle on the file: that cache is keyed by page id
+and is sound only while a page id is never reissued.
 
 ---
 
@@ -146,13 +213,27 @@ only data-area pages — the header, the state block and the WAL regions are
 rewritten in place and are never served from it — and it is gated off the
 moment any handle opts into page reuse: `CowBTree::set_page_reuse` tells the
 device, the device flushes the cache and bypasses it from then on, one-way.
-`EngineOptions::page_reuse` now reaches `set_page_reuse` publicly (Phase 2
-item 6), and this server does not opt into it — `serve_connection` still
-opens with `Database::open`, which defaults it off — so the gate has never
-fired in production here, but it is real and tested
-(`the_reuse_opt_in_flushes_and_gates_the_shared_cache`), not aspirational: if
-`page_reuse` is ever wired through the server's own open path, this is what
-keeps a reissued page id from being served its previous occupant's bytes.
+`EngineOptions::page_reuse` reaches `set_page_reuse` publicly (Phase 2 item 6)
+and this server now reaches it too: `serve_connection` opens every connection
+with `Database::open_on_with_options`, so `--page-reuse` really does fire the
+gate rather than leaving it theoretical. It is tested at both ends —
+`the_reuse_opt_in_flushes_and_gates_the_shared_cache` for the flush, and
+`page_reuse_bounds_the_file_the_server_writes` for the reclamation the flag
+exists for. Without the gate a reissued page id would be served its previous
+occupant's bytes.
+
+**One structural consequence of that flag, recorded here because it is not
+obvious.** Reclamation only offers pages freed before `Device::min_reader_seq`,
+and every read-write handle pins that watermark at the sequence it last read.
+The handle this process holds to keep the file's advisory lock while it serves
+is therefore a bare `FileDevice`, not a `Database`: a `Database` reads once at
+startup and then never again, so it would pin the watermark for the life of the
+server and nothing freed afterwards could ever be reclaimed. Measured, with the
+churn that test runs: 4.3 MB with reuse on and a `FileDevice` keeper, 13 MB
+with reuse off, and **15.5 MB with reuse on and a `Database` keeper** — worse
+than not reclaiming at all, because the free-list rows accumulate and nothing
+draws them down. A `FileDevice` opens no tree, so it registers no reader and
+holds only the lock it is there for.
 
 **What this cache does and does not explain.** It was built while
 investigating AHL-495's published claim that per-connection cache duplication
@@ -220,6 +301,7 @@ unchanged, which is what the `determinism` CI job polices.
 | `COM_STMT_EXECUTE` | yes, binary parameters and binary result sets |
 | `COM_STMT_CLOSE` / `COM_STMT_RESET` | yes |
 | `COM_FIELD_LIST` | refused with `1047` — use `SHOW COLUMNS` |
+| `COM_PROCESS_KILL` | no, refused with `1047` — there is no way to cancel a running statement, and no statement timeout either |
 | TLS | no, and not advertised |
 | Multi-statement / multi-result | no, and not advertised |
 | `LOAD DATA LOCAL INFILE` | no, and not advertised |

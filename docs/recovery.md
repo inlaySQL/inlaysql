@@ -391,6 +391,19 @@ comment, not a default, and not something a future `EngineOptions` flag
 should flip on without deciding how to communicate the same constraint to an
 embedder turning it on for a `Database`.
 
+That last sentence has since been answered once, and the answer is the
+pattern to copy. The MySQL server exposes it as `serve --mysql --page-reuse`,
+off by default, and communicates the constraint three times over: in
+`ServerOptions::page_reuse`'s doc comment, in `docs/server.md`, and — because
+the constraint is about *other processes*, which only the operator can rule
+out — in a warning the server prints at startup naming `inlaysql serve --mcp`
+(a read-only opener of the same file) as the concrete thing it forbids. The
+server also had to stop holding its lock-keeping handle as a `Database`: an
+idle read-write handle pins `min_reader_seq` at the sequence it last read, so
+it would have silently declined every candidate for the life of the process,
+turning the flag into pure cost. It holds a bare `FileDevice` instead, which
+takes the same OS lock and registers no reader.
+
 **DST coverage for reuse specifically**
 (`crates/inlaysql-core/tests/free_list_reuse_dst.rs`) uses a purpose-built
 `TrustedDevice` over the same `Simulator`/fault schedule the rest of this

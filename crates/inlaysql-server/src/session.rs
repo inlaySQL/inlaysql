@@ -17,6 +17,45 @@ use std::collections::BTreeMap;
 /// answering, so nobody reading a log concludes they are talking to MySQL.
 pub const SERVER_VERSION: &str = "8.0.35-inlaysql";
 
+/// The limits this server actually applies, in the units the MySQL system
+/// variables that report them use.
+///
+/// Every number here is enforced by something concrete — `max_connections` by
+/// the accept loop in [`crate::Server::run`], the two timeouts by the socket
+/// options [`crate::serve_connection`] sets — and [`Session::variable`] reports
+/// exactly these values and no others. That pairing is the whole point of the
+/// type: a reported timeout nothing honours is worse than reporting none,
+/// because a pool sizes itself and a driver decides how long to keep a
+/// connection warm against these numbers. Before this existed the server said
+/// `max_connections=0` while refusing the 65th connection, and named two
+/// timeouts it never enforced.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// The most connections served at once, after [`crate::Server::bind`] has
+    /// clamped it. Reported as `max_connections`.
+    pub max_connections: usize,
+    /// The socket read timeout, in seconds. Reported as `wait_timeout`,
+    /// `interactive_timeout` **and** `net_read_timeout` — one number for all
+    /// three because one `SO_RCVTIMEO` is what enforces them: the same timer
+    /// covers waiting for the next command and reading the rest of one
+    /// already begun, and this server does not distinguish those two states.
+    /// Reporting MySQL's much shorter conventional `net_read_timeout` here
+    /// would name a limit nothing applies.
+    pub read_timeout_secs: u64,
+    /// The socket write timeout, in seconds. Reported as `net_write_timeout`.
+    pub write_timeout_secs: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_connections: crate::DEFAULT_MAX_CONNECTIONS,
+            read_timeout_secs: crate::DEFAULT_WAIT_TIMEOUT_SECS,
+            write_timeout_secs: crate::NET_WRITE_TIMEOUT_SECS,
+        }
+    }
+}
+
 /// One warning raised by the statement that just ran.
 ///
 /// The shim raises these for every MySQL-only clause it removed from a
@@ -52,11 +91,13 @@ pub struct Session {
     user_variables: BTreeMap<String, String>,
     /// Warnings from the last statement that raised any.
     warnings: Vec<Warning>,
+    /// What this server enforces, and therefore what it reports.
+    limits: Limits,
 }
 
 impl Session {
     /// A fresh session for `connection_id`.
-    pub fn new(connection_id: u32, user: &str, database: Option<String>) -> Self {
+    pub fn new(connection_id: u32, user: &str, database: Option<String>, limits: Limits) -> Self {
         Self {
             connection_id,
             user: user.to_string(),
@@ -67,6 +108,7 @@ impl Session {
             variables: BTreeMap::new(),
             user_variables: BTreeMap::new(),
             warnings: Vec::new(),
+            limits,
         }
     }
 
@@ -156,8 +198,14 @@ impl Session {
             "lower_case_table_names" => "2",
             "time_zone" => "SYSTEM",
             "system_time_zone" => "UTC",
-            "wait_timeout" | "interactive_timeout" => "28800",
-            "net_read_timeout" | "net_write_timeout" => "60",
+            // The three variables below are read off [`Limits`] rather than
+            // written out here, because each one is a number this server
+            // really applies — see that type for why a reported-but-unenforced
+            // timeout is worse than no answer at all.
+            "wait_timeout" | "interactive_timeout" | "net_read_timeout" => {
+                return Some(self.limits.read_timeout_secs.to_string())
+            }
+            "net_write_timeout" => return Some(self.limits.write_timeout_secs.to_string()),
             // Said plainly, because a client may be deciding whether to trust
             // this link with a password.
             "have_ssl" | "have_openssl" => "DISABLED",
@@ -179,7 +227,7 @@ impl Session {
             "event_scheduler" => "OFF",
             "hostname" => "localhost",
             "socket" => "",
-            "max_connections" => "0",
+            "max_connections" => return Some(self.limits.max_connections.to_string()),
             "group_concat_max_len" => "1024",
             "sql_select_limit" => "18446744073709551615",
             "sql_quote_show_create" => "1",
@@ -259,7 +307,7 @@ mod tests {
 
     #[test]
     fn a_set_variable_wins_over_the_default() {
-        let mut session = Session::new(1, "root", None);
+        let mut session = Session::new(1, "root", None, Limits::default());
         assert_eq!(
             session.variable("sql_mode").as_deref(),
             Some("STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION")
@@ -270,7 +318,7 @@ mod tests {
 
     #[test]
     fn autocommit_reads_back_the_live_value_not_a_recorded_one() {
-        let mut session = Session::new(1, "root", None);
+        let mut session = Session::new(1, "root", None, Limits::default());
         assert_eq!(session.variable("autocommit").as_deref(), Some("1"));
         session.autocommit = false;
         assert_eq!(session.variable("autocommit").as_deref(), Some("0"));
@@ -278,20 +326,66 @@ mod tests {
 
     #[test]
     fn an_unknown_variable_has_no_answer() {
-        assert_eq!(Session::new(1, "root", None).variable("wibble"), None);
+        assert_eq!(
+            Session::new(1, "root", None, Limits::default()).variable("wibble"),
+            None
+        );
+    }
+
+    /// Every limit a client can read back is the one this server was built
+    /// with — not a constant written into the variable table beside it.
+    ///
+    /// This used to be `max_connections = 0` (no cap) against a real cap of
+    /// 64, and two timeouts nothing applied. The numbers below are deliberately
+    /// none of the defaults, so a hard-coded answer cannot pass.
+    #[test]
+    fn the_reported_limits_are_the_ones_the_server_was_given() {
+        let session = Session::new(
+            1,
+            "root",
+            None,
+            Limits {
+                max_connections: 7,
+                read_timeout_secs: 11,
+                write_timeout_secs: 13,
+            },
+        );
+        assert_eq!(session.variable("max_connections").as_deref(), Some("7"));
+        for name in ["wait_timeout", "interactive_timeout", "net_read_timeout"] {
+            assert_eq!(
+                session.variable(name).as_deref(),
+                Some("11"),
+                "{name} must report the socket read timeout that is actually set"
+            );
+        }
+        assert_eq!(session.variable("net_write_timeout").as_deref(), Some("13"));
+
+        // And `SHOW VARIABLES` says the same thing as `@@name`, which is where
+        // a client that lists everything would otherwise see the stale answer.
+        let all = session.all_variables();
+        for (name, value) in [
+            ("max_connections", "7"),
+            ("wait_timeout", "11"),
+            ("net_write_timeout", "13"),
+        ] {
+            assert!(
+                all.iter().any(|(n, v)| n == name && v == value),
+                "SHOW VARIABLES should list {name}={value}, got {all:?}"
+            );
+        }
     }
 
     /// The two claims a security-minded client might actually read.
     #[test]
     fn the_server_does_not_claim_to_have_tls_or_foreign_keys() {
-        let session = Session::new(1, "root", None);
+        let session = Session::new(1, "root", None, Limits::default());
         assert_eq!(session.variable("have_ssl").as_deref(), Some("DISABLED"));
         assert_eq!(session.variable("foreign_key_checks").as_deref(), Some("0"));
     }
 
     #[test]
     fn status_flags_track_autocommit_and_transactions() {
-        let mut session = Session::new(1, "root", None);
+        let mut session = Session::new(1, "root", None, Limits::default());
         assert_eq!(
             session.status_flags(),
             crate::protocol::SERVER_STATUS_AUTOCOMMIT
@@ -310,7 +404,7 @@ mod tests {
 
     #[test]
     fn show_variables_includes_client_set_ones() {
-        let mut session = Session::new(1, "root", None);
+        let mut session = Session::new(1, "root", None, Limits::default());
         session.set_variable("wibble", "7");
         let all = session.all_variables();
         assert!(all.iter().any(|(n, v)| n == "wibble" && v == "7"));
