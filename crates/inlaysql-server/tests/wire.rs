@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use inlaysql_server::{Server, ServerOptions};
 
@@ -105,6 +106,24 @@ impl TestServer {
 
     fn client(&self) -> Client {
         Client::connect(self.addr, "root", &self.password, None).expect("connect")
+    }
+
+    /// A client, retrying while the server still refuses at the connection
+    /// cap. For a test whose subject is a slot being *released*: a thread ends
+    /// when it ends, and polling for that is honest where sleeping a fixed
+    /// interval and hoping is not.
+    fn client_within(&self, timeout: Duration) -> Client {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match Client::connect(self.addr, "root", &self.password, None) {
+                Ok(client) => return client,
+                Err(error) if std::time::Instant::now() < deadline => {
+                    assert_eq!(error.code, 1040, "refused, but not at the cap: {error:?}");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("no slot came back within {timeout:?}: {error:?}"),
+            }
+        }
     }
 
     /// The database file, for a test that asserts on what the server wrote
@@ -488,17 +507,32 @@ impl Client {
     // ---------------------------------------------------------- framing
 
     fn read_packet(&mut self) -> io::Result<Vec<u8>> {
+        self.read_framed().map(|(_, payload)| payload)
+    }
+
+    /// One whole message, both as the bytes that carried it — headers,
+    /// sequence ids, continuation packets and all — and as the payload they
+    /// reassemble to.
+    ///
+    /// The raw half exists for the tests that compare two answers *as bytes*
+    /// rather than as decoded rows: a column definition's charset, flags and
+    /// declared length are on the wire and are not in [`Rows`], so a change to
+    /// one of them would be invisible to every other test in this file.
+    fn read_framed(&mut self) -> io::Result<(Vec<u8>, Vec<u8>)> {
+        let mut raw = Vec::new();
         let mut payload = Vec::new();
         loop {
             let mut header = [0u8; 4];
             self.stream.read_exact(&mut header)?;
+            raw.extend_from_slice(&header);
             let length = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
             self.sequence = header[3].wrapping_add(1);
             let start = payload.len();
             payload.resize(start + length, 0);
             self.stream.read_exact(&mut payload[start..])?;
+            raw.extend_from_slice(&payload[start..]);
             if length < 0xff_ff_ff {
-                return Ok(payload);
+                return Ok((raw, payload));
             }
         }
     }
@@ -686,6 +720,110 @@ impl Client {
             types,
             rows,
         }))
+    }
+
+    /// Every byte the server sent in answer to the command just written.
+    ///
+    /// Stops at whichever packet ends the exchange: an ERR, an OK, or a result
+    /// set's terminating EOF — or an ERR *in place of* that EOF, which is how
+    /// a result set that failed after its first row ends.
+    fn raw_reply(&mut self) -> Vec<u8> {
+        let mut raw = Vec::new();
+        let (bytes, first) = self.read_framed().expect("reply");
+        raw.extend_from_slice(&bytes);
+        match first.first() {
+            Some(0xff) => return raw,
+            Some(0x00) if first.len() >= 7 => return raw,
+            _ => {}
+        }
+
+        let count = Cursor::new(&first).lenenc().expect("column count") as usize;
+        for _ in 0..=count {
+            let (bytes, _) = self.read_framed().expect("column definition");
+            raw.extend_from_slice(&bytes);
+        }
+        loop {
+            let (bytes, payload) = self.read_framed().expect("row");
+            raw.extend_from_slice(&bytes);
+            let terminal = payload.first() == Some(&0xff)
+                || (payload.first() == Some(&0xfe) && payload.len() < 9);
+            if terminal {
+                return raw;
+            }
+        }
+    }
+
+    /// [`Self::query`], answered as bytes rather than as rows.
+    fn raw_query(&mut self, sql: &str) -> Vec<u8> {
+        self.command(0x03, sql.as_bytes());
+        self.raw_reply()
+    }
+
+    /// [`Self::execute`] with no parameters, answered as bytes.
+    fn raw_execute(&mut self, stmt: &Prepared) -> Vec<u8> {
+        assert_eq!(stmt.param_count, 0, "this helper binds nothing");
+        let mut body = stmt.id.to_le_bytes().to_vec();
+        body.push(0); // flags: no cursor
+        body.extend_from_slice(&1u32.to_le_bytes()); // iteration count
+        self.command(0x17, &body);
+        self.raw_reply()
+    }
+
+    /// Run a query that is expected to fail *after* it has already sent rows,
+    /// and report both halves: the rows that arrived, and the error that ended
+    /// the result set in place of its final EOF.
+    fn query_until_error(&mut self, sql: &str) -> (Vec<Vec<Option<String>>>, ServerError) {
+        self.command(0x03, sql.as_bytes());
+        let first = self.read_packet().expect("reply");
+        assert!(
+            first.first() != Some(&0xff),
+            "this statement failed before any row: {:?}",
+            parse_error(&first)
+        );
+        let count = Cursor::new(&first).lenenc().expect("column count") as usize;
+        for _ in 0..count {
+            self.read_packet().expect("column definition");
+        }
+        self.read_packet().expect("metadata EOF");
+
+        let mut rows = Vec::new();
+        loop {
+            let packet = self.read_packet().expect("row");
+            if packet.first() == Some(&0xff) {
+                return (rows, parse_error(&packet));
+            }
+            assert!(
+                !(packet.first() == Some(&0xfe) && packet.len() < 9),
+                "the result set ended cleanly; it was expected to fail"
+            );
+            rows.push(parse_text_row(&packet));
+        }
+    }
+
+    /// Run a query and count its rows without keeping any of them, for a
+    /// result set large enough that keeping them would be the test's own
+    /// memory problem rather than the server's.
+    fn count_rows(&mut self, sql: &str) -> usize {
+        self.command(0x03, sql.as_bytes());
+        let first = self.read_packet().expect("reply");
+        assert!(
+            first.first() != Some(&0xff),
+            "{sql} failed: {:?}",
+            parse_error(&first)
+        );
+        let count = Cursor::new(&first).lenenc().expect("column count") as usize;
+        for _ in 0..=count {
+            self.read_packet().expect("column definition");
+        }
+        let mut rows = 0usize;
+        loop {
+            let packet = self.read_packet().expect("row");
+            if packet.first() == Some(&0xfe) && packet.len() < 9 {
+                return rows;
+            }
+            assert_ne!(packet.first(), Some(&0xff), "the result set failed midway");
+            rows += 1;
+        }
     }
 }
 
@@ -4048,4 +4186,416 @@ fn explain_analyze_is_refused_over_the_wire() {
     assert_eq!(rows.cell(0, 2), "SCAN posts");
 
     client.quit();
+}
+
+// =====================================================================
+// streaming result sets (docs/enterprise-readiness.md, blocker 8)
+// =====================================================================
+
+/// Seed `rows` rows of a two-column table, in batches, and hand back a client
+/// on the same server.
+fn seeded_server(name: &str, rows: i64) -> (TestServer, Client) {
+    let server = TestServer::start(name);
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)");
+    for start in (1..=rows).step_by(500) {
+        let end = (start + 499).min(rows);
+        let mut sql = String::from("INSERT INTO kv (id, body) VALUES ");
+        for id in start..=end {
+            if id > start {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("({id}, 'body-{id}')"));
+        }
+        client.ok_query(&sql);
+    }
+    (server, client)
+}
+
+/// The headline case: a result set far larger than any buffer between the two
+/// ends, over a real socket, arriving whole and in order.
+#[test]
+fn a_large_result_set_arrives_whole_over_a_real_socket() {
+    const ROWS: i64 = 50_000;
+    let (_server, mut client) = seeded_server("large-result", ROWS);
+
+    assert_eq!(client.count_rows("SELECT id, body FROM kv"), ROWS as usize);
+
+    // The ends of it, decoded, so "arrived" means the right rows in the right
+    // order rather than the right *number* of packets.
+    let head = client.ok_query("SELECT id, body FROM kv LIMIT 3").rows();
+    assert_eq!(head.column("id"), vec!["1", "2", "3"]);
+    assert_eq!(head.cell(0, 1), "body-1");
+    let tail = client
+        .ok_query(&format!("SELECT id, body FROM kv WHERE id > {}", ROWS - 2))
+        .rows();
+    assert_eq!(
+        tail.column("id"),
+        vec![(ROWS - 1).to_string(), ROWS.to_string()]
+    );
+    assert_eq!(tail.cell(1, 1), format!("body-{ROWS}"));
+
+    client.quit();
+}
+
+/// Byte-for-byte, the two paths through the server answer the same statement
+/// the same way.
+///
+/// The control is the materialising path *as it still exists*, not a recorded
+/// golden: a computed or otherwise undeclared column cannot be described in
+/// the column-definition packets that must precede the first row, so a query
+/// projecting one is still answered by building the whole result set. A
+/// derived table's columns are exactly that — the planner gives them no type,
+/// because a subquery's projection has none to give — so `SELECT * FROM
+/// (SELECT id, body FROM kv) AS t` returns the identical rows under the
+/// identical labels by the other route.
+///
+/// Compared as raw bytes, which is the point: a column definition's charset,
+/// flags and declared length never reach [`Rows`], and a streaming rewrite
+/// that changed one of them would pass every other test in this file.
+#[test]
+fn a_streamed_result_set_is_byte_identical_to_a_materialised_one() {
+    let (_server, mut client) = seeded_server("byte-identical", 40);
+
+    let streamed = client.raw_query("SELECT id, body FROM kv WHERE id <= 20");
+    let materialised =
+        client.raw_query("SELECT * FROM (SELECT id, body FROM kv WHERE id <= 20) AS t");
+    assert_eq!(
+        streamed, materialised,
+        "the streamed and materialised answers differ on the wire"
+    );
+
+    // The binary protocol too, where the column type decides how every value
+    // is *encoded* rather than only how it is labelled — a type that drifted
+    // would misframe the rows rather than mislabel them.
+    let direct = client
+        .prepare("SELECT id, body FROM kv WHERE id <= 20")
+        .expect("prepare");
+    let derived = client
+        .prepare("SELECT * FROM (SELECT id, body FROM kv WHERE id <= 20) AS t")
+        .expect("prepare");
+    assert_eq!(
+        client.raw_execute(&direct),
+        client.raw_execute(&derived),
+        "the binary-protocol answers differ on the wire"
+    );
+
+    client.quit();
+}
+
+/// `NULL`s, and the order they arrive in, survive the streamed path unchanged.
+///
+/// Same comparison as above and for the same reason, over a table where every
+/// column has holes in it: the binary protocol carries `NULL` in a bitmap
+/// whose bits are offset by two, and the text protocol carries it as a
+/// reserved byte, so a streaming rewrite that lost the distinction between
+/// "absent" and "empty" would show up here and almost nowhere else.
+#[test]
+fn nulls_and_row_order_survive_the_streamed_path() {
+    let server = TestServer::start("streamed-nulls");
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, s TEXT, r REAL)");
+    client.ok_query(
+        "INSERT INTO t (id, n, s, r) VALUES \
+         (1, NULL, 'one', 1.5), (2, 20, NULL, NULL), (3, NULL, '', 0.0), (4, 40, 'four', -2.25)",
+    );
+
+    let streamed = client.raw_query("SELECT id, n, s, r FROM t");
+    let materialised = client.raw_query("SELECT * FROM (SELECT id, n, s, r FROM t) AS x");
+    assert_eq!(streamed, materialised);
+
+    // And decoded, so the assertion above is anchored to something readable.
+    let rows = client.ok_query("SELECT id, n, s, r FROM t").rows();
+    assert_eq!(rows.column("id"), vec!["1", "2", "3", "4"]);
+    assert_eq!(rows.column("n"), vec!["NULL", "20", "NULL", "40"]);
+    assert_eq!(rows.rows[1][2], None, "a NULL is not an empty string");
+    assert_eq!(
+        rows.rows[2][2],
+        Some(String::new()),
+        "an empty string is not a NULL"
+    );
+
+    let prepared = client
+        .prepare("SELECT id, n, s, r FROM t")
+        .expect("prepare");
+    let binary = client.execute(&prepared, &[]).expect("execute").rows();
+    assert_eq!(binary.rows, rows.rows, "the binary protocol agrees");
+
+    client.quit();
+}
+
+/// A result set with no rows still knows what its columns are.
+///
+/// Nothing can be inferred from an answer that has no values in it, and the
+/// old materialising path called every such column `VAR_STRING` — so
+/// `SELECT id FROM kv` described `id` as text when the table happened to be
+/// empty and as an integer when it did not, and contradicted the
+/// `COM_STMT_PREPARE` that had already answered for the same column. The plan
+/// knows, and the plan does not depend on how many rows came back.
+#[test]
+fn an_empty_result_set_still_reports_its_declared_column_types() {
+    let server = TestServer::start("empty-types");
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT, weight REAL)");
+
+    let empty = client.ok_query("SELECT id, body, weight FROM kv").rows();
+    assert!(empty.rows.is_empty());
+    assert_eq!(
+        empty.types,
+        vec![0x08, 0xfd, 0x05],
+        "LONGLONG, VAR_STRING, DOUBLE"
+    );
+
+    // The same three, from the prepare that precedes them: the two answers
+    // have to agree, which is the whole reason the plan decides this.
+    let prepared = client
+        .prepare("SELECT id, body, weight FROM kv")
+        .expect("prepare");
+    let declared: Vec<u8> = prepared.columns.iter().map(|(_, ty)| *ty).collect();
+    assert_eq!(declared, empty.types);
+
+    // A column that is present but `NULL` all the way down is the same
+    // question with rows in it.
+    client.ok_query("INSERT INTO kv (id, body, weight) VALUES (1, NULL, NULL)");
+    let nulls = client.ok_query("SELECT id, body, weight FROM kv").rows();
+    assert_eq!(nulls.types, vec![0x08, 0xfd, 0x05]);
+    assert_eq!(nulls.rows[0][1], None);
+
+    client.quit();
+}
+
+/// The hard case: the query fails once rows are already on the wire.
+///
+/// They cannot be recalled — the protocol has no packet for "ignore what I
+/// just sent" — so MySQL ends the row stream with an ERR packet where its
+/// terminating EOF would have gone, and so does this. The rows that were
+/// already sent stand; the client learns the answer is incomplete from the
+/// error, which is the same packet it already watches for in place of the
+/// *first* one.
+///
+/// The failure is a real one and arrives mid-scan: `replace()` refuses a
+/// result past SQLite's `SQLITE_MAX_LENGTH` before it allocates it, and the
+/// `CASE` keeps it from being evaluated until the fifth row.
+#[test]
+fn an_error_after_the_first_row_ends_the_result_set_with_an_err_packet() {
+    let (_server, mut client) = seeded_server("mid-stream-error", 10);
+
+    let padding = "a".repeat(1000);
+    let blowup = format!(
+        "length(replace(replace(replace(body, 'b', '{padding}'), 'a', '{padding}'), 'a', '{padding}'))"
+    );
+    let sql =
+        format!("SELECT id, body FROM kv WHERE CASE WHEN id < 5 THEN 1 ELSE {blowup} END > 0");
+
+    let (rows, error) = client.query_until_error(&sql);
+    assert_eq!(
+        rows.len(),
+        4,
+        "the rows produced before the failure must still have been sent"
+    );
+    assert_eq!(rows[0][0], Some("1".to_string()));
+    assert_eq!(rows[3][0], Some("4".to_string()));
+    assert!(
+        error.message.contains("limit"),
+        "the error must name what went wrong, got: {}",
+        error.message
+    );
+
+    // And the connection is still in step: the ERR ended the exchange the way
+    // an EOF would have, so the next command is answered normally rather than
+    // one packet behind.
+    let after = client.ok_query("SELECT id FROM kv WHERE id = 7").rows();
+    assert_eq!(after.column("id"), vec!["7"]);
+
+    client.quit();
+}
+
+/// A statement that fails *before* its first row has lost nothing, so it is
+/// answered with a plain ERR packet and no result-set framing at all — the
+/// same reply it would have had if it had never been streamable. This is what
+/// the header-on-first-row ordering buys, and it is easy to lose.
+#[test]
+fn a_failure_before_the_first_row_is_a_plain_error_packet() {
+    let (_server, mut client) = seeded_server("early-failure", 4);
+
+    // `LIMIT` is resolved from its bound parameter only when the statement
+    // runs, long after its columns were described, so a `LIMIT` that is not a
+    // number fails at exactly the moment this is about: after the point of no
+    // return for the column definitions, before the first row.
+    let prepared = client
+        .prepare("SELECT id, body FROM kv LIMIT ?")
+        .expect("prepare");
+    let error = client
+        .execute(&prepared, &[Param::Str("not a number".to_string())])
+        .expect_err("a non-numeric LIMIT must be refused");
+    assert!(
+        error.message.contains("LIMIT"),
+        "the refusal must name the clause, got: {}",
+        error.message
+    );
+
+    // No half-open result set was left behind.
+    let rows = client.ok_query("SELECT id FROM kv LIMIT 2").rows();
+    assert_eq!(rows.column("id"), vec!["1", "2"]);
+
+    client.quit();
+}
+
+/// Everything a blocking operator does still happens, and still answers the
+/// same, when its rows leave through the streamed path: `ORDER BY`, `GROUP
+/// BY`, `DISTINCT` and `LIMIT`/`OFFSET` all decide *which* rows survive and in
+/// what order, and the row callback the server writes from is fed after they
+/// have run, not instead of them.
+#[test]
+fn ordering_grouping_and_paging_answer_the_same_through_the_streamed_path() {
+    let server = TestServer::start("streamed-blocking");
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE kv (id INTEGER PRIMARY KEY, grp TEXT, body TEXT)");
+    client.ok_query(
+        "INSERT INTO kv (id, grp, body) VALUES \
+         (1, 'a', 'one'), (2, 'b', 'two'), (3, 'a', 'three'), (4, 'c', 'four'), (5, 'b', 'five')",
+    );
+
+    let sorted = client
+        .ok_query("SELECT id, body FROM kv ORDER BY body")
+        .rows();
+    assert_eq!(
+        sorted.column("body"),
+        vec!["five", "four", "one", "three", "two"]
+    );
+
+    let distinct = client
+        .ok_query("SELECT DISTINCT grp FROM kv ORDER BY grp")
+        .rows();
+    assert_eq!(distinct.column("grp"), vec!["a", "b", "c"]);
+
+    let paged = client
+        .ok_query("SELECT id, body FROM kv ORDER BY id LIMIT 2 OFFSET 2")
+        .rows();
+    assert_eq!(paged.column("id"), vec!["3", "4"]);
+
+    // Byte-for-byte against the materialising path, sort included.
+    let streamed = client.raw_query("SELECT id, body FROM kv ORDER BY body DESC LIMIT 3");
+    let materialised =
+        client.raw_query("SELECT * FROM (SELECT id, body FROM kv ORDER BY body DESC LIMIT 3) AS t");
+    assert_eq!(streamed, materialised);
+
+    client.quit();
+}
+
+/// The server refuses the one statement that would have taken it down, and
+/// goes on serving.
+///
+/// A blocking operator holds its whole input; unbounded, what ends it is the
+/// out-of-memory killer, and that ends the process — every connection, not the
+/// one that asked. With a ceiling the client gets `ER_OUT_OF_SORTMEMORY`
+/// (1038, SQLSTATE HY001: a resource failure, which is what a driver has to
+/// classify it as), the connection stays up, and the same rows still come back
+/// through the streamed path, which the ceiling does not apply to because
+/// nothing there holds more than a row.
+#[test]
+fn a_query_past_the_memory_ceiling_is_refused_and_the_server_keeps_serving() {
+    const ROWS: i64 = 5_000;
+    let server = TestServer::start_tuned("query-memory", "s3cret", |options| {
+        // Far below what a sort over `ROWS` rows needs, and far below the
+        // shipped default, so this test is about the ceiling rather than about
+        // how big the rows happen to be.
+        options.query_memory_bytes = 16 * 1024;
+    });
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)");
+    for start in (1..=ROWS).step_by(500) {
+        let end = (start + 499).min(ROWS);
+        let mut sql = String::from("INSERT INTO kv (id, body) VALUES ");
+        for id in start..=end {
+            if id > start {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("({id}, 'body-{id}')"));
+        }
+        client.ok_query(&sql);
+    }
+
+    let error = client
+        .query("SELECT id, body FROM kv ORDER BY body")
+        .expect_err("a sort past the ceiling must be refused");
+    assert_eq!(error.code, 1038, "ER_OUT_OF_SORTMEMORY");
+    assert_eq!(error.sqlstate, "HY001", "a memory allocation error");
+    assert!(
+        error.message.contains("ceiling"),
+        "the refusal must say what it hit, got: {}",
+        error.message
+    );
+
+    // The connection is untouched: no half-written result set, nothing out of
+    // step, and the same rows are still readable the way that does not block.
+    assert_eq!(client.count_rows("SELECT id, body FROM kv"), ROWS as usize);
+
+    // And a sort small enough to fit still sorts.
+    let sorted = client
+        .ok_query("SELECT id, body FROM kv WHERE id <= 5 ORDER BY body DESC")
+        .rows();
+    assert_eq!(sorted.column("id"), vec!["5", "4", "3", "2", "1"]);
+
+    // A second connection was never at risk, which is the property the whole
+    // ceiling exists for: one client's query does not decide whether the
+    // others get served.
+    let mut other = server.client();
+    assert_eq!(other.count_rows("SELECT id FROM kv"), ROWS as usize);
+
+    other.quit();
+    client.quit();
+}
+
+/// A client that hangs up part-way through reading a result set costs the
+/// server that connection and nothing else.
+///
+/// This is the failure the streamed path adds and the materialising one did
+/// not have: the server is now writing rows while the engine is still
+/// producing them, so a peer that disappears mid-answer is a write error in the
+/// middle of a scan rather than at the end of one. It has to end that
+/// connection, release its slot and leave the engine alone — and "release its
+/// slot" is the part that would otherwise be invisible until a server that had
+/// been up for a week refused every new connection.
+///
+/// The cap is one, so the slot is the assertion: if the aborted connection's
+/// thread had not ended, nothing else could ever connect.
+#[test]
+fn a_client_that_hangs_up_mid_result_set_gives_its_slot_back() {
+    const ROWS: i64 = 50_000;
+    let server = TestServer::start_with("hangup", "s3cret", 1);
+
+    {
+        let mut setup = server.client();
+        setup.ok_query("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)");
+        for start in (1..=ROWS).step_by(500) {
+            let end = (start + 499).min(ROWS);
+            let mut sql = String::from("INSERT INTO kv (id, body) VALUES ");
+            for id in start..=end {
+                if id > start {
+                    sql.push_str(", ");
+                }
+                sql.push_str(&format!("({id}, 'body-{id}')"));
+            }
+            setup.ok_query(&sql);
+        }
+        setup.quit();
+    }
+
+    {
+        // Read only the metadata, then drop the socket with tens of thousands
+        // of rows still to come.
+        let mut deserter = server.client_within(Duration::from_secs(10));
+        deserter.command(0x03, b"SELECT id, body FROM kv");
+        let first = deserter.read_packet().expect("column count");
+        let count = Cursor::new(&first).lenenc().expect("column count") as usize;
+        for _ in 0..=count {
+            deserter.read_packet().expect("column definition");
+        }
+    }
+
+    // The slot came back, and the database is exactly as it was.
+    let mut after = server.client_within(Duration::from_secs(10));
+    assert_eq!(after.count_rows("SELECT id, body FROM kv"), ROWS as usize);
+    after.quit();
 }

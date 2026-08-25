@@ -65,6 +65,21 @@ pub enum Error {
     /// allocation is attempted, so this is a refusal rather than a failed
     /// `Vec` growth.
     TooBig(String),
+    /// A statement's working set passed
+    /// [`crate::EngineOptions::query_memory_bytes`].
+    ///
+    /// `ORDER BY`, `GROUP BY`, `DISTINCT` and window functions are blocking by
+    /// definition: none can emit its first row before it has seen its last
+    /// input row, so each holds its whole input at once. Without a ceiling the
+    /// only thing that stops one is the operating system, and what the
+    /// operating system does is kill the process — which on a server takes
+    /// every other connection with it. This is the refusal that happens
+    /// instead: one statement fails, the handle is untouched, and the
+    /// connection that asked can retry with a `LIMIT` or a narrower `WHERE`.
+    ///
+    /// Nothing was written; a read cannot have written anything, and this is
+    /// raised while the input is being collected, before any fold or sort.
+    Memory(String),
 }
 
 impl fmt::Display for Error {
@@ -87,6 +102,7 @@ impl fmt::Display for Error {
             Error::Corrupt(m) => write!(f, "corrupt data: {m}"),
             Error::FormatVersion(m) => write!(f, "format version mismatch: {m}"),
             Error::TooBig(m) => write!(f, "string or blob too big: {m}"),
+            Error::Memory(m) => write!(f, "query memory limit exceeded: {m}"),
         }
     }
 }

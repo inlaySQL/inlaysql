@@ -74,6 +74,71 @@ impl ExecRow {
             windows: Vec::new(),
         }
     }
+
+    /// What holding this row costs, for [`collect_bounded`].
+    ///
+    /// The three `Vec`s and everything their cells own. `aggregates` and
+    /// `windows` are empty at the point the budget is checked — they are filled
+    /// by stages that run *after* the input is collected — but they are counted
+    /// anyway, because a row that acquires them later is the same row.
+    fn resident_bytes(&self) -> usize {
+        let mut bytes = core::mem::size_of::<Self>();
+        for cells in [&self.values, &self.aggregates, &self.windows] {
+            bytes = bytes.saturating_add(
+                cells
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<Value>()),
+            );
+            for value in cells {
+                bytes = bytes.saturating_add(value.heap_bytes());
+            }
+        }
+        bytes
+    }
+}
+
+/// Collect a blocking operator's whole input, refusing past `budget` bytes.
+///
+/// `ORDER BY`, `GROUP BY`, `DISTINCT` and window functions all have to hold
+/// their entire input before they can emit anything — see the module docs
+/// above for why that is not a shortcoming to be fixed. What *is* a
+/// shortcoming is holding it without a bound: the only thing that then stops
+/// one query is the operating system's out-of-memory killer, and that does not
+/// stop the query, it stops the process, along with every other connection it
+/// was serving. A refused statement is recoverable; a dead process is not.
+///
+/// `budget` of `0` means no ceiling, which is the old behaviour and is still
+/// what an embedded caller may want — see
+/// [`crate::EngineOptions::query_memory_bytes`].
+///
+/// The accounting is per row and conservative (see [`Value::heap_bytes`]), and
+/// it charges for the row *before* pushing it, so the ceiling is never crossed
+/// by more than one row's worth. It deliberately does not try to account for
+/// what the fold, sort or projection downstream will allocate on top: this
+/// bounds the dominant term, and pretending to a precision it does not have
+/// would make the number harder to choose rather than safer.
+pub(crate) fn collect_bounded(stream: RowStream<'_>, budget: usize) -> Result<Vec<ExecRow>> {
+    if budget == 0 {
+        return stream.collect();
+    }
+    let mut rows: Vec<ExecRow> = Vec::new();
+    let mut held = 0usize;
+    for row in stream {
+        let row = row?;
+        held = held.saturating_add(row.resident_bytes());
+        if held > budget {
+            return Err(crate::error::Error::Memory(alloc::format!(
+                "this statement has to hold its whole input before it can answer \
+                 (ORDER BY, GROUP BY, DISTINCT or a window function), and at {} rows \
+                 that is past the {budget}-byte per-statement ceiling. Narrow the \
+                 `WHERE`, add a `LIMIT` that the sort can be pushed into, or raise \
+                 `EngineOptions::query_memory_bytes`. Nothing was written.",
+                rows.len() + 1
+            )));
+        }
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 /// One stage of the pipeline, boxed so stages can be stacked at run time.
@@ -808,19 +873,7 @@ impl HashJoinTable {
             bytes =
                 bytes.saturating_add(row.capacity().saturating_mul(core::mem::size_of::<Value>()));
             for value in row {
-                bytes = bytes.saturating_add(match value {
-                    Value::Text(text) => {
-                        text.len().saturating_add(2 * core::mem::size_of::<usize>())
-                    }
-                    Value::Blob(blob) => blob
-                        .capacity()
-                        .saturating_add(2 * core::mem::size_of::<usize>()),
-                    Value::Vector(vector) => vector
-                        .capacity()
-                        .saturating_mul(core::mem::size_of::<f32>())
-                        .saturating_add(2 * core::mem::size_of::<usize>()),
-                    Value::Null | Value::Integer(_) | Value::Real(_) => 0,
-                });
+                bytes = bytes.saturating_add(value.heap_bytes());
             }
         }
         bytes

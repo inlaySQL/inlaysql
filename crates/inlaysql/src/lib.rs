@@ -318,6 +318,31 @@ impl Database {
         Ok(Statement::new(self.engine.prepare(sql)?))
     }
 
+    /// [`Database::prepare`], but against the committed state as it is *now*.
+    ///
+    /// This is what a caller that plans a statement in order to run it *once*
+    /// wants — a wire protocol deciding whether it can stream the answer, for
+    /// instance. [`Database::prepare`] plans against whatever this handle last
+    /// read, which is right for a statement that will be kept and re-run
+    /// (every execution re-validates, and [`Error::Stale`] says when to plan
+    /// again) and wrong for a one-shot: a table another connection created
+    /// since the last statement would be [`Error::Catalog`] "no such table"
+    /// here, where [`Database::execute`] would have found it, because
+    /// `execute` refreshes *before* it parses.
+    ///
+    /// ```
+    /// use inlaysql::Database;
+    ///
+    /// let mut db = Database::open_in_memory()?;
+    /// db.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY)", &[])?;
+    /// let select = db.prepare_fresh("SELECT id FROM kv")?;
+    /// assert_eq!(select.columns().len(), 1);
+    /// # Ok::<(), inlaysql::Error>(())
+    /// ```
+    pub fn prepare_fresh(&mut self, sql: &str) -> Result<Statement> {
+        Ok(Statement::new(self.engine.prepare_fresh(sql)?))
+    }
+
     /// Run a prepared statement, binding `?` placeholders from `params`.
     ///
     /// Fails with [`Error::Bind`] if the parameter count is wrong, and with

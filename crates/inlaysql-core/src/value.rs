@@ -176,6 +176,36 @@ impl Value {
         }
     }
 
+    /// Heap bytes this value owns, on top of the [`Value`] itself.
+    ///
+    /// For budgeting a working set that is being *built*, which is why it errs
+    /// upward on the one case where it can: [`Value::Text`] is reference
+    /// counted, so several rows can share one allocation and charging each
+    /// holder over-counts. A ceiling whose job is to refuse before the
+    /// allocator does should over-count rather than under-count, and the case
+    /// that actually threatens a process — a wide scan whose text cells were
+    /// each decoded separately — is counted exactly.
+    ///
+    /// A scalar owns nothing, so this is zero for `NULL`, integers and reals
+    /// without touching memory to find out.
+    pub fn heap_bytes(&self) -> usize {
+        // The allocation header a Rust allocator keeps beside a growable
+        // buffer is not observable from here, so two words per allocation
+        // stands in for it — the same stand-in `HashJoinTable::resident_bytes`
+        // has always used, kept identical so two budgets cannot disagree about
+        // the size of the same row.
+        const OVERHEAD: usize = 2 * core::mem::size_of::<usize>();
+        match self {
+            Value::Null | Value::Integer(_) | Value::Real(_) => 0,
+            Value::Text(text) => text.len().saturating_add(OVERHEAD),
+            Value::Blob(blob) => blob.capacity().saturating_add(OVERHEAD),
+            Value::Vector(vector) => vector
+                .capacity()
+                .saturating_mul(core::mem::size_of::<f32>())
+                .saturating_add(OVERHEAD),
+        }
+    }
+
     /// Borrow the value as text, if it is text.
     pub fn as_str(&self) -> Option<&str> {
         match self {

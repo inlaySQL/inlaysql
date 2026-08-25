@@ -343,7 +343,57 @@ Result-set column types are unified across every row before any of them are
 sent — all integers make an integer column, integers and reals make a real one,
 anything else falls back to text. The engine is dynamically typed the way SQLite
 is, and the binary protocol has no room for a column that changes type halfway
-down.
+down. A column with no values to unify — an empty result set, or one that is
+`NULL` all the way down — is described by the type the *plan* declared for it,
+so `SELECT id FROM t` reports `LONGLONG` whether or not `t` happens to have
+rows in it, and agrees with the `COM_STMT_PREPARE` that preceded it.
+
+#### Result sets are streamed where they can be
+
+A `SELECT` whose every projected column has a declared type is written to the
+socket as the engine produces it: one row and one write buffer, whatever the
+size of the answer. `SELECT * FROM big_table` no longer costs the server the
+size of `big_table`.
+
+The condition is the protocol's, not a heuristic. The column-definition packets
+carry every column's type and they must precede the first row, so a column whose
+type is only knowable from its values cannot be streamed. That is a computed
+expression, an aggregate, a retrieval score, a `UNION` arm, a derived table's
+column, and a `NUMERIC` column — SQLite's affinity type, which really does hold
+an integer in one row and text in the next. Those statements are answered by
+building the whole result set, as everything was before. Everything the engine
+does enforce — `INTEGER`, `REAL`, `TEXT`, `BLOB`, `VECTOR` — is streamed, and
+the two paths produce identical bytes.
+
+`ORDER BY`, `GROUP BY`, `DISTINCT` and window functions still hold their whole
+input inside the engine, because none of them can answer before reading their
+last row. The server does not hold it *as well*, and the engine's own hold is
+bounded by `--query-memory` (see below).
+
+**An error after the first row** ends the result set with an ERR packet where
+its terminating EOF would have gone — MySQL's own behaviour, and the only one
+available, since the protocol has no way to recall a packet already sent. The
+rows that arrived stand and the client learns from the error that the answer is
+incomplete. An error *before* the first row is a plain ERR packet with no
+result-set framing at all: the column definitions are written on the first row
+rather than ahead of it, precisely so that everything the engine can fail at
+first — a stale plan, a bound `LIMIT` that is not a number — still has nothing
+on the wire and can be answered, or retried, normally.
+
+#### One statement's memory has a ceiling
+
+`--query-memory <bytes>` (default 512 MiB; `EngineOptions::query_memory_bytes`
+when embedding; `0` to remove it) bounds what one statement may hold in a
+blocking operator. Past it the statement is refused with `1038`
+`ER_OUT_OF_SORTMEMORY` / `HY001` and the connection carries on. There is no
+spill to disk: a refused query is recoverable and a process killed for memory is
+not, and it takes every other connection with it.
+
+It is a ceiling **per statement**, so the exposure to size against a machine is
+this number times `--max-connections`. It bounds the blocking operator's
+collected input, which is the dominant term, and not the inner side of a
+nested-loop join over a derived table, a hash-join build, or a `UNION`'s arms —
+those still materialise unbounded.
 
 #### Prepared-statement column metadata (AHL-466)
 
@@ -355,7 +405,10 @@ expression, a retrieval score, or a `SELECT` with no `FROM`, the same line
 SQLite itself draws: `sqlite3_column_decltype` answers `NULL` for an
 expression too). The prepare reply's column-definition packets are built
 from it, with `None` falling back to the same "text represents anything"
-default an all-`NULL` executed column gets.
+default an all-`NULL` executed column gets. The same metadata is what decides
+whether a result set can be streamed, and what an executed result set with no
+values to unify is described by, so prepare and execute now agree by
+construction rather than by coincidence.
 
 This only covers what the engine plans. A statement the shim answers instead
 — `SHOW`, `information_schema`, a session `SET` — has no equivalent "plan

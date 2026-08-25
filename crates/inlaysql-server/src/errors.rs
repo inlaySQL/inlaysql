@@ -191,6 +191,17 @@ pub fn from_engine(error: &Error) -> MysqlError {
             "HY000",
             format!("Result of a string function was too large: {message}"),
         ),
+
+        // `ER_OUT_OF_SORTMEMORY`, whose SQLSTATE is HY001 (memory allocation
+        // error) and whose MySQL wording — "consider increasing the sort buffer
+        // size" — describes this exactly: a blocking operator wanted more room
+        // than it was given. It is the code a driver already classifies as a
+        // resource failure rather than a bad statement, which is what decides
+        // whether an ORM retries or reports, and it is the right classification
+        // here: the same statement over fewer rows succeeds.
+        Error::Memory(message) => {
+            MysqlError::new(1038, "HY001", format!("Out of memory: {message}"))
+        }
     }
 }
 

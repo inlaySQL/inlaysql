@@ -59,6 +59,17 @@ SERVE --mysql OPTIONS:
                        under steady-state churn grows for ever and the only
                        way back is to stop the server and run `inlaysql
                        vacuum`, which needs the lock the server holds.
+    --query-memory <bytes>
+                       Most memory one statement may hold in an ORDER BY,
+                       GROUP BY, DISTINCT or window step (default 536870912).
+                       Those cannot answer before they have read every input
+                       row, so without a ceiling one query is bounded only by
+                       the machine — and the out-of-memory killer ends the
+                       process, taking every other connection with it. Past
+                       this, that one statement is refused and the server
+                       keeps serving. PER STATEMENT: --max-connections
+                       clients can each hold this much. 0 removes the
+                       ceiling. Not a spill threshold; there is no spilling.
 
     SECURITY: the MySQL protocol is served in PLAINTEXT. This version has no
     TLS, so every statement, every result and every credential crosses the
@@ -197,6 +208,7 @@ fn serve_mysql(args: &[String]) -> Result<(), String> {
                 options.wait_timeout_secs = number(rest.next(), "--wait-timeout")? as u64
             }
             "--page-reuse" => options.page_reuse = true,
+            "--query-memory" => options.query_memory_bytes = number(rest.next(), "--query-memory")?,
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
     }

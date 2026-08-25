@@ -20,8 +20,8 @@ use crate::auth;
 use crate::errors::{from_engine, MysqlError};
 use crate::packet::{put_lenenc_bytes, put_lenenc_int, Malformed, Reader, Stream};
 use crate::protocol::{
-    self, auth_more_data, auth_switch_request, eof_packet, err_packet, handshake, ok_packet,
-    put_binary_value, text_value, unify_column_type, ColumnDef, Command,
+    self, auth_more_data, auth_switch_request, column_def_for, eof_packet, err_packet, handshake,
+    ok_packet, put_binary_value, streamed_column_def, text_value, ColumnDef, Command,
 };
 use crate::session::{Limits, Session, Warning, SERVER_VERSION};
 use crate::shim::{self, Intercepted};
@@ -335,7 +335,8 @@ impl<S: Read + Write> Connection<S> {
                 affected,
                 insert_id,
             }) => self.ok(affected, insert_id),
-            Ok(Answer::Rows(rows)) => self.write_result_set(&rows, false),
+            Ok(Answer::Rows { rows, plan }) => self.write_result_set(&rows, plan.as_ref(), false),
+            Ok(Answer::Streamed(plan)) => self.stream_answer(&plan, sql, &[], false, None),
             Err(error) => self.fail(&error),
         }
     }
@@ -370,7 +371,15 @@ impl<S: Read + Write> Connection<S> {
                 self.run_statements_on_engine(&statements, params)
             }
             Intercepted::Ok => Ok(Answer::ok()),
-            Intercepted::Rows(rows) => Ok(Answer::Rows(*rows)),
+            // No plan behind it, so no declared column types either: a `SHOW`
+            // or an `information_schema` answer is described by its values
+            // alone, exactly as it was before streaming existed. It is also
+            // bounded by construction — the catalog, not a table — which is
+            // why it is not worth streaming.
+            Intercepted::Rows(rows) => Ok(Answer::Rows {
+                rows: *rows,
+                plan: None,
+            }),
             Intercepted::Failed(error) => Err(error),
             Intercepted::UseDatabase(name) => {
                 self.session.database = Some(name);
@@ -410,14 +419,46 @@ impl<S: Read + Write> Connection<S> {
         }
     }
 
+    /// Run one statement the engine owns.
+    ///
+    /// Planned before it runs, where the old shape ran and planned in one call.
+    /// The plan is the only thing that can answer "which columns, of what
+    /// type" *before* the first row exists, and the MySQL protocol demands
+    /// that answer up front: the column-definition packets go out before any
+    /// row does. So it decides which of the two shapes below this statement
+    /// gets — the answer written to the socket as the engine produces it, or
+    /// the whole answer built in memory and written afterwards.
+    ///
+    /// [`Database::prepare_fresh`] and not `prepare`: planning has to see DDL
+    /// another connection committed, which is what `Database::execute` did by
+    /// refreshing before it parsed.
     fn run_on_engine(&mut self, sql: &str, params: &[Value]) -> Result<Answer, MysqlError> {
         self.begin_implicit()?;
+        let plan = self.db.prepare_fresh(sql).map_err(|e| from_engine(&e))?;
+        if streamed_column_defs(&plan).is_some() {
+            return Ok(Answer::Streamed(plan));
+        }
+
         let before = self.db.last_insert_row_id();
-        let outcome = self
-            .db
-            .execute(sql, params)
-            .map_err(|error| from_engine(&error))?;
-        Ok(self.finish(outcome, before))
+        let outcome = match self.db.execute_prepared(&plan, params) {
+            // The schema moved between planning and running, which is only
+            // possible when another connection committed DDL in that window.
+            // Planning again is always the right answer and the client never
+            // sees the condition — the same recovery `run_plan` makes for a
+            // statement whose plan is *kept* across executions, where the
+            // window is the whole life of the prepared statement rather than
+            // two calls.
+            Err(Error::Stale(_)) => {
+                let fresh = self.db.prepare_fresh(sql).map_err(|e| from_engine(&e))?;
+                let outcome = self
+                    .db
+                    .execute_prepared(&fresh, params)
+                    .map_err(|e| from_engine(&e))?;
+                return Ok(self.finish(outcome, before, Some(&fresh)));
+            }
+            other => other.map_err(|e| from_engine(&e))?,
+        };
+        Ok(self.finish(outcome, before, Some(&plan)))
     }
 
     /// Run every statement a MySQL DDL translation expanded to, in order —
@@ -450,21 +491,29 @@ impl<S: Read + Write> Connection<S> {
             return Ok(Answer::ok());
         }
 
+        // One statement is the overwhelmingly common shape here — a `SELECT`
+        // whose only translation was renaming `LENGTH(...)` to
+        // `octet_length(...)`, say — and it is the only shape that can be
+        // streamed, since the loop below has to run each of several statements
+        // to completion before it knows what to answer with. Handing it to
+        // `run_on_engine` is what stops a query losing the streamed path over a
+        // function name: the rows are the same rows either way, and building
+        // them all in memory first is exactly what this change exists to stop.
+        if let [only] = statements {
+            let count = sqltext::count_placeholders(only);
+            if count > params.len() {
+                return Err(too_few_parameters(only, count, params.len()));
+            }
+            return self.run_on_engine(only, &params[..count]);
+        }
+
         self.begin_implicit()?;
         let mut remaining = params;
         let mut answer = Answer::ok();
         for statement in statements {
             let count = sqltext::count_placeholders(statement);
             if count > remaining.len() {
-                return Err(MysqlError::new(
-                    1210,
-                    "HY000",
-                    format!(
-                        "Incorrect arguments to EXECUTE: `{statement}` needs {count} \
-                         parameter(s), only {} remain",
-                        remaining.len()
-                    ),
-                ));
+                return Err(too_few_parameters(statement, count, remaining.len()));
             }
             let (this_statement, rest) = remaining.split_at(count);
             remaining = rest;
@@ -474,7 +523,7 @@ impl<S: Read + Write> Connection<S> {
                 .db
                 .execute(statement, this_statement)
                 .map_err(|error| from_engine(&error))?;
-            answer = self.finish(outcome, before);
+            answer = self.finish(outcome, before, None);
         }
         Ok(answer)
     }
@@ -503,9 +552,23 @@ impl<S: Read + Write> Connection<S> {
     }
 
     /// Turn an engine outcome into a reply, tracking the insert id.
-    fn finish(&mut self, outcome: Outcome, before: Option<u64>) -> Answer {
+    ///
+    /// `plan` is the statement that produced `outcome`, where the caller has
+    /// one. It is carried into the reply for its *column types*: a column that
+    /// came back empty, or all `NULL`, has no value to infer a wire type from,
+    /// and the plan's declared type is the only honest answer left. See
+    /// [`crate::protocol::column_def_for`].
+    fn finish(
+        &mut self,
+        outcome: Outcome,
+        before: Option<u64>,
+        plan: Option<&inlaysql::Statement>,
+    ) -> Answer {
         match outcome {
-            Outcome::Rows(rows) => Answer::Rows(rows),
+            Outcome::Rows(rows) => Answer::Rows {
+                rows,
+                plan: plan.cloned(),
+            },
             Outcome::Ddl => Answer::ok(),
             Outcome::Written(count) => {
                 let after = self.db.last_insert_row_id();
@@ -674,7 +737,8 @@ impl<S: Read + Write> Connection<S> {
             }) => self.ok(affected, insert_id),
             // Binary result sets: a statement executed through the prepared
             // path answers in the binary protocol, as the client expects.
-            Ok(Answer::Rows(rows)) => self.write_result_set(&rows, true),
+            Ok(Answer::Rows { rows, plan }) => self.write_result_set(&rows, plan.as_ref(), true),
+            Ok(Answer::Streamed(plan)) => self.stream_answer(&plan, &sql, &params, true, Some(id)),
             Err(error) => self.fail(&error),
         }
     }
@@ -701,19 +765,28 @@ impl<S: Read + Write> Connection<S> {
             None => return Err(MysqlError::unknown("prepared statement vanished")),
         };
 
+        // A read whose columns the plan can describe up front is answered from
+        // the socket outwards; staleness is discovered by the streaming call
+        // instead of here, before a byte is written, and repaired there.
+        if streamed_column_defs(&plan).is_some() {
+            return Ok(Answer::Streamed(plan));
+        }
+
         let outcome = match self.db.execute_prepared(&plan, params) {
             Err(Error::Stale(_)) => {
                 let fresh = self.db.prepare(sql).map_err(|e| from_engine(&e))?;
                 if let Some(prepared) = self.statements.get_mut(&id) {
                     prepared.plan = Some(fresh.clone());
                 }
-                self.db
+                let outcome = self
+                    .db
                     .execute_prepared(&fresh, params)
-                    .map_err(|e| from_engine(&e))?
+                    .map_err(|e| from_engine(&e))?;
+                return Ok(self.finish(outcome, before, Some(&fresh)));
             }
             other => other.map_err(|e| from_engine(&e))?,
         };
-        Ok(self.finish(outcome, before))
+        Ok(self.finish(outcome, before, Some(&plan)))
     }
 
     /// Decode `COM_STMT_EXECUTE`: the statement id, then the bound values.
@@ -798,7 +871,16 @@ impl<S: Read + Write> Connection<S> {
         self.stream.flush()
     }
 
-    fn write_result_set(&mut self, rows: &ResultSet, binary: bool) -> io::Result<()> {
+    /// Write a result set that is already entirely in memory.
+    ///
+    /// `plan` is the statement that produced it, where there is one; see
+    /// [`Self::finish`] and [`column_def_for`] for what it decides.
+    fn write_result_set(
+        &mut self,
+        rows: &ResultSet,
+        plan: Option<&inlaysql::Statement>,
+        binary: bool,
+    ) -> io::Result<()> {
         // A result set with no columns is not representable: the leading count
         // would be zero, which a client reads as an OK packet.
         if rows.columns.is_empty() {
@@ -806,26 +888,20 @@ impl<S: Read + Write> Connection<S> {
         }
 
         let schema = shim::schema_name(&self.session);
+        let declared = plan.map(|plan| plan.columns()).unwrap_or_default();
         let defs: Vec<ColumnDef> = rows
             .columns
             .iter()
             .enumerate()
             .map(|(index, name)| {
-                let mut def = unify_column_type(&rows.rows, index);
-                def.name = name.clone();
-                def
+                let ty = declared.get(index).and_then(|column| column.ty);
+                column_def_for(name.clone(), ty, &rows.rows, index)
             })
             .collect();
 
-        let mut count = Vec::new();
-        put_lenenc_int(&mut count, defs.len() as u64);
-        self.stream.write_message(&count)?;
-        for def in &defs {
-            self.stream.write_message(&def.encode(&schema))?;
-        }
         let status = self.session.status_flags();
         let warnings = self.session.warning_count();
-        self.stream.write_message(&eof_packet(status, warnings))?;
+        write_result_set_header(&mut self.stream, &defs, &schema, status, warnings)?;
 
         for row in &rows.rows {
             let packet = if binary {
@@ -838,12 +914,228 @@ impl<S: Read + Write> Connection<S> {
         self.stream.write_message(&eof_packet(status, warnings))?;
         self.stream.flush()
     }
+
+    /// Answer a read by writing its rows to the socket as the engine produces
+    /// them, re-planning once if the schema moved under the plan.
+    ///
+    /// `cached_as` is the prepared-statement id the plan is kept under, when
+    /// it is kept at all. Refreshing it on a re-plan is what stops every
+    /// execution after a `CREATE INDEX` paying for the same re-plan.
+    fn stream_answer(
+        &mut self,
+        plan: &inlaysql::Statement,
+        sql: &str,
+        params: &[Value],
+        binary: bool,
+        cached_as: Option<u32>,
+    ) -> io::Result<()> {
+        match self.write_streamed_result_set(plan, params, binary)? {
+            Streamed::Done => return Ok(()),
+            // Nothing reached the wire, so every recovery a materialised
+            // statement has is still open — and a plan the schema moved under
+            // has exactly one: plan it again, below.
+            Streamed::NothingWritten(Error::Stale(_)) => {}
+            Streamed::NothingWritten(error) => return self.fail(&from_engine(&error)),
+        }
+
+        let fresh = match self.db.prepare_fresh(sql) {
+            Ok(fresh) => fresh,
+            Err(error) => return self.fail(&from_engine(&error)),
+        };
+        if let Some(id) = cached_as {
+            if let Some(prepared) = self.statements.get_mut(&id) {
+                prepared.plan = Some(fresh.clone());
+            }
+        }
+        // The re-planned statement need not still be streamable — a column the
+        // old plan knew the type of may have been dropped or redeclared — so
+        // the fallback is the materialising path, not a second stream.
+        if streamed_column_defs(&fresh).is_none() {
+            return match self.db.query_prepared(&fresh, params) {
+                Ok(rows) => self.write_result_set(&rows, Some(&fresh), binary),
+                Err(error) => self.fail(&from_engine(&error)),
+            };
+        }
+        match self.write_streamed_result_set(&fresh, params, binary)? {
+            Streamed::Done => Ok(()),
+            Streamed::NothingWritten(error) => self.fail(&from_engine(&error)),
+        }
+    }
+
+    /// One pass of [`Self::stream_answer`]: the column definitions, then every
+    /// row as the engine hands it over, then the terminating EOF.
+    ///
+    /// Nothing here retains a row. The engine's row callback lends one row at
+    /// a time — reusing a single projected-row allocation for a non-blocking
+    /// query — and it is encoded straight into a packet and handed to the
+    /// socket's buffered writer, so the memory this holds is the widest single
+    /// row plus one write buffer, whether the answer is ten rows or ten
+    /// million. That is the whole point: `SELECT * FROM big_table` used to
+    /// build every row of the answer in memory before the client could read
+    /// the first one, which is one query taking the server down.
+    fn write_streamed_result_set(
+        &mut self,
+        plan: &inlaysql::Statement,
+        params: &[Value],
+        binary: bool,
+    ) -> io::Result<Streamed> {
+        let Some(defs) = streamed_column_defs(plan) else {
+            // Only ever built from a plan this already answered `Some` for, so
+            // reaching here is a bug above rather than anything a client did.
+            return Ok(Streamed::NothingWritten(Error::Unsupported(
+                "this statement's columns cannot be described before it runs".to_string(),
+            )));
+        };
+        let schema = shim::schema_name(&self.session);
+        let status = self.session.status_flags();
+        let warnings = self.session.warning_count();
+
+        // Split borrow: the row callback writes to the socket while the engine
+        // holds the database handle. They are different fields, and saying so
+        // here is what lets one closure use both.
+        let Connection { stream, db, .. } = self;
+
+        // The header is written from *inside* the callback, not before the
+        // call. Everything the engine can fail at before its first row —
+        // validating a plan the schema moved under, resolving a bound `LIMIT`,
+        // a read error from storage — then still has nothing on the wire, so
+        // it can be answered, or retried, like any other failure. After one
+        // row is out none of that is available: the protocol has no way to
+        // un-send a packet.
+        let mut header_written = false;
+        let mut io_error: Option<io::Error> = None;
+
+        let outcome = db.query_prepared_each(plan, params, |row| {
+            let mut write = || -> io::Result<()> {
+                if !header_written {
+                    write_result_set_header(stream, &defs, &schema, status, warnings)?;
+                    header_written = true;
+                }
+                let packet = if binary {
+                    binary_row(row, &defs)
+                } else {
+                    text_row(row)
+                };
+                stream.write_message(&packet)
+            };
+            match write() {
+                Ok(()) => Ok(()),
+                // The client stopped reading, or the connection died. The
+                // engine only needs to be told to stop; the real error is
+                // carried out in `io_error`, because an `io::Error` has no
+                // home in the engine's own error type and inventing one would
+                // report a client disconnection as a database failure.
+                Err(error) => {
+                    io_error = Some(error);
+                    Err(Error::Storage("the client stopped reading".to_string()))
+                }
+            }
+        });
+
+        // Checked before the engine's own error, which in this case is only the
+        // stand-in that stopped the scan. Nothing can be reported to a client
+        // whose socket is what failed, so this leaves the connection to end.
+        if let Some(error) = io_error {
+            return Err(error);
+        }
+
+        match outcome {
+            Ok(_) => {
+                if !header_written {
+                    write_result_set_header(stream, &defs, &schema, status, warnings)?;
+                }
+                stream.write_message(&eof_packet(status, warnings))?;
+                stream.flush()?;
+                Ok(Streamed::Done)
+            }
+            Err(error) if !header_written => Ok(Streamed::NothingWritten(error)),
+            // Rows are already on the wire and the protocol cannot recall
+            // them, so the result set is terminated by an ERR packet where its
+            // final EOF would have gone. That is MySQL's own answer to the
+            // same problem — a `SELECT` killed or failing part-way through
+            // ends its row stream with an ERR packet — and every client
+            // decodes it, because it is the same packet it already watches for
+            // in place of the *first* one.
+            Err(error) => {
+                let error = from_engine(&error);
+                stream.write_message(&err_packet(error.code, error.sqlstate, &error.message))?;
+                stream.flush()?;
+                Ok(Streamed::Done)
+            }
+        }
+    }
+}
+
+/// `ER_WRONG_ARGUMENTS`: a translated statement wants more bound values than
+/// the client's original statement carried.
+fn too_few_parameters(statement: &str, needed: usize, remaining: usize) -> MysqlError {
+    MysqlError::new(
+        1210,
+        "HY000",
+        format!(
+            "Incorrect arguments to EXECUTE: `{statement}` needs {needed} \
+             parameter(s), only {remaining} remain"
+        ),
+    )
+}
+
+/// The column count, the column definitions and the EOF that ends them — the
+/// metadata every result set opens with, in either protocol.
+fn write_result_set_header<S: Read + Write>(
+    stream: &mut Stream<S>,
+    defs: &[ColumnDef],
+    schema: &str,
+    status: u16,
+    warnings: u16,
+) -> io::Result<()> {
+    let mut count = Vec::new();
+    put_lenenc_int(&mut count, defs.len() as u64);
+    stream.write_message(&count)?;
+    for def in defs {
+        stream.write_message(&def.encode(schema))?;
+    }
+    stream.write_message(&eof_packet(status, warnings))
+}
+
+/// The wire description of every column a statement projects, or `None` if any
+/// one of them cannot be described before the statement runs.
+///
+/// This is the whole streaming decision, and it is made from the plan alone —
+/// never from the table's size, which is not knowable and would not matter if
+/// it were. See [`streamed_column_def`] for what makes a column describable.
+fn streamed_column_defs(plan: &inlaysql::Statement) -> Option<Vec<ColumnDef>> {
+    // A write is excluded twice over: the engine refuses a row callback on one
+    // (a callback may fail part-way, and a consumer's error must not look like
+    // a failed statement after a mutation already committed), and `affected
+    // rows` is not a result set anyway.
+    if !plan.is_read_only() {
+        return None;
+    }
+    let columns = plan.columns();
+    if columns.is_empty() {
+        return None;
+    }
+    columns
+        .iter()
+        .map(|column| streamed_column_def(column.name.clone(), column.ty))
+        .collect()
 }
 
 /// What running a statement produced.
 enum Answer {
-    Ok { affected: u64, insert_id: u64 },
-    Rows(ResultSet),
+    Ok {
+        affected: u64,
+        insert_id: u64,
+    },
+    /// Rows already built in memory, with the plan that produced them when
+    /// the engine was the one that did.
+    Rows {
+        rows: ResultSet,
+        plan: Option<inlaysql::Statement>,
+    },
+    /// A read whose rows go to the socket as the engine produces them. The
+    /// statement has been planned and not yet run.
+    Streamed(inlaysql::Statement),
 }
 
 impl Answer {
@@ -853,6 +1145,16 @@ impl Answer {
             insert_id: 0,
         }
     }
+}
+
+/// How far a streamed result set got before it stopped.
+enum Streamed {
+    /// The whole result set reached the socket, terminating packet included —
+    /// EOF if it ended, ERR if it failed after rows had already been sent.
+    Done,
+    /// The engine failed before a single packet was written, so the caller
+    /// still has every option an unstreamed failure has.
+    NothingWritten(Error),
 }
 
 /// One row in the text protocol: every value a length-encoded string.

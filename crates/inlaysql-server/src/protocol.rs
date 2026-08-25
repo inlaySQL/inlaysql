@@ -202,7 +202,7 @@ impl ColumnDef {
     }
 }
 
-/// Choose one wire type for a column of a result set.
+/// Choose one wire type for a column of a materialised result set.
 ///
 /// The engine is dynamically typed the way SQLite is, so a column can hold an
 /// integer in one row and text in the next. The binary protocol has no room for
@@ -210,8 +210,40 @@ impl ColumnDef {
 /// is unified across every row before any of them are sent: all integers make
 /// an integer column, integers and reals together make a real one, and anything
 /// else falls back to text, which can represent all of it. Scanning first costs
-/// nothing here because the whole result set is already materialised.
-pub fn unify_column_type(rows: &[Vec<Value>], index: usize) -> ColumnDef {
+/// nothing here because the whole result set is already in memory.
+///
+/// The values decide it — except when there are no values to decide from, which
+/// is every row `NULL` and, far more commonly, a result set with no rows at
+/// all. Falling back to text there (what this did before) meant `SELECT id FROM
+/// t` reported `VAR_STRING` when `t` happened to be empty and `LONGLONG` when
+/// it was not, and that `COM_STMT_PREPARE` answered `LONGLONG` for that column
+/// while the `COM_STMT_EXECUTE` that followed contradicted it. `declared` is
+/// the plan's own answer (AHL-466's `Statement::columns`), which does not
+/// depend on how many rows came back — and is what a *streamed* result set has
+/// to use for every row, since it has none of them to look at. Preferring it
+/// here is what makes the two paths agree byte for byte.
+///
+/// `None` for a result set with no plan behind it — the shim's `SHOW` and
+/// `information_schema` answers — where the values really are the only
+/// evidence there is, and the text fallback is all that is left.
+pub fn column_def_for(
+    name: String,
+    declared: Option<DataType>,
+    rows: &[Vec<Value>],
+    index: usize,
+) -> ColumnDef {
+    match infer_column_type(rows, index) {
+        Some(mut def) => {
+            def.name = name;
+            def
+        }
+        None => column_def_from_type(name, declared),
+    }
+}
+
+/// The unified type of `index` across `rows`, or `None` when every value there
+/// is `NULL` or absent and the values therefore say nothing at all.
+fn infer_column_type(rows: &[Vec<Value>], index: usize) -> Option<ColumnDef> {
     let mut saw_integer = false;
     let mut saw_real = false;
     let mut saw_other = false;
@@ -232,32 +264,70 @@ pub fn unify_column_type(rows: &[Vec<Value>], index: usize) -> ColumnDef {
 
     if saw_other {
         if saw_blob && !saw_integer && !saw_real {
-            return ColumnDef {
+            return Some(ColumnDef {
                 name: String::new(),
                 table: String::new(),
                 ty: TYPE_BLOB,
                 charset: CHARSET_BINARY,
                 flags: FLAG_BINARY,
                 length: u32::MAX,
-            };
+            });
         }
-        return ColumnDef::text("");
+        return Some(ColumnDef::text(""));
     }
     if saw_real {
-        return ColumnDef {
+        return Some(ColumnDef {
             name: String::new(),
             table: String::new(),
             ty: TYPE_DOUBLE,
             charset: CHARSET_BINARY,
             flags: FLAG_NUM | FLAG_BINARY,
             length: 22,
-        };
+        });
     }
     if saw_integer {
-        return ColumnDef::integer("");
+        return Some(ColumnDef::integer(""));
     }
-    // Every value was NULL: nothing to infer from, and text renders anything.
-    ColumnDef::text("")
+    None
+}
+
+/// The column definition for a column that will be *streamed*, or `None` if
+/// this column cannot be described before its values exist.
+///
+/// A streamed result set has to name every column's type in the packets that
+/// precede its first row, so there is no scan to unify over: the plan's
+/// declared type is the only evidence available. That is trustworthy exactly
+/// where the engine enforces the declaration — it refuses `INSERT`ing text into
+/// an `INTEGER` column outright ("column `n` is INTEGER but the value is TEXT")
+/// and coerces an integer written to a `REAL` one — so for those types the
+/// answer here is provably the same one [`column_def_for`] would reach after
+/// seeing every row.
+///
+/// `None` for the two cases where it is provably *not*:
+///
+/// * **`NUMERIC`** — SQLite's affinity column, which really does hold an
+///   integer in one row and text in the next. Nothing but the values can say
+///   what it is.
+/// * **A column the plan gives no type at all** (`ty: None`) — a computed
+///   expression, an aggregate, a retrieval score, a `UNION` arm, a derived
+///   table's synthesised column, a `SELECT` with no `FROM`.
+///
+/// A `None` here is not a failure: it means this statement is answered by
+/// materialising it, the way every statement was before. It costs memory
+/// proportional to the answer, so it is worth knowing that it is the *shape of
+/// the projection* that decides, not the size of the table.
+pub fn streamed_column_def(name: String, declared: Option<DataType>) -> Option<ColumnDef> {
+    match declared {
+        Some(
+            ty @ (DataType::Integer
+            | DataType::Real
+            | DataType::Text
+            | DataType::Blob
+            | DataType::Vector(_)
+            | DataType::QuantizedVector(_)),
+        ) => Some(column_def_from_type(name, Some(ty))),
+        Some(DataType::Numeric) | None => None,
+    }
 }
 
 /// Choose a wire type for a column whose declared type the plan already
@@ -580,29 +650,97 @@ mod tests {
         assert_eq!(&packet[9..], b"oops");
     }
 
+    /// A column definition, from values alone — the shim's case, where no plan
+    /// declared anything.
+    fn undeclared(rows: &[Vec<Value>], index: usize) -> ColumnDef {
+        column_def_for(String::new(), None, rows, index)
+    }
+
     #[test]
     fn a_column_type_is_unified_across_every_row() {
         let integers = vec![vec![Value::Integer(1)], vec![Value::Integer(2)]];
-        assert_eq!(unify_column_type(&integers, 0).ty, TYPE_LONGLONG);
+        assert_eq!(undeclared(&integers, 0).ty, TYPE_LONGLONG);
 
         // One real in the column makes the whole column real.
         let mixed = vec![vec![Value::Integer(1)], vec![Value::Real(2.5)]];
-        assert_eq!(unify_column_type(&mixed, 0).ty, TYPE_DOUBLE);
+        assert_eq!(undeclared(&mixed, 0).ty, TYPE_DOUBLE);
 
         // A number beside text has to fall back to text.
         let ragged = vec![vec![Value::Integer(1)], vec![Value::Text("x".into())]];
-        assert_eq!(unify_column_type(&ragged, 0).ty, TYPE_VAR_STRING);
+        assert_eq!(undeclared(&ragged, 0).ty, TYPE_VAR_STRING);
 
         // NULLs never decide the type.
         let nulls = vec![vec![Value::Null], vec![Value::Integer(3)]];
-        assert_eq!(unify_column_type(&nulls, 0).ty, TYPE_LONGLONG);
-        assert_eq!(
-            unify_column_type(&[vec![Value::Null]], 0).ty,
-            TYPE_VAR_STRING
-        );
+        assert_eq!(undeclared(&nulls, 0).ty, TYPE_LONGLONG);
+        assert_eq!(undeclared(&[vec![Value::Null]], 0).ty, TYPE_VAR_STRING);
 
         let blobs = vec![vec![Value::Blob(vec![1, 2])]];
-        assert_eq!(unify_column_type(&blobs, 0).ty, TYPE_BLOB);
+        assert_eq!(undeclared(&blobs, 0).ty, TYPE_BLOB);
+    }
+
+    /// The declared type only ever speaks where the values are silent — an
+    /// empty result set, or a column that is `NULL` all the way down. A
+    /// `NUMERIC` column really does hold different classes in different rows,
+    /// so where there *are* values they still win.
+    #[test]
+    fn a_declared_type_answers_only_where_the_values_cannot() {
+        let empty: Vec<Vec<Value>> = Vec::new();
+        assert_eq!(
+            column_def_for("id".into(), Some(DataType::Integer), &empty, 0).ty,
+            TYPE_LONGLONG,
+            "an empty result set still knows what its columns are"
+        );
+        let nulls = vec![vec![Value::Null], vec![Value::Null]];
+        assert_eq!(
+            column_def_for("b".into(), Some(DataType::Blob), &nulls, 0).ty,
+            TYPE_BLOB
+        );
+        assert_eq!(
+            column_def_for("x".into(), None, &nulls, 0).ty,
+            TYPE_VAR_STRING,
+            "nothing declared and nothing observed leaves only the widest type"
+        );
+        let integers = vec![vec![Value::Integer(1)]];
+        assert_eq!(
+            column_def_for("n".into(), Some(DataType::Numeric), &integers, 0).ty,
+            TYPE_LONGLONG,
+            "an affinity column is described by what it actually held"
+        );
+    }
+
+    /// The types [`streamed_column_def`] accepts are exactly the ones the
+    /// engine enforces on write, so a streamed column definition is the one
+    /// [`column_def_for`] would have reached after seeing every row. This is
+    /// the property that makes a streamed result set byte-identical to a
+    /// materialised one; if a new [`DataType`] is added, it belongs on one
+    /// side of this test or the other, deliberately.
+    #[test]
+    fn a_streamed_column_type_matches_what_the_values_would_have_said() {
+        let cases = [
+            (DataType::Integer, Value::Integer(1)),
+            (DataType::Real, Value::Real(1.5)),
+            (DataType::Text, Value::Text("x".into())),
+            (DataType::Blob, Value::Blob(vec![1])),
+            (DataType::Vector(2), Value::Vector(vec![0.5, 0.25])),
+            (DataType::QuantizedVector(2), Value::Vector(vec![0.5, 0.25])),
+        ];
+        for (declared, value) in cases {
+            let streamed = streamed_column_def("c".into(), Some(declared))
+                .unwrap_or_else(|| panic!("{declared:?} should stream"));
+            let rows = vec![vec![value.clone()], vec![Value::Null]];
+            let materialised = column_def_for("c".into(), Some(declared), &rows, 0);
+            assert_eq!(streamed.ty, materialised.ty, "{declared:?} type");
+            assert_eq!(
+                streamed.charset, materialised.charset,
+                "{declared:?} charset"
+            );
+            assert_eq!(streamed.flags, materialised.flags, "{declared:?} flags");
+            assert_eq!(streamed.length, materialised.length, "{declared:?} length");
+        }
+
+        // The two that genuinely cannot be answered without the values.
+        assert!(streamed_column_def("c".into(), Some(DataType::Numeric)).is_none());
+        assert!(streamed_column_def("c".into(), None).is_none());
     }
 
     #[test]

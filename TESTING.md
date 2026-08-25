@@ -719,6 +719,28 @@ The fast test loads 1,200 rows on a simulated disk and checks a multi-
 transaction save round-trips. The ignored one is the original reproduction:
 5,000 rows, half a minute of durable commits, run nightly.
 
+## Large statements
+
+```sh
+cargo test -p inlaysql --test large_statements                          # the refusals
+cargo test --release -p inlaysql --test large_statements -- --ignored --nocapture   # the row counts
+```
+
+The same one-region bound as above, met from the SQL side instead of the index
+side: `DELETE FROM t`, `UPDATE t SET ...` and `INSERT INTO t SELECT ... FROM t`
+are hard errors on a large table (`docs/enterprise-readiness.md` blocker 5).
+The default tests assert the refusal *and* that the table is untouched
+afterwards *and* that the handle still works — a refusal is an acceptable
+state only while all three hold, and the third one did not until AHL-482.
+The ignored one bisects each threshold and prints the table both that entry and
+the test's own module doc quote; it is what to rerun after any change to the
+record layout, the change log, or what a write dirties.
+
+Note what it found about `DELETE`: it is bounded by the change-log record, not
+by the rows, so its ceiling barely moves with row width. The default test
+proves that by moving the threshold with nothing but the length of the table's
+name, which is the one thing in the commit that only `cdc.rs` repeats per row.
+
 ## ANN recall
 
 ```sh

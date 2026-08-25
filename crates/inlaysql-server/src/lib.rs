@@ -168,6 +168,22 @@ pub struct ServerOptions {
     /// and for every handle: that cache is keyed by page id and is sound only
     /// while a page id is never reissued.
     pub page_reuse: bool,
+    /// Most bytes one statement may hold in a blocking operator
+    /// ([`inlaysql::EngineOptions::query_memory_bytes`]).
+    ///
+    /// `ORDER BY`, `GROUP BY`, `DISTINCT` and window functions have to hold
+    /// their whole input before they can answer, so one statement can ask for
+    /// more memory than the machine has. Unbounded, what ends it is the
+    /// out-of-memory killer, and that ends the *process* — which here means
+    /// every other connection too. Past this, the one statement responsible is
+    /// refused with `ER_OUT_OF_SORTMEMORY` and everything else keeps running.
+    ///
+    /// **Per statement, not per server.** [`ServerOptions::max_connections`]
+    /// clients can each be holding this much at once, so the number to divide
+    /// by the machine's memory is this one times the connection cap. The
+    /// default is [`inlaysql::EngineOptions::default`]'s; `0` removes the
+    /// ceiling.
+    pub query_memory_bytes: usize,
 }
 
 impl Default for ServerOptions {
@@ -182,6 +198,7 @@ impl Default for ServerOptions {
             // Durability-adjacent and file-wide: this one is asked for, never
             // inherited. See the field's doc comment.
             page_reuse: false,
+            query_memory_bytes: EngineOptions::default().query_memory_bytes,
         }
     }
 }
@@ -208,7 +225,8 @@ pub struct Server {
     credentials: Credentials,
     /// What is enforced, and therefore what every session reports.
     limits: session::Limits,
-    page_reuse: bool,
+    /// The engine options every connection's handle is opened with.
+    engine: EngineOptions,
 }
 
 impl Server {
@@ -248,7 +266,11 @@ impl Server {
                 read_timeout_secs: options.wait_timeout_secs,
                 write_timeout_secs: NET_WRITE_TIMEOUT_SECS,
             },
-            page_reuse: options.page_reuse,
+            engine: EngineOptions {
+                page_reuse: options.page_reuse,
+                query_memory_bytes: options.query_memory_bytes,
+                ..EngineOptions::default()
+            },
         })
     }
 
@@ -304,7 +326,7 @@ impl Server {
             let credentials = self.credentials.clone();
             let live = live.clone();
             let limits = self.limits;
-            let page_reuse = self.page_reuse;
+            let engine = self.engine;
             let max = limits.max_connections;
 
             if live.fetch_add(1, Ordering::SeqCst) >= max {
@@ -319,7 +341,7 @@ impl Server {
                 .spawn(move || {
                     let _slot = Slot(owned);
                     if let Err(error) =
-                        serve_connection(stream, &path, &credentials, id, limits, page_reuse)
+                        serve_connection(stream, &path, &credentials, id, limits, engine)
                     {
                         // Never the statement, never the credentials — a
                         // server log is not the place for either.
@@ -351,7 +373,7 @@ fn serve_connection(
     credentials: &Credentials,
     id: u32,
     limits: session::Limits,
-    page_reuse: bool,
+    engine: EngineOptions,
 ) -> io::Result<()> {
     // A request/response protocol gains nothing from waiting to coalesce small
     // writes, and loses a round trip's latency to it every time.
@@ -371,7 +393,7 @@ fn serve_connection(
     // Each connection opens the file for itself: this is the whole of D2. The
     // handles share this process's advisory lock and settle concurrent commits
     // between themselves with first-committer-wins.
-    let db = match open_database(path, page_reuse) {
+    let db = match open_database(path, engine) {
         Ok(db) => db,
         Err(error) => {
             refuse(
@@ -409,17 +431,12 @@ fn serve_connection(
 
 /// One connection's handle on the database file.
 ///
-/// `page_reuse` is the whole reason this is not `Database::open`: that opens
-/// with [`EngineOptions::default`], where reuse is off, and there is no other
-/// way to reach the option from here.
-fn open_database(path: &Path, page_reuse: bool) -> inlaysql::Result<Database> {
-    Database::open_on_with_options(
-        FileDevice::open(path)?,
-        EngineOptions {
-            page_reuse,
-            ..EngineOptions::default()
-        },
-    )
+/// The options are the whole reason this is not `Database::open`: that opens
+/// with [`EngineOptions::default`], where page reuse is off and the query
+/// memory ceiling is the shipped one, and there is no other way to reach
+/// either from here.
+fn open_database(path: &Path, engine: EngineOptions) -> inlaysql::Result<Database> {
+    Database::open_on_with_options(FileDevice::open(path)?, engine)
 }
 
 /// Send one error packet to a client that will not be served, and hang up.
