@@ -797,9 +797,25 @@ fn compare_cells<L: Cell, R: Cell>(
             (Some(a), Some(b)) => collation.compare(a, b),
             _ => match (left.as_blob_cell(), right.as_blob_cell()) {
                 (Some(a), Some(b)) => a.cmp(b),
-                _ => match (left.as_f64_cell(), right.as_f64_cell()) {
-                    (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
-                    _ => unreachable!("equal storage classes compare within the class"),
+                // Two `INTEGER`s compare as 64-bit integers, never through
+                // `f64`. An `f64` holds every integer up to 2^53 exactly and
+                // then starts skipping, so widening both sides first made
+                // 2^53 and 2^53 + 1 the same value: `WHERE id = 9007199254740993`
+                // matched the row holding ...992, and `> 2^53` dropped the row
+                // one above it. `mem_cmp` — `ORDER BY`, `DISTINCT`, index
+                // order — has always had this case, so without it the engine
+                // disagreed with itself, and rows that sorted as distinct
+                // filtered as equal. Snowflake ids, epoch nanoseconds and most
+                // external-system ids live above 2^53.
+                _ => match (left.as_i64_cell(), right.as_i64_cell()) {
+                    (Some(a), Some(b)) => a.cmp(&b),
+                    // One side is a `REAL`: `f64` is then the right common
+                    // type, and is what SQLite uses once it has ruled out the
+                    // two-integer case.
+                    _ => match (left.as_f64_cell(), right.as_f64_cell()) {
+                        (Some(a), Some(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+                        _ => unreachable!("equal storage classes compare within the class"),
+                    },
                 },
             },
         },

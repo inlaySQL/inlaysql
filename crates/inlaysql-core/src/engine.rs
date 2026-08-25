@@ -5924,6 +5924,14 @@ fn unique_key_collides(
             return false;
         }
         match (left, right) {
+            // Two `INTEGER`s collide only when they are the same 64-bit
+            // integer. Comparing them through `f64` — which is what this did —
+            // makes every pair above 2^53 look identical, because an `f64`
+            // cannot represent consecutive integers up there. The symptom is a
+            // `UNIQUE` constraint refusing a row whose key is genuinely new:
+            // insert an external id of 2^53, then one of 2^53 + 1, and the
+            // second was rejected as a duplicate of the first.
+            (Value::Integer(a), Value::Integer(b)) => a == b,
             (Value::Integer(_) | Value::Real(_), Value::Integer(_) | Value::Real(_)) => {
                 match (left.as_f64(), right.as_f64()) {
                     (Some(a), Some(b)) => a == b,
