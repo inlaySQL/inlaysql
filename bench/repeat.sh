@@ -47,9 +47,23 @@ for attempt in $(seq 1 "$REPEATS"); do
   # run.sh prints its own report and ends with "written to <path>"; that path
   # is the raw output for this attempt, kept so the summary can be recomputed
   # or audited without running anything again.
-  transcript="$("$ROOT/bench/run.sh")"
+  #
+  # `|| status=$?` rather than letting `set -e` take the exit: a run that dies
+  # part-way has to say *why*, and capturing its stdout in a substitution is
+  # what swallowed that the first time this happened — three runs, one of them
+  # eight lines long, and the only trace was a summary that never appeared. A
+  # benchmark harness that fails silently is worse than one that does not
+  # retry, because the missing run looks like a run that was never asked for.
+  status=0
+  transcript="$("$ROOT/bench/run.sh")" || status=$?
+  if [[ "$status" -ne 0 ]]; then
+    printf '%s\n' "$transcript" | tail -20 >&2
+    echo "run $attempt of $REPEATS exited $status — see the output above" >&2
+    exit "$status"
+  fi
   written="$(printf '%s\n' "$transcript" | sed -n 's/^written to //p' | tail -1)"
   if [[ -z "$written" ]]; then
+    printf '%s\n' "$transcript" | tail -20 >&2
     echo "run $attempt did not report where it wrote its results; giving up" >&2
     exit 1
   fi

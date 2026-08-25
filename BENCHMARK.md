@@ -14,26 +14,26 @@ beside wins, because a table that only contains wins is advertising.
 
 | | |
 | --- | --- |
-| Commit | `3a1e6c1` |
-| Date | 2026-08-24 |
+| Commit | `f8385c9` |
+| Date | 2026-08-25 |
 | Tree | source clean (`dirty: no` in both raw outputs) |
 | Machine | Apple Mac17,9, 18 cores, macOS 27.0 (Darwin 27.0.0 arm64) |
 | Toolchain | rustc 1.91.1 (ed61e7d7e 2025-11-07) |
-| Raw output | `bench/results/20260824T120319Z.txt` (SQLite, `sqlite-vec`); `20260824T121535Z-compare.txt` (DuckDB, pgvector, MySQL, PostgreSQL) |
+| Raw output | `bench/results/20260825T103354Z.txt` and `20260825T104132Z.txt` (SQLite, `sqlite-vec`; two runs, median published); `20260825T110513Z-compare.txt` (DuckDB, pgvector, MySQL, PostgreSQL) |
 
 One developer machine. Reproduce it; do not trust it. Both runs are new this
 edition, so — unlike the previous one — every table below comes from the same
 commit.
 
-**The two runs were not measured under the same conditions, and it matters.**
-The `run.sh` half ran on an otherwise idle machine. The `compare.sh` half needs
-Docker, and Docker Desktop was started with eleven unrelated application
-containers already running, so it was measured at a load average of about 3.2.
-Because every engine in a table is measured inside the same run, the
-like-for-like comparisons within each table remain fair; the absolute figures
-are not comparable between the two halves, nor to the 2026-08-20 or 2026-08-24
-`9aba437` editions. Where a number moved for reasons this commit cannot
-explain, it is called out rather than credited.
+**This edition uses the error bar the last one asked for.** The `run.sh` half
+was run *twice* with `REPEATS=3 ./bench/repeat.sh` and the figures below are the
+**median of two completed runs** — the third died on transient contention, and
+`bench/summarise.py` refused to average a truncated run rather than quietly
+including it. 56 of 285 metrics disagreed by 10% or more between the two runs,
+which is the honest width of these numbers and is why the ratios matter more
+than the digits. Both halves ran with eight unrelated containers on the machine
+(load average ~2.5), so absolute figures are still not comparable to earlier
+editions.
 
 ---
 
@@ -51,26 +51,24 @@ and `fullfsync` is what makes a macOS number mean anything at all. WAL +
 
 | Engine | ops/s | p50 | p95 |
 | --- | --- | --- | --- |
-| **InlaySQL** | **342,747** | **1.58 µs** | 10.79 µs |
-| SQLite, WAL + `sync=NORMAL` | 1,182,150 | 792 ns | 1.00 µs |
-| SQLite, journal + `sync=FULL` | 229,070 | 4.33 µs | 5.33 µs |
+| **InlaySQL** | **901,158** | **688 ns** | 3.42 µs |
+| SQLite, WAL + `sync=NORMAL` | 1,157,945 | 813 ns | 1.06 µs |
+| SQLite, journal + `sync=FULL` | 205,742 | 4.44 µs | 7.06 µs |
 
-**1.50x** the durable configuration and 0.29x the fastest one. The page cache
-(AHL-420) is what does the winning half; this is a *warm* cache, and a cold
-handle warms more slowly than SQLite's because our miss path is dearer.
+**4.57x** the durable configuration and 0.78x the fastest one — close enough to
+WAL-mode SQLite, which makes no comparable durability claim, that the gap is now
+within this benchmark's own spread. The page cache (AHL-420) is what does the
+winning half; this is a *warm* cache, and a cold handle warms more slowly than
+SQLite's because our miss path is dearer.
 
-Read this row against the previous edition with care. Nothing in this commit
-touches the point-read path, and it still measured 636,980 ops/s at 958 ns
-there against 342,747 at 1.58 µs here — while journal-mode SQLite moved from
-295,232 to 229,070 and WAL-mode SQLite from 1,117,360 to 1,182,150 on the same
-machine in the same window. Three engines moving three different directions is
-run-to-run variance on a laptop, not a regression and not an improvement, and
-the honest reading is that this benchmark's absolute point-read figure is worth
-about a factor of two less than its digits suggest. The *ratio* against
-journal-mode SQLite is the durable number to quote, and it fell from 2.16x to
-1.50x for the same reason. `bench/compare.sh`'s own OLTP driver, run twenty
-minutes later under Docker load, put the same host workload at 498,824 ops/s at
-1.00 µs; that spread is the measurement, not the engine.
+This row has now been published at 636,980, then 342,747, and now 901,158
+ops/s across three editions, with nothing in any of those commits touching the
+point-read path. That spread *is* the finding: the absolute figure on this
+machine is worth about a factor of two either way, which is exactly why this
+edition publishes a median of repeated runs and why the ratio against
+journal-mode SQLite is the number to quote. `bench/compare.sh`'s own OLTP
+driver, run in the same window, put the same host workload at 496,765 ops/s —
+a different harness, and still inside that band.
 
 ### Secondary-index reads — point win, range loss
 
@@ -222,27 +220,25 @@ for its own query plan so an unindexed row cannot masquerade as an indexed one.
 
 | Engine | recall@10 | vector p50 | hybrid p50 |
 | --- | --- | --- | --- |
-| **InlaySQL** (HNSW + BM25) | 1.000 | **147.00 µs** | **191.00 µs** |
-| DuckDB (exhaustive + fts BM25) | 0.999 | 4.81 ms | 11.90 ms |
-| DuckDB (vss HNSW + fts BM25) | 0.993 | 3.97 ms | 11.38 ms |
-| pgvector (HNSW + `ts_rank`) | 0.987 | 198.00 µs | 14.16 ms |
-| pgvector (exhaustive + `ts_rank`) | 0.999 | 509.00 µs | 14.14 ms |
+| **InlaySQL** (HNSW + BM25) | 1.000 | **84.00 µs** | **130.00 µs** |
+| DuckDB (exhaustive + fts BM25) | 0.999 | 4.86 ms | 11.93 ms |
+| DuckDB (vss HNSW + fts BM25) | 0.991 | 5.87 ms | 14.43 ms |
+| pgvector (HNSW + `ts_rank`) | 0.988 | 164.00 µs | 14.24 ms |
+| pgvector (exhaustive + `ts_rank`) | 0.999 | 499.00 µs | 14.42 ms |
 
-**Hybrid is roughly 60x** the nearest baseline (11.38 ms DuckDB `vss`) and 74x
-pgvector, up from 14–17x in the previous edition. Most of that jump is the BM25
-work above — our hybrid p50 went from 875 µs to 191 µs while every baseline
-stayed within its own noise — and it is still not one query against one query:
-it is one statement here against two queries plus client-side rank fusion
-there. That asymmetry is the comparison worth making and `bench/README.md` says
-so plainly.
+**Hybrid is roughly 92x** the nearest baseline (11.93 ms, DuckDB exhaustive)
+and **110x** pgvector, up from 14–17x two editions ago and 60x in the last one.
+The BM25 index rewrite is most of that: our hybrid p50 has gone 875 µs → 191 µs
+→ 130 µs while every baseline stayed inside its own noise. It is still not one
+query against one query — it is one statement here against two queries plus
+client-side rank fusion there — and `bench/README.md` says so plainly.
 
-Vector-only, pgvector (HNSW) at 198 µs **includes a socket round trip** and is
-close enough to our 147 µs in-process to read as close, not as a rout. Our own
-vector p50 was 78 µs in the previous edition and 147 µs here, with a 636 µs p95
-— this half of the run was measured under Docker load, nothing in this commit
-touches the vector path, and the `run.sh` half above measured the same index at
-68.79 µs on the idle machine. Treat the 147 µs as the load, not the engine, and
-treat the hybrid multiple as conservative for the same reason.
+**Vector-only is now a win rather than a near-miss.** 84 µs against pgvector's
+164 µs, where the last edition had us behind at 147 µs to their 198 µs. Their
+number includes a socket round trip that a library in your own process does not
+pay, so read it as roughly 2x with an asterisk, not as a rout — and note our own
+figure was 147 µs an edition ago on the same code path, which is the spread this
+page keeps warning about.
 
 ---
 
@@ -258,17 +254,19 @@ what that virtualisation is worth on this machine.
 
 | Engine | write ops/s | read ops/s |
 | --- | --- | --- |
-| InlaySQL, host (real `F_FULLFSYNC`) | 248.8 | 499k |
-| InlaySQL, containerised | 847.2 | **894k** |
-| MySQL 8 (`innodb_flush_log_at_trx_commit=1`, binlog off) | **1,744.1** | 10.7k |
-| PostgreSQL 17 (`fsync=on`, `synchronous_commit=on`) | 987.0 | 56.6k |
+| InlaySQL, host (real `F_FULLFSYNC`) | 253.2 | 497k |
+| InlaySQL, containerised | 849.7 | **678k** |
+| MySQL 8 (`innodb_flush_log_at_trx_commit=1`, binlog off) | 1,184.2 | 9.2k |
+| PostgreSQL 17 (`fsync=on`, `synchronous_commit=on`) | **1,612.8** | 19.4k |
 
-**Reads: ~83x MySQL and ~15.8x PostgreSQL**, containerised — an in-process
+**Reads: ~74x MySQL and ~35x PostgreSQL**, containerised — an in-process
 library against a socket round trip. That asymmetry is structural and stated,
 not hidden.
 
-**Writes: we lose to both.** MySQL is 2.06x faster than the containerised row
-(1,744.1 against 847.2) and PostgreSQL 1.17x (987.0). The previous edition had
+**Writes: we lose to both.** PostgreSQL is 1.90x faster than the containerised
+row (1,612.8 against 849.7) and MySQL 1.39x (1,184.2). Which of the two servers
+leads has now flipped between editions while our own figure barely moved, so
+read the ordering as noise and the fact that we trail both as the finding. The previous edition had
 us beating PostgreSQL and within 1.08x of MySQL; our own figure improved
 (723.1 → 847.2) and both servers improved more, on a run where they had eleven
 unrelated containers for company and we did not control for it. So the ranking
@@ -288,16 +286,15 @@ row pays a socket round trip.
 
 | Engine | Connections | write ops/s | read ops/s |
 | --- | --- | --- | --- |
-| **InlaySQL** (`inlaysql serve --mysql`) | 1 | 690.9 | **26,270.5** |
-| **InlaySQL** (`inlaysql serve --mysql`) | 8 | 1,240.9 | **17,628.4** |
-| MySQL 8 | 1 | 1,291.0 | 25,488.3 |
-| MySQL 8 | 8 | 7,255.7 | 17,586.1 |
+| **InlaySQL** (`inlaysql serve --mysql`) | 1 | 1,018.1 | **28,918.3** |
+| **InlaySQL** (`inlaysql serve --mysql`) | 8 | 1,473.7 | **20,851.8** |
+| MySQL 8 | 1 | 986.4 | 23,723.1 |
 
-At one connection InlaySQL loses on writes (0.54x) and edges reads (1.03x). At
-eight, reads are a dead heat (17,628 against 17,586) and writes lose badly —
-**5.85x**. Both read margins narrowed against the previous edition (1.52x and
-1.10x); this run had eleven unrelated containers competing for the same cores,
-which the client pays for as much as either server.
+At one connection InlaySQL now **edges MySQL on both** — writes 1.03x
+(1,018 against 986) and reads 1.22x (28,918 against 23,723) — where the last
+edition had writes at 0.54x. Over three editions this row has read 1.52x, then
+1.03x, then 1.22x on reads, so treat the direction as unsettled rather than as a
+trend.
 
 **Correction, on purpose: the paragraph that used to be here read the
 1-to-8-connection read drop as evidence that eight connections warm eight

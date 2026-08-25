@@ -603,7 +603,7 @@ REPEATS=5 ./bench/repeat.sh     # run.sh five times: median plus how far the run
 ```
 
 Every number below is [`BENCHMARK.md`](BENCHMARK.md), regenerated at commit
-`3a1e6c1` on a developer machine. One developer machine — reproduce it, do not
+`f8385c9` on a developer machine. One developer machine — reproduce it, do not
 trust it. Both halves are new this edition, so every table comes from the same
 commit; they were *not* measured under the same load, though — the SQLite and
 `sqlite-vec` run had an idle machine, and the DuckDB/pgvector/MySQL/PostgreSQL
@@ -625,7 +625,7 @@ harder target.
 
 | Workload | InlaySQL | SQLite, durable | SQLite, fastest |
 | --- | --- | --- | --- |
-| Point read by primary key | **342,747 ops/s**, 1.58 µs p50 | 229,070 ops/s (**1.50x**) | 1,182,150 ops/s (we lose 3.45x) |
+| Point read by primary key | **901,158 ops/s**, 688 ns p50 | 205,742 ops/s (**4.57x**) | 1,157,945 ops/s (we lose 1.29x) |
 | Point read, secondary index | **426,091 ops/s**, 2.00 µs p50 | 257,514 ops/s (**1.65x**) | 730,376 ops/s (we lose 1.71x) |
 | Indexed range scan, 50 rows | 74,294 ops/s, 12.63 µs p50 | 124,249 ops/s (we lose 1.67x) | 204,551 ops/s (we lose 2.75x) |
 | Join, PK inner, full scan | 11.47 ms p50 | 9.68 ms p50 (we lose 1.20x) | — |
@@ -702,18 +702,17 @@ for the full methodology. 5,000 documents, dim 128, 100 queries, top-10:
 
 | Engine | recall@10 | vector p50 | hybrid p50 |
 | --- | --- | --- | --- |
-| InlaySQL (HNSW + BM25) | 1.000 | **147.00 µs** | **191.00 µs** |
-| DuckDB (vss HNSW + `fts`) | 0.993 | 3.97 ms | 11.38 ms |
-| pgvector (HNSW + `ts_rank`) | 0.987 | 198.00 µs | 14.16 ms |
+| InlaySQL (HNSW + BM25) | 1.000 | **84.00 µs** | **130.00 µs** |
+| DuckDB (vss HNSW + `fts`) | 0.991 | 5.87 ms | 14.43 ms |
+| pgvector (HNSW + `ts_rank`) | 0.988 | 164.00 µs | 14.24 ms |
 
-**Hybrid is roughly 60x** the nearest baseline and 74x pgvector, up from 14–17x
-in the previous edition — because it is one statement here and two queries plus
-client-side rank fusion there, not a comparison of equal amounts of work either
-way, and `bench/README.md` says so. Vector-only, pgvector's 198 µs **includes a
-socket round trip** and is within touching distance of our 147 µs in-process;
-read that as close, not as a rout in either direction. Our 147 µs is also the
-loaded half of this edition — the idle run above measured the same index at
-68.79 µs — so read the hybrid multiple as a floor.
+**Hybrid is roughly 92x** the nearest baseline and 110x pgvector, up from
+14–17x two editions ago — because it is one statement here and two queries plus
+client-side rank fusion there, not a comparison of equal work either way, and
+`bench/README.md` says so. Vector-only is now ahead too: 84 µs against
+pgvector's 164 µs, where the last edition had us behind. Their number includes a
+socket round trip a library in your process does not pay, so read it as ~2x with
+an asterisk.
 
 Recall on uniformly random vectors is a structural, not a tuning, problem: on
 text-derived embeddings recall@10 stays flat across a 20x range of corpus
