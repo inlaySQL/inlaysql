@@ -254,6 +254,66 @@ pub fn first_word(sql: &str) -> String {
         .to_ascii_uppercase()
 }
 
+/// The leading keyword and everything after it, both borrowed, with leading
+/// whitespace and comments skipped.
+///
+/// [`first_word`] with two differences that both matter where this is used —
+/// counting a statement in [`crate::metrics`], on the path every statement
+/// takes:
+///
+/// * **It allocates nothing.** `first_word` builds a `String` and uppercases
+///   it; the caller here only ever compares case-insensitively, so the copy is
+///   pure cost on a path measured in hundreds of nanoseconds.
+/// * **It skips comments**, without [`strip_comments`]'s full rewrite. Clients
+///   prefix statements with tracing comments constantly, and a counter that
+///   files every one of those under "other" is a counter nobody can read.
+///
+/// It is deliberately *not* a substitute for `normalize`: it looks at the front
+/// of the statement and stops, so it cannot be used to decide what a statement
+/// means. Nothing here is quote-aware, because nothing before the first keyword
+/// can be inside a quote.
+pub fn leading_keyword(sql: &str) -> (&str, &str) {
+    let bytes = sql.as_bytes();
+    let mut at = 0;
+    loop {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        // MySQL only treats `--` as a comment when whitespace follows, which is
+        // the same rule `strip_comments` applies; `#` needs nothing after it.
+        let line_comment = bytes[at..].starts_with(b"#")
+            || (bytes[at..].starts_with(b"--")
+                && bytes.get(at + 2).is_none_or(u8::is_ascii_whitespace));
+        if line_comment {
+            at += match bytes[at..].iter().position(|&b| b == b'\n') {
+                Some(end) => end + 1,
+                None => return ("", ""),
+            };
+            continue;
+        }
+        if bytes[at..].starts_with(b"/*") {
+            at += match bytes[at + 2..]
+                .windows(2)
+                .position(|window| window == b"*/")
+            {
+                Some(end) => 2 + end + 2,
+                // An unterminated block comment swallows the statement, which
+                // is also what the engine's parser will make of it.
+                None => return ("", ""),
+            };
+            continue;
+        }
+        break;
+    }
+    let start = at;
+    while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
+        at += 1;
+    }
+    // Byte indices into ASCII runs of a `&str` are char boundaries, and
+    // everything skipped above was ASCII, so this cannot split a code point.
+    (&sql[start..at], &sql[at..])
+}
+
 /// Split on a separator that is not inside quotes or parentheses.
 pub fn split_top_level(text: &str, separator: char) -> Vec<String> {
     let mut parts = Vec::new();

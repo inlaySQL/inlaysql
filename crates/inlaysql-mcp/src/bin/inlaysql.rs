@@ -107,6 +107,28 @@ SERVE --mysql OPTIONS:
                        `SET max_execution_time = <ms>`, and
                        @@max_execution_time reports what is in force. `KILL
                        [QUERY|CONNECTION] <id>` is the manual form.
+    --slow-query-log <ms>
+                       Write one line to stderr for every statement that runs
+                       longer than this (default 0, off). The line names the
+                       connection, the account, the schema, the kind of
+                       command and the elapsed time — and the statement
+                       itself ONLY if --statement-text is also given. Reported
+                       as slow_query_log and long_query_time, off the same
+                       number that is compared against.
+    --statement-text   Record the statement each connection is running, so
+                       SHOW PROCESSLIST's Info column and the slow-query log
+                       can name it (default off).
+                       READ THIS FIRST: this is a decision about USER DATA,
+                       not about diagnostics. A statement carries whatever
+                       the client put in it — an address in a WHERE, a token
+                       in an INSERT — and this server's standing rule is that
+                       it logs and retains no statement anywhere. With the
+                       flag on, each connection holds its current statement
+                       in memory, its own account and any superuser can read
+                       it in SHOW PROCESSLIST, and it reaches the slow-query
+                       log if one is enabled. Without it, Info is NULL and no
+                       statement text is stored at all. @@inlaysql_statement_
+                       text reports which it is.
 
     SECURITY: the MySQL protocol is served in PLAINTEXT. This version has no
     TLS, so every statement, every result and every credential crosses the
@@ -258,6 +280,10 @@ fn serve_mysql(args: &[String]) -> Result<(), String> {
             "--max-execution-time" => {
                 options.max_execution_time_ms = number(rest.next(), "--max-execution-time")? as u64
             }
+            "--slow-query-log" => {
+                options.slow_query_log_ms = number(rest.next(), "--slow-query-log")? as u64
+            }
+            "--statement-text" => options.statement_text = true,
             other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
         }
     }

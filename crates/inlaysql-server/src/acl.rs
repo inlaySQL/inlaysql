@@ -1506,8 +1506,7 @@ fn parse_scope(text: &str, session: &Session) -> Result<Scope, MysqlError> {
         let acceptable = qualifier == "*"
             || qualifier.eq_ignore_ascii_case(DEFAULT_SCHEMA)
             || session
-                .database
-                .as_deref()
+                .database()
                 .is_some_and(|current| qualifier.eq_ignore_ascii_case(current));
         if !acceptable {
             return Err(MysqlError::new(

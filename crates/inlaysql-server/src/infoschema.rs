@@ -370,6 +370,17 @@ fn relation_of(from_clause: &str) -> Result<Relation, MysqlError> {
         "routines" => Ok(Relation::Routines),
         "key_column_usage" => Ok(Relation::KeyColumnUsage),
         "table_constraints" => Ok(Relation::TableConstraints),
+        // Named on its own because the answer exists, under a different
+        // spelling. This evaluator builds its rows from the catalog, which is
+        // the connection's own read-only view; the process list comes from the
+        // live-connection registry and is filtered by the asking account, and
+        // reaching either from here would mean handing this module a registry
+        // and an account lookup on every `information_schema` query that will
+        // never use them.
+        "processlist" => Err(MysqlError::unsupported(
+            "information_schema.processlist is not implemented; use SHOW [FULL] PROCESSLIST, \
+             which this server does answer",
+        )),
         other => Err(MysqlError::unsupported(format!(
             "information_schema.{other} is not implemented; this server provides \
              TABLES, COLUMNS, SCHEMATA, STATISTICS, VIEWS, TRIGGERS, ROUTINES, \

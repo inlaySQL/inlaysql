@@ -5715,3 +5715,632 @@ fn a_kill_query_does_not_fall_on_the_next_statement() {
     victim.quit();
     killer.quit();
 }
+
+// =====================================================================
+// observability: SHOW PROCESSLIST and SHOW STATUS
+// =====================================================================
+//
+// `docs/enterprise-readiness.md`, blocker 10. The two questions an operator
+// could not ask this server before these existed are "what is it doing right
+// now" and "what has it been doing", and the tests below are written against
+// those two sentences rather than against the implementation: what a client
+// sees over a socket, and who is allowed to see it.
+
+/// One `SHOW STATUS` value, by name. Panics rather than defaulting: a counter
+/// this server does not report is a different failure from one reporting zero,
+/// and a test that silently accepted the first would pass against a server
+/// that reported nothing at all.
+fn status(client: &mut Client, scope: &str, name: &str) -> u64 {
+    let rows = client
+        .ok_query(&format!("SHOW {scope} STATUS LIKE '{name}'"))
+        .rows();
+    assert_eq!(
+        rows.rows.len(),
+        1,
+        "SHOW {scope} STATUS LIKE '{name}' matched {} rows",
+        rows.rows.len()
+    );
+    rows.cell(0, 1)
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} is not a number: {}", rows.cell(0, 1)))
+}
+
+/// The whole process list, as this client sees it.
+fn processlist(client: &mut Client, full: bool) -> Rows {
+    let sql = if full {
+        "SHOW FULL PROCESSLIST"
+    } else {
+        "SHOW PROCESSLIST"
+    };
+    client.ok_query(sql).rows()
+}
+
+/// The columns are MySQL's eight, in MySQL's order, because `mysqladmin
+/// processlist` and every admin UI read them positionally. And the connection
+/// asking is in its own list, doing the thing it is doing.
+#[test]
+fn show_processlist_reports_mysqls_columns_for_this_connection() {
+    let server = TestServer::start("processlist-columns");
+    let mut client = Client::connect(server.addr, "root", &server.password, Some("app"))
+        .expect("connect with a schema");
+    let id = value(&mut client, "CONNECTION_ID()");
+
+    let rows = processlist(&mut client, false);
+    assert_eq!(
+        rows.columns,
+        vec!["Id", "User", "Host", "db", "Command", "Time", "State", "Info"],
+        "the column list a positional client reads"
+    );
+
+    let mine = rows
+        .rows
+        .iter()
+        .find(|row| row[0].as_deref() == Some(id.as_str()))
+        .unwrap_or_else(|| panic!("connection {id} is not in its own process list: {rows:?}"));
+    assert_eq!(mine[1].as_deref(), Some("root"));
+    assert!(
+        mine[2]
+            .as_deref()
+            .is_some_and(|host| host.contains("127.0.0.1")),
+        "Host should be the peer address, got {:?}",
+        mine[2]
+    );
+    assert_eq!(mine[3].as_deref(), Some("app"), "db follows the schema");
+    assert_eq!(
+        mine[4].as_deref(),
+        Some("Query"),
+        "the connection asking is running a query — its own"
+    );
+    assert!(
+        mine[5]
+            .as_deref()
+            .is_some_and(|time| time.parse::<u64>().is_ok()),
+        "Time should be seconds, got {:?}",
+        mine[5]
+    );
+    // `State` is NULL and stays NULL: this engine has no per-stage execution
+    // tracking, and "Sending data" would be invented. See `process_list`.
+    assert_eq!(mine[6], None, "State must be NULL rather than a guess");
+    // And `Info` is NULL, because this server holds no statement text unless
+    // it was asked to.
+    assert_eq!(mine[7], None, "Info must be NULL by default");
+
+    // `USE` moves the `db` column, because the process list reads the same
+    // value the session would use rather than a copy taken at connect.
+    client.ok_query("USE other");
+    let rows = processlist(&mut client, false);
+    let mine = rows
+        .rows
+        .iter()
+        .find(|row| row[0].as_deref() == Some(id.as_str()))
+        .expect("still there");
+    assert_eq!(mine[3].as_deref(), Some("other"));
+    client.quit();
+}
+
+/// **The privilege rule.** An ordinary account sees its own connections and
+/// nothing else; a superuser sees them all. Exactly `KILL`'s rule, so an id in
+/// the list is always an id the viewer could act on — see
+/// `killing_another_account_needs_the_superuser` for the other half.
+#[test]
+fn a_non_superuser_sees_only_its_own_connections() {
+    let server = TestServer::start("processlist-privileges");
+    let mut root = server.client();
+    root.ok_query("CREATE USER 'alice' IDENTIFIED BY 'a-pass'");
+    root.ok_query("CREATE USER 'bob' IDENTIFIED BY 'b-pass'");
+
+    let mut alice = server.client_as("alice", "a-pass");
+    let mut alice_too = server.client_as("alice", "a-pass");
+    let mut bob = server.client_as("bob", "b-pass");
+    let root_id = value(&mut root, "CONNECTION_ID()");
+    let alice_id = value(&mut alice, "CONNECTION_ID()");
+    let alice_too_id = value(&mut alice_too, "CONNECTION_ID()");
+    let bob_id = value(&mut bob, "CONNECTION_ID()");
+
+    // Alice: her own two connections, and neither of the others'.
+    let seen = processlist(&mut alice, false).column("Id");
+    assert!(
+        seen.contains(&alice_id),
+        "alice cannot see herself: {seen:?}"
+    );
+    assert!(
+        seen.contains(&alice_too_id),
+        "alice cannot see her own second connection: {seen:?}"
+    );
+    assert!(
+        !seen.contains(&bob_id),
+        "alice can see bob's connection: {seen:?}"
+    );
+    assert!(
+        !seen.contains(&root_id),
+        "alice can see the superuser's connection: {seen:?}"
+    );
+    // Nothing about another account leaks through the other columns either.
+    for user in processlist(&mut alice, false).column("User") {
+        assert_eq!(user, "alice", "another account's name appeared in the list");
+    }
+
+    // Bob: only his own.
+    let seen = processlist(&mut bob, false).column("Id");
+    assert_eq!(seen, vec![bob_id.clone()], "bob saw more than his own");
+
+    // The superuser: everybody's.
+    let seen = processlist(&mut root, false).column("Id");
+    for id in [&root_id, &alice_id, &alice_too_id, &bob_id] {
+        assert!(seen.contains(id), "the superuser cannot see {id}: {seen:?}");
+    }
+
+    // Every id alice was shown is one she may `KILL`, which is the property
+    // that makes showing it useful rather than merely safe.
+    for id in processlist(&mut alice, false).column("Id") {
+        if id == alice_id {
+            continue; // killing her own connection would end this test's client
+        }
+        alice.ok_query(&format!("KILL QUERY {id}"));
+    }
+    // And an id she was not shown is still refused.
+    let error = alice
+        .query(&format!("KILL QUERY {bob_id}"))
+        .expect_err("bob's connection is not alice's");
+    assert_eq!(error.code, 1095, "{error:?}");
+
+    root.quit();
+    alice.quit();
+    bob.quit();
+}
+
+/// A superuser watching a long statement is the thing a process list exists
+/// for: the connection is `Query`, not `Sleep`, and the `Time` column is what
+/// tells an operator whether to reach for `KILL`.
+#[test]
+fn a_running_statement_is_visible_to_a_superuser_while_it_runs() {
+    let (server, mut victim) = timeout_fixture("processlist-running", SLOW_ROWS, 0);
+    let id: u32 = value(&mut victim, "CONNECTION_ID()").parse().expect("id");
+
+    let running = std::thread::spawn(move || {
+        let outcome = victim.query(SLOW);
+        (victim, outcome)
+    });
+    // Long enough that the statement is inside the join rather than still
+    // being planned — the same wait `kill_query_stops_a_running_statement`
+    // takes, and for the same reason.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut watcher = server.client();
+    let rows = processlist(&mut watcher, false);
+    let victim_row = rows
+        .rows
+        .iter()
+        .find(|row| row[0].as_deref() == Some(id.to_string().as_str()))
+        .unwrap_or_else(|| panic!("the running connection is not listed: {rows:?}"));
+    assert_eq!(
+        victim_row[4].as_deref(),
+        Some("Query"),
+        "a connection running a statement must not read as Sleep"
+    );
+    assert_eq!(
+        status(&mut watcher, "GLOBAL", "Threads_running"),
+        2,
+        "the victim's statement and this one"
+    );
+
+    // And the list is what `KILL` acts on: the id it showed stops the
+    // statement it said was running.
+    watcher.ok_query(&format!("KILL QUERY {id}"));
+    let (mut victim, outcome) = running.join().expect("the victim thread");
+    assert_eq!(outcome.expect_err("stopped").code, 1317);
+
+    // Once it is over the same connection reads as idle, with no statement.
+    std::thread::sleep(Duration::from_millis(100));
+    let rows = processlist(&mut watcher, false);
+    let victim_row = rows
+        .rows
+        .iter()
+        .find(|row| row[0].as_deref() == Some(id.to_string().as_str()))
+        .expect("still connected");
+    assert_eq!(victim_row[4].as_deref(), Some("Sleep"));
+    victim.quit();
+    watcher.quit();
+}
+
+/// **The policy.** Statement text is user data, so the default is that this
+/// server holds none — `Info` is `NULL` even for a statement that is running.
+/// `--statement-text` is the explicit, documented way to change that, and
+/// `@@inlaysql_statement_text` reports which it is.
+#[test]
+fn processlist_info_is_null_unless_statement_text_was_asked_for() {
+    // Off: the default.
+    let server = TestServer::start("processlist-info-off");
+    let mut client = server.client();
+    assert_eq!(value(&mut client, "@@inlaysql_statement_text"), "OFF");
+    let rows = processlist(&mut client, true);
+    assert!(
+        rows.column("Info").iter().all(|info| info == "NULL"),
+        "a default server must not report statement text: {rows:?}"
+    );
+    client.quit();
+
+    // On: the connection's own statement is reported, and it is the statement
+    // that is running — the `SHOW FULL PROCESSLIST` itself.
+    let server = TestServer::start_tuned("processlist-info-on", "s3cret", |options| {
+        options.statement_text = true;
+    });
+    let mut client = server.client();
+    assert_eq!(value(&mut client, "@@inlaysql_statement_text"), "ON");
+    let id = value(&mut client, "CONNECTION_ID()");
+    let rows = processlist(&mut client, true);
+    let mine = rows
+        .rows
+        .iter()
+        .find(|row| row[0].as_deref() == Some(id.as_str()))
+        .expect("in its own list");
+    assert_eq!(mine[7].as_deref(), Some("SHOW FULL PROCESSLIST"));
+
+    // Without FULL the statement is cut at a hundred characters, MySQL's own
+    // number, so one connection running a generated 40 KB INSERT does not cost
+    // the operator every other row. The padding is a trailing comment, which
+    // is part of the text the client sent and therefore part of what `Info`
+    // reports — the statement in flight is the connection's own `SHOW`.
+    let padding = "x".repeat(200);
+    let info_for = |client: &mut Client, sql: &str| -> String {
+        let rows = client.ok_query(sql).rows();
+        rows.rows
+            .iter()
+            .find(|row| row[0].as_deref() == Some(id.as_str()))
+            .expect("in its own list")[7]
+            .clone()
+            .expect("Info")
+    };
+    let short = info_for(&mut client, &format!("SHOW PROCESSLIST -- {padding}"));
+    assert_eq!(short.chars().count(), 100, "truncated to MySQL's 100");
+    assert!(short.starts_with("SHOW PROCESSLIST -- xx"), "{short}");
+    let whole = info_for(&mut client, &format!("SHOW FULL PROCESSLIST -- {padding}"));
+    assert_eq!(
+        whole,
+        format!("SHOW FULL PROCESSLIST -- {padding}"),
+        "FULL must report the whole statement"
+    );
+
+    // An idle connection has no statement in flight, so nothing lingers: a
+    // second connection asking sees the first as Sleep with a NULL Info.
+    let mut watcher = server.client();
+    std::thread::sleep(Duration::from_millis(50));
+    let rows = processlist(&mut watcher, true);
+    let theirs = rows
+        .rows
+        .iter()
+        .find(|row| row[0].as_deref() == Some(id.as_str()))
+        .expect("the idle connection");
+    assert_eq!(theirs[4].as_deref(), Some("Sleep"));
+    assert_eq!(theirs[7], None, "a sleeping connection has no statement");
+    client.quit();
+    watcher.quit();
+}
+
+/// The shim's standing rule applies to these two as well: a filter it cannot
+/// evaluate is refused by name, never dropped. A `SHOW STATUS ... WHERE` that
+/// silently returned every counter, or a `SHOW PROCESSLIST WHERE` that silently
+/// returned every connection, is the exact failure this shim exists to avoid.
+#[test]
+fn a_filter_these_cannot_evaluate_is_refused_rather_than_ignored() {
+    let server = TestServer::start("observability-refusals");
+    let mut client = server.client();
+
+    let error = client
+        .query("SHOW STATUS WHERE Variable_name = 'Questions'")
+        .expect_err("WHERE is not evaluated here");
+    assert_eq!(error.code, 1235, "{error:?}");
+    assert!(error.message.contains("LIKE"), "{error:?}");
+
+    let error = client
+        .query("SHOW PROCESSLIST WHERE Id = 1")
+        .expect_err("PROCESSLIST takes no filter");
+    assert_eq!(error.code, 1235, "{error:?}");
+
+    // And the spellings that do work still do.
+    client.ok_query("SHOW STATUS LIKE 'Questions'");
+    client.ok_query("SHOW PROCESSLIST");
+    client.ok_query("SHOW FULL PROCESSLIST");
+    client.quit();
+}
+
+/// A connection that has authenticated and sent nothing is `Sleep`, not
+/// `Connect`. `Connect` is the state of a connection still handshaking, and an
+/// idle pooled connection showing it is a row an operator would go and
+/// investigate for nothing.
+#[test]
+fn an_authenticated_idle_connection_reads_as_sleep() {
+    let server = TestServer::start("processlist-idle");
+    let mut idle = server.client();
+    let idle_id = value(&mut idle, "CONNECTION_ID()");
+    // ...and then says nothing more.
+
+    let mut watcher = server.client();
+    let rows = processlist(&mut watcher, false);
+    let theirs = rows
+        .rows
+        .iter()
+        .find(|row| row[0].as_deref() == Some(idle_id.as_str()))
+        .unwrap_or_else(|| panic!("the idle connection is not listed: {rows:?}"));
+    assert_eq!(theirs[4].as_deref(), Some("Sleep"));
+    idle.quit();
+    watcher.quit();
+}
+
+/// `information_schema.processlist` is refused, and the refusal names the
+/// spelling that works. The shim's standing rule is that a metadata answer it
+/// cannot give is an error naming what it could not do, never an empty result
+/// a caller reads as "there is nothing there".
+#[test]
+fn information_schema_processlist_names_the_spelling_that_works() {
+    let server = TestServer::start("processlist-infoschema");
+    let mut client = server.client();
+    let error = client
+        .query("SELECT * FROM information_schema.processlist")
+        .expect_err("not implemented");
+    assert_eq!(error.code, 1235, "{error:?}");
+    assert!(
+        error.message.contains("SHOW [FULL] PROCESSLIST"),
+        "the refusal has to say what to use instead: {error:?}"
+    );
+    client.quit();
+}
+
+/// `SHOW STATUS` used to be a two-column result set with no rows in it,
+/// because no counters were kept. These are the counters, and the test is that
+/// they *move* — a counter that is reported and never updated is the failure
+/// this server has already shipped twice.
+#[test]
+fn show_status_counts_the_statements_a_session_ran() {
+    let server = TestServer::start("status-statements");
+    let mut client = server.client();
+
+    let before = status(&mut client, "SESSION", "Questions");
+    client.ok_query("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)");
+    client.ok_query("INSERT INTO t VALUES (1, 'a')");
+    client.ok_query("INSERT INTO t VALUES (2, 'b')");
+    client.ok_query("UPDATE t SET body = 'c' WHERE id = 1");
+    client.ok_query("DELETE FROM t WHERE id = 2");
+    client.ok_query("SELECT * FROM t");
+    assert!(
+        status(&mut client, "SESSION", "Questions") >= before + 6,
+        "Questions did not move"
+    );
+    assert_eq!(status(&mut client, "SESSION", "Com_insert"), 2);
+    assert_eq!(status(&mut client, "SESSION", "Com_update"), 1);
+    assert_eq!(status(&mut client, "SESSION", "Com_delete"), 1);
+    assert_eq!(status(&mut client, "SESSION", "Com_create_table"), 1);
+
+    // A statement the shim answers from the catalog is still a SELECT to
+    // whoever asked for it, and a `SHOW` is counted apart from one.
+    let selects = status(&mut client, "SESSION", "Com_select");
+    client.ok_query("SELECT 1");
+    assert_eq!(status(&mut client, "SESSION", "Com_select"), selects + 1);
+
+    // A prepared statement is counted where it executes, and its prepare is
+    // counted as a prepare rather than as a question — nothing ran. (Every
+    // `SHOW STATUS` below is itself a question, and counts itself: the reading
+    // is taken before the statement being counted and compared after, so the
+    // only question between the two is the reading.)
+    let questions = status(&mut client, "SESSION", "Questions");
+    let stmt = client
+        .prepare("SELECT body FROM t WHERE id = ?")
+        .expect("prepare");
+    assert_eq!(
+        status(&mut client, "SESSION", "Questions"),
+        questions + 1,
+        "the prepare ran nothing, so only this SHOW STATUS is a new question"
+    );
+    assert_eq!(status(&mut client, "SESSION", "Com_stmt_prepare"), 1);
+    client.execute(&stmt, &[Param::Int(1)]).expect("execute");
+    assert_eq!(status(&mut client, "SESSION", "Com_stmt_execute"), 1);
+    assert_eq!(status(&mut client, "SESSION", "Com_select"), selects + 2);
+    client.close_statement(&stmt);
+    assert_eq!(status(&mut client, "SESSION", "Com_stmt_close"), 1);
+
+    // A `PING` is a command, not a statement.
+    let questions = status(&mut client, "SESSION", "Questions");
+    client.ping().expect("ping");
+    assert_eq!(status(&mut client, "SESSION", "Questions"), questions + 1);
+    assert_eq!(status(&mut client, "SESSION", "Com_ping"), 1);
+    client.quit();
+}
+
+/// Session and global are two different numbers, and confusing them is the
+/// easiest way to make a status counter useless. A second connection's work
+/// must show in the server's total and not in this one's.
+#[test]
+fn session_status_is_this_connection_and_global_status_is_the_server() {
+    let server = TestServer::start("status-scope");
+    let mut first = server.client();
+    first.ok_query("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+
+    let mine = status(&mut first, "SESSION", "Com_insert");
+    let everyones = status(&mut first, "GLOBAL", "Com_insert");
+
+    let mut second = server.client();
+    for id in 1..=3 {
+        second.ok_query(&format!("INSERT INTO t VALUES ({id})"));
+    }
+
+    assert_eq!(
+        status(&mut first, "SESSION", "Com_insert"),
+        mine,
+        "another connection's inserts landed on this session's counter"
+    );
+    assert_eq!(
+        status(&mut first, "GLOBAL", "Com_insert"),
+        everyones + 3,
+        "another connection's inserts are missing from the server's counter"
+    );
+
+    // A bare `SHOW STATUS` means SESSION, as it does in MySQL.
+    let bare = first.ok_query("SHOW STATUS LIKE 'Com_insert'").rows();
+    assert_eq!(bare.cell(0, 1), mine.to_string());
+
+    // The counts of connections are global however they are asked for, and
+    // they come off the same registry the process list reads.
+    assert_eq!(status(&mut first, "SESSION", "Threads_connected"), 2);
+    assert_eq!(status(&mut first, "GLOBAL", "Threads_connected"), 2);
+    assert!(status(&mut first, "GLOBAL", "Connections") >= 2);
+    first.quit();
+    second.quit();
+}
+
+/// Errors are bucketed by what an operator would do about them, because a
+/// single total cannot tell "a credential is wrong" from "the workload is
+/// contending" from "something upstream is generating SQL we do not take".
+#[test]
+fn show_status_counts_errors_by_class() {
+    let server = TestServer::start("status-errors");
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+    client.ok_query("INSERT INTO t VALUES (1)");
+
+    let total = status(&mut client, "SESSION", "Inlaysql_errors_total");
+    client
+        .query("SELECT * FROM nope")
+        .expect_err("no such table");
+    client
+        .query("SELECT FROM WHERE")
+        .expect_err("not valid SQL");
+    client
+        .query("INSERT INTO t VALUES (1)")
+        .expect_err("duplicate key");
+    client.query("SAVEPOINT s").expect_err("unsupported");
+
+    assert_eq!(
+        status(&mut client, "SESSION", "Inlaysql_errors_total"),
+        total + 4
+    );
+    assert_eq!(
+        status(&mut client, "SESSION", "Inlaysql_errors_no_such_object"),
+        1
+    );
+    assert_eq!(status(&mut client, "SESSION", "Inlaysql_errors_syntax"), 1);
+    assert_eq!(
+        status(&mut client, "SESSION", "Inlaysql_errors_constraint"),
+        1
+    );
+    assert_eq!(
+        status(&mut client, "SESSION", "Inlaysql_errors_unsupported"),
+        1
+    );
+
+    // A refused login is not a statement error: it is `Aborted_connects`, and
+    // it is global, because the connection it belonged to never existed.
+    let aborted = status(&mut client, "GLOBAL", "Aborted_connects");
+    Client::connect(server.addr, "root", "wrong", None).expect_err("bad password");
+    // The refusing thread records it as it unwinds, which is not synchronous
+    // with this connection; poll rather than sleep a fixed interval and hope.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while status(&mut client, "GLOBAL", "Aborted_connects") == aborted {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a refused login was never counted"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    client.quit();
+}
+
+/// Bytes in and out are the numbers that say whether a client is asking for
+/// more than it can drink, and they have to count the whole of a result set
+/// rather than the statement that asked for it.
+#[test]
+fn show_status_counts_the_bytes_that_crossed_the_socket() {
+    let server = TestServer::start("status-bytes");
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)");
+    for id in 1..=200 {
+        client.ok_query(&format!(
+            "INSERT INTO t VALUES ({id}, '{}')",
+            "x".repeat(200)
+        ));
+    }
+
+    let sent = status(&mut client, "SESSION", "Bytes_sent");
+    let received = status(&mut client, "SESSION", "Bytes_received");
+    let rows = client.ok_query("SELECT * FROM t").rows();
+    assert_eq!(rows.rows.len(), 200);
+
+    let now_sent = status(&mut client, "SESSION", "Bytes_sent");
+    assert!(
+        now_sent - sent > 200 * 200,
+        "a 40 KB result set moved Bytes_sent by only {}",
+        now_sent - sent
+    );
+    assert!(
+        status(&mut client, "SESSION", "Bytes_received") > received,
+        "Bytes_received did not move"
+    );
+    client.quit();
+}
+
+/// The slow-query log is off by default and reports itself as off; turned on,
+/// it counts what it logged, and `long_query_time` reports the threshold that
+/// is actually compared against.
+#[test]
+fn the_slow_query_log_is_off_by_default_and_counts_what_it_logs() {
+    let server = TestServer::start("slow-log-off");
+    let mut client = server.client();
+    assert_eq!(value(&mut client, "@@slow_query_log"), "OFF");
+    assert_eq!(value(&mut client, "@@long_query_time"), "0.000000");
+    client.ok_query("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+    assert_eq!(status(&mut client, "GLOBAL", "Slow_queries"), 0);
+    client.quit();
+
+    // On, at a threshold every real statement here will cross.
+    let server = TestServer::start_tuned("slow-log-on", "s3cret", |options| {
+        options.slow_query_log_ms = 1;
+    });
+    let mut client = server.client();
+    assert_eq!(value(&mut client, "@@slow_query_log"), "ON");
+    assert_eq!(value(&mut client, "@@long_query_time"), "0.001000");
+    seed_pairs(&mut client, 400);
+    client.ok_query("SELECT COUNT(*) FROM t a JOIN t b ON a.n < b.n");
+    assert!(
+        status(&mut client, "SESSION", "Slow_queries") > 0,
+        "a statement over a quarter of a million pairs was not slow at 1ms"
+    );
+    client.quit();
+}
+
+/// Everything `SHOW STATUS` reports has to be reachable by name, and a name
+/// this server invented has to say so — an operator must not mistake this
+/// server's error buckets for a MySQL variable their dashboard understands.
+#[test]
+fn every_reported_status_name_is_mysqls_or_marked_as_this_servers() {
+    let server = TestServer::start("status-names");
+    let mut client = server.client();
+    let rows = client.ok_query("SHOW GLOBAL STATUS").rows();
+    assert!(rows.rows.len() > 20, "only {} counters", rows.rows.len());
+
+    for name in rows.column("Variable_name") {
+        let mysqls_own = name.starts_with("Com_")
+            || matches!(
+                name.as_str(),
+                "Questions"
+                    | "Bytes_received"
+                    | "Bytes_sent"
+                    | "Slow_queries"
+                    | "Connections"
+                    | "Aborted_connects"
+                    | "Connection_errors_max_connections"
+                    | "Max_used_connections"
+                    | "Threads_connected"
+                    | "Threads_running"
+                    | "Uptime"
+            );
+        assert!(
+            mysqls_own || name.starts_with("Inlaysql_"),
+            "`{name}` is neither a MySQL status variable nor marked as this server's own"
+        );
+    }
+    // A LIKE pattern filters it, as it does every other SHOW here.
+    let errors = client
+        .ok_query("SHOW GLOBAL STATUS LIKE 'Inlaysql_errors_%'")
+        .rows();
+    assert!(errors.rows.len() >= 10, "{errors:?}");
+    client.quit();
+}

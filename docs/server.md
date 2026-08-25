@@ -55,8 +55,11 @@ superuser. A password is never stored — an account carries the verifier each
 authentication plugin is defined in terms of. `--user`/`--password` are the
 whole account model until the first `CREATE USER`, and are ignored from then
 on. The full model, and the list of what it deliberately leaves out, is
-[Accounts and privileges](#accounts-and-privileges) below. Nothing is logged:
-not a password, not a verifier, not a statement.
+[Accounts and privileges](#accounts-and-privileges) below. A password is never
+logged, and neither is a verifier — under any flag, in any mode. **A statement
+is never logged or held either, unless `--statement-text` is given**, which is
+a decision about user data rather than about diagnostics and has a section of
+its own: [Observability](#observability-what-this-server-will-tell-you-about-itself).
 
 **Authentication is `caching_sha2_password` by default, or
 `mysql_native_password` via `AuthSwitchRequest` (AHL-467).** MySQL 8+
@@ -96,6 +99,8 @@ socket, and the message does not say which half of the credential was wrong.
 | `--max-connections <n>` | `64` | Beyond this, clients get `1040`. |
 | `--wait-timeout <n>` | `28800` | Seconds a connection may be silent before the server closes it. |
 | `--max-execution-time <ms>` | `0` (off) | Milliseconds one statement may run before the server stops it. A session may change its own with `SET max_execution_time`. **Read the section below.** |
+| `--slow-query-log <ms>` | `0` (off) | Write one stderr line per statement slower than this. Reported as `slow_query_log` and `long_query_time`. |
+| `--statement-text` | off | Hold the statement each connection is running, so `SHOW PROCESSLIST`'s `Info` and the slow-query log can name it. **A decision about user data. Read the section below.** |
 | `--page-reuse` | off | Reclaim superseded pages instead of growing the file for ever. **Read the section below before using it.** |
 | `--paged-vectors` | off | Keep vector indexes in the file instead of in each connection's memory. Recall is identical; latency and foreign-commit cost are not. **Read the section below before using it.** |
 
@@ -289,8 +294,8 @@ accepted and quietly meaning less than it says.
 | `RENAME USER` | Refused, `1235`. A name is an account's identity here, so renaming would orphan every grant written against the old one. |
 | `CREATE USER` with no `IDENTIFIED BY` | Refused, `1235`. MySQL would create an account with no password; `IDENTIFIED BY ''` says so in as many words if that is really what you want. |
 | `IDENTIFIED ... AS '<hash>'` | Refused, `1235`: a hash pasted in is a hash this server cannot check the plugin of. |
-| Hiding metadata | **Not refused, and the one real gap.** Any authenticated account can run `SHOW TABLES` and `DESCRIBE`. Real MySQL shows only what you hold a privilege on; this does not, so table and column *names* are readable by every account even where their contents are not. |
-| Account locking, password expiry, failed-login lockout, an audit log | Absent. |
+| Hiding metadata | **Not refused, and the one real gap.** Any authenticated account can run `SHOW TABLES` and `DESCRIBE`. Real MySQL shows only what you hold a privilege on; this does not, so table and column *names* are readable by every account even where their contents are not. `SHOW PROCESSLIST` deliberately does **not** join this gap: it is filtered by account, on `KILL`'s rule. |
+| Account locking, password expiry, failed-login lockout, an audit log | Absent. `Aborted_connects` counts failed logins in aggregate and `Inlaysql_com_account` counts privilege statements, but neither records *which* — a counter is not an audit trail, and this does not have one. |
 | TLS | Still absent, and still the first thing to know about this server. |
 
 ### The limits a client is told are the limits that are enforced
@@ -306,6 +311,9 @@ applies, because a client tunes against them — a pool sizes itself on
 | `wait_timeout`, `interactive_timeout`, `net_read_timeout` | `--wait-timeout`, set on the connection as the socket read timeout. |
 | `net_write_timeout` | `60`, set on the connection as the socket write timeout. |
 | `max_execution_time`, `max_statement_time` | `--max-execution-time`, or whatever this session last `SET` it to. Read off the same field the engine reads, so the reported number *is* the enforced one. |
+| `slow_query_log` | `ON` when `--slow-query-log` is non-zero, `OFF` otherwise. |
+| `long_query_time` | `--slow-query-log`, converted to MySQL's unit — seconds with a fractional part, so a 500 ms threshold reports `0.500000` rather than rounding to `0`. Read off the milliseconds actually compared against. |
+| `inlaysql_statement_text` | `ON`/`OFF` for `--statement-text`. Under this server's own name, not one of MySQL's: MySQL has no variable that means this, and borrowing `general_log` would claim a feature that does not exist here. |
 
 All three read timeouts report one number because one `SO_RCVTIMEO` is what
 enforces them: the same timer covers waiting for the next command and reading
@@ -385,6 +393,177 @@ Four things to know before setting the timeout:
   the walk is called once per candidate and is where the check lives. Closing
   the unfiltered case means widening those two traits, which is a change to
   everybody's backend, not to this server.
+
+## Observability: what this server will tell you about itself
+
+The two questions an operator has about a running database are "what is it
+doing right now" and "what has it been doing". Until this existed the server
+could answer neither: `EXPLAIN` said what a statement *would* do, and there was
+nothing else — no counters, no process list, no log beyond accept failures and
+connection endings (`docs/enterprise-readiness.md`, blocker 10).
+
+Everything below is answered over the MySQL protocol, on the connection the
+client already has. There is deliberately no HTTP exporter: this workspace
+ships no HTTP server, and adding a listener, a router, a text format and a
+second port to secure — in a project whose dependency tree is a stated design
+constraint — to carry numbers that fit in a result set is the wrong trade.
+`SHOW STATUS` is MySQL's own answer and every agent that scrapes MySQL already
+speaks it.
+
+**The rule the whole of this section is built on: a number that is reported is
+a number that is maintained.** This server has twice shipped a variable it
+reported and did not honour — `max_connections` said `0` against a real cap of
+64, and two timeouts were named and never applied — and the readiness document
+treats that as worse than reporting nothing. So the counter list is short, none
+of it is an estimate, and the two connection counts are not counted at all:
+they are read off the same registry `SHOW PROCESSLIST` reads, so the list and
+the count cannot disagree.
+
+### `SHOW PROCESSLIST`
+
+MySQL's eight columns, in MySQL's order, so `mysqladmin processlist` and any
+admin UI that reads them positionally work:
+
+| Column | What it is |
+| --- | --- |
+| `Id` | The connection id. The same number `CONNECTION_ID()` returns and `KILL` takes. |
+| `User` | The account, or `unauthenticated user` for a connection still in its handshake. |
+| `Host` | The peer address, `host:port`. |
+| `db` | The schema the session last selected. One file is one schema, so this is the cosmetic label `USE` set. |
+| `Command` | `Sleep`, `Query`, `Execute`, `Prepare`, `Init DB`, `Ping` or `Connect` — MySQL's own words for the wire command in flight. |
+| `Time` | Seconds the connection has been in that state. On a `Query`, how long the statement has been running. |
+| `State` | **Always `NULL`, and that is the honest answer.** MySQL's `State` names a stage *inside* a statement — "Sending data", "Copying to tmp table", "Waiting for table metadata lock". This engine has no stage tracking and no lock manager to wait in, so anything put there would be invented. `Command` and `Time` say what this server actually knows. |
+| `Info` | The statement in flight, **only with `--statement-text`**; `NULL` otherwise, and `NULL` for a sleeping connection either way. `SHOW FULL PROCESSLIST` reports the whole statement; without `FULL` it is cut at 100 characters, MySQL's own number. |
+
+**Who sees what.** You always see your own connections and every other
+connection of your own account; seeing anybody else's needs the superuser. That
+is `KILL`'s rule, character for character, and it is one rule on purpose: an id
+in the list is always an id you could act on. A list that showed more than
+`KILL` will touch invites an operator to try something they will be refused; a
+list that showed less would hide a connection they could already end. A
+connection that has not authenticated yet belongs to nobody, so only a
+superuser sees it — otherwise any account could watch logins arrive.
+
+This does not widen the metadata gap in
+[What is deliberately left out](#what-is-deliberately-left-out): that gap is
+about *table and column names* being readable by every account, and the process
+list is filtered by account rather than shown to all.
+
+`information_schema.processlist` is **refused** with `1235` naming
+`SHOW PROCESSLIST`, rather than answered. This shim's rule is that a metadata
+answer it cannot give is an error saying so, never an empty result set a caller
+reads as "there is nothing there"; the `information_schema` evaluator builds
+its rows from the catalog, and the process list comes from the live-connection
+registry with an account check on it, which is not something that view can
+reach without a registry and an account lookup on every `information_schema`
+query that will never use them.
+
+### `SHOW STATUS`
+
+`SHOW STATUS` (or `SHOW SESSION STATUS`) is this connection's counters;
+`SHOW GLOBAL STATUS` is the server's. That is MySQL's split, and a counter with
+no per-connection meaning — the connection counts, `Uptime` — reports its
+global value under both, which is also MySQL's rule. `LIKE` filters it.
+
+**A name is MySQL's, or it says it is not.** Every `Com_*`, `Questions`,
+`Bytes_*`, `Slow_queries`, `Threads_*`, `Uptime`, `Connections`,
+`Aborted_connects`, `Connection_errors_max_connections` and
+`Max_used_connections` below carries exactly its upstream definition, because
+whoever reads it has years of MySQL habit and a dashboard built on it.
+Everything this server counts that MySQL has no variable for is prefixed
+`Inlaysql_`, so it cannot be mistaken for one that is already understood.
+
+| Counter | Means |
+| --- | --- |
+| `Questions` | Statements executed: `COM_QUERY` and `COM_STMT_EXECUTE`. A `COM_STMT_PREPARE` is **not** one — nothing ran. |
+| `Com_select`, `Com_insert`, `Com_update`, `Com_delete`, `Com_replace` | By the client's own leading keyword, before the shim translates anything. A `SELECT` the shim answers from the catalog is still a `Com_select`; a MySQL `ALTER TABLE` that becomes three engine statements is one `Com_alter_table`. |
+| `Com_create_table`, `Com_drop_table`, `Com_alter_table`, `Com_create_index`, `Com_drop_index` | Schema statements, with indexes apart from tables. |
+| `Com_begin`, `Com_commit`, `Com_rollback`, `Com_set_option`, `Com_kill` | `Com_set_option` is MySQL's name for `SET`. `Com_kill` counts `COM_PROCESS_KILL` too — same operation, different spelling. |
+| `Com_stmt_prepare`, `Com_stmt_execute`, `Com_stmt_close`, `Com_stmt_reset`, `Com_ping`, `Com_init_db` | Wire commands. |
+| `Inlaysql_com_show` | Any `SHOW`, `DESCRIBE` or `EXPLAIN`. MySQL has one counter per `SHOW` form; this has one for all of them, which is why it is not spelled like MySQL's. |
+| `Inlaysql_com_account` | `CREATE USER`, `GRANT`, `REVOKE` and the rest — the set that changes who can do what. |
+| `Inlaysql_com_other` | Everything else, including statements this server refused. |
+| `Bytes_received`, `Bytes_sent` | Bytes framed on this connection's socket, packet headers included. |
+| `Slow_queries` | Statements past `long_query_time`. Always `0` when `--slow-query-log` is off, which is the default. |
+| `Uptime` | Seconds since the accept loop started. |
+| `Threads_connected`, `Threads_running` | Live connections, and how many of them are executing something. Derived from the registry `SHOW PROCESSLIST` reads. |
+| `Connections` | Connection attempts the accept loop saw, successful or not. |
+| `Aborted_connects` | Connections that never completed authentication — a wrong password, a client that asked for TLS, an unparsable handshake, a socket dropped mid-exchange, or one refused at the cap. **One number for all of them on purpose:** telling them apart in a counter any account can read would say more about a failed login than the error packet already does. |
+| `Connection_errors_max_connections` | Refused because `--max-connections` was already reached. The one that says the cap is the problem rather than a credential. |
+| `Max_used_connections` | The high-water mark of `Threads_connected`. |
+
+Errors are counted where they reach the client — one error packet, one count —
+and bucketed by *what an operator would do about them*, because a single total
+cannot tell "a credential is wrong" from "the workload is contending" from
+"something upstream is generating SQL we do not take":
+
+| Counter | Codes |
+| --- | --- |
+| `Inlaysql_errors_total` | Every error packet sent. The sum of the rest. |
+| `Inlaysql_errors_access_denied` | `1044`, `1045`, `1095`, `1142`, `1143`, `1227` |
+| `Inlaysql_errors_syntax` | `1064`, `1149` |
+| `Inlaysql_errors_unsupported` | `1235` |
+| `Inlaysql_errors_constraint` | `1048`, `1062`, `3819` |
+| `Inlaysql_errors_conflict` | `1213` — another writer committed first. The one an application retries, and the one whose *rate* decides whether a workload suits an optimistic engine at all. |
+| `Inlaysql_errors_timeout` | `3024` — `max_execution_time` |
+| `Inlaysql_errors_interrupted` | `1317` — `KILL` |
+| `Inlaysql_errors_no_such_object` | `1049`, `1054`, `1094`, `1109`, `1146`, `1176` |
+| `Inlaysql_errors_other` | Everything else, including storage failures and the honest `1105`. |
+
+### `--slow-query-log <ms>`, and the statement-text policy
+
+Off by default. Set it, and every statement that takes longer writes one line
+to stderr:
+
+```
+inlaysql: slow query: connection=7 user="app" db="shop" elapsed=2431ms statement=<not recorded: --statement-text is off>
+```
+
+**The statement itself is not there unless you also pass `--statement-text`,
+and that is a policy, not an oversight.** This server's standing rule is that
+it logs and holds no statement anywhere. Statement text carries whatever the
+client put in it — an address in a `WHERE`, a token in an `INSERT`, a name in
+an `UPDATE` — and a log file outlives the row it came from. Turning the flag on
+changes three things, all of them stated at startup in a warning the operator
+who typed it will see:
+
+* Each connection holds one copy of the statement it is running, for as long as
+  it runs and no longer.
+* `SHOW PROCESSLIST`'s `Info` reports it, to that connection's own account and
+  to a superuser — the same visibility rule as the rest of the row.
+* The slow-query log includes it, debug-quoted so a statement carrying a
+  newline cannot forge a second log line, and cut at 1000 characters with
+  `(+N more characters)` saying so — a generated multi-row `INSERT` is
+  routinely tens of kilobytes, and one line per occurrence at that size is a
+  log nobody can read.
+
+`@@inlaysql_statement_text` reports which it is, so this is checkable from a
+client rather than only from the command line that started the process.
+
+### What it costs the statement being measured
+
+Per command: two clock reads and two relaxed stores for `Command` and `Time`,
+four relaxed `fetch_add`s for the statement counters, four more for the byte
+counts, and an allocation-free scan of the statement's leading keyword. Bytes
+are accumulated in plain `u64`s inside the packet framer and pushed into the
+shared counters once per command, so a ten-million-row result set costs the
+same two adds as a `PING` rather than one per row. Nothing is recorded per row
+anywhere.
+
+Measured over a real socket — 200,000 prepared point reads by primary key, five
+alternating runs of each arm on the same machine — the median went from
+28,410 ns/op to 28,486 ns/op, a 0.3% difference against a run-to-run spread
+several times larger. The `--statement-text` path is the one that costs
+something real (a `String` clone and a mutex per statement), which is the second
+reason it is off by default.
+
+### What is still missing
+
+No histograms and no percentiles: these are counters, and a counter cannot tell
+you the shape of a latency distribution. No per-table or per-index statistics.
+No audit log — `Inlaysql_com_account` counts privilege statements but nothing
+records *which*. No `information_schema.processlist`, `.user_statistics` or
+`performance_schema`; `performance_schema` reports `0` and means it.
 
 ### `--page-reuse`: what it fixes, and what it costs
 
@@ -738,9 +917,14 @@ Answered from `Catalog` and session state, never sent to the engine:
   COLUMNS`, `DESCRIBE <table>` / `DESC <table>` (but **not**
   `DESCRIBE <statement>`, which is `EXPLAIN` and goes to the engine),
   `SHOW KEYS` / `INDEX`, `SHOW VARIABLES`,
-  `SHOW STATUS`, `SHOW WARNINGS` / `ERRORS`, `SHOW DATABASES`, `SHOW ENGINES`,
+  `SHOW WARNINGS` / `ERRORS`, `SHOW DATABASES`, `SHOW ENGINES`,
   `SHOW TABLE STATUS`, `SHOW CREATE TABLE`, `SHOW CREATE DATABASE` — all with
   `LIKE` patterns, including escaped wildcards.
+- `SHOW [SESSION | GLOBAL] STATUS` and `SHOW [FULL] PROCESSLIST` — answered
+  against this server's counters and its live-connection registry rather than
+  the catalog, so they live in `crate::connection` with `KILL`. See
+  [Observability](#observability-what-this-server-will-tell-you-about-itself)
+  for every counter, and for who is allowed to see whose connections.
 - `information_schema.TABLES`, `.COLUMNS`, `.SCHEMATA`, `.STATISTICS`, with a
   projection, a conjunction of `= != LIKE IN IS NULL` comparisons, `ORDER BY`,
   `LIMIT`/`OFFSET`, and `COUNT(*)`. Bound parameters resolve as values inside
@@ -770,6 +954,9 @@ Things the shim refuses rather than fakes:
 - `SHOW TABLES ... WHERE`, `information_schema` joins, `OR` in a shim `WHERE`,
   unknown `information_schema` views, comparisons it cannot evaluate → `1235`,
   naming what was not understood.
+- `information_schema.processlist` → `1235` naming `SHOW [FULL] PROCESSLIST`,
+  which this server does answer. See
+  [Observability](#observability-what-this-server-will-tell-you-about-itself).
 - `mysql`, `performance_schema` and `sys` as schema names → `1044`, rather than
   pretending they exist.
 

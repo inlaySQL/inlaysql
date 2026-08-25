@@ -72,6 +72,7 @@ mod connection;
 mod control;
 mod errors;
 mod infoschema;
+mod metrics;
 mod mysqlddl;
 mod mysqlfunc;
 mod packet;
@@ -88,6 +89,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use control::{Control, Registry};
+use metrics::{Counter, Metrics};
 
 use inlaysql::{Database, EngineOptions, FileDevice};
 
@@ -299,6 +301,42 @@ pub struct ServerOptions {
     /// It is not a privilege escalation: it needs write access to the database
     /// file, and anything with that can already read every row in it.
     pub reset_superuser: bool,
+    /// Log a line to stderr for every statement that runs longer than this
+    /// many milliseconds. `0` (the default) is off.
+    ///
+    /// Reported as `long_query_time` (in seconds, MySQL's unit) and
+    /// `slow_query_log`, and read off this field so the reported threshold is
+    /// the applied one. The line names the connection, the account, the
+    /// elapsed time and the kind of statement — and the statement *text* only
+    /// if [`ServerOptions::statement_text`] is also on, because text is user
+    /// data and this server does not hold it by default.
+    pub slow_query_log_ms: u64,
+    /// Record the statement in flight, so `SHOW PROCESSLIST`'s `Info` column
+    /// and the slow-query log can name it. **Off by default, and turning it on
+    /// is a decision about user data, not about diagnostics.**
+    ///
+    /// This server's standing rule is that a statement is never logged and
+    /// never retained: `docs/server.md` says so from its second paragraph, and
+    /// the reason is that statement text carries whatever the client put in
+    /// it — an email address in a `WHERE`, a token in an `INSERT`, a name in
+    /// an `UPDATE`. None of that belongs in a process list a second account
+    /// can read or in a log file that outlives the row.
+    ///
+    /// With it on:
+    ///
+    /// * `SHOW PROCESSLIST` reports `Info` for the statements the asking
+    ///   account is allowed to see at all — its own always, everybody's with
+    ///   the superuser. That is MySQL's `PROCESS` privilege, with this
+    ///   server's superuser in its place.
+    /// * The slow-query log, if enabled, includes the statement.
+    /// * Each connection holds one copy of its current statement for as long
+    ///   as it runs, and nothing longer.
+    ///
+    /// With it off — the default — no statement text is stored anywhere in
+    /// this process beyond the buffer it was executed from, `Info` is `NULL`,
+    /// and the slow-query log names the statement's *kind* rather than the
+    /// statement.
+    pub statement_text: bool,
 }
 
 impl Default for ServerOptions {
@@ -321,6 +359,10 @@ impl Default for ServerOptions {
             // Overwriting a stored password is never something to do by
             // default; see the field's doc.
             reset_superuser: false,
+            slow_query_log_ms: 0,
+            // Holding statement text is a policy change about user data, so it
+            // is asked for and never inherited. See the field's doc.
+            statement_text: false,
         }
     }
 }
@@ -415,6 +457,8 @@ impl Server {
                 read_timeout_secs: options.wait_timeout_secs,
                 write_timeout_secs: NET_WRITE_TIMEOUT_SECS,
                 max_execution_time_ms: options.max_execution_time_ms,
+                slow_query_log_ms: options.slow_query_log_ms,
+                statement_text: options.statement_text,
             },
             engine: EngineOptions {
                 page_reuse: options.page_reuse,
@@ -472,10 +516,15 @@ impl Server {
         let live = Arc::new(AtomicUsize::new(0));
         let next_id = AtomicU32::new(1);
         // Every live connection, so that one connection's `KILL` can reach
-        // another's. The accept loop owns it because it is the only thing that
-        // knows when a connection begins and ends; each thread removes itself
-        // on the way out, however it ends.
+        // another's and `SHOW PROCESSLIST` can list them. The accept loop owns
+        // it because it is the only thing that knows when a connection begins
+        // and ends; each thread removes itself on the way out, however it ends.
         let registry = Arc::new(Registry::new());
+        // The server's counters, from now. Started here rather than in `bind`
+        // so `Uptime` is time spent serving rather than time since the file was
+        // opened, which is what an operator comparing it against a connection
+        // count means by it.
+        let counters = Arc::new(Metrics::new());
 
         for incoming in self.listener.incoming() {
             let stream = match incoming {
@@ -487,6 +536,11 @@ impl Server {
                     continue;
                 }
             };
+            // Counted here, before anything can refuse it: MySQL's
+            // `Connections` is attempts, successful or not, and an operator
+            // comparing it against `Aborted_connects` is asking exactly how
+            // many of the attempts failed.
+            counters.record(Counter::Connections);
             let id = next_id.fetch_add(1, Ordering::Relaxed).max(1);
             let path = self.path.clone();
             let bootstrap = self.bootstrap.clone();
@@ -494,19 +548,41 @@ impl Server {
             let limits = self.limits;
             let engine = self.engine;
             let max = limits.max_connections;
+            // `unwrap_or` rather than a refusal: a peer address this platform
+            // will not report is a process-list column with nothing in it, not
+            // a reason to turn a client away.
+            let host = stream
+                .peer_addr()
+                .map(|address| address.to_string())
+                .unwrap_or_else(|_| "unknown".to_string());
 
             if live.fetch_add(1, Ordering::SeqCst) >= max {
                 live.fetch_sub(1, Ordering::SeqCst);
+                // Two counters, because they answer two different questions: a
+                // rising `Aborted_connects` says logins are failing, and this
+                // one says *why* — the cap, not a credential.
+                counters.record(Counter::ConnectionErrorsMaxConnections);
+                counters.record(Counter::AbortedConnects);
                 refuse(stream, &MysqlError::too_many_connections());
                 continue;
             }
+            counters.record_max(
+                Counter::MaxUsedConnections,
+                registry.live_count() as u64 + 1,
+            );
 
             // Built and registered on the *accept* thread, before the
             // connection thread is spawned. A `KILL` racing a brand-new
             // connection then either finds it or does not, rather than finding
             // a half-initialised entry: the control exists in full or not at
-            // all.
-            let control = Arc::new(Control::new(id, limits.max_execution_time_ms));
+            // all. The same is true of `SHOW PROCESSLIST`, which is why a
+            // connection appears in it while it is still handshaking.
+            let control = Arc::new(Control::new(
+                id,
+                host,
+                limits.max_execution_time_ms,
+                limits.statement_text,
+            ));
             match control::clone_socket(&stream) {
                 Ok(socket) => control.attach_socket(socket),
                 // `KILL CONNECTION` can still stop a running statement without
@@ -522,6 +598,7 @@ impl Server {
 
             let owned = live.clone();
             let registry_for_thread = registry.clone();
+            let counters_for_thread = counters.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("inlaysql-conn-{id}"))
                 .spawn(move || {
@@ -535,6 +612,7 @@ impl Server {
                         engine,
                         bootstrap,
                         registry_for_thread,
+                        counters_for_thread,
                     ) {
                         // Never the statement, never the credentials — a
                         // server log is not the place for either.
@@ -545,6 +623,7 @@ impl Server {
             if let Err(error) = spawned {
                 live.fetch_sub(1, Ordering::SeqCst);
                 registry.forget(id);
+                counters.record(Counter::AbortedConnects);
                 eprintln!("inlaysql: could not start a thread for connection {id}: {error}");
             }
         }
@@ -564,7 +643,9 @@ impl Drop for Slot {
 /// Removes a connection from the `KILL` registry however the thread ends —
 /// including a panic, which is the case that matters: an entry left behind
 /// would let a later `KILL` of a recycled id write into a control nothing is
-/// reading, and would make `SHOW PROCESSLIST` (when it exists) lie.
+/// reading, would leave a dead connection in `SHOW PROCESSLIST`, and would
+/// leave `Threads_connected` counting it for ever, since that number is the
+/// size of this map.
 struct Registered(Arc<Registry>, u32);
 
 impl Drop for Registered {
@@ -582,6 +663,7 @@ fn serve_connection(
     engine: EngineOptions,
     bootstrap: acl::Bootstrap,
     registry: Arc<Registry>,
+    counters: Arc<Metrics>,
 ) -> io::Result<()> {
     // A request/response protocol gains nothing from waiting to coalesce small
     // writes, and loses a round trip's latency to it every time.
@@ -604,6 +686,9 @@ fn serve_connection(
     let mut db = match open_database(path, engine) {
         Ok(db) => db,
         Err(error) => {
+            // A connection that never got a database never authenticated
+            // either, so it counts where every other failed login counts.
+            counters.record(Counter::AbortedConnects);
             refuse(
                 stream,
                 &MysqlError::new(1049, "42000", format!("Cannot open database: {error}")),
@@ -617,9 +702,10 @@ fn serve_connection(
     // serving and cannot be killed.
     db.set_cancel(Box::new(control::Signal::new(Arc::clone(&control))));
 
-    let result =
-        connection::Connection::new(stream, write_half, db, control, limits, bootstrap, registry)
-            .serve();
+    let result = connection::Connection::new(
+        stream, write_half, db, control, limits, bootstrap, registry, counters,
+    )
+    .serve();
     // A socket timeout arrives as a bare `WouldBlock`/`TimedOut` from whatever
     // read or write was in flight, which in a log reads as an unexplained
     // "Resource temporarily unavailable". Name it instead: this is the one
@@ -751,6 +837,34 @@ pub fn print_exposure_warning(options: &ServerOptions, out: &mut impl Write) -> 
              inlaysql:          may open this file read-only while this server runs — including \n\
              inlaysql:          `inlaysql serve --mcp`, which opens read-only by default. A \n\
              inlaysql:          lock-free reader cannot be seen, so it cannot be waited for."
+        )?;
+    }
+    if options.statement_text {
+        // The default is that this server holds no statement text anywhere.
+        // Turning that off is a decision about *user data* — the values a
+        // statement carries, not the statement's shape — so it is said out
+        // loud at startup, where the person who typed the flag can still
+        // reconsider, and not left to whoever later reads a process list.
+        writeln!(
+            out,
+            "inlaysql: statement text recording is ON: the statement each connection is \n\
+             inlaysql:          running is held in memory, shown in SHOW PROCESSLIST's Info \n\
+             inlaysql:          column to that connection's own account and to any superuser, \n\
+             inlaysql:          and written to the slow-query log if one is enabled. Statement \n\
+             inlaysql:          text contains whatever the client put in it."
+        )?;
+    }
+    if options.slow_query_log_ms > 0 {
+        writeln!(
+            out,
+            "inlaysql: the slow-query log is ON at {} ms; it writes one line to stderr per \n\
+             inlaysql:          statement over that, {}.",
+            options.slow_query_log_ms,
+            if options.statement_text {
+                "including the statement text"
+            } else {
+                "naming the statement's kind but not its text"
+            }
         )?;
     }
     Ok(())

@@ -19,8 +19,9 @@ use inlaysql::{Database, Error, Outcome, ResultSet, Value};
 
 use crate::acl;
 use crate::auth;
-use crate::control::{Asker, Control, KillScope, Registry};
+use crate::control::{Asker, Control, Doing, KillScope, Process, Registry};
 use crate::errors::{from_engine, MysqlError};
+use crate::metrics::{self, Counter, Metrics};
 use crate::packet::{put_lenenc_bytes, put_lenenc_int, Malformed, Reader, Stream};
 use crate::protocol::{
     self, auth_more_data, auth_switch_request, column_def_for, eof_packet, err_packet, handshake,
@@ -68,12 +69,24 @@ pub struct Connection<S: Read + Write> {
     /// reads it from inside its scan loops) and with the accept loop's
     /// registry (which is how another connection's `KILL` reaches it).
     control: Arc<Control>,
-    /// Every live connection, so a `KILL` here can reach one of them.
+    /// Every live connection, so a `KILL` here can reach one of them and
+    /// `SHOW PROCESSLIST` can list them.
     registry: Arc<Registry>,
+    /// The whole server's counters, shared with every other connection.
+    server_counters: Arc<Metrics>,
+    /// This connection's own counters, for `SHOW SESSION STATUS`.
+    ///
+    /// A second set rather than a subtraction from the global one, because
+    /// `SHOW STATUS` means *this session* in MySQL and a client that reads
+    /// `Questions` after running three statements must see three, not the
+    /// server's total. Owned outright — nothing else can reach it — so its
+    /// atomics are uncontended.
+    session_counters: Metrics,
 }
 
 impl<S: Read + Write> Connection<S> {
     /// Wrap an accepted connection.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         read_half: S,
         write_half: S,
@@ -82,6 +95,7 @@ impl<S: Read + Write> Connection<S> {
         limits: Limits,
         bootstrap: acl::Bootstrap,
         registry: Arc<Registry>,
+        server_counters: Arc<Metrics>,
     ) -> Self {
         Self {
             stream: Stream::new(read_half, write_half),
@@ -93,13 +107,30 @@ impl<S: Read + Write> Connection<S> {
             bootstrap,
             control,
             registry,
+            server_counters,
+            session_counters: Metrics::new(),
         }
     }
 
     /// Authenticate, then serve commands until the client disconnects.
     pub fn serve(&mut self) -> io::Result<()> {
-        if !self.authenticate()? {
-            return Ok(());
+        let authenticated = self.authenticate();
+        // The handshake's own packets, counted before the first command: they
+        // crossed this socket, so `Bytes_received`/`Bytes_sent` include them,
+        // and a connection that never got past the handshake still contributes
+        // what it cost.
+        self.publish_traffic();
+        match authenticated {
+            Ok(true) => {}
+            // One number for every way a login can fail — a wrong password, a
+            // client that asked for TLS, an unparsable handshake, a socket
+            // that dropped mid-exchange. Telling them apart in a counter any
+            // account can read would say more about a failed login than the
+            // error packet already does.
+            outcome => {
+                self.server_counters.record(Counter::AbortedConnects);
+                return outcome.map(|_| ());
+            }
         }
         loop {
             let Some(message) = self.stream.read_message()? else {
@@ -253,10 +284,17 @@ impl<S: Read + Write> Connection<S> {
             response.database.clone(),
             self.limits,
         );
-        // Recorded on the shared control, not only in the session: `KILL` runs
-        // on somebody else's thread and has to be able to ask whose connection
-        // this is without touching state this thread owns.
+        // Recorded on the shared control, not only in the session: `KILL` and
+        // `SHOW PROCESSLIST` run on somebody else's thread and have to be able
+        // to ask whose connection this is without touching state this thread
+        // owns.
         self.control.set_user(&response.username);
+        // Authenticated and waiting for a command, which is what `Sleep` means.
+        // Without this a connection that had logged in and not yet sent a
+        // statement would sit in the process list as `Connect` — the state of
+        // one still handshaking, which is exactly the row an operator would go
+        // and investigate.
+        self.control.now_idle();
         if let Some(name) = &response.database {
             if let Err(error) = check_database(name) {
                 self.fail(&error)?;
@@ -402,21 +440,59 @@ impl<S: Read + Write> Connection<S> {
 
     // -------------------------------------------------------- dispatch
 
-    /// Handle one command. Returns whether the connection should stay open.
+    /// Handle one command, with the observability around it.
+    ///
+    /// **The one per-command hook, and deliberately the only one.** Everything
+    /// an operator can ask about a running server is recorded here or in
+    /// [`Self::fail`], because a hook that has to be remembered at each of a
+    /// dozen call sites is a hook that will be missing from the thirteenth. It
+    /// costs the command two clock reads and two relaxed stores (see
+    /// [`Control::command_began`]), four relaxed adds for the byte counts, and
+    /// nothing else — the statement-kind counters live one level down in
+    /// [`Self::run`], where the statement text is.
+    ///
+    /// `COM_QUIT` is answered before any of it: there is no work to time, and a
+    /// process-list entry for a connection that has already asked to leave
+    /// would be a row nobody can act on.
     fn dispatch(&mut self, message: &[u8]) -> io::Result<bool> {
         let Some((&head, body)) = message.split_first() else {
             self.fail(&MysqlError::unknown("empty command packet"))?;
             return Ok(true);
         };
+        let command = Command::from_byte(head);
+        if matches!(command, Command::Quit) {
+            return Ok(false);
+        }
 
-        match Command::from_byte(head) {
+        let doing = doing_for(&command);
+        let began = self.control.command_began(doing);
+        let outcome = self.dispatch_command(command, body);
+        // Taken *before* `command_ended`, which drops it: an idle connection
+        // has no statement in flight, and the slow-query log still needs the
+        // one that just finished. `None` unless `--statement-text` is on, so
+        // on a default server this is not even a lock.
+        let info = self.control.info();
+        let elapsed_ns = self.control.command_ended(began);
+        self.note_if_slow(doing, elapsed_ns, info);
+        self.publish_traffic();
+        outcome
+    }
+
+    /// Handle one command. Returns whether the connection should stay open.
+    fn dispatch_command(&mut self, command: Command, body: &[u8]) -> io::Result<bool> {
+        match command {
+            // Answered in `dispatch`, above, before the timing starts.
             Command::Quit => return Ok(false),
-            Command::Ping => self.ok(0, 0)?,
+            Command::Ping => {
+                self.count(Counter::ComPing);
+                self.ok(0, 0)?
+            }
             Command::InitDb => {
+                self.count(Counter::ComInitDb);
                 let name = String::from_utf8_lossy(body).to_string();
                 match check_database(&name) {
                     Ok(()) => {
-                        self.session.database = Some(name);
+                        self.session.set_database(Some(name));
                         self.ok(0, 0)?;
                     }
                     Err(error) => self.fail(&error)?,
@@ -427,11 +503,20 @@ impl<S: Read + Write> Connection<S> {
                 self.run_text_query(&sql)?;
             }
             Command::StmtPrepare => {
+                self.count(Counter::ComStmtPrepare);
                 let sql = String::from_utf8_lossy(body).to_string();
+                // Recorded for the process list before it is planned: planning
+                // is the part that can be slow, so a `SHOW PROCESSLIST` during
+                // one has to be able to name what is being planned.
+                self.control.set_info(&sql);
                 self.prepare(&sql)?;
             }
-            Command::StmtExecute => self.execute_prepared(body)?,
+            Command::StmtExecute => {
+                self.count(Counter::ComStmtExecute);
+                self.execute_prepared(body)?
+            }
             Command::StmtClose => {
+                self.count(Counter::ComStmtClose);
                 if let Ok(id) = Reader::new(body).u32() {
                     self.statements.remove(&id);
                 }
@@ -440,21 +525,26 @@ impl<S: Read + Write> Connection<S> {
             }
             Command::StmtReset => match Reader::new(body).u32() {
                 Ok(id) if self.statements.contains_key(&id) => {
+                    self.count(Counter::ComStmtReset);
                     if let Some(prepared) = self.statements.get_mut(&id) {
                         prepared.param_types.clear();
                     }
                     self.ok(0, 0)?;
                 }
-                _ => self.fail(&MysqlError::new(
-                    1243,
-                    "HY000",
-                    "Unknown prepared statement handler given to mysqld_stmt_reset",
-                ))?,
+                _ => {
+                    self.count(Counter::ComStmtReset);
+                    self.fail(&MysqlError::new(
+                        1243,
+                        "HY000",
+                        "Unknown prepared statement handler given to mysqld_stmt_reset",
+                    ))?
+                }
             },
             // `mysqladmin kill`, and older drivers. Same operation as the
             // `KILL` statement, same authorisation, same registry — only the
             // spelling differs, so it goes through the same function.
             Command::ProcessKill => {
+                self.count(Counter::ComKill);
                 let target = Reader::new(body).u32();
                 match target {
                     Ok(target) => match self.kill(target, KillScope::Connection) {
@@ -476,6 +566,117 @@ impl<S: Read + Write> Connection<S> {
         Ok(true)
     }
 
+    // --------------------------------------------------- observability
+
+    /// Add one to `counter`, on this session's tally and on the server's.
+    ///
+    /// Both, always: `SHOW STATUS` means the session and `SHOW GLOBAL STATUS`
+    /// means the server, and a global figure derived by summing sessions would
+    /// lose every connection that had already gone.
+    fn count(&self, counter: Counter) {
+        self.session_counters.record(counter);
+        self.server_counters.record(counter);
+    }
+
+    /// One statement is about to run: count it, and name it in the process
+    /// list.
+    ///
+    /// Called from the two functions that execute a client statement —
+    /// [`Self::run`] and [`Self::run_plan`] — and from nowhere else, so a
+    /// MySQL `ALTER TABLE` that expands into several engine statements is
+    /// counted once and a `COM_STMT_PREPARE` (which runs nothing) is not
+    /// counted as a question at all.
+    fn begin_statement(&mut self, sql: &str) {
+        self.count(Counter::Questions);
+        self.count(Counter::for_statement(sql));
+        // No-op, not even a lock, unless `--statement-text` is on.
+        self.control.set_info(sql);
+    }
+
+    /// Move the bytes this connection has framed since last time into the
+    /// counters. Four relaxed adds, once per command — see
+    /// [`crate::packet::Stream::take_traffic`] for why they are not counted
+    /// where they happen.
+    fn publish_traffic(&mut self) {
+        let (received, sent) = self.stream.take_traffic();
+        if received == 0 && sent == 0 {
+            return;
+        }
+        for counters in [&self.session_counters, &*self.server_counters] {
+            counters.add(Counter::BytesReceived, received);
+            counters.add(Counter::BytesSent, sent);
+        }
+    }
+
+    /// Write a slow-query line, if this command was slow and a threshold was
+    /// set.
+    ///
+    /// **Off unless `--slow-query-log` asked for it**, so the comparison below
+    /// is the whole cost on an ordinary server: the elapsed time was measured
+    /// for the process list's `Time` column either way.
+    ///
+    /// The line names the connection, the account, the schema, the wire
+    /// command and the elapsed time. It names the *statement* only when
+    /// `--statement-text` is also on, because statement text is user data and
+    /// this server's default is to hold none — see
+    /// [`crate::ServerOptions::statement_text`]. `info` is whatever the
+    /// process list was showing for this command, taken before the command
+    /// ended and cleared it.
+    fn note_if_slow(&mut self, doing: Doing, elapsed_ns: u64, info: Option<String>) {
+        let threshold = self.limits.slow_query_log_ms;
+        if threshold == 0 || elapsed_ns / 1_000_000 < threshold {
+            return;
+        }
+        self.count(Counter::SlowQueries);
+        let statement = match info {
+            // Debug-formatted, so a statement carrying a newline cannot forge
+            // a second log line. Bounded, because a generated multi-row
+            // `INSERT` is routinely tens of kilobytes and one log line per slow
+            // statement at that size is a log nobody can read and a disk
+            // nobody budgeted for — a real 40 KB line is what made this a
+            // limit rather than a note. The truncation is *stated* rather than
+            // silent, which is the same rule the rest of this server applies
+            // to anything it drops.
+            Some(sql) => {
+                let kept: String = sql.chars().take(SLOW_LOG_STATEMENT_CHARS).collect();
+                let dropped = sql.chars().count().saturating_sub(kept.chars().count());
+                if dropped == 0 {
+                    format!("statement={kept:?}")
+                } else {
+                    format!("statement={kept:?} (+{dropped} more characters)")
+                }
+            }
+            // Only ever `None` because the text was not recorded, and saying
+            // so beats an empty field somebody reads as "there was no
+            // statement".
+            None => "statement=<not recorded: --statement-text is off>".to_string(),
+        };
+        eprintln!(
+            "inlaysql: slow {}: connection={} user={:?} db={:?} elapsed={}ms {statement}",
+            doing.name().to_ascii_lowercase(),
+            self.session.connection_id,
+            self.session.user,
+            self.session.database().unwrap_or(""),
+            elapsed_ns / 1_000_000,
+        );
+    }
+
+    /// Who is asking, for the two operations whose answer depends on it:
+    /// `KILL` and `SHOW PROCESSLIST`.
+    ///
+    /// Read fresh from the account store, never cached at login, for the same
+    /// reason every other statement re-reads it — a superuser whose grant was
+    /// revoked mid-session must stop being one on its next statement, and that
+    /// includes stopping seeing other people's connections.
+    fn asker(&mut self) -> Result<Asker, MysqlError> {
+        let account = self.account()?;
+        Ok(Asker {
+            connection_id: self.session.connection_id,
+            user: self.session.user.clone(),
+            superuser: account.is_superuser(),
+        })
+    }
+
     // ------------------------------------------------------- statements
 
     fn run_text_query(&mut self, sql: &str) -> io::Result<()> {
@@ -492,6 +693,12 @@ impl<S: Read + Write> Connection<S> {
 
     /// Run one statement, through the shim first and the engine otherwise.
     fn run(&mut self, sql: &str, params: &[Value]) -> Result<Answer, MysqlError> {
+        // Counted from the client's own text, before anything is translated:
+        // a MySQL `ALTER TABLE` that becomes three engine statements is one
+        // `Com_alter_table`, and a `SELECT` the shim answers from the catalog
+        // is still a `Com_select` to whoever asked for it. See
+        // `Counter::for_statement` — it allocates nothing.
+        self.begin_statement(sql);
         // Resolved once, up front, so every path below — shim classification,
         // a shim-rewritten DDL statement, and a plain pass-through — reads
         // the same corrected text. See `rewrite_backslash_escapes`: a client
@@ -552,7 +759,7 @@ impl<S: Read + Write> Connection<S> {
             }
             Intercepted::Failed(error) => Err(error),
             Intercepted::UseDatabase(name) => {
-                self.session.database = Some(name);
+                self.session.set_database(Some(name));
                 Ok(Answer::ok())
             }
             Intercepted::Begin => {
@@ -592,6 +799,42 @@ impl<S: Read + Write> Connection<S> {
                 self.kill(connection_id, scope)?;
                 Ok(Answer::ok())
             }
+            Intercepted::ProcessList { full } => {
+                // The account is read here rather than in the shim because
+                // reading it is a query against the account store, and doing
+                // that for every statement on the chance that one of them is a
+                // `SHOW PROCESSLIST` would put a file read on the path of
+                // every statement that is not.
+                let asker = self.asker()?;
+                Ok(Answer::Rows {
+                    rows: process_list(&self.registry.snapshot(&asker), full),
+                    plan: None,
+                })
+            }
+            Intercepted::Status { scope, like } => {
+                let variables = metrics::status_variables(
+                    scope,
+                    &self.session_counters,
+                    &self.server_counters,
+                    &self.registry,
+                );
+                Ok(Answer::Rows {
+                    rows: ResultSet {
+                        columns: vec!["Variable_name".to_string(), "Value".to_string()],
+                        rows: variables
+                            .into_iter()
+                            .filter(|(name, _)| match &like {
+                                Some(pattern) => sqltext::like_matches(pattern, name),
+                                None => true,
+                            })
+                            .map(|(name, value)| {
+                                vec![Value::Text(name.into()), Value::Text(value.into())]
+                            })
+                            .collect(),
+                    },
+                    plan: None,
+                })
+            }
             Intercepted::PassThrough => self.run_on_engine(sql, params),
         }
     }
@@ -614,12 +857,7 @@ impl<S: Read + Write> Connection<S> {
     /// is no statement running but this one, so it stops nothing and the OK
     /// goes out normally.
     fn kill(&mut self, target: u32, scope: KillScope) -> Result<(), MysqlError> {
-        let account = self.account()?;
-        let asker = Asker {
-            connection_id: self.session.connection_id,
-            user: self.session.user.clone(),
-            superuser: account.is_superuser(),
-        };
+        let asker = self.asker()?;
         self.registry.kill(target, scope, &asker)
     }
 
@@ -988,6 +1226,10 @@ impl<S: Read + Write> Connection<S> {
     /// are no longer trustworthy; preparing again is always the right answer,
     /// and doing it here means a client never sees the condition.
     fn run_plan(&mut self, id: u32, sql: &str, params: &[Value]) -> Result<Answer, MysqlError> {
+        // The other half of the pair with `run`: between them every statement
+        // this server executes is counted exactly once. `sql` here is the
+        // statement as it was prepared, which is the client's own text.
+        self.begin_statement(sql);
         // A prepared statement raises its translation warnings on every
         // execution, as MySQL does — the clause was still ignored this time.
         let warnings = self
@@ -1111,7 +1353,16 @@ impl<S: Read + Write> Connection<S> {
         self.stream.flush()
     }
 
+    /// Send one error packet.
+    ///
+    /// **The single place an error reaches a client**, which is why the error
+    /// counters are here and not at each of the several dozen places one is
+    /// constructed: a count taken where errors are *made* would miss every one
+    /// that was made and then handled, and would double-count any that was
+    /// wrapped. Here, one packet is one count.
     fn fail(&mut self, error: &MysqlError) -> io::Result<()> {
+        self.count(Counter::InlaysqlErrorsTotal);
+        self.count(Counter::for_error(error));
         self.stream
             .write_message(&err_packet(error.code, error.sqlstate, &error.message))?;
         self.stream.flush()
@@ -1238,8 +1489,18 @@ impl<S: Read + Write> Connection<S> {
 
         // Split borrow: the row callback writes to the socket while the engine
         // holds the database handle. They are different fields, and saying so
-        // here is what lets one closure use both.
-        let Connection { stream, db, .. } = self;
+        // here is what lets one closure use both. The counters come along for
+        // the error arm at the bottom, which writes an ERR packet without
+        // going through `Self::fail` — a `KILL` landing on a streamed `SELECT`
+        // leaves through there, and it is exactly the error an operator wants
+        // counted.
+        let Connection {
+            stream,
+            db,
+            session_counters,
+            server_counters,
+            ..
+        } = self;
 
         // The header is written from *inside* the callback, not before the
         // call. Everything the engine can fail at before its first row —
@@ -1304,11 +1565,126 @@ impl<S: Read + Write> Connection<S> {
             // in place of the *first* one.
             Err(error) => {
                 let error = from_engine(&error);
+                for counters in [&*session_counters, &**server_counters] {
+                    counters.record(Counter::InlaysqlErrorsTotal);
+                    counters.record(Counter::for_error(&error));
+                }
                 stream.write_message(&err_packet(error.code, error.sqlstate, &error.message))?;
                 stream.flush()?;
                 Ok(Streamed::Done)
             }
         }
+    }
+}
+
+/// The last bytes a connection framed, counted on the way out.
+///
+/// In `Drop` rather than at the bottom of [`Connection::serve`] because `serve`
+/// leaves through half a dozen `?`s — a socket that timed out, a client that
+/// hung up mid-packet — and every one of those is a connection whose traffic
+/// really did cross the wire. Put at the end of the happy path only, the bytes
+/// of every abnormally-ended connection would go missing from `Bytes_sent`,
+/// which is precisely the connection an operator is looking into.
+impl<S: Read + Write> Drop for Connection<S> {
+    fn drop(&mut self) {
+        self.publish_traffic();
+    }
+}
+
+/// Which `Command` column a wire command shows up under.
+///
+/// MySQL's own names, because a client prints this verbatim and an operator
+/// reads it against years of MySQL habit. `Quit` never reaches here — it is
+/// answered before the timing starts.
+fn doing_for(command: &Command) -> Doing {
+    match command {
+        Command::Query => Doing::Query,
+        Command::StmtExecute => Doing::Execute,
+        Command::StmtPrepare => Doing::Prepare,
+        Command::InitDb => Doing::InitDb,
+        Command::Ping => Doing::Ping,
+        Command::StmtClose => Doing::CloseStmt,
+        Command::StmtReset => Doing::ResetStmt,
+        Command::ProcessKill => Doing::Kill,
+        Command::FieldList => Doing::FieldList,
+        Command::Quit | Command::Unknown(_) => Doing::Other,
+    }
+}
+
+/// How much of a statement one slow-query line carries.
+///
+/// Larger than [`INFO_WITHOUT_FULL`] because a log line is read afterwards,
+/// with time to scroll, and the whole point of it is to identify a statement
+/// well enough to reproduce it — a hundred characters of a generated `INSERT`
+/// are all prefix. Bounded at all because such a statement is routinely tens of
+/// kilobytes and one line per occurrence is a log nobody can read.
+const SLOW_LOG_STATEMENT_CHARS: usize = 1000;
+
+/// How much of a statement `SHOW PROCESSLIST` shows without `FULL`.
+///
+/// MySQL's own number. The point of the truncation is that a process list is
+/// read at a terminal, and one connection running a 40 KB generated `INSERT`
+/// should not cost the operator the other sixty rows.
+const INFO_WITHOUT_FULL: usize = 100;
+
+/// The result set `SHOW [FULL] PROCESSLIST` answers with.
+///
+/// MySQL's eight columns, in MySQL's order, because `mysqladmin processlist`
+/// and every admin UI reads them positionally.
+///
+/// **`State` is always `NULL`, and that is the honest answer rather than a
+/// missing feature dressed up.** MySQL's `State` names a *stage* inside a
+/// statement — "Sending data", "Copying to tmp table", "Waiting for table
+/// metadata lock". This engine has no stage tracking and no lock manager to
+/// wait in, so every value that could be put there would be invented. `Command`
+/// and `Time` already say what this server actually knows: what kind of thing
+/// is running, and for how long.
+fn process_list(processes: &[Process], full: bool) -> ResultSet {
+    let text = |value: &str| Value::Text(value.to_string().into());
+    ResultSet {
+        columns: [
+            "Id", "User", "Host", "db", "Command", "Time", "State", "Info",
+        ]
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect(),
+        rows: processes
+            .iter()
+            .map(|process| {
+                vec![
+                    Value::Integer(i64::from(process.id)),
+                    // MySQL's own wording for a connection that has not got
+                    // through its handshake yet.
+                    text(process.user.as_deref().unwrap_or("unauthenticated user")),
+                    text(&process.host),
+                    match &process.db {
+                        Some(name) => text(name),
+                        None => Value::Null,
+                    },
+                    text(process.command.name()),
+                    Value::Integer(process.time_secs.min(i64::MAX as u64) as i64),
+                    Value::Null,
+                    match &process.info {
+                        Some(sql) => text(&truncate_chars(sql, full)),
+                        None => Value::Null,
+                    },
+                ]
+            })
+            .collect(),
+    }
+}
+
+/// The first [`INFO_WITHOUT_FULL`] *characters* of `sql`, unless `full`.
+///
+/// Characters and not bytes: slicing a UTF-8 statement at byte 100 can land
+/// inside a code point, and a panic in a diagnostic is worse than a long line.
+fn truncate_chars(sql: &str, full: bool) -> String {
+    if full {
+        return sql.to_string();
+    }
+    match sql.char_indices().nth(INFO_WITHOUT_FULL) {
+        Some((at, _)) => sql[..at].to_string(),
+        None => sql.to_string(),
     }
 }
 

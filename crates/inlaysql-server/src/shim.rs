@@ -74,6 +74,26 @@ pub enum Intercepted {
         /// Whether to stop the statement or the whole connection.
         scope: crate::control::KillScope,
     },
+    /// `SHOW [FULL] PROCESSLIST`. Answered in [`crate::connection`] for the
+    /// same reason `KILL` is: the registry it reads lives with the accept
+    /// loop, and *which* connections may be shown depends on the asking
+    /// account, which is read fresh from the account store rather than from
+    /// anything the shim can see.
+    ProcessList {
+        /// `SHOW FULL PROCESSLIST`: report the whole statement rather than its
+        /// first hundred characters.
+        full: bool,
+    },
+    /// `SHOW [GLOBAL|SESSION] STATUS [LIKE ...]`. Answered in
+    /// [`crate::connection`], which owns this connection's counters and holds
+    /// the server's.
+    Status {
+        /// Whose counters were asked for. A bare `SHOW STATUS` is
+        /// [`crate::metrics::Scope::Session`], as it is in MySQL.
+        scope: crate::metrics::Scope,
+        /// The `LIKE` pattern, if there was one.
+        like: Option<String>,
+    },
     /// Select a default schema.
     UseDatabase(String),
     /// Recognised, but this server cannot do it.
@@ -813,10 +833,19 @@ fn handle_show(sql: &str, catalog: &Catalog, session: &Session) -> Intercepted {
         Some(rest) => (true, rest),
         None => (false, rest),
     };
-    // Scope words that make no difference to what this server answers.
-    let rest = strip_keyword(rest, "SESSION")
-        .or_else(|| strip_keyword(rest, "GLOBAL"))
-        .unwrap_or(rest);
+    // The scope word. It makes no difference to any of the metadata answers
+    // below — one file is one schema and the catalog is not per session — but
+    // it does to `SHOW STATUS`, whose session and global readings are two
+    // genuinely different numbers, so it is carried rather than discarded.
+    let (scope, rest) = match (
+        strip_keyword(rest, "GLOBAL"),
+        strip_keyword(rest, "SESSION").or_else(|| strip_keyword(rest, "LOCAL")),
+    ) {
+        (Some(rest), _) => (crate::metrics::Scope::Global, rest),
+        (_, Some(rest)) => (crate::metrics::Scope::Session, rest),
+        // MySQL's default for an unqualified `SHOW STATUS`.
+        _ => (crate::metrics::Scope::Session, rest),
+    };
 
     if starts_with_keyword(rest, "DATABASES") || starts_with_keyword(rest, "SCHEMAS") {
         return show_databases(rest, session);
@@ -841,9 +870,40 @@ fn handle_show(sql: &str, catalog: &Catalog, session: &Session) -> Intercepted {
     if starts_with_keyword(rest, "VARIABLES") {
         return show_variables(rest, session);
     }
+    if let Some(after) = strip_keyword(rest, "PROCESSLIST") {
+        // MySQL's own `SHOW PROCESSLIST` takes no filter at all, so anything
+        // trailing it is a statement this shim does not understand — refused
+        // rather than dropped, because a filter silently ignored here would
+        // show an operator every connection when they asked for one.
+        if !after.trim().is_empty() {
+            return Intercepted::Failed(MysqlError::unsupported(format!(
+                "SHOW PROCESSLIST takes no filter, and `{}` was ignored by no version of \
+                 MySQL either",
+                after.trim()
+            )));
+        }
+        return Intercepted::ProcessList { full };
+    }
     if starts_with_keyword(rest, "STATUS") {
-        // No status counters are kept, and inventing them would be fiction.
-        return rows(&["Variable_name", "Value"], Vec::new());
+        // Every counter behind this is maintained at a real choke point; see
+        // `crate::metrics` for why the list is short and why a name that is
+        // not MySQL's own says so. This used to answer zero rows, because
+        // inventing counters would have been fiction — the answer to that was
+        // to count, not to keep the empty result set.
+        let tail = parse_show_tail(rest);
+        if tail.has_where {
+            // The same refusal `SHOW TABLES ... WHERE` gets, for the same
+            // reason: this shim has no expression evaluator, and returning
+            // every counter to a client that asked for some of them is the one
+            // thing it must never do.
+            return Intercepted::Failed(MysqlError::unsupported(
+                "SHOW STATUS ... WHERE is not supported; use LIKE",
+            ));
+        }
+        return Intercepted::Status {
+            scope,
+            like: tail.like,
+        };
     }
     if starts_with_keyword(rest, "WARNINGS") {
         // The warnings the last statement raised — one per MySQL-only clause
@@ -1423,8 +1483,8 @@ fn session_expression(expr: &str, session: &Session) -> Option<Value> {
     match call.as_str() {
         "version()" => return Some(Value::Text(SERVER_VERSION.to_string().into())),
         "database()" | "schema()" => {
-            return Some(match &session.database {
-                Some(name) => Value::Text(name.clone().into()),
+            return Some(match session.database() {
+                Some(name) => Value::Text(name.to_string().into()),
                 None => Value::Null,
             })
         }
@@ -1468,10 +1528,7 @@ fn session_expression(expr: &str, session: &Session) -> Option<Value> {
 
 /// The schema name to report.
 pub fn schema_name(session: &Session) -> String {
-    session
-        .database
-        .clone()
-        .unwrap_or_else(|| DEFAULT_SCHEMA.to_string())
+    session.database().unwrap_or(DEFAULT_SCHEMA).to_string()
 }
 
 /// Build an intercepted result set.

@@ -56,6 +56,17 @@ pub struct Limits {
     /// here — see [`Session::variable`]. This is only the starting value the
     /// accept loop hands each connection.
     pub max_execution_time_ms: u64,
+    /// Milliseconds past which a statement is written to the slow-query log,
+    /// `0` for off. Reported as `slow_query_log` (`ON`/`OFF`) and
+    /// `long_query_time` (seconds, MySQL's unit), and enforced by
+    /// [`crate::connection`] against the same number.
+    pub slow_query_log_ms: u64,
+    /// Whether the statement in flight is recorded, for `SHOW PROCESSLIST`'s
+    /// `Info` column and the slow-query log. Reported as
+    /// `inlaysql_statement_text` — under this server's own name and not one of
+    /// MySQL's, because MySQL has no variable that means this and borrowing
+    /// `general_log` would claim a whole feature that does not exist here.
+    pub statement_text: bool,
 }
 
 impl Default for Limits {
@@ -65,6 +76,8 @@ impl Default for Limits {
             read_timeout_secs: crate::DEFAULT_WAIT_TIMEOUT_SECS,
             write_timeout_secs: crate::NET_WRITE_TIMEOUT_SECS,
             max_execution_time_ms: crate::DEFAULT_MAX_EXECUTION_TIME_MS,
+            slow_query_log_ms: 0,
+            statement_text: false,
         }
     }
 }
@@ -90,8 +103,10 @@ pub struct Session {
     pub connection_id: u32,
     /// The authenticated user name.
     pub user: String,
-    /// The current default schema, if one has been selected.
-    pub database: Option<String>,
+    /// The current default schema, if one has been selected. Read freely;
+    /// changed through [`Session::set_database`], which also mirrors it onto
+    /// the control so `SHOW PROCESSLIST` can report it from another thread.
+    database: Option<String>,
     /// Whether each statement commits on its own.
     pub autocommit: bool,
     /// Whether the engine currently has a transaction open.
@@ -125,6 +140,11 @@ impl Session {
         database: Option<String>,
         limits: Limits,
     ) -> Self {
+        // Mirrored at construction as well as on every change: a client that
+        // named a schema in its handshake has one before it sends a statement,
+        // and a process list that showed `NULL` for it would be wrong from the
+        // connection's first second.
+        control.set_database(database.as_deref());
         Self {
             connection_id: control.id(),
             control,
@@ -138,6 +158,22 @@ impl Session {
             warnings: Vec::new(),
             limits,
         }
+    }
+
+    /// The default schema this session last selected.
+    pub fn database(&self) -> Option<&str> {
+        self.database.as_deref()
+    }
+
+    /// Select a default schema.
+    ///
+    /// The only way to change it, so the copy on the shared [`Control`] cannot
+    /// fall behind — `SHOW PROCESSLIST` reads that copy from another thread,
+    /// and a `db` column that lagged a `USE` would send an operator to the
+    /// wrong schema.
+    pub fn set_database(&mut self, database: Option<String>) {
+        self.control.set_database(database.as_deref());
+        self.database = database;
     }
 
     /// Replace the warnings a client would see for the statement just run.
@@ -242,6 +278,39 @@ impl Session {
             "max_execution_time" | "max_statement_time" => {
                 return Some(self.control.timeout_ms().to_string())
             }
+            // The three below are the same pairing as the timeouts above:
+            // each one is read off the field the connection actually applies,
+            // so a client cannot be told a threshold the server is not using.
+            "slow_query_log" => {
+                return Some(
+                    if self.limits.slow_query_log_ms > 0 {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
+                    .to_string(),
+                )
+            }
+            // MySQL's unit is seconds with a fractional part; the server takes
+            // milliseconds because that is the resolution a statement timeout
+            // is set at here, so this converts rather than rounding to a
+            // second and reporting `0` for a 500 ms threshold.
+            "long_query_time" => {
+                let millis = self.limits.slow_query_log_ms;
+                return Some(format!("{}.{:06}", millis / 1000, (millis % 1000) * 1000));
+            }
+            // Not one of MySQL's: this server's own switch, under its own
+            // name. See [`Limits::statement_text`].
+            "inlaysql_statement_text" => {
+                return Some(
+                    if self.limits.statement_text {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
+                    .to_string(),
+                )
+            }
             // Said plainly, because a client may be deciding whether to trust
             // this link with a password.
             "have_ssl" | "have_openssl" => "DISABLED",
@@ -296,8 +365,10 @@ impl Session {
             "have_ssl",
             "hostname",
             "init_connect",
+            "inlaysql_statement_text",
             "interactive_timeout",
             "license",
+            "long_query_time",
             "lower_case_table_names",
             "max_allowed_packet",
             "max_connections",
@@ -306,6 +377,7 @@ impl Session {
             "net_write_timeout",
             "performance_schema",
             "protocol_version",
+            "slow_query_log",
             "socket",
             "sql_auto_is_null",
             "sql_mode",
@@ -386,6 +458,8 @@ mod tests {
                 read_timeout_secs: 11,
                 write_timeout_secs: 13,
                 max_execution_time_ms: 250,
+                slow_query_log_ms: 1500,
+                statement_text: true,
             },
         );
         assert_eq!(session.variable("max_connections").as_deref(), Some("7"));
@@ -397,6 +471,18 @@ mod tests {
             );
         }
         assert_eq!(session.variable("net_write_timeout").as_deref(), Some("13"));
+        // The slow-query threshold is the same pairing: reported in MySQL's
+        // unit (seconds) off the milliseconds the connection actually compares
+        // against, so a 1.5 s threshold cannot be reported as `1` or as `0`.
+        assert_eq!(session.variable("slow_query_log").as_deref(), Some("ON"));
+        assert_eq!(
+            session.variable("long_query_time").as_deref(),
+            Some("1.500000")
+        );
+        assert_eq!(
+            session.variable("inlaysql_statement_text").as_deref(),
+            Some("ON")
+        );
 
         // And `SHOW VARIABLES` says the same thing as `@@name`, which is where
         // a client that lists everything would otherwise see the stale answer.
@@ -405,12 +491,33 @@ mod tests {
             ("max_connections", "7"),
             ("wait_timeout", "11"),
             ("net_write_timeout", "13"),
+            ("long_query_time", "1.500000"),
+            ("slow_query_log", "ON"),
+            ("inlaysql_statement_text", "ON"),
         ] {
             assert!(
                 all.iter().any(|(n, v)| n == name && v == value),
                 "SHOW VARIABLES should list {name}={value}, got {all:?}"
             );
         }
+    }
+
+    /// The default server records no statement text and logs no slow query, so
+    /// the two variables that report those must say so. A client — or an
+    /// auditor — reading `inlaysql_statement_text` is asking whether this
+    /// process is holding the values their statements carry.
+    #[test]
+    fn the_defaults_report_that_nothing_is_being_recorded() {
+        let session = Session::new(Control::detached(1), "root", None, Limits::default());
+        assert_eq!(session.variable("slow_query_log").as_deref(), Some("OFF"));
+        assert_eq!(
+            session.variable("long_query_time").as_deref(),
+            Some("0.000000")
+        );
+        assert_eq!(
+            session.variable("inlaysql_statement_text").as_deref(),
+            Some("OFF")
+        );
     }
 
     /// The two claims a security-minded client might actually read.

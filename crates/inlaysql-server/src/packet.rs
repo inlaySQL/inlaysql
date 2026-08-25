@@ -34,6 +34,17 @@ pub struct Stream<S: Read + Write> {
     /// The id the next packet written will carry. Set from the last packet
     /// read, so a reply continues the exchange it answers.
     sequence: u8,
+    /// Bytes framed in and out since [`Stream::take_traffic`] last ran, headers
+    /// included, for `Bytes_received` and `Bytes_sent`.
+    ///
+    /// Plain `u64`s and not the shared atomics they end up in: a result set is
+    /// one `write_message` per row, so an atomic here would put a contended
+    /// read-modify-write on the per-row path in exchange for a number nobody
+    /// can read until the statement finishes anyway. The connection drains
+    /// these into [`crate::metrics::Metrics`] once per command instead — two
+    /// atomic adds for a ten-million-row `SELECT`, the same two as for a
+    /// `PING`.
+    traffic: (u64, u64),
 }
 
 impl<S: Read + Write> Stream<S> {
@@ -47,7 +58,16 @@ impl<S: Read + Write> Stream<S> {
             reader: BufReader::new(read_half),
             writer: BufWriter::new(write_half),
             sequence: 0,
+            traffic: (0, 0),
         }
+    }
+
+    /// The bytes read and written since this last ran, and reset.
+    ///
+    /// Taken rather than read so the caller can add them to a running total
+    /// without keeping a second copy of what it has already counted.
+    pub fn take_traffic(&mut self) -> (u64, u64) {
+        std::mem::take(&mut self.traffic)
     }
 
     /// Read one whole message, following continuation packets.
@@ -81,6 +101,10 @@ impl<S: Read + Write> Stream<S> {
             let start = payload.len();
             payload.resize(start + length, 0);
             self.reader.read_exact(&mut payload[start..])?;
+            // Counted after the read succeeds, so `Bytes_received` is bytes
+            // this server actually took delivery of rather than bytes it hoped
+            // for. Header included, because that is what crossed the wire.
+            self.traffic.0 += (4 + length) as u64;
 
             // Only a full-size packet promises another after it.
             if length < MAX_PAYLOAD {
@@ -100,6 +124,7 @@ impl<S: Read + Write> Stream<S> {
             self.sequence = self.sequence.wrapping_add(1);
             self.writer.write_all(&header)?;
             self.writer.write_all(&rest[..take])?;
+            self.traffic.1 += (4 + take) as u64;
             rest = &rest[take..];
             // A message whose length is a multiple of the maximum needs a
             // trailing empty packet to say it has ended.
@@ -110,6 +135,7 @@ impl<S: Read + Write> Stream<S> {
                 let header = [0, 0, 0, self.sequence];
                 self.sequence = self.sequence.wrapping_add(1);
                 self.writer.write_all(&header)?;
+                self.traffic.1 += 4;
                 return Ok(());
             }
         }
@@ -369,6 +395,33 @@ mod tests {
     fn a_message_of_exactly_the_maximum_round_trips() {
         let payload: Vec<u8> = (0..MAX_PAYLOAD).map(|i| (i % 251) as u8).collect();
         assert_eq!(round_trip(&payload), payload);
+    }
+
+    /// `Bytes_sent` and `Bytes_received` count what crossed the socket,
+    /// headers included — and count a continued message once per packet, not
+    /// once per message, or a large result set would be reported as a small
+    /// one.
+    #[test]
+    fn traffic_counts_every_packet_header_and_payload() {
+        let (read_half, write_half) = loopback();
+        let mut stream = Stream::new(read_half, write_half);
+        stream.write_message(b"hello").unwrap();
+        stream.flush().unwrap();
+        assert_eq!(stream.take_traffic(), (0, 9), "4 header + 5 payload");
+        // Taken, so the next reading starts from zero.
+        assert_eq!(stream.take_traffic(), (0, 0));
+
+        stream.read_message().unwrap().expect("a message");
+        assert_eq!(stream.take_traffic(), (9, 0));
+
+        // A message that needs a continuation packet is counted as both.
+        let payload: Vec<u8> = (0..MAX_PAYLOAD + 10).map(|i| (i % 251) as u8).collect();
+        stream.write_message(&payload).unwrap();
+        assert_eq!(
+            stream.take_traffic(),
+            (0, (MAX_PAYLOAD + 10 + 8) as u64),
+            "two packets, so two headers"
+        );
     }
 
     #[test]
