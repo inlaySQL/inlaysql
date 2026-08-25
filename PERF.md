@@ -499,6 +499,151 @@ where InnoDB's redo log carries small physiological diffs. Per-commit bytes
 are therefore structurally larger here, and that is a page-format question, not
 something a correctness-preserving fix reaches.
 
+### The durable commit, counted — and what the MySQL/PostgreSQL row measures (AHL-496)
+
+AHL-480 profiled this loop once and found a real defect. This pass counted it
+instead of sampling it, then went and measured the *device* the comparison runs
+on. Both answers were surprises, and the second one is the important one.
+
+**What a single-row `INSERT` actually costs.** Instrumented with a counting
+`Device` wrapped around `FileDevice`, over 3,000 steady-state commits of
+`profile --suite writes` (warmed past `CDC_RETENTION`, ~7,100 rows resident):
+
+| Per durable commit | Measured |
+| --- | --- |
+| `sync` calls | **1.0257** |
+| `write` calls | 2.051 |
+| device `read` calls | 6.40 (26.2 KiB) |
+| Dirty pages copied into the record | **6.45** (mode 7; 5 while the tree is one level shallower) |
+| Bytes: WAL record | 26.5 KiB |
+| Bytes: data-area copy of the same pages | 26.4 KiB |
+| Bytes: WAL-region zero-fill, amortised | **26.9 KiB** |
+| **Bytes total** | **79.9 KiB** |
+
+Three things fall out of that table.
+
+**The 1.0257.** The second `F_FULLFSYNC` AHL-480 named is still there, and its
+frequency has moved the wrong way: the WAL region wraps once every **39**
+commits, not the ~283 that section claims. The arithmetic says it cannot be
+283 — a 1 MiB region cannot hold 283 records of 26.5 KiB — so treat the old
+figure as measured on a database small enough to be one B-tree level shallower,
+and this one as what a steady state costs. A wrap is not waste: it writes and
+syncs the state block first, because records that a checkpoint has not yet
+covered cannot be erased. What *is* waste is that it then writes a whole 1 MiB
+of zeros, which is where a third of every commit's bytes goes.
+
+**Six and a half pages for one row.** Mode 7, and it decomposes exactly: a
+root-to-leaf path for the row (4 pages at this depth) plus a second, disjoint
+root-to-leaf path for the metadata cluster — `write_version`, `next_row_id` and
+the newest `cdc:` entry, which are adjacent to each other but nowhere near the
+row — sharing only the root, so 3 more. **Roughly 43% of every commit's bytes
+exist to maintain three counters and one change-log entry**, and that is a
+consequence of rows and metadata living in one tree, not of the page format.
+
+**Six and a half reads, too.** A commit writes 6.5 pages and the *next* commit
+reads those same pages back off the device, because a committed page is dropped
+from the handle rather than promoted into the decoded cache. For a write-only
+workload the page cache is a 100% miss and the descent pays a `pread` and a
+`page::decode` per level, every commit.
+
+**Where the time goes, in two regimes.** `sample(1)` on the `writes` suite,
+self time. The left column is a real `F_FULLFSYNC` against the internal SSD;
+the right is the same binary with its file on an APFS RAM disk, which is a
+stand-in for a container volume — cheap barrier, everything else identical.
+
+| Cost | Host, real `F_FULLFSYNC` | Cheap `fsync` |
+| --- | --- | --- |
+| `fsync`, the commit's own barrier | **88.4%** | 42.3% |
+| `fsync`, from a WAL-region wrap | 2.5% | 1.4% |
+| `wal::encode_record` | 1.3% | **11.7%** |
+| allocator | 2.1% | **14.6%** |
+| `memmove` | 1.0% | 8.3% |
+| `pwrite` | 1.5% | 3.6% |
+| `pread` | 0.7% | 2.9% |
+| throughput | 237 ops/s | 4,414 ops/s |
+
+So on the host the answer is "91% fsync" and nothing we do to the CPU can move
+it by more than ~9%. The interesting column is the right-hand one, because that
+is the regime `BENCHMARK.md`'s containerised row runs in.
+
+**What was fixed.** `wal::encode_record` was copying every dirty page **three**
+times to emit one record — `bytes.clone()` into `WalRecord::pages` at the call
+site, `extend_from_slice` into a `body` `Vec` that started at 128 bytes and
+`realloc`'d its way to 26 KiB, then a third copy of the whole body into the
+buffer the checksum ran over — plus a fresh 26 KiB allocation in
+`write_dirty_pages` for the coalesced data write. `encode_record_into` does one
+pass into a buffer the handle keeps (`record_buf`/`run_buf`, capped at 64 KiB of
+retained capacity so a bulk load cannot leave a megabyte pinned per
+connection). **The bytes on disk are unchanged**, which
+`the_borrowed_encoder_matches_the_owned_one` pins byte for byte in both
+layouts.
+
+Measured interleaved, six rounds each, medians: **4,170 → 4,257 ops/s** in the
+cheap-`fsync` regime (~+2%), non-`fsync` samples down 4.1%. On the host it is
+invisible, as the 91% predicts (117/131/126 against 134/130/114 — noise). This
+is a small win and is reported as one.
+
+**What is left, and why it is not reachable from here.** With the copies gone,
+the largest single item of our own work is the **FNV-1a checksum over the
+record: ~15%** of a commit when `fsync` is cheap. Confirmed by stubbing it out
+in a throwaway build — 4,363 → 4,987 and 4,358 → 5,078 ops/s, +14% and +16%.
+FNV-1a is a serial xor-multiply chain, ~4 cycles a byte; there is no faster way
+to compute *the same value*, and changing the value is a format break. The only
+lever is the byte count, which is 26.5 KiB because the record carries 6.5 whole
+page images. Every other cost in the table scales off the same number.
+
+**And now the part that reframes the benchmark.** `BENCHMARK.md` reports
+InlaySQL at 849.7 durable writes/s containerised against PostgreSQL's 1,612.8
+and MySQL's 1,184.2, and calls trailing both "the finding". Measured on a
+Docker named volume of the same class, from a container, with a loop that does
+nothing but `pwrite` + `fsync`:
+
+| Bytes per `fsync` | 4 KiB | 26 KiB | 80 KiB | 256 KiB |
+| --- | --- | --- | --- | --- |
+| Durable commits/s (round-robin, median of 6) | 850 | 846 | 836 | 875 |
+
+**The volume's `fsync` cost is flat in bytes.** Our 80 KiB per commit costs
+exactly what PostgreSQL's few hundred bytes cost. `fdatasync` is not cheaper
+than `fsync` there (723 against 857), and extending the file is not dearer than
+overwriting in place (741 against 818, inside the noise) — so neither the write
+amplification nor the fact that we grow the file every commit is being paid for
+on this storage. One durable commit costs ~1.18 ms and **nothing else matters**.
+
+Against that floor, back to back in one session: **PostgreSQL 17, one client,
+`fsync=on`/`synchronous_commit=on`, on its own named volume: 769–827 tps**, when
+the raw floor was 836–850. InlaySQL containerised, run in the same session:
+735/827/1,207 ops/s. Everyone is at the same wall.
+
+And the wall moves. The same probe, same command, same machine, ninety minutes
+apart: 1,777 commits/s and 846 commits/s — **a 2.1x drift with host load.**
+1,612.8 is 91% of the fast reading; 849.7 is 100% of the slow one.
+
+So the honest statement is: **the published row is measuring the volume's
+`fsync` latency at two different moments, not two engines.** InlaySQL is already
+at the one-`fsync`-per-commit floor of that device. Beating PostgreSQL there is
+not a matter of doing less work per commit — at 1.18 ms of barrier against
+~0.2 ms of our own work, the CPU side is ~15% of the number and the whole of
+this section's fix is 2% of that 15%. It requires committing *less often than
+once per commit*, which for a single sequential connection means either group
+commit (which cannot fire — one writer, one commit in flight, by design) or a
+durability relaxation this engine deliberately does not offer.
+
+**What is owed.** Two measurements, and one of them is cheap:
+
+1. Re-run the whole containerised comparison **in one session, interleaved**,
+   InlaySQL and PostgreSQL and MySQL and the raw `pwrite`+`fsync` floor
+   alternating, on a quiet machine. Until that exists, no ordering in that
+   table should be believed — including the ones that flatter us.
+2. If the write path is picked up again, the target is the **6.5 pages**, not
+   the code around them. In descending order of what the count says: the second
+   root-to-leaf path for the metadata cluster (~43% of the bytes), the 1 MiB
+   zero-fill per wrap (~34% of the bytes — and it may not be needed at all,
+   since `read_committed_state` already filters records at or below the
+   checkpoint the wrap has just synced, but that argument is exactly the class
+   AHL-406 punished and needs its own DST pass before anyone acts on it), and
+   promoting freshly committed pages into the decoded cache so a commit stops
+   re-reading what it just wrote.
+
 ### Why a miss is dearer than SQLite's, located (AHL-488)
 
 `PERF.md` had asserted since AHL-420 that our miss path is dearer than SQLite's

@@ -85,6 +85,29 @@ const S_NEXT: usize = 8;
 const S_SEQ: usize = 16;
 const S_CHECKSUM: usize = 24;
 
+/// How much capacity a commit's scratch buffer may keep between commits.
+///
+/// `record_buf` and `run_buf` exist so an ordinary commit stops allocating and
+/// freeing ~26 KiB twice over; keeping them unconditionally would instead mean
+/// a handle that once committed a bulk load holds that transaction's whole
+/// record — up to `wal::max_record_len`, 1 MiB at the default page size —
+/// until it closes, twice, for as long as it lives. A server keeps one handle
+/// per connection, so "forever, per connection" is the wrong bound to leave
+/// implicit. Sixteen pages covers the steady-state commit this exists for
+/// (~6.5 dirty pages) with room to spare; anything larger is handed back to
+/// the allocator, which is exactly the behaviour every commit had before.
+const COMMIT_BUF_RETAIN_MAX: usize = 64 * 1024;
+
+/// Keep `buf` for the next commit if it is small enough to be worth keeping —
+/// see [`COMMIT_BUF_RETAIN_MAX`].
+fn retain_commit_buf(buf: Vec<u8>) -> Vec<u8> {
+    if buf.capacity() > COMMIT_BUF_RETAIN_MAX {
+        Vec::new()
+    } else {
+        buf
+    }
+}
+
 /// The result of inserting into a subtree: either the subtree was replaced by
 /// one new page, or it split into two new pages around a separator.
 enum InsertOutcome {
@@ -124,6 +147,20 @@ pub struct CowBTree<D: Device> {
     checkpoint_seq: u64,
     /// Newly allocated pages of the open transaction, keyed by page id.
     dirty: BTreeMap<PageId, Vec<u8>>,
+    /// The encoded commit record, kept between commits so the write path does
+    /// not allocate a fresh ~26 KiB buffer every time it commits.
+    ///
+    /// Same argument as the `scratch` read buffer below: a commit's record
+    /// is rebuilt from scratch each time (`encode_record_into` clears it
+    /// first), so nothing can leak from one commit into the next, and the only
+    /// thing carried across is capacity. Sized once by
+    /// [`CowBTree::pending_record_len`], which is exact.
+    record_buf: Vec<u8>,
+    /// The coalesced data-area write of one commit's dirty pages, kept for the
+    /// same reason as `record_buf`. [`CowBTree::write_dirty_pages`] refills it
+    /// from the dirty set on every call and clears it between runs, so it too
+    /// carries capacity and nothing else.
+    run_buf: Vec<u8>,
     /// The working root of the open transaction.
     pending_root: PageId,
     /// The working next-free-page counter of the open transaction.
@@ -391,6 +428,8 @@ impl<D: Device> CowBTree<D> {
             next_seq: checkpoint_seq + 1,
             checkpoint_seq,
             dirty: BTreeMap::new(),
+            record_buf: Vec::new(),
+            run_buf: Vec::new(),
             pending_root: 0,
             pending_next: 0,
             has_pending: false,
@@ -870,23 +909,27 @@ impl<D: Device> CowBTree<D> {
             // free-list rows before the record below is built, so they ride
             // the same commit — see `CowBTree::finalize_free_list`.
             self.finalize_free_list(seq)?;
-            let record = crate::wal::WalRecord {
-                seq,
-                prev_seq: current_seq,
-                prev_root: current_root,
-                root: self.pending_root,
-                next: self.pending_next,
-                pages: self
-                    .dirty
-                    .iter()
-                    .map(|(&id, bytes)| (id, bytes.clone()))
-                    .collect(),
-            };
-            let encoded = if self.format_version >= crate::wal::MULTI_REGION_FORMAT_VERSION {
-                crate::wal::encode_record(&record)
-            } else {
-                crate::wal::encode_legacy_record(&record)
-            };
+            // Borrowed out of the handle and put back below, because the
+            // encoder writes into it while `self.dirty` is being read: two
+            // fields, one `&mut self`. An early `?` between here and the
+            // restore drops the buffer instead of returning it, which costs
+            // the next commit one allocation and nothing else — the failure
+            // that got us here is a device error, not a lost commit.
+            let mut encoded = core::mem::take(&mut self.record_buf);
+            encoded.clear();
+            encoded.reserve(self.pending_record_len());
+            crate::wal::encode_record_into(
+                &mut encoded,
+                self.format_version,
+                crate::wal::RecordMeta {
+                    seq,
+                    prev_seq: current_seq,
+                    prev_root: current_root,
+                    root: self.pending_root,
+                    next: self.pending_next,
+                },
+                self.dirty.iter().map(|(&id, bytes)| (id, &bytes[..])),
+            );
             if encoded.len() > crate::wal::max_record_len(self.page_size) {
                 return Err(Error::Storage(alloc::format!(
                     "transaction does not fit the write-ahead log ({} > {} bytes)",
@@ -936,6 +979,7 @@ impl<D: Device> CowBTree<D> {
                     append_offset: append_offset + encoded.len(),
                 }),
             );
+            self.record_buf = retain_commit_buf(encoded);
             Ok(Some(seq))
         })();
         if prepared.is_err() {
@@ -1901,7 +1945,12 @@ impl<D: Device> CowBTree<D> {
     fn write_dirty_pages(&mut self) -> Result<()> {
         let page_size = self.page_size;
         let format_version = self.format_version;
-        let mut run: Vec<u8> = Vec::with_capacity(self.dirty.len() * page_size);
+        // Borrowed out and put back for the same reason `commit` borrows
+        // `record_buf`: the run is filled from `self.dirty` and handed to
+        // `self.device`, so it cannot itself be reached through `&mut self`.
+        let mut run = core::mem::take(&mut self.run_buf);
+        run.clear();
+        run.reserve(self.dirty.len() * page_size);
         let mut run_start: PageId = 0;
         let mut run_end: PageId = 0;
         for (&id, bytes) in &self.dirty {
@@ -1940,6 +1989,7 @@ impl<D: Device> CowBTree<D> {
                 &run,
             )?;
         }
+        self.run_buf = retain_commit_buf(run);
         Ok(())
     }
 

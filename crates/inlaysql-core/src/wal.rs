@@ -164,46 +164,102 @@ const LEGACY_R_NEXT: usize = 20;
 const LEGACY_R_COUNT: usize = 28;
 const LEGACY_R_PAGES: usize = 32;
 
+/// Everything in a commit record except the page images: the ordering scalars
+/// a record needs whether or not its pages are already sitting in a
+/// [`WalRecord`]. See [`encode_record_into`], which exists so the commit path
+/// never has to build one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordMeta {
+    /// Monotonic commit sequence number.
+    pub seq: u64,
+    /// Sequence number this transaction was based on.
+    pub prev_seq: u64,
+    /// Root this transaction was based on.
+    pub prev_root: PageId,
+    /// The tree root page id after the commit (0 = empty tree).
+    pub root: PageId,
+    /// The next free page id after the commit.
+    pub next: PageId,
+}
+
+/// Encode a commit record into `out`, replacing whatever it held, taking the
+/// pages from wherever the caller already keeps them.
+///
+/// Byte-for-byte what [`encode_record`] (or [`encode_legacy_record`], below
+/// [`MULTI_REGION_FORMAT_VERSION`]) produces for the same input — pinned by
+/// `the_borrowed_encoder_matches_the_owned_one`, because this is the on-disk
+/// format and "faster but different" would be a silent format break rather
+/// than a bug anyone notices.
+///
+/// # Why it exists (AHL-496)
+///
+/// A durable commit is the whole write path, and this encoding was copying
+/// every dirty page **three** times to emit one record: once into
+/// `WalRecord::pages` (`bytes.clone()` at the call site), once into a `body`
+/// `Vec` that started at 128 bytes and `realloc`'d its way up, and once more
+/// into the `out` buffer the checksum then ran over. A steady-state
+/// single-row `INSERT` on this engine dirties ~6.5 pages, so that is ~80 KiB
+/// of `memcpy` and a dozen allocations to produce a 26 KiB record, every
+/// commit. On a device whose `fsync` is cheap — a container volume, which is
+/// exactly the shape `BENCHMARK.md`'s MySQL/PostgreSQL row measures —
+/// `wal::encode_record` was **11.7% of wall clock on its own**, with the
+/// allocator behind it at another ~15%. One pass into one buffer the caller
+/// keeps costs one copy and no allocation once the buffer has grown.
+///
+/// The length prefix is written as a placeholder and patched at the end
+/// rather than derived from a first pass: it is covered by the checksum, so
+/// it has to be *in* the buffer before `fnv1a` runs, and patching four bytes
+/// is cheaper than either walking the pages twice or keeping the body in a
+/// second allocation.
+pub fn encode_record_into<'a, I>(out: &mut Vec<u8>, format_version: u32, meta: RecordMeta, pages: I)
+where
+    I: ExactSizeIterator<Item = (PageId, &'a [u8])>,
+{
+    out.clear();
+    push_u32(out, 0); // length placeholder, patched once the body is known
+    push_u64(out, meta.seq);
+    if format_version >= MULTI_REGION_FORMAT_VERSION {
+        push_u64(out, meta.prev_seq);
+        push_u64(out, meta.prev_root);
+    }
+    push_u64(out, meta.root);
+    push_u64(out, meta.next);
+    push_u32(out, pages.len() as u32);
+    for (id, bytes) in pages {
+        push_u64(out, id);
+        push_u32(out, bytes.len() as u32);
+        out.extend_from_slice(bytes);
+    }
+    let total = (out.len() + 8) as u32;
+    out[R_LEN..R_LEN + 4].copy_from_slice(&total.to_le_bytes());
+    let checksum = crate::checksum::fnv1a(out);
+    push_u64(out, checksum);
+}
+
 /// Encode a commit record into its on-disk form.
 pub fn encode_record(record: &WalRecord) -> Vec<u8> {
-    let mut body = Vec::with_capacity(128);
-    push_u64(&mut body, record.seq);
-    push_u64(&mut body, record.prev_seq);
-    push_u64(&mut body, record.prev_root);
-    push_u64(&mut body, record.root);
-    push_u64(&mut body, record.next);
-    push_u32(&mut body, record.pages.len() as u32);
-    for (id, bytes) in &record.pages {
-        push_u64(&mut body, *id);
-        push_u32(&mut body, bytes.len() as u32);
-        body.extend_from_slice(bytes);
-    }
-
-    let mut out = Vec::with_capacity(body.len() + 12);
-    push_u32(&mut out, (4 + body.len() + 8) as u32); // total length
-    out.extend_from_slice(&body);
-    let checksum = crate::checksum::fnv1a(&out);
-    push_u64(&mut out, checksum);
-    out
+    encode_owned(record, MULTI_REGION_FORMAT_VERSION)
 }
 
 /// Encode a record using the single-region v2-v4 layout.
 pub fn encode_legacy_record(record: &WalRecord) -> Vec<u8> {
-    let mut body = Vec::with_capacity(128);
-    push_u64(&mut body, record.seq);
-    push_u64(&mut body, record.root);
-    push_u64(&mut body, record.next);
-    push_u32(&mut body, record.pages.len() as u32);
-    for (id, bytes) in &record.pages {
-        push_u64(&mut body, *id);
-        push_u32(&mut body, bytes.len() as u32);
-        body.extend_from_slice(bytes);
-    }
-    let mut out = Vec::with_capacity(body.len() + 12);
-    push_u32(&mut out, (4 + body.len() + 8) as u32);
-    out.extend_from_slice(&body);
-    let checksum = crate::checksum::fnv1a(&out);
-    push_u64(&mut out, checksum);
+    encode_owned(record, MULTI_REGION_FORMAT_VERSION - 1)
+}
+
+fn encode_owned(record: &WalRecord, format_version: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_record_into(
+        &mut out,
+        format_version,
+        RecordMeta {
+            seq: record.seq,
+            prev_seq: record.prev_seq,
+            prev_root: record.prev_root,
+            root: record.root,
+            next: record.next,
+        },
+        record.pages.iter().map(|(id, bytes)| (*id, &bytes[..])),
+    );
     out
 }
 
@@ -392,6 +448,106 @@ mod tests {
     fn a_record_round_trips() {
         let r = record(7);
         assert_eq!(decode_record(&encode_record(&r)), Some(r));
+    }
+
+    /// [`encode_record_into`] exists to take the copies out of the commit path
+    /// (AHL-496), and the only thing that makes that safe is that it writes the
+    /// *same bytes*. A faster encoder that shifted one field would not surface
+    /// as a failed test somewhere — it would surface as a database written by
+    /// this version that a previous one cannot read, and the reverse. So the
+    /// two encoders are compared byte for byte, in both layouts, over the cases
+    /// where a hand-written offset would plausibly drift: no pages at all, one
+    /// page, several pages of *different* lengths (so a wrong length field
+    /// misaligns everything after it), and a zero-length page.
+    #[test]
+    fn the_borrowed_encoder_matches_the_owned_one() {
+        let cases = [
+            WalRecord {
+                seq: 1,
+                prev_seq: 0,
+                prev_root: 0,
+                root: 0,
+                next: 0,
+                pages: Vec::new(),
+            },
+            record(9),
+            WalRecord {
+                seq: u64::MAX,
+                prev_seq: u64::MAX - 1,
+                prev_root: 12345,
+                root: 999,
+                next: 1000,
+                pages: vec![
+                    (1, vec![0x11; 7]),
+                    (2, Vec::new()),
+                    (7, vec![0x22; 4096]),
+                    (9, vec![0x33; 63]),
+                ],
+            },
+        ];
+        for original in cases {
+            for (format_version, owned) in [
+                (
+                    MULTI_REGION_FORMAT_VERSION - 1,
+                    encode_legacy_record(&original),
+                ),
+                (MULTI_REGION_FORMAT_VERSION, encode_record(&original)),
+            ] {
+                let mut borrowed = Vec::new();
+                encode_record_into(
+                    &mut borrowed,
+                    format_version,
+                    RecordMeta {
+                        seq: original.seq,
+                        prev_seq: original.prev_seq,
+                        prev_root: original.prev_root,
+                        root: original.root,
+                        next: original.next,
+                    },
+                    original.pages.iter().map(|(id, bytes)| (*id, &bytes[..])),
+                );
+                assert_eq!(
+                    borrowed, owned,
+                    "format {format_version}, seq {}",
+                    original.seq
+                );
+            }
+        }
+    }
+
+    /// The buffer is reused across commits, so the encoder has to *replace*
+    /// what it holds rather than append to it. A leftover prefix would leave
+    /// the length field pointing into the middle of the previous record — a
+    /// record the scan would reject, i.e. a silently lost commit — so this
+    /// encodes a long record and then a short one into the same buffer.
+    #[test]
+    fn reusing_the_buffer_leaves_no_trace_of_the_previous_record() {
+        let mut buf = Vec::new();
+        let big = WalRecord {
+            seq: 4,
+            prev_seq: 3,
+            prev_root: 30,
+            root: 40,
+            next: 41,
+            pages: vec![(1, vec![0xEE; 4096]), (2, vec![0xDD; 4096])],
+        };
+        let small = record(2);
+        for original in [&big, &small, &big, &small] {
+            encode_record_into(
+                &mut buf,
+                MULTI_REGION_FORMAT_VERSION,
+                RecordMeta {
+                    seq: original.seq,
+                    prev_seq: original.prev_seq,
+                    prev_root: original.prev_root,
+                    root: original.root,
+                    next: original.next,
+                },
+                original.pages.iter().map(|(id, bytes)| (*id, &bytes[..])),
+            );
+            assert_eq!(buf, encode_record(original));
+            assert_eq!(decode_record(&buf).as_ref(), Some(original));
+        }
     }
 
     #[test]
