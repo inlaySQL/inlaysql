@@ -1146,21 +1146,17 @@ impl Engine {
     ///   retained range has exactly one non-empty record, so this cannot
     ///   happen — and if it did it would mean this handle cannot know what
     ///   changed, which is precisely when guessing must not be an option.
-    /// * A vector backend keeps itself in the database. Its graph, its live
-    ///   set and its entry point are in the file, and another handle's commit
-    ///   moved them underneath the copy this handle holds in memory; only
-    ///   re-opening it re-reads them. Feeding incremental edits to a stale
-    ///   in-memory view of a shared graph would corrupt it, which is the one
-    ///   outcome worse than a rebuild.
+    /// * A vector backend that keeps itself in the database is not current
+    ///   after re-opening it — its graph is mid-build, or was written by a
+    ///   binary this one cannot read. See
+    ///   [`Engine::adopt_self_persisting_vector_indexes`], which is what makes
+    ///   such a backend current, and why replaying rows into one would be
+    ///   wrong rather than merely redundant.
     fn catch_up_indexes(&mut self, from: u64) -> Result<bool> {
         if from > self.write_version || from < self.cdc_floor {
             return Ok(false);
         }
-        if self
-            .vector_indexes
-            .values()
-            .any(|index| index.is_self_persisting())
-        {
+        if !self.adopt_self_persisting_vector_indexes()? {
             return Ok(false);
         }
 
@@ -1203,6 +1199,21 @@ impl Engine {
             if declared.is_empty() {
                 continue;
             }
+            // The ones the replay must leave alone. A self-persisting backend
+            // was brought up to date by re-opening it, above, and the writer's
+            // edit is already in the graph this handle just read: replaying the
+            // row into it would apply that edit a second time — `remove`
+            // tombstoning a node the graph still has live, `insert` adding a
+            // duplicate of it — and would do so as *writes*, from a handle that
+            // is only reading, into a graph shared by every other handle on the
+            // file.
+            let declared: Vec<Index> = declared
+                .into_iter()
+                .filter(|index| !self.index_is_self_persisting(index))
+                .collect();
+            if declared.is_empty() {
+                continue;
+            }
             for &id in ids {
                 self.indexes_dirty = true;
                 for index in &declared {
@@ -1223,8 +1234,98 @@ impl Engine {
                 }
                 if let Some(bytes) = self.storage.get_row(&table.name, id)? {
                     let row = decode_row(&bytes)?;
-                    self.index_row_retrieval(&table, id, &row)?;
+                    for index in &declared {
+                        self.index_row_for_index(&table, index, id, &row)?;
+                    }
                 }
+            }
+        }
+        Ok(true)
+    }
+
+    /// The `Vector` index declaration a retrieval key names, if the catalog
+    /// still names one.
+    fn declared_vector_index(&self, key: &(String, Vec<String>)) -> Option<Index> {
+        let table = self.catalog.table(&key.0)?;
+        self.catalog
+            .indexes_for(&table.name)
+            .into_iter()
+            .find(|index| {
+                index.kind == IndexKind::Vector
+                    && retrieval_key(&index.table, &index.columns) == *key
+            })
+            .cloned()
+    }
+
+    /// Whether `index`'s backend keeps its own structure inside the database.
+    fn index_is_self_persisting(&self, index: &Index) -> bool {
+        index.kind == IndexKind::Vector
+            && self
+                .vector_indexes
+                .get(&retrieval_key(&index.table, &index.columns))
+                .is_some_and(|backend| backend.is_self_persisting())
+    }
+
+    /// Re-read every vector backend that keeps its structure in the database,
+    /// so this handle sees the graph the committing handle wrote rather than
+    /// the copy it held before. Answers `false` when what it finds is not
+    /// current, which is the caller's signal to rebuild from the rows instead.
+    ///
+    /// # Why re-opening is the catch-up, and a replay would be wrong
+    ///
+    /// For an in-memory backend this handle's copy *is* the index, so bringing
+    /// it up to date means applying the changed rows to it. For a
+    /// self-persisting one the index is in the file and the writer already
+    /// updated it there — every node record, the entry point, the live set and
+    /// the stamp. What this handle holds is a cache of that, and the honest way
+    /// to refresh a cache is to read it again. Replaying rows on top would
+    /// apply the writer's change twice and, worse, would do it as writes from a
+    /// handle that only read.
+    ///
+    /// # What it costs, and why it is still worth doing
+    ///
+    /// Re-opening walks the graph's node records to rebuild the `RowId ->
+    /// node` map, so this is O(nodes) per foreign commit — not free, and the
+    /// reason `docs/enterprise-readiness.md` presents the paged index as a
+    /// trade rather than a default. It replaces something far worse: declining
+    /// here means the *whole table* is rebuilt, which re-tokenises every
+    /// document into the full-text index and re-inserts every embedding into a
+    /// graph that was already correct. That is the failure
+    /// `tests/foreign_commit_indexes.rs` exists to prevent, and turning the
+    /// paged index on used to reintroduce it — measured at 41 re-indexed
+    /// documents for one foreign insert into a 40-row table.
+    fn adopt_self_persisting_vector_indexes(&mut self) -> Result<bool> {
+        let stale: Vec<(String, Vec<String>)> = self
+            .vector_indexes
+            .iter()
+            .filter(|(_, backend)| backend.is_self_persisting())
+            .map(|(key, _)| key.clone())
+            .collect();
+        if stale.is_empty() {
+            return Ok(true);
+        }
+        for key in stale {
+            // The catalog is known equal to the one these backends were opened
+            // under — `adopt_committed_state` checked that before calling here
+            // — so a backend with no declaration behind it cannot happen. If it
+            // somehow does, decline rather than leave a live index nobody can
+            // name.
+            let (Some(index), Some(table)) = (
+                self.declared_vector_index(&key),
+                self.catalog.table(&key.0).cloned(),
+            ) else {
+                return Ok(false);
+            };
+            self.open_one_index(&table, &index)?;
+            // The same currency test `load_saved_indexes` applies to a saved
+            // blob, applied to the stamp the graph carries: a graph that does
+            // not describe these rows is not a catch-up, it is a rebuild.
+            let current = self
+                .vector_indexes
+                .get(&key)
+                .is_some_and(|backend| backend.stored_write_version() == Some(self.write_version));
+            if !current {
+                return Ok(false);
             }
         }
         Ok(true)
