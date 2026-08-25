@@ -102,7 +102,27 @@ impl Database {
     /// before `CREATE INDEX` existed was grandfathered). Use
     /// [`Database::open_implicit`] to restore the old index-everything
     /// behaviour.
+    /// `":memory:"` is refused rather than quietly taken as a filename — see
+    /// the error text for why.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        // SQLite spells an in-memory database `":memory:"`, and anyone porting
+        // from it — or from `rusqlite` — writes that first. Treating it as an
+        // ordinary path is legal on every filesystem this runs on, so it
+        // silently produced a real file called `:memory:` on disk: durable
+        // where the caller wanted ephemeral, in the working directory, and
+        // invisible until someone noticed a stray file. Refusing is this
+        // project's rule for a construct it does not mean what the caller
+        // thinks (`docs/architecture.md`: refuse, never ignore), and it is the
+        // only response that names the call the caller actually wanted.
+        if path.as_os_str() == ":memory:" {
+            return Err(Error::Unsupported(
+                "`:memory:` is not a path here — call `Database::open_in_memory()` \
+                 for an in-memory database. Opening it as a file would have \
+                 created one named `:memory:` on disk."
+                    .to_string(),
+            ));
+        }
         Self::open_on(FileDevice::open(path)?)
     }
 
