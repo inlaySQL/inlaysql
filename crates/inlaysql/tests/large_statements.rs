@@ -62,8 +62,18 @@ use inlaysql::{Database, Error, Outcome, Value};
 use inlaysql_core::sim::SimDisk;
 
 /// Copy-on-write never reclaims a page here (`page_reuse` is off by default),
-/// so the file grows with the number of writes rather than the amount of data.
-const CAPACITY: usize = 1024 * 1024 * 1024;
+/// so the file grows with the number of writes rather than the amount of
+/// data. Kept modest on purpose: `SimDisk::sync` clones this whole buffer
+/// into a 16-entry fault-injection history on every commit
+/// (`inlaysql-core/src/sim/disk.rs`), so a gigabyte-scale capacity here costs
+/// gigabytes per commit, and cargo runs this file's five tests concurrently —
+/// that combination is what OOM-killed CI rather than merely running slowly.
+const CAPACITY: usize = 64 * 1024 * 1024;
+
+/// Headroom for `the_row_counts_where_each_statement_breaks` below, which
+/// deliberately pushes into the tens of thousands of rows and is `#[ignore]`d
+/// for exactly that reason.
+const REPRO_CAPACITY: usize = 256 * 1024 * 1024;
 
 /// Rows per loading transaction. Kept well under the refusal threshold the
 /// table above records, because the loader is not what these tests are about —
@@ -75,7 +85,13 @@ fn batch_for(width: usize, name_len: usize) -> usize {
 
 /// A table of `rows` rows whose `body` is about `width` bytes wide.
 fn loaded(name: &str, rows: usize, width: usize) -> Database {
-    let disk = Rc::new(RefCell::new(SimDisk::new(CAPACITY)));
+    loaded_with_capacity(name, rows, width, CAPACITY)
+}
+
+/// As `loaded`, but with an explicit disk capacity for the bisecting test,
+/// which needs more headroom than the default tests do.
+fn loaded_with_capacity(name: &str, rows: usize, width: usize, capacity: usize) -> Database {
+    let disk = Rc::new(RefCell::new(SimDisk::new(capacity)));
     let mut db = Database::open_on(disk).expect("open");
     db.execute(
         &format!("CREATE TABLE {name} (id INTEGER PRIMARY KEY, body TEXT)"),
@@ -311,7 +327,7 @@ fn a_commit_refused_for_size_leaves_a_usable_handle() {
 #[ignore = "bisects three thresholds over ~70k-row databases; run explicitly"]
 fn the_row_counts_where_each_statement_breaks() {
     fn survives(rows: usize, width: usize, sql: &str) -> bool {
-        let mut db = loaded("t", rows, width);
+        let mut db = loaded_with_capacity("t", rows, width, REPRO_CAPACITY);
         let survived = db.execute(sql, &[]).is_ok();
         if !survived {
             assert_eq!(
@@ -342,7 +358,7 @@ fn the_row_counts_where_each_statement_breaks() {
     /// it arrives at the *start* of a statement, at half the region, so nothing
     /// was written and what is already buffered still commits.
     fn buffered_insert_refusal(width: usize) -> i64 {
-        let mut db = loaded("t", 0, width);
+        let mut db = loaded_with_capacity("t", 0, width, REPRO_CAPACITY);
         db.begin().expect("begin");
         let insert = db
             .prepare("INSERT INTO t (id, body) VALUES (?, ?)")
