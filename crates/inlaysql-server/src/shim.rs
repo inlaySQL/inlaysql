@@ -94,6 +94,16 @@ pub enum Intercepted {
         /// The `LIKE` pattern, if there was one.
         like: Option<String>,
     },
+    /// `OPTIMIZE TABLE t [, u ...]`. Parsed here and carried out in
+    /// [`crate::connection`], which is where the [`inlaysql::Database`] is —
+    /// this is the one intercepted statement whose answer comes from the
+    /// engine rather than from the catalog, because what it reports is what a
+    /// build actually did.
+    Optimize {
+        /// The tables to build, in the order the client named them. MySQL
+        /// reports one row per table in that order and so does this.
+        tables: Vec<String>,
+    },
     /// Select a default schema.
     UseDatabase(String),
     /// Recognised, but this server cannot do it.
@@ -123,7 +133,7 @@ pub fn handles(sql: &str) -> bool {
     }
     match first_word(&sql).as_str() {
         "SET" | "SHOW" | "USE" | "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT"
-        | "RELEASE" | "DO" | "KILL" => true,
+        | "RELEASE" | "DO" | "KILL" | "OPTIMIZE" => true,
         // `DESCRIBE <table>` is a column listing, answered here from the
         // catalog. `DESCRIBE <statement>` is MySQL's other spelling of
         // `EXPLAIN`, which the engine now has — so it belongs to the engine,
@@ -387,6 +397,10 @@ pub fn intercept(
         "DESCRIBE" | "DESC" => handle_describe(&sql, catalog, session),
         // `DO expr` evaluates and discards. Nothing observable, so nothing to do.
         "DO" => Intercepted::Ok,
+        "OPTIMIZE" => match parse_optimize(&sql, catalog) {
+            Ok(tables) => Intercepted::Optimize { tables },
+            Err(error) => Intercepted::Failed(error),
+        },
         "KILL" => handle_kill(&sql),
         "SELECT" => handle_select(&sql, params, catalog, session),
         // Everything else runs on the engine — the shim only translates it out
@@ -460,6 +474,104 @@ fn handle_engine_statement(sql: &str, catalog: &Catalog) -> Intercepted {
             }
         }
     }
+}
+
+// ------------------------------------------------------- OPTIMIZE TABLE
+
+/// The columns MySQL's `OPTIMIZE TABLE` answers with, in its order.
+///
+/// It is a *result set*, not an OK packet, and `mysqlcheck --optimize` reads
+/// it row by row. Replying OK would be the cheaper thing to build and the
+/// wrong shape on the wire.
+pub const OPTIMIZE_COLUMNS: &[&str] = &["Table", "Op", "Msg_type", "Msg_text"];
+
+/// MySQL's own text for a table that needed nothing doing.
+///
+/// Taken verbatim rather than invented: a client that pattern-matches
+/// `Msg_text` — and `mysqlcheck` does — reads this exact string from a MyISAM
+/// table that is already optimal.
+pub const OPTIMIZE_UP_TO_DATE: &str = "Table is already up to date";
+
+/// `OPTIMIZE [NO_WRITE_TO_BINLOG | LOCAL] TABLE t [, u ...]`.
+///
+/// # Why this spelling, and what it is *not* claiming
+///
+/// This is the one statement in MySQL's vocabulary that means "do the
+/// maintenance you have been putting off, now, and tell me what you did",
+/// which is exactly what this engine needs a spelling for: index commits are
+/// deferred to the first read, and a bulk load therefore hides minutes of
+/// index building inside whichever query arrives first. So the statement is
+/// answered honestly rather than either refused or accepted-and-ignored.
+///
+/// What it does here is build the deferred retrieval indexes. What MySQL's
+/// does for InnoDB is rebuild the table and reclaim free space, which this
+/// does *not* do — and the difference is why the `Msg_text` says which of the
+/// two outcomes happened rather than always saying `OK`. A statement that
+/// reported `OK` after doing nothing would be the lookalike this repo refuses
+/// to ship.
+///
+/// `NO_WRITE_TO_BINLOG` and its `LOCAL` synonym are accepted and are not a
+/// dropped clause: there is no binary log here, so "do not write to it" is
+/// honoured by construction. Everything else MySQL allows after the table list
+/// is refused by name.
+///
+/// Public because [`crate::acl::shim_requirement`] has to know which tables the
+/// statement names to check the privilege on each — through this function and
+/// not a second parser beside it, so the set of tables checked cannot come
+/// apart from the set of tables touched.
+pub fn parse_optimize(sql: &str, catalog: &Catalog) -> Result<Vec<String>, MysqlError> {
+    let rest = strip_keyword(sql, "OPTIMIZE").unwrap_or("");
+    let rest = strip_keyword(rest, "NO_WRITE_TO_BINLOG")
+        .or_else(|| strip_keyword(rest, "LOCAL"))
+        .unwrap_or(rest);
+    let Some(list) = strip_keyword(rest, "TABLE") else {
+        return Err(MysqlError::unsupported(format!(
+            "`{sql}` is not supported; the only form is OPTIMIZE [NO_WRITE_TO_BINLOG | LOCAL] \
+             TABLE <table> [, ...]"
+        )));
+    };
+    if list.trim().is_empty() {
+        return Err(MysqlError::parse("OPTIMIZE TABLE needs at least one table"));
+    }
+
+    let mut tables = Vec::new();
+    for part in split_top_level(list, ',') {
+        let name = unquote_identifier(part.trim());
+        // `db.t` is how a client that has not selected a schema names a table.
+        // Only this server's own schema exists, so a qualifier that names
+        // another one is a table this server does not have — said as "no such
+        // table" rather than guessed past.
+        let name = match name.rsplit_once('.') {
+            Some((_, bare)) => bare.to_string(),
+            None => name,
+        };
+        if name.is_empty() {
+            return Err(MysqlError::parse("OPTIMIZE TABLE has an empty table name"));
+        }
+        // Resolved now, not at run time: MySQL reports a missing table as a
+        // row in the result set, but this server has no way to build half the
+        // list and report the rest, so it refuses the whole statement — the
+        // same direction every other unresolvable name here takes.
+        if visible_table(catalog, &name).is_none() {
+            return Err(MysqlError::no_such_table(&name));
+        }
+        tables.push(name);
+    }
+    Ok(tables)
+}
+
+/// One `OPTIMIZE TABLE` row, in MySQL's shape.
+///
+/// `Msg_type` is `status` in both cases because both are outcomes rather than
+/// warnings; what separates them is `Msg_text`, and a client that only reads
+/// `Msg_type` learns the same thing MySQL would have told it.
+pub fn optimize_row(schema: &str, table: &str, message: &str) -> Vec<Value> {
+    vec![
+        Value::Text(format!("{schema}.{table}").into()),
+        Value::Text("optimize".into()),
+        Value::Text("status".into()),
+        Value::Text(message.into()),
+    ]
 }
 
 // ----------------------------------------------------------------- KILL

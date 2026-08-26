@@ -84,12 +84,29 @@ pub use inlaysql_core::hnsw::{HnswIndex, VectorMetric};
 pub use inlaysql_core::TreeStorage;
 pub use inlaysql_core::{
     is_reserved_table_name, Cancel, Catalog, Change, ChangeKind, Changes, Collation, Column,
-    ColumnInfo, DataType, Error, Index, IndexKind, Outcome, Result, ResultSet, Stopped, Table,
-    TableAccess, Value, VectorTuning, RESERVED_TABLE_PREFIX,
+    ColumnInfo, DataType, Error, Index, IndexKind, Outcome, Reindexed, Result, ResultSet, Stopped,
+    Table, TableAccess, Value, VectorTuning, RESERVED_TABLE_PREFIX,
 };
 pub use statement::Statement;
 pub use storage::RedbStorage;
 pub use vacuum::vacuum;
+
+/// The most bytes one commit's write-ahead-log record may hold, for the page
+/// size every database this crate opens or creates actually uses.
+///
+/// Not a separately maintained number: it is
+/// [`inlaysql_core::wal::max_record_len`] evaluated at
+/// [`inlaysql_core::btree::DEFAULT_PAGE_SIZE`] — the exact same formula
+/// `CowBTree::commit` measures a transaction's encoded record against before
+/// writing it, and the exact same page size every `Database::open*`
+/// constructor hands `TreeStorage`. A caller sizing a batch import against any
+/// other number is sizing it against a ceiling nothing here enforces; this is
+/// the one that does. See `docs/enterprise-readiness.md` blocker 5 for why the
+/// ceiling itself (one WAL region, ~1 MiB by default) is a deliberate,
+/// load-bearing constant rather than something to raise.
+pub fn max_transaction_bytes() -> usize {
+    inlaysql_core::wal::max_record_len(inlaysql_core::btree::DEFAULT_PAGE_SIZE)
+}
 
 /// An open database.
 pub struct Database {
@@ -429,6 +446,43 @@ impl Database {
     /// committed data, so skipping this call costs time and never correctness.
     pub fn checkpoint(&mut self) -> Result<()> {
         self.engine.checkpoint()
+    }
+
+    /// Build the retrieval indexes now, instead of leaving it to whichever
+    /// query arrives first.
+    ///
+    /// Index builds are deferred: a `CREATE INDEX` and every write after it
+    /// leave the work pending, and the first read that needs the index pays
+    /// for all of it. That is the right trade for a database taking a row at a
+    /// time, and the wrong one after a bulk load — a 1.2M-vector corpus put
+    /// four and a half minutes of graph building inside one innocent `SELECT`,
+    /// which is where this exists to move it to.
+    ///
+    /// The deferral itself is unchanged. A loader that never queries still
+    /// pays nothing; this is a request, not a policy.
+    ///
+    /// `table` narrows the build to one table's indexes, `None` covers them
+    /// all. Nothing pending is a **no-op**, reported as an empty
+    /// [`Reindexed`], so calling this on a schedule costs one flag test.
+    ///
+    /// Stoppable through [`Database::set_cancel`], between one index and the
+    /// next — see [`inlaysql_core::Engine::reindex`] for exactly where the
+    /// check lands and what a stopped build leaves behind (the work still
+    /// pending, and a handle that answers correctly).
+    ///
+    /// `REINDEX [name]` is the same thing in SQL, for a caller that has a
+    /// statement string rather than a handle. Both are refused on a read-only
+    /// handle, and for the same reason: building an index commits structure
+    /// into the file, which is a write however it was asked for.
+    pub fn reindex(&mut self, table: Option<&str>) -> Result<Reindexed> {
+        if self.read_only {
+            return Err(Error::Storage(
+                "this database handle is open read-only; refusing to build indexes, which \
+                 writes them into the file"
+                    .to_string(),
+            ));
+        }
+        self.engine.reindex(table)
     }
 
     /// Install the signal this handle's long loops ask before carrying on.

@@ -211,9 +211,15 @@ Exact `VECTOR(25)`, three runs, `QPS = 1 / best_search_time`:
 | 64 | 1,280 | 1.0000 | 104 | 9.647 ms |
 
 Build: 294.9 s — 36.2 s loading over the wire and **258.7 s building the graph
-on the first read**, which is the single largest cost in this table and the one
-a user hits as an unexplained multi-minute stall on whichever query happens to
-be first. Index: 1,047 MiB for a 112.9 MiB corpus (9.3x).
+on the first read**, which is the single largest cost in this table. It used to
+be unaskable-for as well as slow: a user hit it as an unexplained multi-minute
+stall on whichever query happened to be first, with no statement that could
+have moved it. That half is closed — `OPTIMIZE TABLE t` over the wire,
+`REINDEX` in SQL, `Database::reindex` embedded, all cancellable and all a no-op
+when nothing is pending
+([`docs/indexes.md`](docs/indexes.md#the-build-is-deferred-and-you-can-ask-for-it)).
+The 258.7 s is unchanged; it is now a statement the loader runs on purpose
+rather than a stall. Index: 1,047 MiB for a 112.9 MiB corpus (9.3x).
 
 `VECTOR(25, INT8)` on the same data builds in 461.3 s (1.56x slower), holds
 790 MiB (1.34x smaller), and **tops out at recall 0.9982** — a quantisation

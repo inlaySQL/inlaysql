@@ -162,6 +162,15 @@ SERVE --mysql OPTIONS:
     The SQL surface is a subset: a stock ORM's migrations will NOT run yet.
     `docs/server.md` lists exactly what works and what does not.
 
+    ONE TRANSACTION MAY NOT WRITE MORE THAN ~1 MiB. There is no flag for this
+    — one commit must fit one write-ahead-log region, which is load-bearing
+    for crash recovery and does not move (docs/enterprise-readiness.md,
+    blocker 5). @@inlaysql_max_transaction_bytes reports the exact ceiling,
+    and a statement or transaction that exceeds it fails with 1197
+    (ER_TRANS_CACHE_FULL) naming the byte counts — split the work into smaller
+    batches and commit each one. See docs/server.md, The ~1 MiB transaction
+    ceiling.
+
 CHANGES OPTIONS:
     --from <version>   Start after this version. 0 (the default) means the whole
                        retained log.

@@ -66,3 +66,47 @@ CREATE INDEX on_missing ON docs (nope)
 
 statement error
 CREATE INDEX on_missing_table ON missing (body)
+
+# REINDEX runs the deferred index build now instead of leaving it to the first
+# read. It returns no rows, as SQLite's does, and it is a no-op when there is
+# nothing pending — so running it twice is not an error and not a rebuild.
+statement ok
+REINDEX
+
+statement ok
+REINDEX
+
+# By table, and by index name.
+statement ok
+REINDEX docs
+
+statement ok
+REINDEX docs_embedding
+
+# Whitespace, comments, quoting and a trailing semicolon all mean what they
+# mean everywhere else. Both comment forms are here because the statement is
+# recognised ahead of the parser and has to skip the same leading trivia every
+# other statement does — a REINDEX behind a comment that fell through would be
+# a parse error, not a silent one, but it would still be wrong.
+statement ok
+/* build it */ reindex "docs" ;
+
+statement ok
+-- build it
+REINDEX docs -- and nothing else
+
+# The index it built answers the query it was built for.
+statement ok
+SELECT id, vector_score(embedding, vector('[1,0,0]')) FROM docs ORDER BY score DESC LIMIT 1
+
+# A name that is neither a table nor an index is refused rather than widened to
+# "everything" — a typo must not become a full-database rebuild.
+statement error
+REINDEX nosuchthing
+
+# One optional name, and no other grammar.
+statement error
+REINDEX docs, docs
+
+statement error
+REINDEX docs extra

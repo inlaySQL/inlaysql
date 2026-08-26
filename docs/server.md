@@ -316,6 +316,7 @@ applies, because a client tunes against them — a pool sizes itself on
 | `long_query_time` | `--slow-query-log`, converted to MySQL's unit — seconds with a fractional part, so a 500 ms threshold reports `0.500000` rather than rounding to `0`. Read off the milliseconds actually compared against. |
 | `inlaysql_statement_text` | `ON`/`OFF` for `--statement-text`. Under this server's own name, not one of MySQL's: MySQL has no variable that means this, and borrowing `general_log` would claim a feature that does not exist here. |
 | `inlaysql_hnsw_ef_search` | The candidate-list size every vector search on this session runs at, or `0` for the index's own tuning. Read off the same field the engine reads. See below. |
+| `inlaysql_max_transaction_bytes` | The most bytes one commit's write-ahead-log record may hold. Read-only — no flag, no `SET` — because it is not this server's number to choose; see below. |
 
 All three read timeouts report one number because one `SO_RCVTIMEO` is what
 enforces them: the same timer covers waiting for the next command and reading
@@ -441,6 +442,66 @@ Four things to know:
   the index's own tuning widens the beam with the candidate count, so
   `LIMIT 10` runs at `ef=80` and `LIMIT 100` at `ef=800`. `@@inlaysql_hnsw_ef_search`
   can only report what was imposed; `EXPLAIN` reports what will run.
+
+### The ~1 MiB transaction ceiling: `inlaysql_max_transaction_bytes` and `1197`
+
+One commit record must fit one write-ahead-log region — `WAL_BLOCKS` (256) x
+`DEFAULT_PAGE_SIZE` (4096) = 1 MiB, and the record carries a copy of every page
+the commit wrote, so a bulk `INSERT`, a wide `UPDATE` or a whole-table `DELETE`
+can be a hard error rather than a slow path. `docs/enterprise-readiness.md`
+blocker 5 has the full measurement — which statements break at which sizes,
+and why the fix is not to raise this — but until now the ceiling itself had no
+server-side control: a client just got `1030`, a generic storage error naming
+no limit, no matter which of the two ways it was hit. An `ann-benchmarks` bulk
+load hit exactly this (`bench/README.md`); the in-process benchmark harness
+hides it because it catches the error and commits early, and a SQL client has
+no such net.
+
+**`@@inlaysql_max_transaction_bytes` reports the ceiling**, read-only — there
+is no flag and no `SET`, because unlike every other variable on this page the
+number is not this server's to choose. It is
+[`inlaysql::max_transaction_bytes`], the same formula the storage backend
+measures a transaction's encoded record against before committing it, so a
+batch sized against this number is sized against the number that will
+actually refuse it — not a separately maintained guess.
+
+```sql
+SELECT @@inlaysql_max_transaction_bytes;   -- 1048576 by default
+SHOW VARIABLES LIKE 'inlaysql_max_transaction_bytes';
+```
+
+**The refusal is `1197` (`ER_TRANS_CACHE_FULL`), not `1030`.** Two MySQL codes
+are near misses: `1153` (`ER_NET_PACKET_TOO_LARGE`) is for a *wire packet* over
+`max_allowed_packet` — wrong here, because every byte of the statement arrived
+and parsed fine; what failed is committing the transaction it produced. `1197`
+is the closer meaning: a transaction that outgrew its buffer, and MySQL's own
+remedy for it — "commit in smaller pieces" — is this server's only remedy too.
+The message names the actual byte counts where they are known and points back
+at `@@inlaysql_max_transaction_bytes`, so the fix is not a guess:
+
+```
+ERROR 1197 (HY000): transaction does not fit the write-ahead log
+(1782144 > 1048576 bytes); every commit here is one write-ahead-log record and
+@@inlaysql_max_transaction_bytes is its ceiling — split the statement or
+transaction into smaller batches and commit each one
+```
+
+It is the same `1197` whichever of the two ways the ceiling is hit:
+
+* **A single autocommit statement** — one huge `INSERT`, a whole-table
+  `UPDATE` — is refused at commit, after it has run and buffered everything it
+  wanted to write. Nothing is half-applied; the table is exactly what it was.
+* **An explicit `BEGIN`..`COMMIT`** buffering many statements is refused
+  *before* the statement that would overflow the record even runs
+  (`Engine::ensure_transaction_fits`, checked at half the region as a margin).
+  What was already buffered still commits — `COMMIT` right after the refusal
+  keeps it — which is what lets a caller drain a large import in batches: catch
+  `1197`, commit, start a new transaction, continue.
+
+Before this, the second case surfaced as `1568` — the same flat code every
+other transaction-state refusal gets (`ROLLBACK` with nothing open, `CREATE
+INDEX` inside a transaction) — which told a client nothing about which of
+those it had actually hit.
 
 ## Observability: what this server will tell you about itself
 
@@ -1088,6 +1149,9 @@ Answered from `Catalog` and session state, never sent to the engine:
   the comparison — they are never spliced into SQL text, so there is no
   injection path through the shim's own parsing.
 - `USE`, `BEGIN`, `START TRANSACTION`, `COMMIT`, `ROLLBACK`, `DO`.
+- `OPTIMIZE [NO_WRITE_TO_BINLOG | LOCAL] TABLE t [, u ...]` — the one shim
+  statement whose answer comes from the *engine* rather than from the catalog.
+  See [`OPTIMIZE TABLE`](#optimize-table-builds-the-deferred-indexes) below.
 - `KILL [CONNECTION | QUERY] <id>` — answered against the live-connection
   registry the accept loop owns, not the engine. See
   [Stopping a statement](#stopping-a-statement---max-execution-time-and-kill).
@@ -1121,6 +1185,53 @@ Reported honestly rather than flatteringly: `have_ssl` is `DISABLED`,
 `foreign_key_checks` is `0` (there is no enforcement), every column is
 `NULL`-able with no default (the engine refuses `NOT NULL` and `DEFAULT`), and
 `TABLE_ROWS` is `NULL` — unknown — rather than `0`, which would read as empty.
+
+### `OPTIMIZE TABLE` builds the deferred indexes
+
+Retrieval-index commits are deferred to the first read that needs them, so a
+bulk load leaves the whole build waiting inside whichever query arrives first —
+258.7 s of a 294.9 s glove-25 load, in the ann-benchmarks run. `OPTIMIZE TABLE`
+is how a client asks for it up front. It is MySQL's own spelling for "do the
+maintenance you have been putting off", which is exactly the operation this
+engine needed a name for, and it is answered in MySQL's own shape:
+
+```
+mysql> OPTIMIZE TABLE docs;
++---------------+----------+----------+-----------------------+
+| Table         | Op       | Msg_type | Msg_text              |
++---------------+----------+----------+-----------------------+
+| inlaysql.docs | optimize | status   | OK; rebuilt docs_body |
++---------------+----------+----------+-----------------------+
+
+mysql> OPTIMIZE TABLE docs;
++---------------+----------+----------+-----------------------------+
+| Table         | Op       | Msg_type | Msg_text                    |
++---------------+----------+----------+-----------------------------+
+| inlaysql.docs | optimize | status   | Table is already up to date |
++---------------+----------+----------+-----------------------------+
+```
+
+A result set, not an OK packet, because that is what `mysqlcheck --optimize`
+reads. `Table is already up to date` is MySQL's own text for a table that
+needed nothing, and it is there because the alternative — answering `OK` after
+doing nothing — is a maintenance statement lying to the operator running it.
+
+**What it does not do**: MySQL's `OPTIMIZE TABLE` also rebuilds the table and
+reclaims free space. This does not, which is why the `Msg_text` names the
+outcome rather than always saying `OK`. `NO_WRITE_TO_BINLOG` and `LOCAL` are
+accepted and are not a dropped clause — there is no binary log here, so "do not
+write to it" is honoured by construction. Every other `OPTIMIZE` form is
+refused by name.
+
+The privilege is MySQL's for this statement — `SELECT` *and* `INSERT` on every
+table named, checked per table, from the same parse that will run it. It
+commits any open transaction first, as MySQL does and for the sharper reason an
+account statement does: index structure a later `ROLLBACK` could undo is
+maintenance that did not happen after the client was told it had. It is
+stoppable by `--max-execution-time` and by `KILL`, between one index and the
+next; a stopped build leaves the work pending, so the next read does it. See
+[`docs/indexes.md`](indexes.md#the-build-is-deferred-and-you-can-ask-for-it)
+for the engine side and for the SQL and embedded spellings.
 
 ### MySQL-named scalar functions are mapped, not guessed
 
@@ -1473,13 +1584,21 @@ translated the same way:
 | `Conflict` | 1213 (retryable) | 40001 |
 | `Stale` | 1615 | HY000 |
 | read-only handle | 1290 | HY000 |
-| `Storage` | 1030 | HY000 |
+| `Storage` (ordinary failure) | 1030 | HY000 |
+| `Storage`/`Transaction`, "too large for the write-ahead log" | 1197 `ER_TRANS_CACHE_FULL` | HY000 |
+| `Transaction` (any other message) | 1568 | 25001 |
 | `Corrupt` | 1194 | HY000 |
 | `FormatVersion` | 1112 | 42000 |
 
 `Type` uses `HY000` rather than a `22xxx` class deliberately: PDO renders
 SQLSTATE `22007` as "Invalid datetime format", so an integer/text mismatch was
 reaching users as a date error.
+
+`Storage` and `Transaction` are each split by message rather than mapped
+whole, the same way `Catalog` and `Constraint` are above: one engine error
+carries several distinct conditions, and only one of them — the transaction
+ceiling — gets `1197`. See "The ~1 MiB transaction ceiling" above for what a
+client does with it.
 
 The refusals [Accounts and privileges](#accounts-and-privileges) makes carry
 MySQL's own codes, so a client's error handling recognises the shape:

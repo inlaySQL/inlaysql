@@ -59,6 +59,8 @@ pub enum Plan {
     /// parameters and the catalog. [`crate::explain`] asks the executor's own
     /// chooser for them rather than re-deriving them.
     Explain(Box<Plan>),
+    /// `REINDEX [name]` — do the deferred retrieval-index build now.
+    Reindex(ReindexPlan),
     /// `BEGIN` / `BEGIN TRANSACTION`.
     Begin,
     /// `COMMIT` / `END`.
@@ -110,12 +112,17 @@ impl Plan {
             // name the columns an index is probed on, so an `ALTER TABLE` that
             // moved them has to make this stale too.
             Plan::Explain(inner) => inner.tables(),
+            // `REINDEX` names its tables but holds no ordinal into any of
+            // them: it rebuilds a retrieval index from whatever the rows say
+            // now. Listing them here would make a prepared `REINDEX` go stale
+            // for a column rename it does not care about.
             Plan::CreateTable(_)
             | Plan::DropTable(_)
             | Plan::AlterTable(_)
             | Plan::Scalar(_)
             | Plan::CreateUniqueIndex(_)
             | Plan::DropIndex(_)
+            | Plan::Reindex(_)
             | Plan::Begin
             | Plan::Commit
             | Plan::Rollback => Vec::new(),
@@ -135,6 +142,11 @@ impl Plan {
     /// taking the write path, being counted against a transaction's size
     /// budget, or being rolled back as a failed write. It never runs the
     /// statement inside it — see [`crate::explain`].
+    ///
+    /// `REINDEX` is deliberately **not** read-only even though it changes no
+    /// row: it commits index structure into the database and saves index
+    /// blobs, so a handle opened read-only cannot run it and must not be told
+    /// it can.
     pub fn is_read_only(&self) -> bool {
         matches!(
             self,
@@ -197,6 +209,18 @@ impl Plan {
                 out.push((create.table.as_str(), TableAccess::Read));
             }
             Plan::DropIndex(drop) => out.push((drop.name.as_str(), TableAccess::DropIndex)),
+            // Rebuilding an index reads every row of the table to fill it and
+            // rewrites the structure that answers for it — the same two things
+            // `CREATE INDEX` does, minus the declaration. Every table is named
+            // because [`ReindexPlan`] resolved them at plan time; a bare
+            // `REINDEX` that carried "all of them" as an absence would be
+            // read here as "touches nothing", which is a grant nobody wrote.
+            Plan::Reindex(reindex) => {
+                for table in &reindex.tables {
+                    out.push((table.as_str(), TableAccess::Alter));
+                    out.push((table.as_str(), TableAccess::Read));
+                }
+            }
             Plan::Insert(insert) => {
                 let target = insert.table.as_str();
                 out.push((target, TableAccess::Insert));
@@ -347,6 +371,10 @@ impl Plan {
             | Plan::CreateIndex(_)
             | Plan::CreateUniqueIndex(_)
             | Plan::DropIndex(_)
+            // SQLite's `REINDEX` returns no rows, and neither does this one.
+            // What was built is reported through `Engine::reindex`'s return
+            // value, which is where a caller that wants the detail asks.
+            | Plan::Reindex(_)
             | Plan::Begin
             | Plan::Commit
             | Plan::Rollback => Vec::new(),
@@ -547,6 +575,36 @@ pub struct CreateUniqueIndexPlan {
 pub struct DropIndexPlan {
     /// Index name as written; matched case-insensitively.
     pub name: String,
+}
+
+/// A planned `REINDEX`.
+///
+/// The table list is resolved **at plan time**, not at run time, and that is
+/// what makes the statement attributable: [`Plan::table_access`] has to be
+/// able to name every table an authorisation layer would gate this on, and a
+/// bare `REINDEX` names none of them in its own text. A plan that carried
+/// `None` for "all of them" would answer "touches nothing" there, which is
+/// what a caller reads as "anyone may run it".
+///
+/// The cost of resolving early is that a *prepared* bare `REINDEX` reused
+/// after a `CREATE TABLE` rebuilds the tables it was planned against and not
+/// the new one. `Engine::execute` re-plans every time, so only an explicitly
+/// prepared-and-kept statement can see it, and the answer is to prepare it
+/// again — the same answer every other plan that holds resolved names gives.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReindexPlan {
+    /// The tables whose retrieval indexes to build, lowercased, in catalog
+    /// order. Empty when the database has no tables at all, which makes the
+    /// statement a no-op rather than an error.
+    pub tables: Vec<String>,
+    /// The one index to build, when the statement named an index rather than a
+    /// table; `None` means every index of every table in `tables`.
+    ///
+    /// SQLite's `REINDEX <index-name>` rebuilds that index and not its
+    /// siblings, so neither does this. Widening it to the whole table would be
+    /// the accept-and-do-something-else shape `AGENTS.md` calls out: the
+    /// statement would report success having done more than it was asked.
+    pub index: Option<String>,
 }
 
 /// A planned `UPDATE`.

@@ -41,8 +41,8 @@ use crate::hnsw_paged::PagedHnswIndex;
 use crate::plan::{
     Aggregate, AlterAction, AlterTablePlan, ConflictAction, ConflictUpdate, CreateTablePlan,
     DeletePlan, DropTablePlan, FrameBound, FromItem, InsertPlan, InsertSource, JoinKind,
-    OnConflict, Order, OrderKey, Plan, ScalarPlan, ScoreExpr, SelectItem, SelectPlan, SetOp,
-    SetOperationPlan, SubqueryBody, UpdatePlan, WindowFn, WindowFunc,
+    OnConflict, Order, OrderKey, Plan, ReindexPlan, ScalarPlan, ScoreExpr, SelectItem, SelectPlan,
+    SetOp, SetOperationPlan, SubqueryBody, UpdatePlan, WindowFn, WindowFunc,
 };
 use crate::row::{
     decode_row, decode_row_masked, decode_value_at, encode_typed_row, ColumnMask, RowBuf,
@@ -228,6 +228,63 @@ impl Outcome {
                 "statement did not return rows".to_string(),
             )),
         }
+    }
+}
+
+/// What a forced index build covered.
+///
+/// Private on purpose: the scope a caller can ask for is a table name or
+/// nothing, and this is how the engine spells the two extra shapes the
+/// `REINDEX` statement can resolve to — a list of tables, and a single index.
+enum Reindex {
+    /// Every retrieval index this handle holds.
+    Everything,
+    /// One table's, by lowercased table name.
+    Table(String),
+    /// Several tables', by lowercased table name.
+    Tables(Vec<String>),
+    /// Exactly one index, by its backend key.
+    ///
+    /// A B-tree index resolves to a key no backend lives under, so `REINDEX
+    /// <btree index>` covers nothing and reports nothing. That is the right
+    /// answer rather than a gap: a B-tree index's entries *are* durable rows,
+    /// written in the same commit as the rows they describe, so there is no
+    /// state for a rebuild to correct (see `Engine::load_saved_indexes`).
+    Index((String, Vec<String>)),
+}
+
+impl Reindex {
+    /// Whether the backend living under `key` is in scope.
+    fn covers(&self, key: &(String, Vec<String>)) -> bool {
+        match self {
+            Reindex::Everything => true,
+            Reindex::Table(table) => &key.0 == table,
+            Reindex::Tables(tables) => tables.contains(&key.0),
+            Reindex::Index(wanted) => wanted == key,
+        }
+    }
+}
+
+/// What [`Engine::reindex`] built.
+///
+/// Empty means nothing was pending and nothing ran — which is the honest
+/// answer for a database whose indexes already describe every committed row,
+/// and the answer a caller should expect from a second `REINDEX` in a row.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Reindexed {
+    /// The retrieval indexes that were committed, by catalog name.
+    ///
+    /// Exactly the indexes whose table was holding writes that had not reached
+    /// them yet. A backend does not report whether its own commit found
+    /// anything, so the claim stops there: "its table had pending writes and
+    /// this brought it up to date", never "this many rows were re-indexed".
+    pub indexes: Vec<String>,
+}
+
+impl Reindexed {
+    /// Whether the build did nothing because nothing was pending.
+    pub fn is_empty(&self) -> bool {
+        self.indexes.is_empty()
     }
 }
 
@@ -486,8 +543,23 @@ pub struct Engine {
     /// but kept the same key shape as the full-text map so every retrieval
     /// index goes through one maintenance path rather than two.
     vector_indexes: BTreeMap<(String, Vec<String>), Box<dyn VectorIndex>>,
-    /// Set by writes, cleared by [`Engine::refresh_indexes`].
-    indexes_dirty: bool,
+    /// The tables, lowercased, whose retrieval backends are holding writes
+    /// that have not been committed into them yet.
+    ///
+    /// Set by writes, cleared by [`Engine::build_indexes`]. A **set** rather
+    /// than the single flag this used to be, and the reason is `REINDEX t`: a
+    /// build narrowed to one table has to leave the other tables pending, and
+    /// with one flag the only two things it could do were leave every table
+    /// pending — so the *next* `REINDEX t` would claim to have rebuilt an
+    /// index that had nothing to do — or clear it and tell the next read that
+    /// a table nobody built was current, which is the silent-empty-index
+    /// failure. Per table, both answers are exact.
+    ///
+    /// It costs a `BTreeSet` probe per indexed row where it used to cost a
+    /// store. That sits next to the `Vec<Index>` clone
+    /// [`Engine::index_row_retrieval`] already does per row, which is orders
+    /// of magnitude more.
+    dirty_tables: BTreeSet<String>,
     next_row_id: RowId,
     /// The row id the last `INSERT` that auto-assigned one handed out. See
     /// [`Engine::last_insert_row_id`].
@@ -615,7 +687,7 @@ impl Engine {
             hash_join_cache: RefCell::new(None),
             text_indexes: BTreeMap::new(),
             vector_indexes: BTreeMap::new(),
-            indexes_dirty: false,
+            dirty_tables: BTreeSet::new(),
             next_row_id,
             last_insert_row_id: None,
             write_version,
@@ -850,14 +922,40 @@ impl Engine {
             Plan::Explain(inner) => {
                 Ok(Outcome::Rows(crate::explain::explain(self, inner, params)?))
             }
+            Plan::Reindex(reindex) => self.run_reindex(reindex),
             Plan::Begin => self.begin().map(|()| Outcome::Ddl),
             Plan::Commit => self.commit().map(|()| Outcome::Ddl),
             Plan::Rollback => self.rollback().map(|()| Outcome::Ddl),
         };
-        if outcome.is_err() && !statement.plan().is_read_only() {
+        if self.must_discard(statement, &outcome) {
             self.discard_failed_statement();
         }
         outcome
+    }
+
+    /// Whether a statement that has just finished left buffered writes that
+    /// have to be thrown away.
+    ///
+    /// `is_read_only` is the proxy for it everywhere except one place. A
+    /// **cancelled `REINDEX`** must not be discarded, and the reason is not
+    /// tidiness: [`Engine::discard_failed_statement`] reloads the handle, a
+    /// reload rebuilds every index it cannot restore from a saved blob, and
+    /// that rebuild is [`Engine::restore_indexes`] — which is deliberately not
+    /// interruptible. Discarding here would make a `KILL` on a four-minute
+    /// index build cost the *whole* build with no way to stop it, which is the
+    /// opposite of what the client asked for.
+    ///
+    /// It is sound because of where the cancellation lands:
+    /// [`Engine::build_indexes`] only ever stops between backends, so there is
+    /// no half-applied write to undo, and the tables it did not reach are
+    /// still marked dirty — the state a build that was never asked for leaves.
+    /// A `REINDEX` that failed for any *other* reason takes the ordinary path.
+    fn must_discard(&self, statement: &Statement, outcome: &Result<Outcome>) -> bool {
+        match outcome {
+            Ok(_) => false,
+            Err(Error::Cancelled(_)) if matches!(statement.plan(), Plan::Reindex(_)) => false,
+            Err(_) => !statement.plan().is_read_only(),
+        }
     }
 
     /// Undo whatever a write statement buffered before it failed.
@@ -1291,7 +1389,7 @@ impl Engine {
         self.persisted_version = self.write_version;
         self.text_indexes.clear();
         self.vector_indexes.clear();
-        self.indexes_dirty = false;
+        self.dirty_tables.clear();
         self.restore_indexes()
     }
 
@@ -1401,8 +1499,11 @@ impl Engine {
             if declared.is_empty() {
                 continue;
             }
+            // Once for the table, not once per row: `name` is already the
+            // lowercased key this set holds, and the loop below reconciles
+            // however many rows into the same backends.
+            self.dirty_tables.insert(name.clone());
             for &id in ids {
-                self.indexes_dirty = true;
                 for index in &declared {
                     let key = retrieval_key(&index.table, &index.columns);
                     match index.kind {
@@ -1593,7 +1694,7 @@ impl Engine {
         self.persisted_version = self.write_version;
         self.text_indexes.clear();
         self.vector_indexes.clear();
-        self.indexes_dirty = false;
+        self.dirty_tables.clear();
         // Changes the rolled-back statement had queued describe rows that do
         // not exist. Publishing them would tell a CDC consumer about a write
         // nobody made.
@@ -1784,7 +1885,7 @@ impl Engine {
         // them away and rebuild from the rows, which are now current.
         self.text_indexes.clear();
         self.vector_indexes.clear();
-        self.indexes_dirty = false;
+        self.dirty_tables.clear();
         self.restore_indexes()?;
         self.storage.put_meta(CATALOG_KEY, &self.catalog.encode())?;
         self.end_write()?;
@@ -2904,9 +3005,73 @@ impl Engine {
     /// graph incrementally on commit (AHL-381), so the first read after a load
     /// pays one full build and every later read only reconciles the rows that
     /// changed since.
+    ///
+    /// That trade is right for the incremental case and wrong for the bulk
+    /// one, where "one full build" is minutes and lands on whichever query
+    /// happens to arrive first with nothing in the statement to explain why.
+    /// [`Engine::reindex`] is the way to ask for it deliberately instead; it
+    /// runs exactly this work through [`Engine::build_indexes`], so the
+    /// deferral itself is unchanged — a loader that never queries still pays
+    /// nothing.
     fn refresh_indexes(&mut self) -> Result<()> {
-        if !self.indexes_dirty {
+        if self.dirty_tables.is_empty() {
             return Ok(());
+        }
+        self.build_indexes(&Reindex::Everything).map(|_| ())
+    }
+
+    /// Record that `table`'s retrieval backends are holding uncommitted writes.
+    fn mark_indexes_dirty(&mut self, table: &str) {
+        // Compared case-insensitively against a set that holds one entry per
+        // table written since the last build — a handful at most — rather than
+        // lowercasing the name into a fresh `String` on every row. This runs
+        // once per indexed row, so the allocation is the thing to avoid.
+        if self
+            .dirty_tables
+            .iter()
+            .any(|dirty| dirty.eq_ignore_ascii_case(table))
+        {
+            return;
+        }
+        self.dirty_tables.insert(table.to_ascii_lowercase());
+    }
+
+    /// Commit the retrieval indexes in `scope`, and report which ones.
+    ///
+    /// The one place index backends are committed, reached from the deferred
+    /// path ([`Engine::refresh_indexes`]) and from the forced one
+    /// ([`Engine::reindex`]) alike, so the two cannot come to mean different
+    /// things.
+    ///
+    /// # Where a cancellation lands, and why it is safe here
+    ///
+    /// The check sits **between** backends and never inside one. What that
+    /// buys is exact: at every point the engine can stop, every backend is
+    /// either fully committed or has not been touched, and its table is still
+    /// in `dirty_tables` — so the work is still pending and the next read does
+    /// it, the same state a build that was never asked for leaves. Nothing can
+    /// be caught half-built, which is what makes this cancellable where
+    /// [`Engine::restore_indexes`] deliberately is not: that one runs with the
+    /// indexes already cleared, so stopping it leaves a handle whose
+    /// `bm25_score` silently answers nothing.
+    ///
+    /// What it does *not* buy is a stoppable single build. `VectorIndex::
+    /// commit` is one opaque call, and on a corpus with one vector index that
+    /// call is the whole four minutes. Pushing the check inside it would mean
+    /// every backend promising to restore its pending set on the way out —
+    /// `HnswIndex::build` moves each vector out of the row register as it
+    /// inserts it, and `PagedHnswIndex::build` has already overwritten the
+    /// stored graph by then — and a seam whose contract three of the four
+    /// backends here cannot keep is worse than no seam.
+    fn build_indexes(&mut self, scope: &Reindex) -> Result<Reindexed> {
+        // The no-op, and the only place it is decided. Nothing has been
+        // written since the last build, so every backend already describes
+        // every committed row and committing them again would be work with no
+        // outcome — including the storage commit and the index save below,
+        // which are what would make an idle `REINDEX` in a cron job cost real
+        // I/O for nothing.
+        if self.dirty_tables.is_empty() {
+            return Ok(Reindexed::default());
         }
         // A self-persisting index is told two things before it commits: which
         // write version its structure will describe, and whether it may make
@@ -2915,21 +3080,52 @@ impl Engine {
         let write_version = self.write_version;
         let may_commit = !self.in_transaction;
         let mut wrote_to_storage = false;
-        for index in self.text_indexes.values_mut() {
+        let mut committed: Vec<(String, Vec<String>)> = Vec::new();
+        // Borrowed as fields rather than through `&self`, which is what lets
+        // them live across the `iter_mut()` loops below.
+        let interrupt = &self.interrupt;
+        let dirty = &self.dirty_tables;
+        for (key, index) in self.text_indexes.iter_mut() {
+            if !scope.covers(key) {
+                continue;
+            }
+            interrupt.check_now()?;
             if index.is_self_persisting() {
                 index.prepare_commit(write_version, may_commit);
                 wrote_to_storage = true;
             }
             index.commit()?;
+            // Every in-scope backend is committed, and that is deliberate: a
+            // self-persisting one restamps itself here with the current write
+            // version even when it had nothing pending, which is the
+            // difference between the next open reading its graph back and
+            // rebuilding it from every row. Only the ones whose *table* was
+            // holding writes are reported, which is what makes a second
+            // `REINDEX t` in a row say it built nothing rather than name an
+            // index it knew was already current.
+            if dirty.contains(&key.0) {
+                committed.push(key.clone());
+            }
         }
-        for index in self.vector_indexes.values_mut() {
+        for (key, index) in self.vector_indexes.iter_mut() {
+            if !scope.covers(key) {
+                continue;
+            }
+            interrupt.check_now()?;
             if index.is_self_persisting() {
                 index.prepare_commit(write_version, may_commit);
                 wrote_to_storage = true;
             }
             index.commit()?;
+            if dirty.contains(&key.0) {
+                committed.push(key.clone());
+            }
         }
-        self.indexes_dirty = false;
+        // A table stops being dirty only once *every* backend it has was
+        // committed. `REINDEX <index>` on a table with two retrieval indexes
+        // covers one of them, and marking the table clean there would tell the
+        // next read the other one was current.
+        self.clear_dirty_tables_covered_by(scope);
 
         // A self-persisting index has just written its graph into the open
         // transaction and, by design, did not commit it. Someone has to, or the
@@ -2949,12 +3145,120 @@ impl Engine {
         // transaction, which would make a transaction's buffered writes durable
         // before its own `commit`. The save happens at the first read after the
         // transaction instead.
+        //
+        // And skipped after a narrowed build, which is not a policy choice but
+        // a correctness one: `persist_indexes` stamps *every* blob with the
+        // current write version, so saving while another table's index is
+        // still dirty would write a blob claiming to describe rows it has
+        // never seen — and the next open would believe it.
         if !self.in_transaction
+            && self.dirty_tables.is_empty()
             && self.write_version.saturating_sub(self.persisted_version) >= INDEX_PERSIST_INTERVAL
         {
             self.persist_indexes()?;
         }
-        Ok(())
+        Ok(Reindexed {
+            indexes: self.index_names_for(&committed),
+        })
+    }
+
+    /// Drop from `dirty_tables` every table all of whose live retrieval
+    /// backends `scope` covered.
+    fn clear_dirty_tables_covered_by(&mut self, scope: &Reindex) {
+        let fully_covered = |engine: &Engine, table: &str| -> bool {
+            engine
+                .text_indexes
+                .keys()
+                .chain(engine.vector_indexes.keys())
+                .filter(|key| key.0 == table)
+                .all(|key| scope.covers(key))
+        };
+        let done: Vec<String> = self
+            .dirty_tables
+            .iter()
+            .filter(|table| fully_covered(self, table))
+            .cloned()
+            .collect();
+        for table in done {
+            self.dirty_tables.remove(&table);
+        }
+    }
+
+    /// The catalog names of the backends under `keys`.
+    ///
+    /// Derived from the catalog rather than carried out of the loop, because a
+    /// backend has no name — the maps are keyed by table and column list, and
+    /// the name is what a person asked for and what a report has to give back.
+    fn index_names_for(&self, keys: &[(String, Vec<String>)]) -> Vec<String> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        self.catalog
+            .indexes()
+            .filter(|index| index.kind.is_retrieval())
+            .filter(|index| keys.contains(&retrieval_key(&index.table, &index.columns)))
+            .map(|index| index.name.clone())
+            .collect()
+    }
+
+    /// Run the deferred index build now, rather than leaving it to whichever
+    /// read arrives first.
+    ///
+    /// This is the embedded half of the `REINDEX` statement — both go through
+    /// [`Engine::build_indexes`], so there is one build here, not two. It
+    /// changes no default: nothing about [`Engine::refresh_indexes`]'s
+    /// deferral moves, so a bulk loader that never queries still never pays
+    /// for a build it did not ask for.
+    ///
+    /// `table` narrows it to one table's indexes; `None` covers every index
+    /// this handle holds. A build with nothing pending is a **no-op** that
+    /// reports an empty [`Reindexed`] — it does not re-derive an index that is
+    /// already current, and there is no spelling here that would make it,
+    /// because that work has no correct outcome different from doing nothing.
+    ///
+    /// Allowed inside a transaction, as SQLite's `REINDEX` is, with the one
+    /// consequence [`Engine::refresh_indexes`] already documents: the indexes
+    /// are not *saved* until the transaction ends, because saving commits.
+    pub fn reindex(&mut self, table: Option<&str>) -> Result<Reindexed> {
+        self.refresh_snapshot()?;
+        // The same arming every statement gets, in the same place, so a host
+        // that installed a deadline covers this call too — it is exactly the
+        // call a host is most likely to want to put one on.
+        self.statement_now.set(self.clock.now_micros());
+        self.interrupt.begin_statement();
+        let scope = match table {
+            None => Reindex::Everything,
+            Some(name) => {
+                self.catalog.require_table(name)?;
+                Reindex::Table(name.to_ascii_lowercase())
+            }
+        };
+        self.build_indexes(&scope)
+    }
+
+    /// The `REINDEX` statement, resolved.
+    fn run_reindex(&mut self, plan: &ReindexPlan) -> Result<Outcome> {
+        let scope = match &plan.index {
+            Some(name) => match self
+                .catalog
+                .indexes()
+                .find(|index| index.name.eq_ignore_ascii_case(name))
+            {
+                Some(index) => Reindex::Index(retrieval_key(&index.table, &index.columns)),
+                // Planned against a catalog this handle has since moved past.
+                // `Plan::tables` is empty for `REINDEX`, so the staleness check
+                // every other plan gets does not cover this one.
+                None => {
+                    return Err(Error::Catalog(alloc::format!(
+                        "no such index: {name}; the catalog moved since this statement was \
+                         prepared"
+                    )))
+                }
+            },
+            None => Reindex::Tables(plan.tables.clone()),
+        };
+        self.build_indexes(&scope)?;
+        Ok(Outcome::Ddl)
     }
 
     // --------------------------------------------------------------- INSERT
@@ -3762,7 +4066,7 @@ impl Engine {
     /// can coexist — see `Catalog::create_index`'s dup-check), so "one index
     /// per column" is no longer the shape to iterate, "one index" is.
     fn index_row_retrieval(&mut self, table: &Table, id: RowId, row: &[Value]) -> Result<()> {
-        self.indexes_dirty = true;
+        self.mark_indexes_dirty(&table.name);
         let declared: Vec<Index> = self
             .catalog
             .indexes_for(&table.name)
@@ -3848,7 +4152,7 @@ impl Engine {
     /// [`Engine::write_btree_entries`] explains, and a convenience wrapper
     /// that hid the ordering is what made the DST sweep fail once already.
     fn deindex_row_retrieval(&mut self, table: &Table, id: RowId, row: &[Value]) -> Result<()> {
-        self.indexes_dirty = true;
+        self.mark_indexes_dirty(&table.name);
         let declared: Vec<Index> = self
             .catalog
             .indexes_for(&table.name)

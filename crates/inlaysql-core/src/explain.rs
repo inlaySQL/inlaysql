@@ -704,6 +704,7 @@ fn statement_kind(plan: &Plan) -> &'static str {
         Plan::AlterTable(_) => "ALTER TABLE",
         Plan::CreateIndex(_) | Plan::CreateUniqueIndex(_) => "CREATE INDEX",
         Plan::DropIndex(_) => "DROP INDEX",
+        Plan::Reindex(_) => "REINDEX",
         Plan::Begin => "BEGIN",
         Plan::Commit => "COMMIT",
         Plan::Rollback => "ROLLBACK",

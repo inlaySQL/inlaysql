@@ -61,7 +61,7 @@ pub use catalog::{
 };
 pub use cdc::{Change, ChangeKind, Changes};
 pub use collation::Collation;
-pub use engine::{Engine, EngineOptions, Outcome, ResultSet};
+pub use engine::{Engine, EngineOptions, Outcome, Reindexed, ResultSet};
 pub use error::{Error, Result};
 pub use plan::{ColumnInfo, TableAccess};
 pub use shared::SharedStorage;

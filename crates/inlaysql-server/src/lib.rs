@@ -511,6 +511,11 @@ impl Server {
                 max_execution_time_ms: options.max_execution_time_ms,
                 slow_query_log_ms: options.slow_query_log_ms,
                 statement_text: options.statement_text,
+                // No `ServerOptions` field, and no flag in `USAGE` for it: the
+                // WAL region size is not something this binary's options
+                // choose, so there is nothing here to plumb through — only the
+                // engine's own answer to report.
+                max_transaction_bytes: inlaysql::max_transaction_bytes(),
             },
             engine: EngineOptions {
                 page_reuse: options.page_reuse,

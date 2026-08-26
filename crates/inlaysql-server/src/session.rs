@@ -67,6 +67,21 @@ pub struct Limits {
     /// MySQL's, because MySQL has no variable that means this and borrowing
     /// `general_log` would claim a whole feature that does not exist here.
     pub statement_text: bool,
+    /// The most bytes one commit's write-ahead-log record may hold. Reported
+    /// as `inlaysql_max_transaction_bytes`, read-only — there is no flag and
+    /// no `SET` for it, because unlike every other field here it is not an
+    /// operator's choice: `docs/enterprise-readiness.md` blocker 5 explains
+    /// why one WAL region's size is load-bearing for crash recovery and does
+    /// not move.
+    ///
+    /// Read from [`inlaysql::max_transaction_bytes`] rather than written down
+    /// as a literal here, for the same reason `max_execution_time` is read off
+    /// [`Control`] instead of a copy: this is the exact formula
+    /// `CowBTree::commit` measures a transaction's record against, so what a
+    /// client reads back cannot name a ceiling that is not the one that
+    /// actually refuses it. Before this existed the only place that number
+    /// appeared was inside a `1030` error message a client had already hit.
+    pub max_transaction_bytes: usize,
 }
 
 impl Default for Limits {
@@ -78,6 +93,7 @@ impl Default for Limits {
             max_execution_time_ms: crate::DEFAULT_MAX_EXECUTION_TIME_MS,
             slow_query_log_ms: 0,
             statement_text: false,
+            max_transaction_bytes: inlaysql::max_transaction_bytes(),
         }
     }
 }
@@ -295,6 +311,17 @@ impl Session {
             "inlaysql_hnsw_ef_search" => {
                 return Some(self.control.vector_ef_search().unwrap_or(0).to_string())
             }
+            // Read off `Limits`, not `Control`: unlike the two variables
+            // above, nothing sets this per session — there is no `SET` for
+            // it, because the number is not a session's to choose (see
+            // `Limits::max_transaction_bytes`). What makes this one honest is
+            // the same thing that makes those two honest: the value comes
+            // from `inlaysql::max_transaction_bytes`, the formula the storage
+            // backend actually measures a commit against, not a literal typed
+            // in beside it.
+            "inlaysql_max_transaction_bytes" => {
+                return Some(self.limits.max_transaction_bytes.to_string())
+            }
             // The three below are the same pairing as the timeouts above:
             // each one is read off the field the connection actually applies,
             // so a client cannot be told a threshold the server is not using.
@@ -383,6 +410,7 @@ impl Session {
             "hostname",
             "init_connect",
             "inlaysql_hnsw_ef_search",
+            "inlaysql_max_transaction_bytes",
             "inlaysql_statement_text",
             "interactive_timeout",
             "license",
@@ -478,6 +506,7 @@ mod tests {
                 max_execution_time_ms: 250,
                 slow_query_log_ms: 1500,
                 statement_text: true,
+                max_transaction_bytes: 999_999,
             },
         );
         assert_eq!(session.variable("max_connections").as_deref(), Some("7"));
@@ -501,6 +530,18 @@ mod tests {
             session.variable("inlaysql_statement_text").as_deref(),
             Some("ON")
         );
+        // Not one of the enforced-elsewhere numbers above — this one has no
+        // flag and no `SET`, so the only way it could be wrong is if
+        // `Session::variable` read it from somewhere other than the `Limits`
+        // it was constructed with. `999_999` is deliberately not
+        // `inlaysql::max_transaction_bytes()`'s real answer, for the same
+        // reason the numbers above are not their real defaults.
+        assert_eq!(
+            session
+                .variable("inlaysql_max_transaction_bytes")
+                .as_deref(),
+            Some("999999")
+        );
 
         // And `SHOW VARIABLES` says the same thing as `@@name`, which is where
         // a client that lists everything would otherwise see the stale answer.
@@ -512,6 +553,7 @@ mod tests {
             ("long_query_time", "1.500000"),
             ("slow_query_log", "ON"),
             ("inlaysql_statement_text", "ON"),
+            ("inlaysql_max_transaction_bytes", "999999"),
         ] {
             assert!(
                 all.iter().any(|(n, v)| n == name && v == value),
@@ -536,6 +578,28 @@ mod tests {
             session.variable("inlaysql_statement_text").as_deref(),
             Some("OFF")
         );
+    }
+
+    /// `@@inlaysql_max_transaction_bytes` by default is
+    /// `inlaysql::max_transaction_bytes()` — not a copy of it. The two could
+    /// only disagree if `Limits::default` stopped calling that function, and
+    /// this is the test that would catch it: it names both sides rather than
+    /// pinning a literal that would pass even if one drifted from the other.
+    #[test]
+    fn the_default_transaction_ceiling_is_the_one_the_engine_enforces() {
+        let session = Session::new(Control::detached(1), "root", None, Limits::default());
+        assert_eq!(
+            session
+                .variable("inlaysql_max_transaction_bytes")
+                .as_deref(),
+            Some(inlaysql::max_transaction_bytes().to_string()).as_deref()
+        );
+        // And that function is not a stand-in for a made-up number: it is
+        // `WAL_BLOCKS` (256) x `DEFAULT_PAGE_SIZE` (4096), the one MiB
+        // `docs/enterprise-readiness.md` blocker 5 documents. Pinned as a
+        // literal here so a change to either constant is a deliberate edit to
+        // this test.
+        assert_eq!(inlaysql::max_transaction_bytes(), 256 * 4096);
     }
 
     /// The two claims a security-minded client might actually read.

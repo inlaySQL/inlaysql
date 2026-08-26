@@ -1178,10 +1178,19 @@ around.
 * **A transaction may not write more than 1 MiB.** `WAL_BLOCKS` (256) x
   `DEFAULT_PAGE_SIZE` (4096), in `inlaysql_core::wal`, with no server flag to
   raise it. A bulk load over the wire has to be split into batches that fit, or
-  it fails with `1030: transaction does not fit the write-ahead log`. The
-  in-process harness hides this — `crates/inlaysql-bench`'s `batched()` catches
-  `Error::Transaction` and commits early — so it only becomes visible to a user
-  writing SQL. `module.py` sizes batches for it and halves on refusal.
+  it is refused. The in-process harness hides this — `crates/inlaysql-bench`'s
+  `batched()` catches `Error::Transaction` and commits early — so it only
+  becomes visible to a user writing SQL. `module.py` sizes batches for it and
+  halves on refusal.
+
+  It used to be visible only as `1030: Got error from storage engine:
+  transaction does not fit the write-ahead log` — a generic code naming no
+  limit, however the ceiling was hit. A SQL client now gets `1197`
+  (`ER_TRANS_CACHE_FULL`) either way, with the byte counts in the message and
+  `@@inlaysql_max_transaction_bytes` to size the next batch against — a session
+  variable read off the same formula the storage backend measures a commit
+  against, so it cannot report a ceiling that is not the one enforced. See
+  `docs/server.md`, "The ~1 MiB transaction ceiling".
 * **88% of the build is one single-threaded stall on the first read.** Of
   294.9 s for 1.18M vectors, 36.2 s was the load and **258.7 s was the graph**,
   built when the index is first *read* rather than when the rows are written.

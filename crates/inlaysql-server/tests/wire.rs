@@ -5670,6 +5670,140 @@ fn the_statement_timeout_is_off_unless_it_is_asked_for() {
     client.quit();
 }
 
+// ------------------------------------------- the ~1 MiB transaction ceiling
+
+/// A fresh two-column table, on its own server, for the transaction-ceiling
+/// tests below — the same shape `crates/inlaysql/tests/large_statements.rs`
+/// uses to pin where each statement actually breaks, so the row counts that
+/// module documents (buffered `INSERT`s inside `BEGIN`..`COMMIT` refused at
+/// 884 for 512-byte bodies) are the numbers to expect here too.
+fn ceiling_fixture(name: &str) -> (TestServer, Client) {
+    let server = TestServer::start(name);
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)");
+    (server, client)
+}
+
+/// The pairing the whole point of `@@inlaysql_max_transaction_bytes` rests on:
+/// a number a client did not have to find by trial and error, and a refusal
+/// that actually happens at it. Before this test could even be written the
+/// refusal had nothing to check itself against — a client saw `1030` and had
+/// no variable to size a batch by at all.
+///
+/// The margins are 10% either side of the reported budget, not the exact
+/// byte, because "exact" is a property of the internal page and overflow-chain
+/// encoding — `crates/inlaysql/tests/large_statements.rs` documents at length
+/// why a byte count is not a clean function of a statement's shape — and that
+/// is not this test's subject. Ten percent is an order of magnitude past the
+/// actual per-row bookkeeping overhead (a handful of 4 KiB pages against a
+/// payload approaching 1 MiB), so this does not go flaky the day that
+/// bookkeeping grows by a page or two; it fails the day the reported number
+/// stops being the one that gets enforced, which is the one thing worth
+/// failing for.
+#[test]
+fn the_reported_transaction_ceiling_is_what_actually_gets_refused() {
+    let (_server, mut client) = ceiling_fixture("txn-ceiling-reported");
+
+    let budget: usize = value(&mut client, "@@inlaysql_max_transaction_bytes")
+        .parse()
+        .expect("a byte count");
+    // `WAL_BLOCKS` (256) x `DEFAULT_PAGE_SIZE` (4096) — the one MiB
+    // `docs/enterprise-readiness.md` blocker 5 documents, not a number this
+    // test invented. Pinned so a change to either constant is a deliberate
+    // edit here, not a silent drift between what is reported and what is
+    // enforced.
+    assert_eq!(budget, 256 * 4096, "@@inlaysql_max_transaction_bytes");
+    assert_eq!(
+        client
+            .ok_query("SHOW VARIABLES LIKE 'inlaysql_max_transaction_bytes'")
+            .rows()
+            .cell(0, 1),
+        budget.to_string()
+    );
+
+    // Comfortably under: succeeds outright, as one autocommit statement.
+    let under = "x".repeat(budget - budget / 10);
+    client.ok_query(&format!("INSERT INTO t (id, body) VALUES (1, '{under}')"));
+    assert_eq!(
+        client.ok_query("SELECT COUNT(*) FROM t").rows().cell(0, 0),
+        "1"
+    );
+
+    // Comfortably over: refused, named as exactly this, and pointed back at
+    // the number that predicted it.
+    let over = "x".repeat(budget + budget / 10);
+    let error = client
+        .query(&format!("INSERT INTO t (id, body) VALUES (2, '{over}')"))
+        .expect_err("a statement bigger than the reported ceiling");
+    assert_eq!(error.code, 1197, "{error:?}");
+    assert_eq!(error.sqlstate, "HY000");
+    assert!(
+        error.message.contains("inlaysql_max_transaction_bytes"),
+        "no pointer back to the reported limit: {}",
+        error.message
+    );
+    assert!(
+        error.message.to_ascii_lowercase().contains("batch"),
+        "no actionable fix named: {}",
+        error.message
+    );
+
+    // Refused, not half-applied: still exactly the one row from before.
+    assert_eq!(
+        client.ok_query("SELECT COUNT(*) FROM t").rows().cell(0, 0),
+        "1"
+    );
+    client.quit();
+}
+
+/// The other place this ceiling is enforced: mid-transaction, before the
+/// statement that would overflow the record even runs
+/// (`Engine::ensure_transaction_fits`). This is the shape the `ann-benchmarks`
+/// bulk load actually hit (`bench/README.md`) — batched `INSERT`s inside one
+/// `BEGIN`. It used to surface as `1568`, the same code every other
+/// "transaction is in the wrong state" refusal gets (`ROLLBACK` with nothing
+/// open, `CREATE INDEX` inside a transaction, ...), which told a client
+/// nothing about which of those it had hit. It is now the same `1197` the
+/// single-statement case above gets, because it is the same fact about the
+/// same file caught at a different moment.
+#[test]
+fn a_buffered_transaction_over_the_ceiling_gets_the_same_actionable_error() {
+    let (_server, mut client) = ceiling_fixture("txn-ceiling-buffered");
+    client.ok_query("BEGIN");
+
+    let body = "x".repeat(512);
+    let mut id = 0i64;
+    let error = loop {
+        id += 1;
+        assert!(
+            id < 20_000,
+            "no refusal after a whole region's worth of rows"
+        );
+        match client.query(&format!("INSERT INTO t (id, body) VALUES ({id}, '{body}')")) {
+            Ok(_) => continue,
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(error.code, 1197, "{error:?}");
+    assert_eq!(error.sqlstate, "HY000");
+    assert!(
+        error.message.contains("inlaysql_max_transaction_bytes"),
+        "no pointer back to the reported limit: {}",
+        error.message
+    );
+
+    // The refusal arrived before the statement ran, so nothing it would have
+    // written was ever buffered — what was already there still is, and still
+    // commits. A caller draining a large import in batches depends on exactly
+    // this.
+    client.ok_query("COMMIT");
+    assert_eq!(
+        client.ok_query("SELECT COUNT(*) FROM t").rows().cell(0, 0),
+        (id - 1).to_string()
+    );
+    client.quit();
+}
+
 // --------------------------------------------------- ANN recall/latency knob
 
 /// A server with a four-dimensional vector column and a graph over it.
@@ -6945,4 +7079,169 @@ fn every_reported_status_name_is_mysqls_or_marked_as_this_servers() {
         .rows();
     assert!(errors.rows.len() >= 10, "{errors:?}");
     client.quit();
+}
+
+// =====================================================================
+// OPTIMIZE TABLE
+// =====================================================================
+
+/// A server holding a `docs` table with a full-text index and rows that have
+/// not been indexed yet — the shape a bulk load leaves behind, where the whole
+/// build is still waiting for whichever query arrives first.
+fn optimize_fixture(name: &str) -> (TestServer, Client) {
+    let server = TestServer::start(name);
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)");
+    client.ok_query("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)");
+    client.ok_query("CREATE INDEX docs_body ON docs (body)");
+    client.ok_query("CREATE INDEX notes_body ON notes (body)");
+    for id in 1..=5 {
+        client.ok_query(&format!(
+            "INSERT INTO docs (id, body) VALUES ({id}, 'alpha document {id}')"
+        ));
+        client.ok_query(&format!(
+            "INSERT INTO notes (id, body) VALUES ({id}, 'beta note {id}')"
+        ));
+    }
+    (server, client)
+}
+
+/// `OPTIMIZE TABLE` answers with MySQL's four-column result set, and the
+/// `Msg_text` distinguishes a build that happened from one that had nothing to
+/// do.
+///
+/// The second half is the assertion worth having. MySQL's own wording for a
+/// table that needed nothing is `Table is already up to date`, and answering
+/// `OK` there — or answering an OK *packet* instead of a result set — would be
+/// a maintenance statement telling an operator it did work it did not do.
+#[test]
+fn optimize_table_reports_what_it_built_and_what_it_did_not() {
+    let (_server, mut client) = optimize_fixture("optimize-report");
+
+    let built = client.ok_query("OPTIMIZE TABLE docs").rows();
+    assert_eq!(built.columns, ["Table", "Op", "Msg_type", "Msg_text"]);
+    assert_eq!(built.column("Table"), ["inlaysql.docs"]);
+    assert_eq!(built.column("Op"), ["optimize"]);
+    assert_eq!(built.column("Msg_type"), ["status"]);
+    assert_eq!(
+        built.column("Msg_text"),
+        ["OK; rebuilt docs_body"],
+        "the report does not name the index it built"
+    );
+
+    // Nothing has changed since, so there is nothing to build.
+    let again = client.ok_query("OPTIMIZE TABLE docs").rows();
+    assert_eq!(again.column("Msg_text"), ["Table is already up to date"]);
+
+    // And the index it built really answers — the build was the work, not a
+    // flag flip.
+    assert_eq!(
+        client.count_rows("SELECT id, bm25_score(body, 'alpha') AS s FROM docs ORDER BY s DESC"),
+        5
+    );
+
+    // A write puts the table back in the pending state, and the next
+    // `OPTIMIZE` says so rather than repeating itself.
+    client.ok_query("INSERT INTO docs (id, body) VALUES (6, 'alpha again')");
+    let after_write = client.ok_query("OPTIMIZE TABLE docs").rows();
+    assert_eq!(after_write.column("Msg_text"), ["OK; rebuilt docs_body"]);
+    client.quit();
+}
+
+/// Every spelling a client actually sends, and one row per table in the order
+/// the client named them.
+#[test]
+fn optimize_table_takes_mysqls_whole_form() {
+    let (_server, mut client) = optimize_fixture("optimize-forms");
+
+    let rows = client
+        .ok_query("OPTIMIZE NO_WRITE_TO_BINLOG TABLE `notes`, docs")
+        .rows();
+    assert_eq!(
+        rows.column("Table"),
+        ["inlaysql.notes", "inlaysql.docs"],
+        "the rows are not in the order the tables were named"
+    );
+    assert_eq!(rows.rows.len(), 2);
+
+    // `LOCAL` is MySQL's synonym for the same modifier, and a qualified name
+    // is how a client that has selected no schema writes one.
+    client.ok_query("INSERT INTO notes (id, body) VALUES (6, 'beta again')");
+    let rows = client
+        .ok_query("OPTIMIZE LOCAL TABLE inlaysql.notes")
+        .rows();
+    assert_eq!(rows.column("Msg_text"), ["OK; rebuilt notes_body"]);
+
+    // A prepared `OPTIMIZE` runs the same way — the shim owns it at
+    // `COM_STMT_PREPARE` too, so it cannot mean one thing sent and another
+    // prepared.
+    client.ok_query("INSERT INTO notes (id, body) VALUES (7, 'beta once more')");
+    let prepared = client.prepare("OPTIMIZE TABLE notes").expect("prepare");
+    let rows = client.execute(&prepared, &[]).expect("execute").rows();
+    assert_eq!(rows.column("Msg_text"), ["OK; rebuilt notes_body"]);
+    client.quit();
+}
+
+/// A table this server does not have is a refusal, not a row claiming success
+/// — and a form of the statement it cannot honour is refused by name rather
+/// than accepted and partly ignored.
+#[test]
+fn optimize_table_refuses_what_it_cannot_do() {
+    let (_server, mut client) = optimize_fixture("optimize-refusals");
+
+    let error = client
+        .query("OPTIMIZE TABLE nosuchtable")
+        .expect_err("no such table");
+    assert_eq!(error.code, 1146, "{}", error.message);
+
+    // One bad name in a list refuses the whole statement: there is no way to
+    // build half of it and report the rest.
+    let error = client
+        .query("OPTIMIZE TABLE docs, nosuchtable")
+        .expect_err("no such table");
+    assert_eq!(error.code, 1146, "{}", error.message);
+
+    for sql in [
+        // MySQL's other `OPTIMIZE` targets, which this server does not have.
+        "OPTIMIZE PARTITION p0",
+        "OPTIMIZE TABLE",
+    ] {
+        let error = client.query(sql).expect_err(sql);
+        assert!(
+            error.message.contains("OPTIMIZE") || error.message.contains("TABLE"),
+            "`{sql}` was refused without saying what it could not do: {}",
+            error.message
+        );
+    }
+    client.quit();
+}
+
+/// The privilege is MySQL's for this statement — SELECT and INSERT on every
+/// table named — and it is checked per table, from the same parse that will
+/// run it.
+#[test]
+fn optimize_table_needs_mysqls_privileges_on_every_table_it_names() {
+    let (server, mut root) = optimize_fixture("optimize-acl");
+    root.ok_query("CREATE USER 'reader' IDENTIFIED BY 'r-pass'");
+    root.ok_query("GRANT SELECT ON docs TO 'reader'");
+
+    let mut reader = server.client_as("reader", "r-pass");
+    let error = reader
+        .query("OPTIMIZE TABLE docs")
+        .expect_err("SELECT alone is not enough");
+    assert_eq!(error.code, 1142, "{}", error.message);
+
+    root.ok_query("GRANT INSERT ON docs TO 'reader'");
+    let mut reader = server.client_as("reader", "r-pass");
+    reader.ok_query("OPTIMIZE TABLE docs");
+
+    // The grant is per table, so the table it was not granted on is still
+    // refused — including when it is named alongside one that was.
+    let error = reader
+        .query("OPTIMIZE TABLE docs, notes")
+        .expect_err("no grant on notes");
+    assert_eq!(error.code, 1142, "{}", error.message);
+    assert!(error.message.contains("notes"), "{}", error.message);
+    reader.quit();
+    root.quit();
 }

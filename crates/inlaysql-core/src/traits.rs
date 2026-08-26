@@ -858,6 +858,20 @@ impl Interrupt {
         self.check_rows(1)
     }
 
+    /// Ask now, whatever the countdown says.
+    ///
+    /// For the loops whose unit is not a row and is not bounded: committing
+    /// one index backend is a single call that can run for minutes, so
+    /// spending one row of the stride against it would put the next check
+    /// [`CANCEL_STRIDE`] index commits away — which on a database with one
+    /// index means never. Cheap for the same reason [`Interrupt::check_rows`]
+    /// is: a handle with no signal installed still takes one load and one
+    /// predictable branch, and never calls out.
+    #[inline]
+    pub fn check_now(&self) -> Result<()> {
+        self.check_rows(usize::MAX)
+    }
+
     /// Ask, having done `rows` rows of work since the last time.
     #[inline]
     pub fn check_rows(&self, rows: usize) -> Result<()> {

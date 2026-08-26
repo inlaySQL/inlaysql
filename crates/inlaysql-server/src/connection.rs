@@ -400,7 +400,7 @@ impl<S: Read + Write> Connection<S> {
         if !shim::handles(sql) {
             return Ok(());
         }
-        let requirement = acl::shim_requirement(sql, &self.session);
+        let requirement = acl::shim_requirement(sql, &self.session, self.db.catalog());
         let account = self.account()?;
         acl::enforce(&mut self.db, &account, &requirement)
     }
@@ -757,6 +757,7 @@ impl<S: Read + Write> Connection<S> {
                     }),
                 }
             }
+            Intercepted::Optimize { tables } => self.optimize(&tables),
             Intercepted::Failed(error) => Err(error),
             Intercepted::UseDatabase(name) => {
                 self.session.set_database(Some(name));
@@ -859,6 +860,52 @@ impl<S: Read + Write> Connection<S> {
     fn kill(&mut self, target: u32, scope: KillScope) -> Result<(), MysqlError> {
         let asker = self.asker()?;
         self.registry.kill(target, scope, &asker)
+    }
+
+    /// `OPTIMIZE TABLE`, and the one report on this server that says what a
+    /// build actually did.
+    ///
+    /// Index commits are deferred to the first read that needs them, which
+    /// after a bulk load puts the whole build inside whichever query arrives
+    /// first. This is how a client asks for it up front —
+    /// [`Database::reindex`] under a name a MySQL client already sends — and
+    /// the row it answers with distinguishes the two outcomes, because a
+    /// statement that reported `OK` after doing nothing would be telling the
+    /// operator their maintenance window did something it did not.
+    ///
+    /// It is stoppable: the deadline and the `KILL` flag this connection
+    /// installed reach the build between one index and the next. A stopped
+    /// build leaves the work pending, so the next read does it — see
+    /// `inlaysql_core::Engine::reindex`.
+    ///
+    /// The open transaction is committed first, exactly as it is before an
+    /// account statement and for the same reason MySQL commits before its own
+    /// `OPTIMIZE TABLE`: this writes index structure into the database, and a
+    /// later `ROLLBACK` undoing a maintenance statement the client was told
+    /// had finished is not a state worth having.
+    fn optimize(&mut self, tables: &[String]) -> Result<Answer, MysqlError> {
+        self.commit()?;
+        let schema = shim::schema_name(&self.session);
+        let mut rows = Vec::with_capacity(tables.len());
+        for table in tables {
+            let built = self.db.reindex(Some(table)).map_err(|e| from_engine(&e))?;
+            let message = if built.is_empty() {
+                shim::OPTIMIZE_UP_TO_DATE.to_string()
+            } else {
+                format!("OK; rebuilt {}", built.indexes.join(", "))
+            };
+            rows.push(shim::optimize_row(&schema, table, &message));
+        }
+        Ok(Answer::Rows {
+            rows: ResultSet {
+                columns: shim::OPTIMIZE_COLUMNS
+                    .iter()
+                    .map(|column| column.to_string())
+                    .collect(),
+                rows,
+            },
+            plan: None,
+        })
     }
 
     /// Run one statement the engine owns.

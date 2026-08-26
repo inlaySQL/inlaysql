@@ -19,7 +19,7 @@ cargo test --workspace          # everything below except the sweeps and the fuz
 | A churn workload stops growing the file once reuse is on (opt-in, AHL-481) | `crates/inlaysql/tests/free_list_growth.rs` | every push |
 | The streaming executor stops early only when that is still the right answer | `crates/inlaysql-core/tests/streaming.rs` | every push |
 | A cancelled statement leaves nothing behind, at every point it can be stopped | `crates/inlaysql-core/tests/cancellation.rs` | every push |
-| SQL Logic Test subset | `crates/inlaysql/tests/sqllogictest/` | every push — **1094/1094** |
+| SQL Logic Test subset | `crates/inlaysql/tests/sqllogictest/` | every push — **1154/1154** |
 | Metamorphic logic-bug tests (SQLancer-style) | `crates/inlaysql-core/tests/logic_bugs.rs` | every push |
 | Comparison is a genuine total order over every storage class, every collation | `eval.rs`, `engine.rs` | every push |
 | Differential testing against SQLite | `crates/inlaysql/tests/differential.rs` | 200 rounds every push, 50,000 nightly |
@@ -27,6 +27,15 @@ cargo test --workspace          # everything below except the sweeps and the fuz
 | Coverage-guided fuzzing | `fuzz/` | nightly, 5 min per target, artifacts published |
 | Concurrent writers: conflicts reported, nothing lost | `crates/inlaysql/tests/concurrent_writers.rs` | every push |
 | An index larger than one transaction | `crates/inlaysql/tests/large_index.rs` | every push (the 5,000-row case nightly) |
+| A foreign commit re-indexes only the rows it touched | `crates/inlaysql-core/tests/foreign_commit_indexes.rs` | every push |
+| The raw leaf scan reads pages whose ids were handed out again | `crates/inlaysql/tests/raw_scan_reuse.rs` | every push |
+| `INTEGER` comparison is exact above 2^53 | `crates/inlaysql/tests/large_integers.rs` | every push |
+| A cancelled statement leaves the table and the handle untouched | `crates/inlaysql-core/tests/cancellation.rs` | every push |
+| An explicit `REINDEX` moves the build off the first query | `crates/inlaysql-core/tests/reindex.rs` | every push |
+| The paged BM25 index scores bit-identically to the in-memory one | `crates/inlaysql-core/tests/bm25_paged_agreement.rs`, `crates/inlaysql/tests/paged_full_text.rs` | every push |
+| A blocking operator refuses rather than exhausting memory | `crates/inlaysql-core/tests/query_memory.rs`, `crates/inlaysql-server/tests/streaming_memory.rs` | every push |
+| A statement too large for one WAL region is refused, not half-applied | `crates/inlaysql/tests/large_statements.rs` | every push |
+| `:memory:` is refused rather than taken as a filename | `crates/inlaysql/tests/memory_path.rs` | every push |
 | ANN recall does not slide as the corpus grows, **per metric** | `crates/inlaysql-core/src/hnsw.rs` | every push (the 25,600-node case nightly) |
 | A vector index's distance metric, end to end | `crates/inlaysql-core/tests/vector_metrics.rs`, `crates/inlaysql/tests/vector_metrics.rs` | every push |
 | Raising `ef_search` really does raise recall, and the reported `ef` is the enforced one | `crates/inlaysql/tests/ef_search.rs`, `crates/inlaysql-core/src/hnsw.rs` | every push |
@@ -65,6 +74,25 @@ had no `rustup`, so every job died on its first step. It installs one now
 (`.github/actions/rust`), which is why per-pull-request checks are back.
 Everything on this page also reproduces locally with the commands given, which
 is the property that actually matters.
+
+## Instruments, not assertions
+
+Three `#[ignore]`d tests exist to *measure* rather than to pass. They print a
+table and assert only that the thing under test still answers, because a timing
+threshold in CI fails on a busy machine and teaches everyone to ignore it.
+
+```sh
+cargo test --release -p inlaysql --test index_memory_cost -- --nocapture --ignored
+cargo test --release -p inlaysql-core --test vector_query_cost -- --nocapture --ignored
+cargo test --release -p inlaysql-core --test bm25_skipping_headroom -- --nocapture --ignored
+```
+
+They are how several published figures were corrected rather than argued about:
+`index_memory_cost` found this project's own 10M-vector estimate understated by
+2.3x, `vector_query_cost` established that the distance kernel is already
+vectorised and that fusing it to `fmla` would buy 4% of a query while changing
+what the index computes, and `bm25_skipping_headroom` is the measurement that
+made block-max WAND get built, measured and then reverted.
 
 ## Deterministic simulation testing
 

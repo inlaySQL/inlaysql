@@ -214,6 +214,13 @@ fn is_operator_word(word: &str) -> bool {
 /// is the only function in the crate that parses.
 pub fn prepare(sql: &str, catalog: &Catalog) -> Result<Prepared> {
     check_nesting(sql)?;
+    // Before `sqlparser`, because `sqlparser` has no `REINDEX` — its SQLite
+    // grammar stops at the statements SQLite's own parser generates a plan
+    // for, and `REINDEX` is not one of them. See [`parse_reindex`] for why
+    // that is a tokenizer pass rather than a string comparison.
+    if let Some(plan) = parse_reindex(sql, catalog)? {
+        return Ok(Prepared::new(sql, plan, 0, Vec::new(), catalog));
+    }
     let mut statements = Parser::parse_sql(&SQLiteDialect {}, sql)
         .map_err(|e| Error::Parse(alloc::format!("{e}")))?;
 
@@ -236,6 +243,163 @@ pub fn prepare(sql: &str, catalog: &Catalog) -> Result<Prepared> {
         vector_params,
         catalog,
     ))
+}
+
+/// `REINDEX [name]`, or `None` when the statement is not one.
+///
+/// # Why this is hand-rolled
+///
+/// `sqlparser` does not have the statement. Its SQLite grammar covers what
+/// SQLite compiles into a query plan, and `REINDEX` is maintenance — the
+/// keyword exists in its keyword table only as a `VACUUM` option. So the
+/// choice was to add the statement here or to leave the engine with no
+/// spelling for "build the deferred indexes now", which is what
+/// `crates/inlaysql-core/src/engine.rs` documents as costing the first read
+/// after a bulk load the whole build with nothing able to ask for it earlier.
+///
+/// It is a **tokenizer** pass and not a `starts_with("REINDEX")`, and that is
+/// the part worth defending: `/* comment */ REINDEX`, `reindex "my table"`,
+/// ``REINDEX `t` ;`` and `REINDEX --trailing` all have to mean what they mean
+/// in every other statement, and each one of them is a case a string
+/// comparison gets wrong in a different direction. The tokenizer is the same
+/// one the parser below would have used, so there is one lexer here, not two.
+///
+/// Anything that is not `REINDEX` returns `None` untouched — this runs in
+/// front of every statement the engine ever parses, so it may not have an
+/// opinion about any of them.
+fn parse_reindex(sql: &str, catalog: &Catalog) -> Result<Option<Plan>> {
+    use sqlparser::keywords::Keyword;
+    use sqlparser::tokenizer::{Token, Tokenizer};
+
+    if !could_be_reindex(sql) {
+        return Ok(None);
+    }
+    let tokens = match Tokenizer::new(&SQLiteDialect {}, sql).tokenize() {
+        Ok(tokens) => tokens,
+        // Not this function's error to report: hand it back and let the real
+        // parser fail on it with the message it would have given anyway.
+        Err(_) => return Ok(None),
+    };
+    let mut words = tokens
+        .into_iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)));
+
+    // Quoted, this is an identifier and not the keyword — `"REINDEX"` on its
+    // own is a `SELECT`-less nonsense statement, but it is the parser's
+    // nonsense, not ours.
+    match words.next() {
+        Some(Token::Word(word))
+            if word.keyword == Keyword::REINDEX && word.quote_style.is_none() => {}
+        _ => return Ok(None),
+    }
+
+    let mut target: Option<String> = None;
+    let mut seen_semicolon = false;
+    for token in words {
+        match token {
+            Token::EOF => break,
+            Token::SemiColon if !seen_semicolon => seen_semicolon = true,
+            // An identifier, quoted or not. A keyword used as a name arrives
+            // as a `Word` too, which is what lets `REINDEX "order"` work.
+            Token::Word(word) if target.is_none() && !seen_semicolon => {
+                target = Some(word.value);
+            }
+            Token::DoubleQuotedString(name) if target.is_none() && !seen_semicolon => {
+                target = Some(name);
+            }
+            other => {
+                return Err(Error::Parse(alloc::format!(
+                    "REINDEX takes one optional table or index name, found `{other}`"
+                )))
+            }
+        }
+    }
+
+    Ok(Some(Plan::Reindex(plan_reindex(target, catalog)?)))
+}
+
+/// Whether `sql` could be a `REINDEX` at all, decided without tokenizing.
+///
+/// **This is why [`parse_reindex`] is not a tax on every other statement.**
+/// It runs in front of every statement this engine parses, and tokenizing
+/// twice to find one keyword would put a second lexer pass on the path of
+/// every `SELECT` — `PERF.md` has parsing at roughly half the cost of the
+/// point read it precedes. So the leading whitespace and comments are skipped
+/// by hand here and the first seven bytes are compared in place: one pass, no
+/// allocation, and it stops at the byte that decides.
+///
+/// Conservative in the direction that matters. A false *positive* costs one
+/// tokenize of a statement that turns out not to be a `REINDEX`; a false
+/// negative would send a real `REINDEX` to a parser that has never heard of
+/// it, so every form of leading trivia SQLite accepts is skipped here.
+fn could_be_reindex(sql: &str) -> bool {
+    let mut rest = sql;
+    loop {
+        rest = rest.trim_start();
+        // `--` and `/* */` and nothing else, because SQLite's dialect has
+        // nothing else. `#` is MySQL's comment and the engine does not take
+        // it — the MySQL shim strips it before the engine ever sees it — so
+        // skipping it here would be this function believing in a comment the
+        // parser two lines later does not.
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = match after.find('\n') {
+                Some(at) => &after[at + 1..],
+                None => "",
+            };
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("/*") {
+            rest = match after.find("*/") {
+                Some(at) => &after[at + 2..],
+                None => "",
+            };
+            continue;
+        }
+        break;
+    }
+    // Bytes, not characters: `REINDEX` is ASCII, so a seven-byte prefix of a
+    // valid `str` that matches it cannot have split a multi-byte character.
+    rest.as_bytes()
+        .get(..7)
+        .is_some_and(|head| head.eq_ignore_ascii_case(b"REINDEX"))
+}
+
+/// Resolve `REINDEX`'s optional name onto the tables to rebuild.
+///
+/// SQLite resolves the name as a collation, then a table, then an index. This
+/// engine has no `REINDEX`-able collation — a collation here is a property of
+/// a column, and changing one is `ALTER TABLE`, which rebuilds the indexes
+/// itself — so the order is table, then index, then a refusal that says so.
+/// Guessing "everything" from a name that matched nothing would turn a typo
+/// into a full-database rebuild.
+fn plan_reindex(target: Option<String>, catalog: &Catalog) -> Result<crate::plan::ReindexPlan> {
+    let Some(name) = target else {
+        return Ok(crate::plan::ReindexPlan {
+            tables: catalog
+                .tables()
+                .map(|table| table.name.to_ascii_lowercase())
+                .collect(),
+            index: None,
+        });
+    };
+    if let Some(table) = catalog.table(&name) {
+        return Ok(crate::plan::ReindexPlan {
+            tables: alloc::vec![table.name.to_ascii_lowercase()],
+            index: None,
+        });
+    }
+    if let Some(index) = catalog
+        .indexes()
+        .find(|index| index.name.eq_ignore_ascii_case(&name))
+    {
+        return Ok(crate::plan::ReindexPlan {
+            tables: alloc::vec![index.table.to_ascii_lowercase()],
+            index: Some(index.name.clone()),
+        });
+    }
+    Err(Error::Catalog(alloc::format!(
+        "unable to identify the object to be reindexed: `{name}` is neither a table nor an index"
+    )))
 }
 
 /// Resolve one parsed statement into a [`Plan`].
@@ -404,6 +568,7 @@ fn plan_explain(
         | Plan::CreateIndex(_)
         | Plan::CreateUniqueIndex(_)
         | Plan::DropIndex(_)
+        | Plan::Reindex(_)
         | Plan::Begin
         | Plan::Commit
         | Plan::Rollback

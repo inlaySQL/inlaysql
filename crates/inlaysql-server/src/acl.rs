@@ -816,7 +816,7 @@ fn as_int(value: &Value) -> Option<i64> {
 /// [`Requirement::Undetermined`]. The list is exactly the set
 /// [`crate::shim::handles`] claims, so a statement can never be classified as
 /// the shim's here and reach the engine there, or the other way round.
-pub fn shim_requirement(sql: &str, session: &Session) -> Requirement {
+pub fn shim_requirement(sql: &str, session: &Session, catalog: &Catalog) -> Requirement {
     // Normalised first, exactly as `crate::shim::intercept` normalises before
     // it dispatches. **This line is a privilege check, not tidiness.** Both
     // sides have to read the same text, and without it they did not: a
@@ -864,6 +864,28 @@ pub fn shim_requirement(sql: &str, session: &Session) -> Requirement {
         // `ER_KILL_DENIED_ERROR` otherwise — so answering `Authenticated` here
         // is deferral to a stricter check, not an absence of one.
         "KILL" => Requirement::Authenticated,
+        // MySQL's own requirement for `OPTIMIZE TABLE`: SELECT and INSERT on
+        // every table named. Attributable per table because the statement
+        // names them, and parsed by the same function that will run it — a
+        // second parser here is how the set of tables checked stops being the
+        // set of tables touched.
+        "OPTIMIZE" => match crate::shim::parse_optimize(sql, catalog) {
+            Ok(tables) => Requirement::Needs(
+                tables
+                    .into_iter()
+                    .flat_map(|table| {
+                        [Privileges::SELECT, Privileges::INSERT].map(move |privilege| Need {
+                            table: Some(table.to_ascii_lowercase()),
+                            privilege,
+                        })
+                    })
+                    .collect(),
+            ),
+            // Refused at the point it runs, with its own message. Until then
+            // it is a statement nothing here could attribute, which is the
+            // default-deny case this variant exists for.
+            Err(error) => Requirement::Undetermined(error.message),
+        },
         other => Requirement::Undetermined(format!(
             "`{other}` is answered by this server rather than by the engine, and there is no \
              privilege defined for it"
@@ -2203,7 +2225,7 @@ mod tests {
     /// classify has to be refused, not waved through.
     #[test]
     fn an_unclassifiable_shim_statement_is_refused_rather_than_allowed() {
-        let requirement = shim_requirement("FLUSH PRIVILEGES", &session());
+        let requirement = shim_requirement("FLUSH PRIVILEGES", &session(), &Catalog::new());
         assert!(
             matches!(requirement, Requirement::Undetermined(_)),
             "{requirement:?}"
@@ -2229,7 +2251,7 @@ mod tests {
             "/*!40101 SET NAMES utf8 */",
         ] {
             assert_eq!(
-                shim_requirement(sql, &session()),
+                shim_requirement(sql, &session(), &Catalog::new()),
                 Requirement::Authenticated,
                 "{sql}"
             );
@@ -2239,27 +2261,36 @@ mod tests {
     #[test]
     fn changing_your_own_password_is_not_an_administrative_act() {
         assert_eq!(
-            shim_requirement("ALTER USER 'root' IDENTIFIED BY 'x'", &session()),
+            shim_requirement(
+                "ALTER USER 'root' IDENTIFIED BY 'x'",
+                &session(),
+                &Catalog::new()
+            ),
             Requirement::Authenticated
         );
         assert_eq!(
-            shim_requirement("ALTER USER 'other' IDENTIFIED BY 'x'", &session()),
+            shim_requirement(
+                "ALTER USER 'other' IDENTIFIED BY 'x'",
+                &session(),
+                &Catalog::new()
+            ),
             Requirement::Administrative
         );
         // Naming yourself *and* somebody else is still administrative.
         assert_eq!(
             shim_requirement(
                 "ALTER USER 'root' IDENTIFIED BY 'x', 'o' IDENTIFIED BY 'y'",
-                &session()
+                &session(),
+                &Catalog::new()
             ),
             Requirement::Administrative
         );
         assert_eq!(
-            shim_requirement("SHOW GRANTS", &session()),
+            shim_requirement("SHOW GRANTS", &session(), &Catalog::new()),
             Requirement::Authenticated
         );
         assert_eq!(
-            shim_requirement("SHOW GRANTS FOR 'other'", &session()),
+            shim_requirement("SHOW GRANTS FOR 'other'", &session(), &Catalog::new()),
             Requirement::Administrative
         );
     }

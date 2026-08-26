@@ -177,6 +177,50 @@ its (always-empty) value first, the way the general-purpose walk has to.
 the general walk plus the ordinary decode, rather than trusting the two to
 stay in step by inspection.
 
+## The build is deferred, and you can ask for it
+
+A write does not build the index it belongs to. It stages the document or the
+embedding in the backend and marks the table dirty; the *first read that needs
+the index* commits every backend, which for a graph index is where the graph is
+actually built. That is the right trade row at a time — writes stay cheap and
+the cost is paid once per read-after-write — and the wrong one after a bulk
+load, where it hides the whole build inside one innocent `SELECT`. The
+ann-benchmarks run measured it: of a 294.9 s glove-25 load, **258.7 s was the
+graph build happening inside whichever query arrived first**, with nothing in
+the statement to explain the wait.
+
+So the build can be asked for:
+
+| | |
+| --- | --- |
+| SQL | `REINDEX` — every table; `REINDEX <table>`; `REINDEX <index>` |
+| Embedded | `Database::reindex(None)` / `Database::reindex(Some("docs"))` |
+| MySQL wire | `OPTIMIZE TABLE docs [, notes]` |
+
+All three run the same code. Three things are worth knowing:
+
+- **The default did not change.** A loader that never queries still never pays
+  for a build. This is a request, not a policy.
+- **Nothing pending is a no-op**, decided per *table*, so a second `REINDEX
+  docs` in a row does nothing and says so — over the wire in MySQL's own words,
+  `Table is already up to date`. Safe to put in a cron job.
+- **It can be stopped**, by a statement timeout or a `KILL`, between one index
+  and the next. A stopped build leaves the work pending exactly as if it had
+  never been asked for, so the next read does it and no search ever sees a
+  half-built index. It is *not* stoppable inside one index's commit — that call
+  is opaque to the engine, and a backend that could be interrupted half-way
+  through its own build would have to be able to put its pending set back,
+  which none of the graph backends can. On a database with one index, that
+  means the check happens before the build starts and not again.
+
+`REINDEX` is SQLite's spelling and is answered in SQLite's terms: it returns no
+rows. `OPTIMIZE TABLE` is MySQL's, and is answered with MySQL's four-column
+result set, on the MySQL side of the seam ([`docs/server.md`](server.md)) —
+the engine's dialect gains nothing MySQL-shaped. What this engine's `OPTIMIZE
+TABLE` does *not* do is MySQL's other half, rebuilding the table to reclaim
+free space; that is why the `Msg_text` names what happened rather than always
+saying `OK`.
+
 ## The one rule
 
 **The rows are the source of truth. A saved index is a cache.**
