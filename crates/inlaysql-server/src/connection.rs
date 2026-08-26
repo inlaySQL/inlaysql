@@ -1970,7 +1970,7 @@ fn decode_vector_param(
     }
 
     let mut embedding = Vec::with_capacity(dim);
-    for (component, chunk) in bytes.chunks_exact(4).enumerate() {
+    for (component, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
         let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         // Refused rather than stored. A NaN compares false against everything,
         // so a graph node holding one is unreachable from its own neighbours

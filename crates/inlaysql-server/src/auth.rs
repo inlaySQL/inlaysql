@@ -504,7 +504,7 @@ fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
     }
     let mut out = [0u8; N];
     let bytes = text.as_bytes();
-    for (slot, pair) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+    for (slot, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
         let high = (pair[0] as char).to_digit(16)?;
         let low = (pair[1] as char).to_digit(16)?;
         *slot = ((high << 4) | low) as u8;
