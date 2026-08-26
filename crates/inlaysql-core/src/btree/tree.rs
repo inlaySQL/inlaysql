@@ -199,6 +199,11 @@ pub struct CowBTree<D: Device> {
     /// walking from the root again. See [`ReadCursor`] for the shape and
     /// [`CowBTree::reseek`] for how it is used and invalidated.
     cursor: RefCell<Option<ReadCursor>>,
+    /// The last committed row-id range leaf. A subsequent range wholly inside
+    /// that leaf can skip the root-to-leaf walk; a range that is not covered
+    /// falls back to the ordinary traversal. Kept separate from the point
+    /// cursor because the two read patterns have different locality.
+    range_cursor: RefCell<Option<RangeCursor>>,
     /// Whether [`CowBTree::alloc_page`] may hand out a page id the free list
     /// (Phase 2 item 6) has recorded as reclaimable. `false` by default and
     /// for every existing caller: with this off, allocation is exactly the
@@ -438,6 +443,7 @@ impl<D: Device> CowBTree<D> {
             cache: RefCell::new(PageCache::new(DEFAULT_PAGE_CACHE_BYTES)),
             scratch: RefCell::new(vec![0u8; page_size]),
             cursor: RefCell::new(None),
+            range_cursor: RefCell::new(None),
             reuse_enabled: false,
             free_candidates: Vec::new(),
             freed_this_txn: Vec::new(),
@@ -525,6 +531,7 @@ impl<D: Device> CowBTree<D> {
         if self.reuse_enabled {
             self.cache.borrow_mut().clear();
             *self.cursor.borrow_mut() = None;
+            *self.range_cursor.borrow_mut() = None;
         }
     }
 
@@ -850,6 +857,26 @@ impl<D: Device> CowBTree<D> {
             *slot = Some(ReadCursor {
                 root,
                 leaf,
+                low,
+                high,
+            });
+        }
+    }
+
+    /// Retain the last committed row-id range leaf reached by a walk.
+    ///
+    /// The sources name the cumulative key span supplied by the internal
+    /// separators on the path to that leaf. They are cloned only after the
+    /// walk has finished, so ordinary range scans do not allocate bounds for
+    /// every leaf they visit.
+    fn retain_range_cursor(&self, root: PageId, generation: u64, candidate: RangeCursorCandidate) {
+        let low = bound_key(candidate.low_source);
+        let high = bound_key(candidate.high_source);
+        if let Ok(mut slot) = self.range_cursor.try_borrow_mut() {
+            *slot = Some(RangeCursor {
+                root,
+                leaf: candidate.leaf,
+                generation,
                 low,
                 high,
             });
@@ -1512,7 +1539,38 @@ impl<D: Device> CowBTree<D> {
             after,
             limit,
         };
-        self.walk_raw_row_ids(self.read_root(), &bounds, self.has_pending, &mut out)?;
+        let root = self.read_root();
+        let pending = self.has_pending;
+        let generation = (!pending)
+            .then(|| self.device.commit_generation())
+            .flatten();
+        if let Some(generation) = generation {
+            if let Ok(slot) = self.range_cursor.try_borrow() {
+                if let Some(cursor) = slot.as_ref() {
+                    if cursor.root == root
+                        && cursor.generation == generation
+                        && cursor.covers(&bounds)
+                        && self.scan_row_ids_from_range_cursor(cursor, &bounds, &mut out)?
+                    {
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+        let mut candidate = None;
+        self.walk_raw_row_ids(
+            root,
+            &bounds,
+            pending,
+            &mut out,
+            RangeSpanSources::default(),
+            &mut candidate,
+        )?;
+        if let Some(generation) = generation {
+            if let Some(candidate) = candidate {
+                self.retain_range_cursor(root, generation, candidate);
+            }
+        }
         Ok(out)
     }
 
@@ -2410,6 +2468,41 @@ impl<D: Device> CowBTree<D> {
         })
     }
 
+    /// Read a range directly from the retained committed leaf when its whole
+    /// interval fits inside that leaf. A raw leaf is still read once because
+    /// row-id scans deliberately do not cache leaf nodes; the saving is the
+    /// root-to-leaf descent and its internal-page work.
+    fn scan_row_ids_from_range_cursor(
+        &self,
+        cursor: &RangeCursor,
+        bounds: &WalkBounds<'_>,
+        out: &mut Vec<RowId>,
+    ) -> Result<bool> {
+        let leaf = cursor.leaf;
+        if let Some(node) = self.cached_page(leaf, false) {
+            let Node::Leaf { bytes, .. } = &*node else {
+                return Ok(false);
+            };
+            self.scan_leaf_row_ids_into(bytes, bounds, out)?;
+            return Ok(true);
+        }
+        self.with_raw_page(leaf, false, |page_size, bytes| {
+            match bytes[page::OFF_KIND] {
+                page::KIND_LEAF => {
+                    self.scan_leaf_row_ids_into(bytes, bounds, out)?;
+                    Ok(true)
+                }
+                page::KIND_INTERNAL => {
+                    // A retained cursor naming an internal page is not
+                    // usable, but the normal walk remains a correct fallback.
+                    let _ = page::decode(page_size, bytes)?;
+                    Ok(false)
+                }
+                other => Err(Error::Corrupt(alloc::format!("unknown node kind {other}"))),
+            }
+        })
+    }
+
     /// Read one page into the reusable scratch buffer and hand it to `f`.
     ///
     /// The buffer is what removes the per-read heap allocation the tree used to
@@ -2712,6 +2805,8 @@ impl<D: Device> CowBTree<D> {
         bounds: &WalkBounds<'_>,
         pending: bool,
         out: &mut Vec<RowId>,
+        span: RangeSpanSources,
+        last_leaf: &mut Option<RangeCursorCandidate>,
     ) -> Result<()> {
         if id == 0 || out.len() >= bounds.limit {
             return Ok(());
@@ -2720,6 +2815,11 @@ impl<D: Device> CowBTree<D> {
         let cached = match self.cached_page(id, pending) {
             Some(node) => match &*node {
                 Node::Leaf { bytes, .. } => {
+                    *last_leaf = Some(RangeCursorCandidate {
+                        leaf: id,
+                        low_source: span.low.clone(),
+                        high_source: span.high.clone(),
+                    });
                     self.scan_leaf_row_ids_into(bytes, bounds, out)?;
                     return Ok(());
                 }
@@ -2734,6 +2834,11 @@ impl<D: Device> CowBTree<D> {
                 let decoded = self.with_raw_page(id, pending, |page_size, bytes| {
                     match bytes[page::OFF_KIND] {
                         page::KIND_LEAF => {
+                            *last_leaf = Some(RangeCursorCandidate {
+                                leaf: id,
+                                low_source: span.low.clone(),
+                                high_source: span.high.clone(),
+                            });
                             self.scan_leaf_row_ids_into(bytes, bounds, out)?;
                             Ok(None)
                         }
@@ -2759,7 +2864,20 @@ impl<D: Device> CowBTree<D> {
             };
             let (leftmost, cells) = (*leftmost, cells);
             if cells.is_empty() || bounds.starts_below(cells[0].key.resolve(bytes)) {
-                self.walk_raw_row_ids(leftmost, bounds, pending, out)?;
+                self.walk_raw_row_ids(
+                    leftmost,
+                    bounds,
+                    pending,
+                    out,
+                    RangeSpanSources {
+                        low: span.low.clone(),
+                        high: cells
+                            .first()
+                            .map(|_| (Rc::clone(&node), 0))
+                            .or_else(|| span.high.clone()),
+                    },
+                    last_leaf,
+                )?;
             }
             for (i, separator) in cells.iter().enumerate() {
                 if out.len() >= bounds.limit {
@@ -2774,7 +2892,20 @@ impl<D: Device> CowBTree<D> {
                     None => true,
                 };
                 if below_upper && above_lower {
-                    self.walk_raw_row_ids(separator.child, bounds, pending, out)?;
+                    self.walk_raw_row_ids(
+                        separator.child,
+                        bounds,
+                        pending,
+                        out,
+                        RangeSpanSources {
+                            low: Some((Rc::clone(&node), i)),
+                            high: cells
+                                .get(i + 1)
+                                .map(|_| (Rc::clone(&node), i + 1))
+                                .or_else(|| span.high.clone()),
+                        },
+                        last_leaf,
+                    )?;
                 }
             }
         }
@@ -3074,6 +3205,69 @@ impl ReadCursor {
         }
         true
     }
+}
+
+/// A committed range leaf that can answer another wholly-contained range.
+///
+/// The tree has no sibling pointers, so this intentionally handles only the
+/// case where the requested interval fits inside one retained leaf. Any range
+/// that needs another leaf falls back to the normal root walk, which preserves
+/// the existing traversal semantics without requiring a path mutation API.
+struct RangeCursor {
+    /// The committed root under which `leaf` was reached.
+    root: PageId,
+    /// The leaf whose key span is `low..high`.
+    leaf: PageId,
+    /// The device generation at which the leaf was retained. Devices that
+    /// cannot provide this cross-handle epoch never retain or use the cursor.
+    generation: u64,
+    /// Inclusive lower edge of the leaf span, or unbounded for the first leaf.
+    low: Option<Vec<u8>>,
+    /// Exclusive upper edge of the leaf span, or unbounded for the last leaf.
+    high: Option<Vec<u8>>,
+}
+
+impl RangeCursor {
+    /// Whether `bounds` cannot need a key outside this leaf.
+    fn covers(&self, bounds: &WalkBounds<'_>) -> bool {
+        let lower = bounds
+            .after
+            .filter(|after| *after > bounds.start)
+            .unwrap_or(bounds.start);
+        if self.low.as_ref().is_some_and(|low| lower < low.as_slice()) {
+            return false;
+        }
+        if self
+            .high
+            .as_ref()
+            .is_some_and(|high| lower >= high.as_slice())
+        {
+            return false;
+        }
+        if matches!((bounds.end, self.high.as_deref()), (None, Some(_)))
+            || matches!((bounds.end, self.high.as_deref()), (Some(end), Some(high)) if end > high)
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// A range walk's last leaf plus the separator sources that define its span.
+///
+/// `Rc<Node>` keeps the source pages alive until [`CowBTree::retain_range_cursor`]
+/// copies the two boundary keys. It avoids cloning those keys on every leaf.
+struct RangeCursorCandidate {
+    leaf: PageId,
+    low_source: Option<(Rc<Node>, usize)>,
+    high_source: Option<(Rc<Node>, usize)>,
+}
+
+/// Separator sources describing one child span during a range walk.
+#[derive(Clone, Default)]
+struct RangeSpanSources {
+    low: Option<(Rc<Node>, usize)>,
+    high: Option<(Rc<Node>, usize)>,
 }
 
 /// Clone the separator key `source` names, if any. The one place
@@ -4292,6 +4486,132 @@ mod tests {
                 .unwrap(),
             committed_pending
         );
+    }
+
+    #[test]
+    fn a_range_cursor_reuses_one_committed_leaf_only() {
+        let entry = |id: u64| {
+            let mut key = b"\x01idx:i\0".to_vec();
+            key.extend_from_slice(&id.to_be_bytes());
+            key.extend_from_slice(&id.to_be_bytes());
+            key
+        };
+        let device = Rc::new(RefCell::new(CountingDisk::new(true)));
+        let mut db = CowBTree::create(device.clone(), PAGE).unwrap();
+        for id in 0..400u64 {
+            db.put(&entry(id), &[]).unwrap();
+            if id % 32 == 31 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        // With the decoded-page cache off, a cursor hit is exactly one raw
+        // leaf read; a fallback must also read the root and internal pages.
+        db.set_page_cache_bytes(0);
+        reads_since(&db);
+
+        let first = db
+            .scan_range_row_ids_from(&entry(100), Some(&entry(103)), None, usize::MAX)
+            .unwrap();
+        assert_eq!(first, vec![100, 101, 102]);
+        let (low, high) = {
+            let cursor = db.range_cursor.borrow();
+            let cursor = cursor.as_ref().expect("the scan must retain its leaf");
+            (
+                cursor
+                    .low
+                    .clone()
+                    .expect("the middle leaf has a lower edge"),
+                cursor
+                    .high
+                    .clone()
+                    .expect("the middle leaf has an upper edge"),
+            )
+        };
+
+        // A point lookup can populate the same leaf in the decoded cache. The
+        // range cursor must use that cached page without falling back to I/O.
+        db.set_page_cache_bytes(DEFAULT_PAGE_CACHE_BYTES);
+        assert_eq!(
+            db.get(&entry(102)).unwrap(),
+            Some(RowBuf::Owned(Vec::new()))
+        );
+        reads_since(&db);
+        let cached = db
+            .scan_range_row_ids_from(&low, Some(&high), None, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            reads_since(&db),
+            0,
+            "a cached cursor leaf needs no device read"
+        );
+        assert_eq!(cached, direct_row_ids_for_span(&db, &low, &high));
+
+        db.set_page_cache_bytes(0);
+        reads_since(&db);
+        let direct = db
+            .scan_range_row_ids_from(&low, Some(&high), None, usize::MAX)
+            .unwrap();
+        assert_eq!(
+            reads_since(&db),
+            1,
+            "a covered range should read its leaf without restarting the descent"
+        );
+        assert_eq!(
+            direct,
+            db.scan_range_row_ids_decoded_from(&low, Some(&high), None, usize::MAX)
+                .unwrap()
+        );
+
+        // A commit by another handle advances the device generation while db
+        // keeps the same snapshot root. The old cursor must still be rejected.
+        let mut other = CowBTree::open(device).unwrap();
+        other.put(&entry(500), &[]).unwrap();
+        other.commit().unwrap();
+        reads_since(&db);
+        let after_other_commit = db
+            .scan_range_row_ids_from(&low, Some(&high), None, usize::MAX)
+            .unwrap();
+        assert_eq!(after_other_commit, direct);
+        assert!(
+            reads_since(&db) > 1,
+            "a generation mismatch must fall back to the full range walk"
+        );
+
+        // A new root on this handle also makes the old cursor ineligible.
+        let root_before = db.root();
+        db.put(&entry(501), &[]).unwrap();
+        db.commit().unwrap();
+        assert_ne!(db.root(), root_before);
+        reads_since(&db);
+        let after_root_change = db
+            .scan_range_row_ids_from(&low, Some(&high), None, usize::MAX)
+            .unwrap();
+        assert_eq!(after_root_change, direct);
+        assert!(reads_since(&db) > 1);
+
+        // Pending pages never use the committed cursor. Delete an existing
+        // entry so a stale cursor would return a visibly wrong row-id set.
+        db.delete(&entry(101)).unwrap();
+        let dirty_raw = db
+            .scan_range_row_ids_from(&low, Some(&high), None, usize::MAX)
+            .unwrap();
+        let dirty_decoded = db
+            .scan_range_row_ids_decoded_from(&low, Some(&high), None, usize::MAX)
+            .unwrap();
+        assert_eq!(dirty_raw, dirty_decoded);
+        assert_eq!(dirty_raw.len(), direct.len() - 1);
+        assert!(!dirty_raw.contains(&101));
+        db.rollback();
+    }
+
+    fn direct_row_ids_for_span(
+        db: &CowBTree<Rc<RefCell<CountingDisk>>>,
+        low: &[u8],
+        high: &[u8],
+    ) -> Vec<RowId> {
+        db.scan_range_row_ids_decoded_from(low, Some(high), None, usize::MAX)
+            .unwrap()
     }
 
     /// The row-id-and-value walk is the table scan's fast path, so it has to
