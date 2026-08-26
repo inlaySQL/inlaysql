@@ -1,0 +1,35 @@
+# InlaySQL's `ann-benchmarks` algorithm definition.
+#
+# Copy this directory to `ann_benchmarks/algorithms/inlaysql/` in an
+# `ann-benchmarks` checkout — see bench/README.md. `definitions.py` imports
+# `<module>.module` and calls `<constructor>(*base_args, arg_group)`.
+#
+# `float/any` and not `float/angular`: the constructor refuses a non-angular
+# metric outright (`vector_score` is cosine similarity and the SQL surface has
+# no other scorer), so a euclidean dataset fails loudly with the reason instead
+# of being quietly skipped by a missing config key.
+float:
+  any:
+    - base_args: ['@metric']
+      constructor: InlaySQL
+      disabled: false
+      docker_tag: ann-benchmarks-inlaysql
+      module: ann_benchmarks.algorithms.inlaysql
+      name: inlaysql
+      run_groups:
+        # InlaySQL exposes no `m` and no `ef_construction` in SQL, so there is
+        # no graph-shape grid to sweep — unlike pgvector, whose config varies
+        # `M` here. The one build-time knob the SQL surface has is the column
+        # type: exact `VECTOR(d)` against quantised `VECTOR(d, INT8)`.
+        exact:
+          arg_groups: [{quantization: 'exact'}]
+          args: {}
+          # The over-fetch factor: `LIMIT k * over_fetch`, truncated to k. The
+          # only query-time dial a SQL user has, because the graph walk is
+          # `max(ef_search, k * ef_search_multiplier)` = `max(64, 2k)` and
+          # `ef_search` is not settable outside Rust.
+          query_args: [[1, 2, 4, 8, 16, 32, 64]]
+        int8:
+          arg_groups: [{quantization: 'int8'}]
+          args: {}
+          query_args: [[1, 2, 4, 8, 16, 32, 64]]

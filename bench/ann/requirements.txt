@@ -1,0 +1,13 @@
+# Python-side dependencies for the ann-benchmarks adapter and its standalone
+# runner (`bench/ann/run.py`). Dev tooling only: nothing here is a dependency of
+# the engine, and no Rust dependency was added for any of it.
+#
+#   python3 -m venv bench/ann/.venv
+#   bench/ann/.venv/bin/pip install -r bench/ann/requirements.txt
+#
+# Inside a real ann-benchmarks checkout, h5py and numpy come from its own
+# requirements; only mysql-connector-python is extra, and bench/ann/Dockerfile
+# installs it.
+h5py>=3.10
+numpy>=1.26
+mysql-connector-python>=8.3

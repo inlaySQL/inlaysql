@@ -17,6 +17,10 @@ REPEATS=5 SUITE=retrieval ./bench/repeat.sh
 # The HNSW parameter grid behind the shipped defaults. Not in `all`: it is
 # one graph build per (M, ef_construction) point and takes minutes.
 cargo run --release -p inlaysql-bench -- --suite sweep --docs 20000
+
+# ann-benchmarks: somebody else's corpus, somebody else's ground truth,
+# somebody else's protocol. See "ann-benchmarks" below.
+bench/ann/.venv/bin/python bench/ann/run.py --dataset glove-25-angular
 ```
 
 Writes a timestamped file to `bench/results/` (git-ignored) containing the
@@ -928,6 +932,248 @@ that page and is the reason a repeat on a quiet machine is still worth doing.
 The first such run (AHL-495) read 1.52x and 1.10x on reads under a load average
 of 5.4; neither run had a controlled machine, and the read margin is inside the
 spread between them. Run `./bench/compare.sh` yourself to reproduce it.
+
+## ann-benchmarks — an external corpus, an external ground truth, an external protocol
+
+Everything above this line is ours. Our harness, our corpus, our oracle, our
+machine. `BENCHMARK.md` says so on every page, and saying so does not fix it:
+a benchmark whose data, protocol and definition of "correct" all come from the
+engine's own authors cannot be checked by anyone who did not write the engine.
+Two of this repository's own numbers have already been wrong in exactly that
+way — a published 10M-vector memory estimate that understated by 2.3x, and a
+"we trail on writes" row that turned out to be measuring `fsync` policy rather
+than engines.
+
+[`ann-benchmarks`](https://github.com/erikbern/ann-benchmarks) is the field's
+common ground for approximate nearest neighbour search. It removes all three at
+once:
+
+* **An external corpus.** Fixed datasets published as HDF5 (`glove-*-angular`,
+  `nytimes-256-angular`, `sift-128-euclidean`, ...), downloaded byte-for-byte
+  from `ann-benchmarks.com`. Nothing here generates data.
+* **An external ground truth.** Each file carries its own `neighbors` and
+  `distances` arrays — the exact answer, computed by somebody else. The
+  `vectors` suite above scores InlaySQL against an oracle this repository
+  computes; this one never does.
+* **An external protocol.** recall@k against those arrays, QPS as
+  `1 / best_search_time`, and a parameter sweep, all defined upstream. Every
+  other engine on the ann-benchmarks leaderboard was measured this way, so the
+  output is comparable to their published runs without a translation step.
+
+```sh
+python3 -m venv bench/ann/.venv
+bench/ann/.venv/bin/pip install -r bench/ann/requirements.txt
+SDKROOT=$(xcrun --show-sdk-path) cargo build --release -p inlaysql-mcp --bin inlaysql
+
+bench/ann/.venv/bin/python bench/ann/run.py --dataset random-xs-20-angular   # ~1 min, smoke
+bench/ann/.venv/bin/python bench/ann/run.py --dataset glove-25-angular       # the real one
+bench/ann/.venv/bin/python bench/ann/run.py --dataset glove-25-angular --quantization int8
+```
+
+The dataset downloads on first use into `bench/ann/data/` and the results land
+in `bench/ann/results/<dataset>/<k>/inlaysql/` — both git-ignored, both in
+`ann-benchmarks`' own layout, so an `ann-benchmarks` checkout can plot or
+export these files next to every other engine's without converting anything.
+
+### Inside ann-benchmarks proper
+
+`bench/ann/run.py` is the protocol in one file so the adapter can be run from a
+checkout of *this* repository. The adapter itself is a plain `ann-benchmarks`
+plugin and belongs upstream:
+
+```sh
+git clone https://github.com/erikbern/ann-benchmarks && cd ann-benchmarks
+mkdir -p ann_benchmarks/algorithms/inlaysql
+cp /path/to/inlaysql/bench/ann/{__init__.py,module.py,config.yml,Dockerfile} \
+   ann_benchmarks/algorithms/inlaysql/
+python install.py --algorithm inlaysql          # builds bench/ann/Dockerfile
+python run.py --dataset glove-25-angular --algorithm inlaysql
+python plot.py --dataset glove-25-angular
+```
+
+Four files, not the directory: `run.py`, `requirements.txt`, the downloaded
+corpora and the virtualenv are this repository's scaffolding for running the
+same adapter without `ann-benchmarks` installed, and none of them belongs in
+`ann_benchmarks/algorithms/`.
+
+`bench/ann/Dockerfile` pins the engine by revision (`--build-arg
+INLAYSQL_REV=...`) so a rebuilt image measures the same engine.
+
+### The seam: the MySQL wire protocol
+
+`bench/ann/module.py` reaches the engine through `inlaysql serve --mysql` over
+an ordinary MySQL client connection, running ordinary SQL:
+
+```sql
+CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(25));
+CREATE INDEX items_embedding ON items (embedding);
+INSERT INTO items (id, embedding) VALUES (0, vector('[...]')), ...;
+SELECT id, vector_score(embedding, vector('[...]')) AS score
+  FROM items ORDER BY score DESC LIMIT 10;
+```
+
+No private entry point, and no Rust written for the benchmark — the number has
+to be what a user gets, not what an internal API can be made to do. It is also
+the only seam that reaches the engine from Python at all: InlaySQL ships no
+Python binding and no C API, so the alternative was the MCP JSON-RPC server,
+which is row-limited and built for language models. The same shape as
+`ann-benchmarks`' own `pgvector` plugin, which drives a local PostgreSQL over
+`psycopg`; both pay a loopback round trip per query that an in-process index
+does not. Measured on this machine, that round trip is **0.037 ms** (`SELECT 1`
+p50 over 3,000 calls on the same connection) against a 0.331 ms glove query —
+about 11%, plus 11 µs of client-side embedding formatting. Real, disclosed, and
+not subtracted.
+
+The adapter spawns the server itself on a port the OS picks, so there is no
+daemon to manage and no port to collide with. `INLAYSQL_HOST`/`INLAYSQL_PORT`
+point it at one that is already running instead.
+
+### Numbers: glove-25-angular
+
+1,183,514 vectors x dim 25, 10,000 queries, k = 10, three runs, on one
+Apple-silicon developer machine. **Recall is against the dataset's own
+`distances` array, not ours.**
+
+Exact `VECTOR(25)` — build 294.9 s (36.2 s loading over the wire, **258.7 s
+building the graph on the first read**), index 1,047 MiB (928 B/vector, 9.3x
+the raw `f32` corpus), server RSS 1,056 MiB:
+
+```
+over_fetch     ef   recall@10        QPS    p50 ms    p95 ms
+         1     64      0.9878     3021.1     0.331     0.357
+         2     64      0.9974     1974.2     0.507     0.551
+         4     80      0.9996     1178.5     0.850     0.938
+         8    160      1.0000      653.2     1.534     1.699
+        16    320      1.0000      357.5     2.794     3.116
+        32    640      1.0000      195.2     5.114     5.674
+        64   1280      1.0000      103.6     9.647    10.745
+```
+
+Quantised `VECTOR(25, INT8)` — build 461.3 s, server RSS after build 790 MiB:
+
+```
+over_fetch     ef   recall@10        QPS    p50 ms    p95 ms
+         1     64      0.9860     2823.3     0.356     0.390
+         2     64      0.9955     1835.6     0.548     0.615
+         4     80      0.9978     1103.8     0.911     1.040
+         8    160      0.9982      618.6     1.622     1.878
+        16    320      0.9982      342.0     2.924     3.398
+        32    640      0.9982      187.4     5.330     6.180
+        64   1280      0.9982      101.1     9.880    11.433
+```
+
+The two together are the more interesting result. On external data, int8 costs
+**1.56x the build time** (461 s against 295 s) and buys **1.34x less resident
+memory** (790 MiB against 1,056 MiB), and its recall **stops at 0.9982** — the
+quantisation error floor, which no amount of over-fetching gets back, where
+exact reaches 1.0000 at `over_fetch = 8`. At the operating point most people
+would pick (`over_fetch = 1`, recall ~0.987) it is also ~7% *slower* per query,
+because the graph walk is the cost and int8 does not shorten it. The "int8 is
+smaller" half of the trade holds on this corpus; nothing about it is faster.
+
+The exact run above is a repeat: an earlier run of the same command built in
+294.7 s, reported the identical recall to four decimals at every point, and QPS
+within 1.7%. The curve is stable on this machine.
+
+`random-xs-20-angular` (9,000 x 20, ann-benchmarks' own smoke dataset) is
+recall 1.0000 at every point, 9,926 QPS at `over_fetch = 1`, 0.8 s to build. It
+proves the wiring, not the index.
+
+**These are not directly comparable in absolute terms to the QPS numbers on
+ann-benchmarks.com.** Those are run on a fixed cloud instance type; this is a
+laptop. What *is* comparable is the shape — the recall/QPS curve, measured the
+same way, on the same data, against the same truth — and anyone can regenerate
+it on their own machine and put both on the same axes.
+
+### What the exercise exposed
+
+Every one of these is a finding about the engine, reported rather than routed
+around.
+
+* **Cosine only, so most of the standard datasets cannot be run at all.**
+  `vector_score` is cosine similarity and the SQL surface has no Euclidean or
+  inner-product scorer. `sift-128-euclidean` and `fashion-mnist-784-euclidean`
+  — the two datasets everyone starts with — are refused by the constructor
+  rather than scored against a ground truth built with a metric the engine does
+  not implement. Only the `-angular` datasets are answerable, which is why
+  `glove-25-angular` is the headline here.
+* **No `ef_search` knob outside Rust.** `ann-benchmarks` expects
+  `set_query_arguments` to sweep the index's query-time parameter, the way the
+  `pgvector` plugin sweeps `SET hnsw.ef_search`. InlaySQL's `HnswParams` has
+  `m`, `ef_construction`, `ef_search` and `ef_search_multiplier`, and **none of
+  them is reachable from SQL** — not in DDL, not as a session variable
+  ("Tuning, and the curve behind the defaults" above points at
+  `HnswIndex::with_params`, which is a Rust API). The one dial a SQL user has
+  is the `LIMIT`, because the graph walk is `max(ef_search, k *
+  ef_search_multiplier)` = `max(64, 2k)`. So the sweep is an **over-fetch
+  factor**: ask for `k * over_fetch` rows, keep the first `k`. It produces a
+  real curve, and `over_fetch` 1 and 2 land on the same graph walk at `k = 10`
+  because both clamp to `ef = 64` — the floor showing through.
+* **Embeddings cannot be bound as parameters.** Over the wire, a string
+  parameter into a `VECTOR` column is `1366: column is VECTOR(n) but the value
+  is TEXT`, and `vector_score(embedding, ?)` fails the same way. Every
+  embedding therefore crosses as a `vector('[...]')` decimal-text literal the
+  server re-parses. That is 11-18 µs per query of client-side formatting
+  (reported as `inlaysql_literal_format_us`, inside the timed region because it
+  is inside a user's timed region too), and it is why loading glove-25 ships
+  363.9 MiB of SQL text for a 112.9 MiB corpus — 3.22x, measured, not estimated.
+* **A transaction may not write more than 1 MiB.** `WAL_BLOCKS` (256) x
+  `DEFAULT_PAGE_SIZE` (4096), in `inlaysql_core::wal`, with no server flag to
+  raise it. A bulk load over the wire has to be split into batches that fit, or
+  it fails with `1030: transaction does not fit the write-ahead log`. The
+  in-process harness hides this — `crates/inlaysql-bench`'s `batched()` catches
+  `Error::Transaction` and commits early — so it only becomes visible to a user
+  writing SQL. `module.py` sizes batches for it and halves on refusal.
+* **88% of the build is one single-threaded stall on the first read.** Of
+  294.9 s for 1.18M vectors, 36.2 s was the load and **258.7 s was the graph**,
+  built when the index is first *read* rather than when the rows are written.
+  So the query that happens to be first blocks for four and a half minutes,
+  and there is no SQL that asks for the build explicitly. Left out of `fit()`
+  it would have landed on ann-benchmarks' first timed query as an outlier, so
+  the adapter forces it with a warm-up query — which is exactly what an
+  application has to do too. `bench/ann/run.py` reports the two halves
+  separately for this reason; ann-benchmarks' own `build_time` is the sum and
+  cannot show which dominates.
+* **928 bytes of RAM per 100-byte vector.** 1,047 MiB of index — measured as
+  the server's RSS growth over an empty server, ann-benchmarks' `index_size` —
+  for a raw `f32` corpus of 112.9 MiB at dim 25. 9.3x. The in-memory index holds
+  the embedding, a normalised copy and the graph, once *per connection*.
+  `--paged-vectors` is the lever for that and is off by default; this run did
+  not use it.
+* **The planner was checked, not trusted.** `fit()` runs `EXPLAIN` and fails if
+  the plan is not `SEARCH ... USING VECTOR INDEX`. A row labelled HNSW that was
+  really a table scan is the most misleading number a vector benchmark can
+  publish — the same check `bench/external/pgvector_driver.py` makes against
+  PostgreSQL's planner.
+
+One methodology bug worth recording, because it produced a plausible-looking
+wrong answer: `ann-benchmarks` defines *angular* distance as
+`scipy.spatial.distance.cosine`, i.e. `1 - cos` — not the Euclidean distance
+between normalised vectors. The two rank identically, so the returned
+neighbours are the same either way; only the *values* differ, and the recall
+test compares values against `true_distances[k-1] + 1e-3`. Written the wrong
+way round it scored a perfect answer as recall 0.0000. `run.py` names the check
+against the published file that settles it.
+
+### BM25 quality has no equivalent here yet
+
+There is no ann-benchmarks for text ranking. The counterpart is
+[BEIR](https://github.com/beir-cellar/beir) — an external corpus, external
+relevance judgements and an external metric (nDCG@10), which is the same three
+things this section buys for vectors. It is **not** built, and it is a larger
+job than this one, because BEIR asks for something the vector side does not:
+
+* a subset with a public `qrels` file and a manageable size — `scifact` (5K
+  documents, 300 queries) or `nfcorpus` (3.6K, 323) are the usual starters;
+* an `nDCG@10` implementation matching `pytrec_eval`'s, since BEIR's headline
+  numbers are graded relevance, not the binary recall this file computes;
+* a decision about what is being measured. BM25 is a *ranking function*, and
+  BEIR's published BM25 baselines are Anserini/Lucene's — with Lucene's
+  analyzer, stemming and tokenisation. InlaySQL's `bm25_score` has its own
+  tokeniser, so a gap against that baseline would be a tokenisation difference
+  and not a scoring one unless the analysis pipeline is matched or the
+  difference is measured separately. That is the whole design question, and it
+  has to be answered before a number from it means anything.
 
 ## What these numbers are not
 

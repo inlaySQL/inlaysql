@@ -176,6 +176,63 @@ embeddings are what an application actually stores.
 (0.986 vs 1.000 exact) and nothing measurable on the random one (0.922 both),
 for a 1.65x smaller file and a 3.96x smaller resident payload.
 
+## Against an external benchmark — `ann-benchmarks`, glove-25-angular
+
+Every other table on this page uses our corpus, our oracle and our harness.
+This one uses none of them.
+[`ann-benchmarks`](https://github.com/erikbern/ann-benchmarks) publishes fixed
+datasets with **precomputed ground-truth neighbours** and one recall/QPS
+protocol that every engine on its leaderboard is measured by;
+`bench/ann/module.py` is InlaySQL's plugin for it, reaching the engine over
+`inlaysql serve --mysql` with ordinary SQL, and `bench/ann/run.py` runs the
+protocol without Docker. Methodology, the seam and every limitation the
+exercise exposed are in
+[`bench/README.md`](bench/README.md#ann-benchmarks--an-external-corpus-an-external-ground-truth-an-external-protocol).
+
+```sh
+bench/ann/.venv/bin/python bench/ann/run.py --dataset glove-25-angular
+```
+
+| | |
+| --- | --- |
+| Commit | `4d9f535` (tree dirty: the adapter was uncommitted when it ran) |
+| Date | 2026-08-26 |
+| Machine | Apple Mac17,9, macOS 27.0 (Darwin 27.0.0 arm64), rustc 1.91.1 |
+| Dataset | `glove-25-angular` — 1,183,514 x dim 25, 10,000 queries, k = 10 |
+| Recall against | the dataset's own `distances` array. **Not our oracle.** |
+
+Exact `VECTOR(25)`, three runs, `QPS = 1 / best_search_time`:
+
+| over-fetch | effective `ef` | recall@10 | QPS | p50 |
+| --- | --- | --- | --- | --- |
+| 1 | 64 | 0.9878 | 3,021 | 0.331 ms |
+| 4 | 80 | 0.9996 | 1,179 | 0.850 ms |
+| 8 | 160 | **1.0000** | 653 | 1.534 ms |
+| 64 | 1,280 | 1.0000 | 104 | 9.647 ms |
+
+Build: 294.9 s — 36.2 s loading over the wire and **258.7 s building the graph
+on the first read**, which is the single largest cost in this table and the one
+a user hits as an unexplained multi-minute stall on whichever query happens to
+be first. Index: 1,047 MiB for a 112.9 MiB corpus (9.3x).
+
+`VECTOR(25, INT8)` on the same data builds in 461.3 s (1.56x slower), holds
+790 MiB (1.34x smaller), and **tops out at recall 0.9982** — a quantisation
+floor no amount of over-fetching recovers, where exact reaches 1.0000. It is
+also ~7% slower per query at `over_fetch = 1`. The smaller-memory half of that
+trade is real; there is no faster half.
+
+**Not comparable in absolute terms to the QPS figures on ann-benchmarks.com**,
+which are run on a fixed cloud instance type. The curve is comparable, and it
+is the first number on this page that somebody who has never seen this
+repository can check.
+
+Three things the adapter could not do, and they are engine limitations rather
+than harness ones: `vector_score` is cosine-only, so `sift-128-euclidean` and
+`fashion-mnist-784-euclidean` cannot be answered at all; `ef_search` is not
+reachable from SQL, so the sweep above is an over-fetched `LIMIT` rather than
+the `SET hnsw.ef_search` pgvector's own plugin uses; and an embedding cannot be
+bound as a parameter over the wire, so every one crosses as decimal text.
+
 ## Retrieval — BM25 is no longer the expensive half
 
 2,000 documents, dim 384, `LIMIT 10`. Ingest 14,063 docs/s.
@@ -337,6 +394,16 @@ engines. "Comparable" is not "hardware-durable".
 
 ## What is not measured here
 
+- **No external benchmark for text or hybrid ranking.** Vector search now has
+  one — the `ann-benchmarks` table above is an external corpus, an external
+  ground truth and an external protocol. BM25 and the hybrid fusion still have
+  none: every quality figure for them on this page is scored against a
+  reference ranking this repository computes. The counterpart would be a BEIR
+  subset (`scifact`, `nfcorpus`) with its own `qrels` and nDCG@10, and
+  `bench/README.md` records what building it needs — chiefly a decision about
+  whether to match Lucene's analyzer, since BEIR's published BM25 baselines are
+  Anserini's and a gap against them would otherwise be a tokenisation
+  difference wearing a scoring result.
 - **No server-to-server numbers with a trustworthy driver.** The server-to-server
   table above (AHL-495) is the first such run this project has had. It is
   enough to retire the older "we win reads only by being in-process" caveat —

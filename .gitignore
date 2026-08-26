@@ -2,6 +2,13 @@
 **/*.rs.bk
 *.inlay
 bench/results/
+# The ann-benchmarks corpora (hundreds of megabytes, downloaded from
+# ann-benchmarks.com), the result files a run writes, and the throwaway
+# virtualenv `bench/ann/requirements.txt` describes. The adapter itself —
+# module.py, run.py, config.yml, Dockerfile — is committed.
+bench/ann/data/
+bench/ann/results/
+bench/ann/.venv/
 .DS_Store
 
 # cargo-fuzz build artifacts, corpora, and the per-run status the trust
