@@ -47,11 +47,19 @@ pub struct Statement {
     /// This statement's output columns, computed once at prepare time from
     /// `plan` and `schema` — see [`Statement::columns`].
     columns: Vec<ColumnInfo>,
+    /// One entry per placeholder — see [`Statement::parameter_vector_dims`].
+    vector_params: Vec<Option<usize>>,
 }
 
 impl Statement {
     /// Assemble a statement from a freshly resolved plan.
-    pub(crate) fn new(sql: &str, plan: Plan, parameters: usize, catalog: &Catalog) -> Self {
+    pub(crate) fn new(
+        sql: &str,
+        plan: Plan,
+        parameters: usize,
+        vector_params: Vec<Option<usize>>,
+        catalog: &Catalog,
+    ) -> Self {
         // The plan was resolved against this catalog a moment ago, so the
         // lookups cannot miss; taking the tables from the catalog rather than
         // threading them out of the planner keeps the two in step by
@@ -69,6 +77,7 @@ impl Statement {
             parameters,
             schema,
             columns,
+            vector_params,
         }
     }
 
@@ -85,6 +94,28 @@ impl Statement {
     /// How many `?` placeholders the statement has.
     pub fn parameter_count(&self) -> usize {
         self.parameters
+    }
+
+    /// Per placeholder, in `?` order: the embedding dimension this statement's
+    /// shape pins it to, or `None` where it pins none.
+    ///
+    /// `Some(384)` means the value bound there is written into a `VECTOR(384)`
+    /// column or scored against one, and nothing else will do. That is not a
+    /// convenience — it is the only way a caller decoding an untyped wire
+    /// value can tell an embedding from a `BLOB`. A `VECTOR` has no MySQL type
+    /// code any driver in the field sends (MySQL only grew `MYSQL_TYPE_VECTOR`
+    /// in 9.0, and `mysql-connector-python` still tags `bytes` as
+    /// `MYSQL_TYPE_STRING`), so `crates/inlaysql-server` reads this to know
+    /// which parameters to decode as packed `f32` rather than as bytes.
+    /// Guessing from the payload instead would misread a decimal-text
+    /// embedding whose length happened to be `4 * dim` as garbage floats.
+    ///
+    /// Populated where the statement *declares* the width: an `INSERT` or
+    /// `UPDATE` into a vector column, `ON CONFLICT DO UPDATE SET`, and
+    /// `vector_score(column, ?)`. Not for `?` in a projection or a `WHERE`
+    /// comparison, where nothing names a width to check against.
+    pub fn parameter_vector_dims(&self) -> &[Option<usize>] {
+        &self.vector_params
     }
 
     /// This statement's output columns, in projection order.
@@ -354,6 +385,68 @@ mod tests {
                 statement.columns()
             );
         }
+    }
+
+    // --------------------------------------- AHL-478: parameter_vector_dims()
+
+    /// The wire server decodes a parameter as packed `f32` on the strength of
+    /// this and nothing else, so a slot it misses is a bound embedding that
+    /// still cannot be sent, and a slot it invents is a `BLOB` decoded as
+    /// floats. Both directions are pinned here.
+    #[test]
+    fn a_statement_names_which_placeholders_carry_an_embedding() {
+        let catalog = catalog_with(vec![
+            Column::primary_key("id", DataType::Integer),
+            Column::new("body", DataType::Text),
+            Column::new("embedding", DataType::Vector(4)),
+            Column::new("compact", DataType::QuantizedVector(8)),
+        ]);
+        let dims = |sql: &str| {
+            crate::sql::prepare(sql, &catalog)
+                .unwrap_or_else(|error| panic!("{sql}: {error:?}"))
+                .parameter_vector_dims()
+                .to_vec()
+        };
+
+        // Every shape that names a width: the target column of a write, and
+        // the column `vector_score` is scoring against.
+        assert_eq!(
+            dims("INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)"),
+            vec![None, None, Some(4)]
+        );
+        assert_eq!(
+            dims("INSERT INTO docs (id, compact) VALUES (?, ?)"),
+            vec![None, Some(8)],
+            "an int8 column is still bound as full-width f32; the engine quantises it"
+        );
+        assert_eq!(
+            dims("UPDATE docs SET embedding = ?, body = ? WHERE id = ?"),
+            vec![Some(4), None, None]
+        );
+        assert_eq!(
+            dims(
+                "INSERT INTO docs (id, embedding) VALUES (?, ?) \
+                 ON CONFLICT (id) DO UPDATE SET embedding = ?"
+            ),
+            vec![None, Some(4), Some(4)]
+        );
+        assert_eq!(
+            dims(
+                "SELECT id, vector_score(embedding, ?) AS score \
+                 FROM docs WHERE id > ? ORDER BY score DESC LIMIT 5"
+            ),
+            vec![Some(4), None]
+        );
+
+        // And every shape that does not. A `?` compared against a vector
+        // column names no width to check a payload against, and one in a
+        // projection names nothing at all — decoding either as packed floats
+        // would be this server inventing a type for a value the client sent as
+        // bytes.
+        assert_eq!(dims("SELECT ? FROM docs"), vec![None]);
+        assert_eq!(dims("SELECT id FROM docs WHERE embedding = ?"), vec![None]);
+        assert_eq!(dims("SELECT id FROM docs WHERE body = ?"), vec![None]);
+        assert!(dims("SELECT id FROM docs").is_empty());
     }
 
     #[test]

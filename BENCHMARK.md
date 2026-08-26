@@ -240,8 +240,14 @@ deliberately absent — inner product is not a metric, and the reasoning is in
 `crates/inlaysql-core/src/hnsw.rs`. The sweep above is an over-fetched `LIMIT`
 and predates `SET inlaysql_hnsw_ef_search`, which the adapter now sweeps
 instead — the same dial pgvector's own plugin sweeps as `SET hnsw.ef_search`;
-`m` and `ef_construction` are still Rust-only. An embedding still cannot be
-bound as a parameter over the wire, so every one crosses as decimal text.
+`m` and `ef_construction` are still Rust-only. An embedding **can** now be bound
+as a parameter over the wire (AHL-478) — `dim` little-endian `f32`s in a string
+parameter, MySQL 9's own `VECTOR` storage format — where every one used to cross
+as decimal text. Measured on `glove-25-angular`, that took the load from 363.9
+MiB on the wire for a 112.9 MiB corpus (3.22x) to 127.9 MiB (1.13x) and from
+41.20 s to 19.77 s, counted by the server's own `Bytes_received`. Recall is
+untouched: the same `f32`s reach the index either way, and only their spelling
+on the wire changed. See `bench/README.md` and `docs/server.md`.
 
 ## Retrieval — BM25 is no longer the expensive half
 

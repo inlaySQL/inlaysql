@@ -1141,14 +1141,40 @@ around.
   needs a catalog format change to record them per index and a rebuild to
   apply them. That is why there is still no graph-shape grid in `config.yml`,
   where pgvector's varies `M`.
-* **Embeddings cannot be bound as parameters.** Over the wire, a string
-  parameter into a `VECTOR` column is `1366: column is VECTOR(n) but the value
-  is TEXT`, and `vector_score(embedding, ?)` fails the same way. Every
-  embedding therefore crosses as a `vector('[...]')` decimal-text literal the
-  server re-parses. That is 11-18 µs per query of client-side formatting
-  (reported as `inlaysql_literal_format_us`, inside the timed region because it
-  is inside a user's timed region too), and it is why loading glove-25 ships
-  363.9 MiB of SQL text for a 112.9 MiB corpus — 3.22x, measured, not estimated.
+* **Embeddings are bound as parameters — fixed (AHL-478).** This used to read
+  "embeddings cannot be bound": a string parameter into a `VECTOR` column was
+  `1366: column is VECTOR(n) but the value is TEXT` whatever was bound to it,
+  and `vector_score(embedding, ?)` failed the same way, so every embedding had
+  to cross as a `vector('[...]')` decimal-text literal the server re-parsed.
+
+  An embedding now binds as `dim` little-endian `f32`s in a string parameter —
+  `numpy`'s own buffer, sent as `bytes`, which is MySQL 9's `VECTOR` storage
+  format. Which `?` is an embedding comes from the statement rather than from
+  the packet, because the MySQL protocol has no vector type code any driver in
+  the field emits; see `docs/server.md`, "Binding a `VECTOR` parameter".
+
+  Both halves measured on glove-25 (1,183,514 x 25, 112.9 MiB of raw `f32`),
+  same machine, same batching, bytes read off the **server's** own
+  `Bytes_received` counter rather than estimated from the SQL the client built:
+
+  | Load path | Bytes on the wire | vs corpus | Load time |
+  | --- | --- | --- | --- |
+  | `vector('[...]')` decimal text | 363.9 MiB | 3.22x | 41.20 s |
+  | bound packed `f32` | 127.9 MiB | **1.13x** | **19.77 s** |
+
+  2.85x fewer bytes and 2.08x faster to load. The 363.9 MiB figure is the same
+  one this section reported before the fix, reproduced by re-running the old
+  path. Per query, formatting the query embedding fell from 11-18 µs of decimal
+  formatting to about 0.3 µs of `tobytes()` — reported as
+  `inlaysql_embedding_pack_us`, still inside the timed region because it is
+  inside a user's timed region too. `run.py` prints the wire figure for every
+  run, so the claim stays measured rather than remembered.
+
+  **The recall/QPS tables above were measured with the old inlining path and
+  have not been re-run.** They are still true readings: the bytes stored and the
+  graph built are identical either way — the change is how the same `f32`s reach
+  the server — so recall is unaffected, and the QPS numbers are if anything
+  pessimistic by the 11-18 µs of formatting that is no longer paid.
 * **A transaction may not write more than 1 MiB.** `WAL_BLOCKS` (256) x
   `DEFAULT_PAGE_SIZE` (4096), in `inlaysql_core::wal`, with no server flag to
   raise it. A bulk load over the wire has to be split into batches that fit, or

@@ -1152,6 +1152,12 @@ impl<S: Read + Write> Connection<S> {
                     .collect()
             })
             .unwrap_or_default();
+        // Which placeholders take an embedding — see `decode_vector_param`.
+        let vector_dims: Vec<Option<usize>> = prepared
+            .plan
+            .as_ref()
+            .map(|plan| plan.parameter_vector_dims().to_vec())
+            .unwrap_or_default();
         self.statements.insert(id, prepared);
 
         let mut packet = vec![0x00];
@@ -1165,7 +1171,24 @@ impl<S: Read + Write> Connection<S> {
         let schema = shim::schema_name(&self.session);
         if param_count > 0 {
             for index in 0..param_count {
-                let def = ColumnDef::text(format!("?{}", index + 1));
+                // An embedding parameter is described as a binary string of
+                // exactly the width it must carry, which is what
+                // `decode_vector_param` will insist on; every other parameter
+                // keeps the text description, the widest thing a client may
+                // send. Most drivers skip these packets entirely, but a server
+                // that advertises `VAR_STRING utf8mb4` for a slot it will only
+                // accept packed `f32` in is telling a client something untrue.
+                let def = match vector_dims.get(index).copied().flatten() {
+                    Some(dim) => ColumnDef {
+                        name: format!("?{}", index + 1),
+                        table: String::new(),
+                        ty: protocol::TYPE_BLOB,
+                        charset: protocol::CHARSET_BINARY,
+                        flags: protocol::FLAG_BINARY,
+                        length: u32::try_from(dim.saturating_mul(4)).unwrap_or(u32::MAX),
+                    },
+                    None => ColumnDef::text(format!("?{}", index + 1)),
+                };
                 self.stream.write_message(&def.encode(&schema))?;
             }
             let status = self.session.status_flags();
@@ -1325,6 +1348,16 @@ impl<S: Read + Write> Connection<S> {
             types
         };
 
+        // Which placeholders the *statement* says are embeddings. Read from the
+        // plan rather than inferred from the wire, because the wire cannot say:
+        // see [`decode_vector_param`].
+        let vector_dims: Vec<Option<usize>> = self
+            .statements
+            .get(&id)
+            .and_then(|prepared| prepared.plan.as_ref())
+            .map(|plan| plan.parameter_vector_dims().to_vec())
+            .unwrap_or_default();
+
         let mut params = Vec::with_capacity(count);
         for (index, (ty, unsigned)) in types.iter().enumerate() {
             let is_null = null_bitmap
@@ -1334,7 +1367,12 @@ impl<S: Read + Write> Connection<S> {
                 params.push(Value::Null);
                 continue;
             }
-            params.push(decode_binary_param(&mut reader, *ty, *unsigned).map_err(|_| malformed())?);
+            match vector_dims.get(index).copied().flatten() {
+                Some(dim) => params.push(decode_vector_param(&mut reader, *ty, dim, index)?),
+                None => params.push(
+                    decode_binary_param(&mut reader, *ty, *unsigned).map_err(|_| malformed())?,
+                ),
+            }
         }
 
         if let Some(prepared) = self.statements.get_mut(&id) {
@@ -1815,6 +1853,95 @@ fn binary_row(row: &[Value], defs: &[ColumnDef]) -> Vec<u8> {
     packet
 }
 
+/// Decode one bound parameter the statement says is an embedding.
+///
+/// **The MySQL wire has no `VECTOR` type this can key off.** MySQL only grew
+/// `MYSQL_TYPE_VECTOR` (242) in 9.0, and no driver in the field emits it for an
+/// ordinary bound value — `mysql-connector-python` tags both `str` and `bytes`
+/// as `MYSQL_TYPE_STRING`, Go's `database/sql` sends `[]byte` as a string too.
+/// So the type byte cannot distinguish an embedding from any other string, and
+/// this server used to have no way to accept one at all: a bound embedding
+/// failed with 1366 and every caller had to inline it into the SQL as decimal
+/// text, at 3.22x the corpus in wire bytes.
+///
+/// What decides is therefore the *statement*, not the packet:
+/// [`inlaysql::Statement::parameter_vector_dims`] says which placeholders are
+/// written into a `VECTOR(dim)` column or scored against one, and `dim` here is
+/// its answer. Guessing from the payload instead was rejected — a decimal-text
+/// embedding whose length happened to be `4 * dim` would decode as garbage
+/// floats and be indexed without a word.
+///
+/// The accepted form is `dim` little-endian IEEE-754 `binary32` values and
+/// nothing else: MySQL 9's own `VECTOR` storage format, the narrowest possible
+/// encoding, and one every driver can send as a byte string. The decimal text
+/// that `vector('[...]')` takes is *not* accepted here, deliberately — that
+/// spelling exists so a small example can be written by hand, and widening the
+/// parameter path to it would reintroduce the ambiguity above for no saving.
+///
+/// Every refusal below is a value a vector index must never be allowed to
+/// contain: a graph built over a NaN cannot order its own neighbours, and a
+/// truncated payload is a different embedding, not a shorter one.
+fn decode_vector_param(
+    reader: &mut Reader<'_>,
+    ty: u8,
+    dim: usize,
+    index: usize,
+) -> Result<Value, MysqlError> {
+    let position = index + 1;
+    let expected = dim.saturating_mul(4);
+    let incorrect = |message: String| MysqlError::new(1366, "HY000", message);
+
+    // The length-encoded string parameter types: VARCHAR, the four blob widths,
+    // VAR_STRING and STRING. Anything else is a fixed-width number or a
+    // temporal value, whose payload is not a byte string at all — decoding it
+    // as one would misframe every parameter after it, so it is refused here
+    // rather than read.
+    if !matches!(ty, 0x0f | 0xf9..=0xfc | 0xfd | 0xfe) {
+        return Err(incorrect(format!(
+            "parameter {position} is an embedding for a VECTOR({dim}) column, but it was bound \
+             as MySQL type 0x{ty:02x}; bind it as a binary string of {expected} bytes \
+             (little-endian f32), the form MySQL 9 stores a VECTOR in"
+        )));
+    }
+
+    let bytes = reader
+        .lenenc_bytes()
+        .map_err(|_| MysqlError::unknown("malformed COM_STMT_EXECUTE packet"))?
+        .unwrap_or_default();
+    if bytes.len() != expected {
+        return Err(incorrect(format!(
+            "parameter {position} is an embedding for a VECTOR({dim}) column, which is \
+             {expected} bytes of little-endian f32, but {} bytes were bound{}",
+            bytes.len(),
+            if bytes.first() == Some(&b'[') {
+                " — this looks like the decimal text `vector('[...]')` takes, which the \
+                 parameter path does not accept; pack the floats instead"
+            } else {
+                ""
+            }
+        )));
+    }
+
+    let mut embedding = Vec::with_capacity(dim);
+    for (component, chunk) in bytes.chunks_exact(4).enumerate() {
+        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        // Refused rather than stored. A NaN compares false against everything,
+        // so a graph node holding one is unreachable from its own neighbours
+        // and silently drops the row out of every search; an infinity makes
+        // every distance from it infinite. Both corrupt an index that is built
+        // once and queried forever, and neither shows up as an error later.
+        if !value.is_finite() {
+            return Err(incorrect(format!(
+                "parameter {position} is an embedding for a VECTOR({dim}) column, but component \
+                 {component} is {value}; a vector index cannot order a row against a value that \
+                 is not finite"
+            )));
+        }
+        embedding.push(value);
+    }
+    Ok(Value::Vector(embedding))
+}
+
 /// Decode one bound parameter.
 fn decode_binary_param(
     reader: &mut Reader<'_>,
@@ -2129,6 +2256,70 @@ mod tests {
         let bytes = vec![1, 2];
         let mut reader = Reader::new(&bytes);
         assert!(decode_binary_param(&mut reader, 0x08, false).is_err());
+    }
+
+    /// The whole point of decoding an embedding separately: the same bytes
+    /// under the same type code mean an embedding at a vector slot and a plain
+    /// string everywhere else, and only the statement can tell them apart.
+    #[test]
+    fn an_embedding_parameter_decodes_from_packed_f32() {
+        let mut bytes = vec![8]; // length-encoded: two f32s
+        bytes.extend_from_slice(&0.5f32.to_le_bytes());
+        bytes.extend_from_slice(&(-0.25f32).to_le_bytes());
+        bytes.push(42); // a byte that must still be there afterwards
+
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(
+            decode_vector_param(&mut reader, 0xfe, 2, 0).unwrap(),
+            Value::Vector(vec![0.5, -0.25])
+        );
+        assert_eq!(reader.u8().unwrap(), 42, "the payload was consumed exactly");
+
+        // Every length-encoded string type code is accepted rather than only
+        // the one code today's drivers happen to send. `mysql-connector-python`
+        // and go-sql-driver both tag a byte string `MYSQL_TYPE_STRING`, but
+        // that is a choice each driver makes freely — a client tagging the same
+        // bytes `MYSQL_TYPE_BLOB` or `MYSQL_TYPE_VARCHAR` is sending the same
+        // thing and must not be refused for spelling it differently.
+        for ty in [0x0f, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe] {
+            let mut reader = Reader::new(&bytes);
+            assert!(
+                decode_vector_param(&mut reader, ty, 2, 0).is_ok(),
+                "type {ty:#x} was refused"
+            );
+        }
+    }
+
+    /// Each refusal, checked for the *code* a client branches on as well as the
+    /// message a human reads. 1366 is the engine's own answer to "that value
+    /// does not belong in that column", which is exactly this condition.
+    #[test]
+    fn a_bad_embedding_parameter_is_refused_with_a_reason() {
+        let short = vec![4, 0, 0, 0, 0];
+        let error = decode_vector_param(&mut Reader::new(&short), 0xfe, 2, 3).unwrap_err();
+        assert_eq!(error.code, 1366);
+        assert!(error.message.contains("parameter 4"), "{error:?}");
+        assert!(error.message.contains("8 bytes"), "{error:?}");
+
+        let mut nan = vec![8];
+        nan.extend_from_slice(&1.0f32.to_le_bytes());
+        nan.extend_from_slice(&f32::NAN.to_le_bytes());
+        let error = decode_vector_param(&mut Reader::new(&nan), 0xfe, 2, 0).unwrap_err();
+        assert_eq!(error.code, 1366);
+        assert!(error.message.contains("component 1"), "{error:?}");
+
+        // A fixed-width code is refused on the code alone: its payload is not
+        // length-encoded, so reading it as bytes would misframe the rest.
+        let longlong = 1i64.to_le_bytes().to_vec();
+        let error = decode_vector_param(&mut Reader::new(&longlong), 0x08, 2, 0).unwrap_err();
+        assert_eq!(error.code, 1366);
+        assert!(error.message.contains("0x08"), "{error:?}");
+
+        // A truncated packet is a protocol fault rather than a bad value, and
+        // is reported as one rather than panicking on the missing bytes.
+        let truncated = vec![8, 0, 0];
+        let error = decode_vector_param(&mut Reader::new(&truncated), 0xfe, 2, 0).unwrap_err();
+        assert_eq!(error.code, 1105);
     }
 
     #[test]

@@ -315,8 +315,15 @@ makes it a constant rather than a reading):
 
 | encoding | held per vector | payload alone | 10M vectors |
 | --- | --- | --- | --- |
-| exact `f32` | 3,554 B | 1,536 B | **33.1 GiB** |
-| `VECTOR(n, INT8)` | 1,250 B | 388 B | **11.6 GiB** |
+| exact `f32` | **2,018 B** (was 3,554) | 1,536 B | **18.8 GiB** (was 33.1) |
+| `VECTOR(n, INT8)` | **866 B** (was 1,250) | 388 B | **8.1 GiB** (was 11.6) |
+
+The reduction is `HnswIndex` no longer holding every embedding twice — a source
+map *and* each committed node's own prepared copy. Recall and distance-call
+counts are bit-identical across the change (0.587 / 0.721 / 0.897 / 0.986 at
+`ef` 8 / 32 / 64 / 128, 1,318 calls per query), so the graph is unchanged;
+query mean moved 57.16 µs to 59.89 µs, which is inside this machine's noise and
+is recorded rather than claimed as free.
 
 The factor of 2.3 is not overhead in the usual sense. `HnswIndex` holds each
 embedding **twice** — `embeddings` is the source of truth and every committed

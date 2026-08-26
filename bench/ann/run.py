@@ -277,15 +277,27 @@ def main() -> int:
             )
         else:
             cost = "index: unmeasured (no server process to read RSS from)"
+        # What the load cost on the socket, counted by the server itself. It is
+        # printed because it used to be 3.22x the corpus: every embedding
+        # crossed as decimal text, because a bound one was refused with 1366.
+        wire = algo.load_wire_bytes
+        traffic = (
+            f"{wire / 1024 / 1024:.1f} MiB received for a "
+            f"{train.nbytes / 1024 / 1024:.1f} MiB f32 corpus "
+            f"({wire / max(1, train.nbytes):.2f}x)"
+            if wire
+            else "unmeasured (the server's Bytes_received could not be read)"
+        )
         print(
             f"\nbuild:   {build_time:.1f}s  ({algo.load_seconds:.1f}s loading over the wire, "
             f"{algo.graph_seconds:.1f}s building the graph on the first read)"
+            f"\nwire:    {traffic}"
             f"\nmemory:  {cost}   server RSS: {raw_rss / 1024:.0f} MiB"
             f"\nplan:    {algo.get_additional()['inlaysql_plan']}"
         )
         print(
             f"\n{'ef_search':>10} {'recall@' + str(options.count):>11} "
-            f"{'QPS':>10} {'p50 ms':>9} {'p95 ms':>9} {'fmt us':>8}"
+            f"{'QPS':>10} {'p50 ms':>9} {'p95 ms':>9} {'pack us':>8}"
         )
         rows = []
         for ef_search in sweep_for(query_args, options.count):
@@ -319,7 +331,7 @@ def main() -> int:
                 f"{ef_search:>10} {recall:>11.4f} {qps:>10.1f} "
                 f"{samples[len(samples) // 2] * 1e3:>9.3f} "
                 f"{samples[int(len(samples) * 0.95)] * 1e3:>9.3f} "
-                f"{attrs['inlaysql_literal_format_us']:>8.1f}"
+                f"{attrs['inlaysql_embedding_pack_us']:>8.2f}"
             )
             rows.append((ef_search, recall, qps))
     finally:

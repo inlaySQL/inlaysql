@@ -228,7 +228,14 @@ pub fn prepare(sql: &str, catalog: &Catalog) -> Result<Prepared> {
     let plan = plan_statement(statements.remove(0), catalog, &mut binder)?;
     reject_write_subqueries(&plan)?;
 
-    Ok(Prepared::new(sql, plan, binder.count, catalog))
+    let vector_params = binder.vector_params();
+    Ok(Prepared::new(
+        sql,
+        plan,
+        binder.count,
+        vector_params,
+        catalog,
+    ))
 }
 
 /// Resolve one parsed statement into a [`Plan`].
@@ -509,6 +516,21 @@ struct Binder<'c> {
     /// t` is a circular-reference error there even when a real table `t`
     /// exists, not a scan of it. See [`Binder::resolve_cte`].
     cte_reserved: Vec<Vec<String>>,
+    /// Per placeholder, the embedding dimension the statement's *shape* pins
+    /// it to, or `None` where it pins none.
+    ///
+    /// A `VECTOR` value has no type of its own on the MySQL wire — MySQL only
+    /// grew one in 9.0 and no driver in the field sends its code — so a bound
+    /// embedding arrives as an untyped string of bytes that is
+    /// indistinguishable from a `TEXT` or `BLOB` parameter carrying the same
+    /// bytes. Without this the wire server had no way to tell them apart and
+    /// every embedding had to be inlined into the SQL as decimal text, which
+    /// cost 3.22x the corpus in wire bytes. The statement already knows the
+    /// answer at plan time — the target column's width, or the width of the
+    /// column `vector_score()` is scoring against — so it is recorded here
+    /// rather than guessed from the bytes, where a text embedding whose length
+    /// happened to be `4 * dim` would decode as garbage floats.
+    vector_params: Vec<Option<usize>>,
 }
 
 impl<'c> Binder<'c> {
@@ -525,6 +547,7 @@ impl<'c> Binder<'c> {
             subqueries_allowed: true,
             ctes: Vec::new(),
             cte_reserved: Vec::new(),
+            vector_params: Vec::new(),
         }
     }
 
@@ -560,6 +583,30 @@ impl<'c> Binder<'c> {
         let index = self.count;
         self.count += 1;
         PlanExpr::Param(index)
+    }
+
+    /// Record that `expr`, if it is a bare placeholder, must carry an embedding
+    /// of `dim` components. See [`Binder::vector_params`].
+    ///
+    /// A no-op for anything else, which is deliberate: only a bare `?` names a
+    /// slot a caller can bind. `-?` over a vector column is not an embedding
+    /// with a sign, it is nonsense, and it keeps the type error it already had
+    /// rather than being decoded as one.
+    fn pin_vector_param(&mut self, expr: &PlanExpr, dim: usize) {
+        let PlanExpr::Param(index) = expr else {
+            return;
+        };
+        if self.vector_params.len() <= *index {
+            self.vector_params.resize(*index + 1, None);
+        }
+        self.vector_params[*index] = Some(dim);
+    }
+
+    /// One entry per placeholder, in `?` order — see [`Binder::vector_params`].
+    fn vector_params(&self) -> Vec<Option<usize>> {
+        let mut pinned = self.vector_params.clone();
+        pinned.resize(self.count, None);
+        pinned
     }
 
     /// Register an outer reference made by the query at `depth`, returning the
@@ -1782,7 +1829,12 @@ fn plan_insert(
                         // happens either way.
                         full_row[target] = Some(match bind_value(expr, binder)? {
                             PlanExpr::Literal(value) => PlanExpr::Literal(coerce(value, column)?),
-                            other => other,
+                            other => {
+                                if let Some(dim) = column.ty.vector_dim() {
+                                    binder.pin_vector_param(&other, dim);
+                                }
+                                other
+                            }
                         });
                     }
                     rows.push(full_row);
@@ -1896,8 +1948,13 @@ fn resolve_on_conflict(
                     ));
                 };
                 let column = assignment_target_column(name)?;
-                let (ordinal, _) = table.require_column(&column)?;
-                assignments.push((ordinal, resolve_expr(&assignment.value, &scope, binder)?));
+                let (ordinal, column) = table.require_column(&column)?;
+                let dim = column.ty.vector_dim();
+                let value = resolve_expr(&assignment.value, &scope, binder)?;
+                if let Some(dim) = dim {
+                    binder.pin_vector_param(&value, dim);
+                }
+                assignments.push((ordinal, value));
             }
             if assignments.is_empty() {
                 return Err(Error::Type(
@@ -3615,8 +3672,12 @@ fn plan_update(
             ));
         };
         let column_name = assignment_target_column(&name)?;
-        let (index, _) = table.require_column(&column_name)?;
+        let (index, column) = table.require_column(&column_name)?;
+        let dim = column.ty.vector_dim();
         let expr = resolve_expr(&assignment.value, &scope, binder)?;
+        if let Some(dim) = dim {
+            binder.pin_vector_param(&expr, dim);
+        }
         set.push((index, expr));
     }
 
@@ -5638,6 +5699,7 @@ fn resolve_score_expr(
             )));
         };
         let query = bind_value(query, binder)?;
+        binder.pin_vector_param(&query, dim);
         if let PlanExpr::Literal(literal) = &query {
             let Value::Vector(embedding) = literal else {
                 return Err(Error::Type(

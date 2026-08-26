@@ -252,7 +252,30 @@ impl Reply {
 enum Param {
     Int(i64),
     Str(String),
+    /// A length-encoded payload under a type code the test chooses.
+    ///
+    /// An embedding has no type code of its own — see `decode_vector_param` —
+    /// so the tests that bind one have to say which of the string codes a
+    /// driver would have used, and the tests that bind one *wrongly* have to be
+    /// able to name a code that is not a string at all.
+    Bytes {
+        ty: u8,
+        bytes: Vec<u8>,
+    },
     Null,
+}
+
+impl Param {
+    /// An embedding packed the way a driver sends it: little-endian `f32`,
+    /// tagged `MYSQL_TYPE_STRING`, which is what `mysql-connector-python` puts
+    /// on a Python `bytes` value.
+    fn vector(components: &[f32]) -> Self {
+        let mut bytes = Vec::with_capacity(components.len() * 4);
+        for value in components {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        Param::Bytes { ty: 0xfe, bytes }
+    }
 }
 
 /// `Debug` only so that `Result<Client, ServerError>::expect_err` compiles in
@@ -643,9 +666,11 @@ impl Client {
         let columns = u16::from_le_bytes([packet[5], packet[6]]);
         let params = u16::from_le_bytes([packet[7], packet[8]]);
 
+        let mut param_defs = Vec::with_capacity(params as usize);
         if params > 0 {
             for _ in 0..params {
-                self.read_packet().expect("param def");
+                let packet = self.read_packet().expect("param def");
+                param_defs.push(parse_column_definition(&packet));
             }
             self.read_packet().expect("param EOF");
         }
@@ -662,6 +687,7 @@ impl Client {
             param_count: params as usize,
             column_count: columns as usize,
             columns: column_defs,
+            params: param_defs,
         })
     }
 
@@ -690,6 +716,7 @@ impl Client {
                 match param {
                     Param::Int(_) => body.extend_from_slice(&[0x08, 0]),
                     Param::Str(_) => body.extend_from_slice(&[0xfe, 0]),
+                    Param::Bytes { ty, .. } => body.extend_from_slice(&[*ty, 0]),
                     Param::Null => body.extend_from_slice(&[0x06, 0]),
                 }
             }
@@ -697,6 +724,16 @@ impl Client {
                 match param {
                     Param::Int(value) => body.extend_from_slice(&value.to_le_bytes()),
                     Param::Str(value) => put_lenenc_bytes(&mut body, value.as_bytes()),
+                    // Length-encoded for the string codes; written raw for
+                    // anything else, so a test can bind an embedding under a
+                    // fixed-width numeric code and see it refused.
+                    Param::Bytes { ty, bytes } => {
+                        if matches!(ty, 0x0f | 0xf9..=0xfc | 0xfd | 0xfe) {
+                            put_lenenc_bytes(&mut body, bytes);
+                        } else {
+                            body.extend_from_slice(bytes);
+                        }
+                    }
                     Param::Null => {}
                 }
             }
@@ -886,6 +923,10 @@ struct Prepared {
     /// `(name, wire type)` for each column `COM_STMT_PREPARE_OK` reported —
     /// empty when `column_count` is `0`. See AHL-466.
     columns: Vec<(String, u8)>,
+    /// `(name, wire type)` for each *parameter* definition, in `?` order. The
+    /// server describes an embedding slot as a binary string rather than as
+    /// text, which is the only place the reply says a parameter is special.
+    params: Vec<(String, u8)>,
 }
 
 // --------------------------------------------------------------- decoding
@@ -5771,6 +5812,347 @@ fn an_ef_search_that_cannot_be_honoured_is_refused() {
         "SELECT id, vector_score(embedding, vector('[1,0,0,1]')) AS score \
          FROM docs ORDER BY score DESC LIMIT 10",
     );
+
+    client.quit();
+}
+
+// ------------------------------------------- AHL-478: bound embeddings
+
+/// **The defect this whole item exists to close.**
+///
+/// A `VECTOR` was the one value type this server could not accept as a bound
+/// parameter: a `?` into a vector column failed with 1366 whatever was bound to
+/// it, so every embedding had to be inlined into the SQL as decimal text and
+/// re-parsed. Measured on `glove-25-angular`, that was 363.9 MiB of SQL for a
+/// 112.9 MiB corpus — 3.22x — plus 11-18 µs of client-side float formatting on
+/// every query. Embeddings are the one thing in a database that is always
+/// machine-generated and never typed by a human, so binding them is not a
+/// convenience: it is how they are supposed to arrive.
+///
+/// The encoding is `dim` little-endian `f32`s bound as a string parameter,
+/// which is MySQL 9's own `VECTOR` storage format and what every driver can
+/// send as a byte string. Which `?` is an embedding comes from the *statement*
+/// (`Statement::parameter_vector_dims`) and not from the packet, because the
+/// packet cannot say — see `decode_vector_param`.
+#[test]
+fn an_embedding_binds_as_packed_f32_and_reads_back_unchanged() {
+    let server = TestServer::start("bound-embedding");
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR(4))");
+    client.ok_query("CREATE INDEX docs_embedding ON docs (embedding)");
+
+    let insert = client
+        .prepare("INSERT INTO docs (id, embedding) VALUES (?, ?)")
+        .expect("prepare insert");
+    // The reply describes the embedding slot as a binary string of exactly the
+    // width it must carry, rather than as the utf8mb4 text every other
+    // parameter is described as. Nothing forces a client to read this, but a
+    // server that advertised text for a slot it will only take packed floats
+    // in would be saying something untrue.
+    assert_eq!(
+        insert.params,
+        vec![
+            ("?1".to_string(), 0xfd), // MYSQL_TYPE_VAR_STRING
+            ("?2".to_string(), 0xfc), // MYSQL_TYPE_BLOB, 16 bytes wide
+        ]
+    );
+
+    // Values chosen to be exactly representable in `f32` so that "unchanged"
+    // below means bit-for-bit and not "close enough": a round trip that
+    // silently rounded would still pass a tolerance test.
+    let corpus: [[f32; 4]; 3] = [
+        [0.5, 0.25, -0.125, 1.0],
+        [1.0, 0.0, 0.0, 0.0],
+        [-1.0, 0.75, 0.5, -0.0625],
+    ];
+    for (index, embedding) in corpus.iter().enumerate() {
+        let (affected, _) = client
+            .execute(
+                &insert,
+                &[Param::Int(index as i64 + 1), Param::vector(embedding)],
+            )
+            .expect("execute insert")
+            .ok();
+        assert_eq!(affected, 1);
+    }
+
+    // Read back through the binary protocol: a `VECTOR` column comes out as the
+    // JSON text `vector()` accepts, rendered with `f32`'s shortest
+    // round-tripping form, so no component moved on the way through.
+    let select = client
+        .prepare("SELECT id, embedding FROM docs ORDER BY id")
+        .expect("prepare select");
+    let rows = client.execute(&select, &[]).expect("execute select").rows();
+    assert_eq!(rows.rows.len(), 3);
+    assert_eq!(rows.cell(0, 1), "[0.5,0.25,-0.125,1]");
+    assert_eq!(rows.cell(1, 1), "[1,0,0,0]");
+    assert_eq!(rows.cell(2, 1), "[-1,0.75,0.5,-0.0625]");
+
+    // The query side: `vector_score(column, ?)` takes the same packed form, so
+    // a search no longer has to format its query embedding as decimal text
+    // either. Row 2 is the exact corpus vector, so it scores first.
+    let search = client
+        .prepare(
+            "SELECT id, vector_score(embedding, ?) AS score \
+             FROM docs ORDER BY score DESC LIMIT 3",
+        )
+        .expect("prepare search");
+    assert_eq!(search.params, vec![("?1".to_string(), 0xfc)]);
+    let rows = client
+        .execute(&search, &[Param::vector(&[1.0, 0.0, 0.0, 0.0])])
+        .expect("execute search")
+        .rows();
+    assert_eq!(rows.cell(0, 0), "2", "the identical vector ranks first");
+
+    // `UPDATE ... SET embedding = ?` binds the same way; so does the `SET` of
+    // an upsert, which resolves its assignments through the same path.
+    let update = client
+        .prepare("UPDATE docs SET embedding = ? WHERE id = ?")
+        .expect("prepare update");
+    let (affected, _) = client
+        .execute(
+            &update,
+            &[Param::vector(&[0.25, 0.25, 0.25, 0.25]), Param::Int(1)],
+        )
+        .expect("execute update")
+        .ok();
+    assert_eq!(affected, 1);
+    let rows = client
+        .execute(&select, &[])
+        .expect("execute select after update")
+        .rows();
+    assert_eq!(rows.cell(0, 1), "[0.25,0.25,0.25,0.25]");
+
+    let upsert = client
+        .prepare(
+            "INSERT INTO docs (id, embedding) VALUES (?, ?) \
+             ON CONFLICT (id) DO UPDATE SET embedding = ?",
+        )
+        .expect("prepare upsert");
+    let (affected, _) = client
+        .execute(
+            &upsert,
+            &[
+                Param::Int(1),
+                Param::vector(&[0.0, 0.0, 0.0, 1.0]),
+                Param::vector(&[0.5, 0.5, 0.5, 0.5]),
+            ],
+        )
+        .expect("execute upsert")
+        .ok();
+    assert_eq!(affected, 1);
+    let rows = client
+        .execute(&select, &[])
+        .expect("execute select after upsert")
+        .rows();
+    assert_eq!(rows.cell(0, 1), "[0.5,0.5,0.5,0.5]");
+
+    // A NULL embedding is still a NULL, not a zero vector: the null bitmap is
+    // read before the payload is, and the vector path never sees it.
+    let (affected, _) = client
+        .execute(&insert, &[Param::Int(9), Param::Null])
+        .expect("execute insert null")
+        .ok();
+    assert_eq!(affected, 1);
+
+    client.quit();
+}
+
+/// Every way a bound embedding can be wrong, and the refusal each one gets.
+///
+/// The alternative to refusing is worse than an error: an HNSW graph is built
+/// once and queried forever, so a NaN that reaches it makes its own node
+/// unreachable from every neighbour and silently drops that row out of every
+/// search from then on. A short payload is a *different* embedding, not a
+/// shorter one. None of these announce themselves later, so each is refused at
+/// the point the bytes arrive, and the row count is checked afterwards to prove
+/// nothing was written on the way to the error.
+#[test]
+fn a_malformed_embedding_parameter_is_refused_rather_than_indexed() {
+    let server = TestServer::start("bad-embedding");
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR(4))");
+    client.ok_query("CREATE INDEX docs_embedding ON docs (embedding)");
+    let insert = client
+        .prepare("INSERT INTO docs (id, embedding) VALUES (?, ?)")
+        .expect("prepare insert");
+
+    let refused = |client: &mut Client, id: i64, param: Param, expected: &str| {
+        let error = client
+            .execute(&insert, &[Param::Int(id), param])
+            .expect_err("a malformed embedding must not be accepted");
+        assert_eq!(error.code, 1366, "{error:?}");
+        assert!(
+            error.message.contains(expected),
+            "the refusal did not say why: {error:?}"
+        );
+    };
+
+    // Too few and too many components. Both are exactly the case a length
+    // check exists for: an index asked to compare a prefix would answer, and
+    // answer wrongly.
+    refused(
+        &mut client,
+        1,
+        Param::vector(&[1.0, 2.0, 3.0]),
+        "16 bytes of little-endian f32, but 12 bytes were bound",
+    );
+    refused(
+        &mut client,
+        2,
+        Param::vector(&[1.0, 2.0, 3.0, 4.0, 5.0]),
+        "but 20 bytes were bound",
+    );
+
+    // A payload that is not a whole number of floats at all — the truncated
+    // write a client gets from a short read or a sliced buffer.
+    refused(
+        &mut client,
+        3,
+        Param::Bytes {
+            ty: 0xfe,
+            bytes: vec![0u8; 14],
+        },
+        "but 14 bytes were bound",
+    );
+    refused(
+        &mut client,
+        4,
+        Param::Bytes {
+            ty: 0xfe,
+            bytes: Vec::new(),
+        },
+        "but 0 bytes were bound",
+    );
+
+    // Non-finite components, named individually so the client can find the one
+    // its own pipeline produced.
+    refused(
+        &mut client,
+        5,
+        Param::vector(&[1.0, f32::NAN, 3.0, 4.0]),
+        "component 1 is NaN",
+    );
+    refused(
+        &mut client,
+        6,
+        Param::vector(&[1.0, 2.0, f32::INFINITY, 4.0]),
+        "component 2 is inf",
+    );
+    refused(
+        &mut client,
+        7,
+        Param::vector(&[f32::NEG_INFINITY, 2.0, 3.0, 4.0]),
+        "component 0 is -inf",
+    );
+
+    // The decimal text that `vector('[...]')` takes is *not* the parameter
+    // encoding, and the refusal says so rather than leaving the caller to
+    // guess: this is the exact mistake the old inlining path trains a caller
+    // to make.
+    refused(
+        &mut client,
+        8,
+        Param::Str("[1.0,2.0,3.0,4.0]".to_string()),
+        "pack the floats instead",
+    );
+
+    // A type code that is not a string at all. Its payload is fixed-width
+    // rather than length-encoded, so reading it as bytes would misframe every
+    // parameter after it — refused on the code, before anything is read.
+    refused(
+        &mut client,
+        9,
+        Param::Bytes {
+            ty: 0x08, // MYSQL_TYPE_LONGLONG
+            bytes: 7i64.to_le_bytes().to_vec(),
+        },
+        "bound as MySQL type 0x08",
+    );
+
+    // Nothing above reached the table, and the connection is in step after
+    // every one of them: these are statement errors, not protocol ones.
+    let rows = client.ok_query("SELECT COUNT(*) FROM docs").rows();
+    assert_eq!(
+        rows.cell(0, 0),
+        "0",
+        "a refused embedding was still written"
+    );
+    let (affected, _) = client
+        .execute(
+            &insert,
+            &[Param::Int(10), Param::vector(&[1.0, 0.0, 0.0, 0.0])],
+        )
+        .expect("a good embedding still binds after nine refusals")
+        .ok();
+    assert_eq!(affected, 1);
+
+    client.quit();
+}
+
+/// The parameter path widened; the SQL text path did not.
+///
+/// Packed `f32` is what a *bound* embedding looks like, and it stays that way:
+/// writing the same bytes as a blob literal into a vector column is still the
+/// type error it always was, and a `?` that is not an embedding still arrives
+/// as the text or bytes it was sent as. The two paths are separate on purpose —
+/// a text spelling that accepted raw bytes would have no way to tell them from
+/// a `BLOB` a caller meant literally.
+#[test]
+fn binding_an_embedding_does_not_widen_the_sql_text_path() {
+    let server = TestServer::start("embedding-text-path");
+    let mut client = server.client();
+    client.ok_query(
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR(4), payload BLOB, body TEXT)",
+    );
+
+    // A blob literal spelling the same 16 bytes is refused, as it was before.
+    let error = client
+        .query("INSERT INTO docs (id, embedding) VALUES (1, X'0000803F00000000000000000000803F')")
+        .expect_err("a blob literal is not a vector literal");
+    assert_eq!(error.code, 1366, "{error:?}");
+    assert!(error.message.contains("VECTOR(4)"), "{error:?}");
+
+    // And so is `vector(?)`, which would mean re-parsing decimal text on every
+    // execution when the parameter can carry the floats themselves.
+    let error = client
+        .prepare("INSERT INTO docs (id, embedding) VALUES (?, vector(?))")
+        .expect_err("vector() still takes a literal");
+    assert_eq!(error.code, 1366, "{error:?}");
+
+    // A `?` bound to a BLOB or TEXT column is untouched by any of this: the
+    // same bytes that would be an embedding at a vector slot stay bytes here.
+    let insert = client
+        .prepare("INSERT INTO docs (id, payload, body) VALUES (?, ?, ?)")
+        .expect("prepare");
+    assert_eq!(
+        insert.params.iter().map(|(_, ty)| *ty).collect::<Vec<_>>(),
+        vec![0xfd, 0xfd, 0xfd],
+        "no slot here takes an embedding, so none is described as binary"
+    );
+    let packed: Vec<u8> = [1.0f32, 0.0, 0.0, 1.0]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    client
+        .execute(
+            &insert,
+            &[
+                Param::Int(1),
+                Param::Bytes {
+                    ty: 0xfe,
+                    bytes: packed.clone(),
+                },
+                Param::Str("plain".to_string()),
+            ],
+        )
+        .expect("a blob parameter is still a blob")
+        .ok();
+    let rows = client
+        .ok_query("SELECT id, LENGTH(payload), body FROM docs")
+        .rows();
+    assert_eq!(rows.cell(0, 1), "16", "the blob kept its bytes");
+    assert_eq!(rows.cell(0, 2), "plain");
 
     client.quit();
 }

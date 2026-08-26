@@ -15,10 +15,11 @@
 //!
 //! # Incremental maintenance
 //!
-//! The graph is a cache over [`HnswIndex::embeddings`], which are the source of
-//! truth. Before AHL-381 every [`VectorIndex::commit`] discarded the graph and
-//! rebuilt it from every embedding — a full `O(n log n)` build to add one row.
-//! Now `commit` reconciles the pending writes against the graph:
+//! The graph *is* the corpus: a committed row's prepared vector lives in its
+//! node and nowhere else (see "One copy of each embedding" below). Before
+//! AHL-381 every [`VectorIndex::commit`] discarded the graph and rebuilt it
+//! from every embedding — a full `O(n log n)` build to add one row. Now
+//! `commit` reconciles the pending writes against the graph:
 //!
 //! * an **insert** appends one node via the standard greedy insert, connecting
 //!   it to `M` neighbours per layer found by the same search queries use;
@@ -36,6 +37,43 @@
 //! corpus crossed a power of `M` in between, which moves a rare upper-layer
 //! node one sparse layer, and the graph is still a pure function of the insert
 //! sequence, so determinism holds.
+//!
+//! # One copy of each embedding
+//!
+//! This index used to hold every vector **twice**: a `BTreeMap` of the
+//! embeddings as the caller handed them over, plus — in every committed node —
+//! the [`VectorMetric::prepare`]d form the distance kernel actually reads. At
+//! dim 384 that is a 1,536-byte payload charged 3,072 times over, measured at
+//! 3,554 resident bytes per vector by `inlaysql/tests/index_memory_cost.rs`,
+//! and it is why `docs/enterprise-readiness.md` blocker 6's 10M-vector
+//! estimate was understated more than twofold.
+//!
+//! Both copies existed because the map was the source a rebuild replays and
+//! the node was the only form a distance can be taken against. Only one of
+//! those is load-bearing. Preparation is a pure function applied *exactly
+//! once* per vector — nothing here ever prepares a prepared vector — so the
+//! prepared form is as faithful a source as the raw one: a rebuild replays it
+//! unchanged and gets the graph it would have got from re-preparing the raw
+//! vectors, bit for bit, because the old build's `prepared()` call and the new
+//! `insert`'s are the same call on the same bytes. So the raw copy dies with
+//! the `insert` that accepted it, and the row map keeps payload only for rows
+//! no node owns yet — see [`Held`].
+//!
+//! Deriving the prepared form per distance computation was the other way to
+//! hold it once, and the measurement refuses it: `PERF.md` section 4 puts the
+//! dot products at 52% of a vector query, so normalising inside the kernel
+//! would have bought the same 1,536 bytes at several times the cost of the
+//! query it was saving them for. Dropping the source costs nothing at query
+//! time — the walk reads exactly the bytes it read before, out of exactly the
+//! node it read them from.
+//!
+//! What it does cost is the file: with no raw vector left to write, a saved
+//! index carries each node's prepared vector inline
+//! ([`FORMAT_VERSION_INLINE`]) instead of an embedding section to recompute
+//! them from. Versions 3, 4 and 5 still decode, so an existing database is
+//! read rather than rebuilt; a file *this* build writes is refused by an older
+//! one, which then rebuilds from the rows, which is what a version bump has
+//! always meant here.
 //!
 //! # Why the layer distribution is `1/M` and not `1/2`
 //!
@@ -91,9 +129,24 @@ use crate::traits::{RowFilter, RowId, Scored, VectorIndex};
 /// graph built under cosine and searched under L2 answers with the wrong
 /// neighbours and no error anywhere, because both metrics are defined on the
 /// same vectors and neither can tell it is looking at the other's graph.
+///
+/// Version 6 puts every node's vector in the node record and drops the
+/// separate embedding section, because the index no longer keeps a raw
+/// embedding to write there — see the module note "One copy of each
+/// embedding". It is what every index writes from now on, cosine included, so
+/// unlike version 5 it always carries the metric and encoding tags rather than
+/// implying them from the version byte.
+///
+/// Versions 3, 4 and 5 are still **read**: their embedding section is decoded,
+/// prepared once, and moved into the nodes, which is precisely what the old
+/// decoder did with it, so an existing database is loaded rather than rebuilt.
+/// Only writing changed. An older build handed a version-6 file refuses it as
+/// corrupt and the engine rebuilds from the rows, which is the same
+/// belt-and-braces every previous bump relied on.
 const FORMAT_VERSION_EXACT: u8 = 3;
 const FORMAT_VERSION_Q8: u8 = 4;
 const FORMAT_VERSION_METRIC: u8 = 5;
+const FORMAT_VERSION_INLINE: u8 = 6;
 
 /// Absolute ceiling on a node's layer, whatever the corpus size says.
 ///
@@ -390,12 +443,40 @@ impl StoredVector {
     }
 }
 
+/// Where one indexed row's prepared vector is, right now.
+///
+/// The map this lives in is a **register of rows, not a second copy of the
+/// corpus**: a row that has reached the graph keeps its vector in its node and
+/// leaves nothing but a marker here. That is the whole of the memory fix — see
+/// the module note "One copy of each embedding" — and it is a named enum
+/// rather than an `Option<StoredVector>` so the two states have to be read as
+/// "the graph owns this one" and "nothing owns it yet", which is what they
+/// mean, instead of as "some" and "none", which is what a bug would read them
+/// as.
+#[derive(Debug, Clone)]
+enum Held {
+    /// Accepted by [`VectorIndex::insert`] and not yet in the graph. This is
+    /// the only variant that carries bytes, and it carries them for one commit
+    /// window: [`VectorIndex::commit`] and [`HnswIndex::build`] both *move*
+    /// the vector out of here into the node they create.
+    Staged(StoredVector),
+    /// In the graph, at `nodes[node_ids[&id]].vector`. Deliberately carries no
+    /// node index of its own: a second place to record where a node is, is a
+    /// second place for it to be wrong, and `node_ids` already answers that
+    /// question for every live row.
+    Graph,
+}
+
 /// One node of the graph.
 #[derive(Debug, Clone)]
 struct Node {
     /// The row this node stands for.
     id: RowId,
-    /// L2-normalised embedding.
+    /// The row's [`VectorMetric::prepare`]d embedding — L2-normalised under
+    /// cosine, as given under L2 — and the **only** copy of it the index
+    /// holds. Dropping this node drops the vector, which is why
+    /// [`HnswIndex::build`] takes the vectors back out of the old graph before
+    /// it clears it.
     vector: StoredVector,
     /// `neighbors[l]` are the node indices connected at layer `l`.
     neighbors: Vec<Vec<usize>>,
@@ -425,11 +506,15 @@ pub struct HnswIndex {
     /// because a graph whose metric changed under it is a graph of the wrong
     /// neighbours, and [`HnswIndex::load`] refuses a file that disagrees.
     metric: VectorMetric,
-    /// Source of truth: the embeddings, keyed by row id. Updated by insert and
-    /// remove; the graph is reconciled to these on [`HnswIndex::commit`].
-    embeddings: BTreeMap<RowId, StoredVector>,
+    /// Every row the index holds, and where its prepared vector is. Updated by
+    /// insert and remove; the graph is reconciled to it on
+    /// [`HnswIndex::commit`]. It carries payload only for rows no node owns
+    /// yet — see [`Held`] and the module note "One copy of each embedding".
+    rows: BTreeMap<RowId, Held>,
     /// The committed graph, empty until the first commit. Tombstoned nodes stay
-    /// here until a rebuild drops them.
+    /// here until a rebuild drops them — and so do their vectors, which is the
+    /// only reason a tombstone can still be navigated through after the row
+    /// behind it is gone.
     nodes: Vec<Node>,
     /// Row id -> node index, for the *live* node standing for each id. A
     /// tombstoned node is unmapped here, so an insert of an id that was removed
@@ -502,7 +587,7 @@ impl HnswIndex {
             dim,
             encoding,
             metric,
-            embeddings: BTreeMap::new(),
+            rows: BTreeMap::new(),
             nodes: Vec::new(),
             node_ids: BTreeMap::new(),
             entry: None,
@@ -517,13 +602,21 @@ impl HnswIndex {
         }
     }
 
-    /// Bytes occupied by vector payloads in the source map and committed
-    /// graph. Container and adjacency overhead are intentionally excluded so
-    /// exact and int8 columns are directly comparable.
+    /// Bytes occupied by vector payloads: the committed graph's, plus whatever
+    /// is staged and not yet in it. Container and adjacency overhead are
+    /// intentionally excluded so exact and int8 columns are directly
+    /// comparable.
+    ///
+    /// Every vector is counted once because every vector *exists* once. This
+    /// number used to be twice the corpus, for the same reason the index used
+    /// to be — see the module note "One copy of each embedding".
     pub fn resident_vector_bytes(&self) -> usize {
-        self.embeddings
+        self.rows
             .values()
-            .map(StoredVector::payload_bytes)
+            .filter_map(|held| match held {
+                Held::Staged(vector) => Some(vector.payload_bytes()),
+                Held::Graph => None,
+            })
             .chain(self.nodes.iter().map(|node| node.vector.payload_bytes()))
             .sum()
     }
@@ -566,57 +659,65 @@ impl HnswIndex {
 
     /// Number of indexed embeddings.
     pub fn len(&self) -> usize {
-        self.embeddings.len()
+        self.rows.len()
     }
 
     /// Whether the index holds no embeddings.
     pub fn is_empty(&self) -> bool {
-        self.embeddings.is_empty()
+        self.rows.is_empty()
     }
 
     /// Serialise the index, graph included.
     ///
     /// ```text
-    /// index := u8 version, (u8 metric, u8 encoding)?, u32 dim,
-    ///          u32 embedding_count, embedding*,
-    ///          u32 node_count, node*,
-    ///          u8 has_entry, u32 entry index, u32 entry level
-    /// embedding := u64 row id, f32 * dim
-    /// node      := u8 deleted, u64 row id, u32 layer_count, layer*, (f32*dim)?
-    /// layer     := u32 neighbour_count, u32 * neighbour_count   (node indices)
+    /// index  := u8 version, u8 metric, u8 encoding, u32 dim,
+    ///           u32 staged_count, staged*,
+    ///           u32 node_count, node*,
+    ///           u8 has_entry, u32 entry index, u32 entry level
+    /// staged := u64 row id, vector
+    /// node   := u8 deleted, u64 row id, u32 layer_count, layer*, vector
+    /// layer  := u32 neighbour_count, u32 * neighbour_count   (node indices)
+    /// vector := f32 * dim   |   f32 scale, i8 * dim          (by encoding)
     /// ```
     ///
-    /// The two tags are present only at [`FORMAT_VERSION_METRIC`], which only
-    /// a non-cosine index writes; versions 3 and 4 name the encoding in the
-    /// version byte itself and mean cosine. A cosine index therefore encodes
-    /// byte for byte what it always did.
-    ///
     /// The graph is stored rather than recomputed because building it is the
-    /// expensive part — every insert walks the graph. A live node's vector is
-    /// *not* stored: it is the metric's prepared form of the embedding, so
-    /// [`HnswIndex::decode`] recomputes it and the file stays half the size. A
-    /// tombstoned node has no embedding left to recompute from, so its vector
-    /// is stored inline and it can still be traversed after a reload.
+    /// expensive part — every insert walks the graph.
+    ///
+    /// **Every** node's vector is stored inline, live or tombstoned. Until
+    /// [`FORMAT_VERSION_INLINE`] a live node's was not: the file carried the
+    /// raw embeddings separately and the decoder re-derived each node's
+    /// prepared vector from them. There is no raw embedding left to carry (see
+    /// the module note "One copy of each embedding"), so the node record grew
+    /// the vector the embedding section used to hold and the embedding section
+    /// went away. The file is a little *smaller* for it — one row id per live
+    /// vector rather than two — and it no longer has a way to disagree with
+    /// itself about what a node's vector is.
+    ///
+    /// The `staged` section is the rows accepted since the last commit, which
+    /// have no node to live in yet. It is normally empty, because the engine
+    /// commits an index before it saves one; it is written all the same
+    /// because [`HnswIndex::len`] counts those rows and a save that dropped
+    /// them would quietly shrink the index across a reload.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        match (self.metric, self.encoding) {
-            (VectorMetric::Cosine, VectorEncoding::Exact) => out.push(FORMAT_VERSION_EXACT),
-            (VectorMetric::Cosine, VectorEncoding::Q8) => out.push(FORMAT_VERSION_Q8),
-            (metric, encoding) => {
-                out.push(FORMAT_VERSION_METRIC);
-                out.push(metric.tag());
-                out.push(match encoding {
-                    VectorEncoding::Exact => 0,
-                    VectorEncoding::Q8 => 1,
-                });
-            }
-        }
+        out.push(FORMAT_VERSION_INLINE);
+        out.push(self.metric.tag());
+        out.push(match self.encoding {
+            VectorEncoding::Exact => 0,
+            VectorEncoding::Q8 => 1,
+        });
         put_len(&mut out, self.dim);
 
-        put_len(&mut out, self.embeddings.len());
-        for (id, embedding) in &self.embeddings {
+        let staged = self
+            .rows
+            .values()
+            .filter(|held| matches!(held, Held::Staged(_)))
+            .count();
+        put_len(&mut out, staged);
+        for (id, held) in &self.rows {
+            let Held::Staged(vector) = held else { continue };
             out.extend_from_slice(&id.to_le_bytes());
-            encode_stored_vector(&mut out, embedding);
+            encode_stored_vector(&mut out, vector);
         }
 
         put_len(&mut out, self.nodes.len());
@@ -630,9 +731,7 @@ impl HnswIndex {
                     put_len(&mut out, *neighbor);
                 }
             }
-            if node.deleted {
-                encode_stored_vector(&mut out, &node.vector);
-            }
+            encode_stored_vector(&mut out, &node.vector);
         }
 
         match self.entry {
@@ -650,13 +749,25 @@ impl HnswIndex {
         out
     }
 
-    /// Parse bytes produced by [`HnswIndex::encode`].
+    /// Parse bytes produced by [`HnswIndex::encode`], or by any build back to
+    /// the one that wrote [`FORMAT_VERSION_EXACT`].
     ///
     /// Everything the graph asserts about itself is checked here — every live
-    /// node has an embedding, every neighbour index is in range, the entry
-    /// point exists and is live, and no two live nodes claim the same row. A
-    /// graph that fails any of those would search into nowhere, and the
-    /// engine's answer would be silently wrong rather than loudly missing.
+    /// node has a vector, every neighbour index is in range, the entry point
+    /// exists and is live, and no two live nodes claim the same row. A graph
+    /// that fails any of those would search into nowhere, and the engine's
+    /// answer would be silently wrong rather than loudly missing.
+    ///
+    /// # Reading a file older than the node-inline format
+    ///
+    /// Versions 3, 4 and 5 carry the *raw* embeddings in a section of their
+    /// own and no vector on a live node, because the decoder that wrote them
+    /// re-derived one with [`StoredVector::prepared`]. That is done here too,
+    /// once, on the way in — the same call on the same bytes, so an old file
+    /// decodes to the graph it always decoded to — and the raw section is then
+    /// dropped rather than kept, which is the whole point. An embedding in
+    /// such a file with no node to go with it (an index saved with writes
+    /// staged) comes back staged, exactly as it went in.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let version = cursor.u8()?;
@@ -664,7 +775,7 @@ impl HnswIndex {
             // Versions 3 and 4 predate the metric and can only be cosine.
             FORMAT_VERSION_EXACT => (VectorMetric::Cosine, VectorEncoding::Exact),
             FORMAT_VERSION_Q8 => (VectorMetric::Cosine, VectorEncoding::Q8),
-            FORMAT_VERSION_METRIC => {
+            FORMAT_VERSION_METRIC | FORMAT_VERSION_INLINE => {
                 let metric = VectorMetric::from_tag(cursor.u8()?)?;
                 let encoding = match cursor.u8()? {
                     0 => VectorEncoding::Exact,
@@ -683,14 +794,19 @@ impl HnswIndex {
                 )))
             }
         };
+        let inline = version == FORMAT_VERSION_INLINE;
         let dim = cursor.count(4)?;
         let mut index = Self::with_encoding(dim, HnswParams::DEFAULT, encoding, metric);
 
-        let embedding_count = cursor.count(8)?;
-        for _ in 0..embedding_count {
+        // At version 6 this is the staged rows, which own their vectors. Below
+        // it, it is every live row's raw embedding, held only until the nodes
+        // below have taken a prepared copy of the ones they need.
+        let mut loose: BTreeMap<RowId, StoredVector> = BTreeMap::new();
+        let loose_count = cursor.count(8)?;
+        for _ in 0..loose_count {
             let id = RowId::from_le_bytes(cursor.array8()?);
-            let embedding = decode_stored_vector(&mut cursor, dim, encoding)?;
-            index.embeddings.insert(id, embedding);
+            let vector = decode_stored_vector(&mut cursor, dim, encoding)?;
+            loose.insert(id, vector);
         }
 
         // One byte of `deleted`, eight of row id, four of layer count.
@@ -709,14 +825,14 @@ impl HnswIndex {
                 }
                 neighbors.push(layer);
             }
-            // A live node's vector is the metric's prepared embedding and must
-            // be recomputable; a tombstoned node has no embedding left, so its
-            // vector was stored inline and is read back here.
-            let vector = if deleted {
+            // Version 6 stores every node's vector. Before it, only a
+            // tombstone's was stored — it has no embedding left to recompute
+            // from — and a live node's had to be re-derived from the raw
+            // embedding, which had to be there.
+            let vector = if inline || deleted {
                 decode_stored_vector(&mut cursor, dim, encoding)?
             } else {
-                index
-                    .embeddings
+                loose
                     .get(&id)
                     .map(|embedding| embedding.prepared(metric, encoding))
                     .ok_or_else(|| {
@@ -770,6 +886,25 @@ impl HnswIndex {
             }
         }
 
+        // The row register. A live node's row is [`Held::Graph`] — the node it
+        // was just given is where its vector is. Anything left over in `loose`
+        // is a row with no node: at version 6 that is exactly the staged
+        // section, and below it, an embedding whose index was saved with
+        // writes still pending. Both mean the same thing and are held the same
+        // way, prepared, because that is the only form this index keeps.
+        for id in node_ids.keys() {
+            index.rows.insert(*id, Held::Graph);
+            loose.remove(id);
+        }
+        for (id, vector) in loose {
+            let vector = if inline {
+                vector
+            } else {
+                vector.prepared(metric, encoding)
+            };
+            index.rows.insert(id, Held::Staged(vector));
+        }
+
         index.nodes = nodes;
         index.node_ids = node_ids;
         index.tombstones = tombstones;
@@ -778,32 +913,60 @@ impl HnswIndex {
         Ok(index)
     }
 
-    /// Rebuild the graph from the current embeddings. Deterministic: rows are
-    /// visited in row-id order, and each node's layer is a pure function of its
-    /// row id and the corpus size.
+    /// Rebuild the graph from the vectors the index holds. Deterministic: rows
+    /// are visited in row-id order, and each node's layer is a pure function of
+    /// its row id and the corpus size.
+    ///
+    /// The old graph is **emptied into** the new one rather than dropped and
+    /// re-read from a source map, because there is no source map any more: a
+    /// committed vector lives in its node, so clearing `nodes` first would take
+    /// the corpus with it. Every vector below is moved, never copied, which is
+    /// also what keeps a rebuild from briefly holding two corpora — the shape
+    /// the old `pending` vector had, and a second reason this used to be the
+    /// index's high-water mark.
     fn build(&mut self) -> Result<()> {
-        self.nodes.clear();
+        let count = self.rows.len();
+        let ceiling = max_level_for(count, self.params.m);
+        let shift = level_shift(self.params.m);
+
+        // Vectors of the outgoing graph, by node index, taken out one at a
+        // time as the row register points at them. Tombstoned nodes are here
+        // too and are never claimed: a rebuild is where the graph finally
+        // forgets them, which is the whole reason `commit` triggers one.
+        let mut orphaned: Vec<Option<StoredVector>> = core::mem::take(&mut self.nodes)
+            .into_iter()
+            .map(|node| Some(node.vector))
+            .collect();
+        let mut pending: Vec<(RowId, StoredVector, usize)> = Vec::with_capacity(count);
+        for (id, held) in core::mem::take(&mut self.rows) {
+            let vector = match held {
+                Held::Staged(vector) => vector,
+                // `node_ids` is still the outgoing graph's, because it is
+                // cleared below rather than above.
+                Held::Graph => match self.node_ids.get(&id).and_then(|at| orphaned[*at].take()) {
+                    Some(vector) => vector,
+                    // A row that claims a node it is not in has no vector
+                    // anywhere and cannot be rebuilt into the graph. Carrying
+                    // it forward as a row the index "holds" would make `len`
+                    // count a row no search can reach, so it is dropped — and
+                    // it cannot happen: `rows`, `node_ids` and `nodes` are
+                    // written together, here, in `commit` and in `decode`.
+                    None => {
+                        debug_assert!(false, "row {id} claims a graph node it is not in");
+                        continue;
+                    }
+                },
+            };
+            pending.push((id, vector, level_of(id, shift, ceiling)));
+        }
+        drop(orphaned);
+
         self.node_ids.clear();
         self.entry = None;
         self.entry_level = 0;
         self.tombstones = 0;
         self.built_m = self.params.m;
         self.built_ef_construction = self.params.ef_construction;
-
-        let count = self.embeddings.len();
-        let ceiling = max_level_for(count, self.params.m);
-        let shift = level_shift(self.params.m);
-        let pending: Vec<(RowId, StoredVector, usize)> = self
-            .embeddings
-            .iter()
-            .map(|(id, embedding)| {
-                (
-                    *id,
-                    embedding.prepared(self.metric, self.encoding),
-                    level_of(*id, shift, ceiling),
-                )
-            })
-            .collect();
 
         // One scratch set for the whole build. Allocating a fresh one per
         // inserted node would dominate: there are `count` inserts and each
@@ -816,7 +979,15 @@ impl HnswIndex {
         Ok(())
     }
 
-    /// Greedily insert one node into the graph.
+    /// Greedily insert one node into the graph, which takes ownership of
+    /// `vector`.
+    ///
+    /// Ownership, not a copy: this is the moment a vector stops being loose
+    /// and becomes the graph's, so the layer walks below read it back out of
+    /// the node they just built rather than keeping a second one alive to
+    /// search with. The `vector.clone()` that used to sit on the push was one
+    /// deep copy of the payload per inserted row — a whole second corpus at
+    /// the peak of a rebuild.
     fn insert_node(
         &mut self,
         id: RowId,
@@ -829,7 +1000,7 @@ impl HnswIndex {
             self.nodes.push(Node::new(id, vector, level));
             self.entry = Some(0);
             self.entry_level = level;
-            self.node_ids.insert(id, 0);
+            self.claim(id, 0);
             return Ok(());
         };
 
@@ -855,13 +1026,13 @@ impl HnswIndex {
 
         // Connect the node at every existing layer from `current` down to 0.
         let new_index = self.nodes.len();
-        self.nodes.push(Node::new(id, vector.clone(), level));
-        self.node_ids.insert(id, new_index);
+        self.nodes.push(Node::new(id, vector, level));
+        self.claim(id, new_index);
         for layer in (0..=current).rev() {
             let candidates = search_layer(
                 &self.nodes,
                 self.metric,
-                &vector,
+                &self.nodes[new_index].vector,
                 ep,
                 self.params.ef_construction,
                 layer,
@@ -929,8 +1100,47 @@ impl HnswIndex {
         );
     }
 
+    /// Every row's prepared vector, in row-id order: the corpus as the graph
+    /// holds it.
+    ///
+    /// Test-only, and it exists because there is no longer one map to iterate
+    /// — a committed vector is in its node and a staged one is in the row
+    /// register, and an oracle wants both. It hands back the *prepared* form
+    /// on purpose: that is what the graph takes distances against, so an
+    /// oracle built on these is grading the graph rather than grading
+    /// [`VectorMetric::prepare`].
+    #[cfg(test)]
+    fn prepared_vectors(&self) -> Vec<(RowId, &StoredVector)> {
+        self.rows
+            .iter()
+            .map(|(id, held)| {
+                let vector = match held {
+                    Held::Staged(vector) => vector,
+                    Held::Graph => &self.nodes[self.node_ids[id]].vector,
+                };
+                (*id, vector)
+            })
+            .collect()
+    }
+
+    /// Record that `index` is now the live node for `id`.
+    ///
+    /// The one place the two maps that answer "where is this row's vector" are
+    /// written, so they cannot drift: `node_ids` says which node, and `rows`
+    /// says the node is where the bytes are rather than holding a second set
+    /// of them.
+    fn claim(&mut self, id: RowId, index: usize) {
+        self.node_ids.insert(id, index);
+        self.rows.insert(id, Held::Graph);
+    }
+
     /// Mark a node deleted, leaving it in the graph for navigation but out of
     /// search results and out of `node_ids`.
+    ///
+    /// The node keeps its vector, which after this is the *only* reference to
+    /// it: `remove` has already dropped the row's register entry. That is what
+    /// a tombstone needs — a node with no vector could not be a waypoint —
+    /// and it is why a rebuild is the only thing that reclaims the memory.
     fn tombstone(&mut self, index: usize) {
         if self.nodes[index].deleted {
             return;
@@ -1121,14 +1331,25 @@ impl VectorIndex for HnswIndex {
                 self.dim
             )));
         }
-        self.embeddings
-            .insert(id, StoredVector::from_f32(embedding, self.encoding));
+        // Prepared here rather than at commit, because the prepared form is
+        // the only form this index keeps and the caller's raw vector must not
+        // outlive this call. It is the same `from_f32(..).prepared(..)` pair
+        // the commit path used to apply to the stored raw copy, on the same
+        // bytes, so the vector that reaches the graph is bit for bit the one
+        // that reached it before — which is what makes this a memory change
+        // and not a recall change.
+        let vector =
+            StoredVector::from_f32(embedding, self.encoding).prepared(self.metric, self.encoding);
+        self.rows.insert(id, Held::Staged(vector));
         self.pending_inserts.push(id);
         Ok(())
     }
 
     fn remove(&mut self, id: RowId) -> Result<()> {
-        self.embeddings.remove(&id);
+        // Drops a staged vector outright; for a committed row it drops only
+        // the register entry, and the node keeps the vector until `commit`
+        // tombstones it and a later rebuild drops the node.
+        self.rows.remove(&id);
         self.pending_removes.push(id);
         Ok(())
     }
@@ -1163,14 +1384,26 @@ impl VectorIndex for HnswIndex {
         // row sequence even when one id arrives more than once.
         let inserts = core::mem::take(&mut self.pending_inserts);
         let shift = level_shift(self.params.m);
-        let ceiling = max_level_for(self.embeddings.len(), self.params.m);
+        let ceiling = max_level_for(self.rows.len(), self.params.m);
         let mut visited = Visited::new(self.nodes.len());
         for id in inserts {
-            let Some(embedding) = self.embeddings.get(&id) else {
+            // The vector is taken out of the register, not read from it:
+            // `insert_node` below is where it comes to rest. `claim` puts the
+            // row back as [`Held::Graph`].
+            let vector = match self.rows.remove(&id) {
                 // Removed again before this commit ran: nothing to insert.
-                continue;
+                None => continue,
+                Some(Held::Staged(vector)) => vector,
+                // The same id twice in one commit window — an update applied
+                // twice. The first pass moved the vector into a node; this
+                // pass retires that node and builds another from the same
+                // vector, which is exactly what re-reading the source map
+                // used to give it, tombstone and all.
+                Some(Held::Graph) => match self.node_ids.get(&id) {
+                    Some(&at) => self.nodes[at].vector.clone(),
+                    None => continue,
+                },
             };
-            let vector = embedding.prepared(self.metric, self.encoding);
             let level = level_of(id, shift, ceiling);
             // A replace without an intervening remove retires the old node the
             // same way a remove would.
@@ -1816,11 +2049,18 @@ mod tests {
 
     #[test]
     fn quantized_graph_round_trips_and_shrinks_vector_memory() {
-        let exact = built(256, 384);
+        // Both indexes over the same raw corpus, rather than one fed from the
+        // other's stored vectors: the index no longer keeps the raw form, and
+        // an int8 index fed an already-prepared vector would be measuring a
+        // different corpus than the exact one it is compared against.
+        let corpus = vectors(256, 384);
+        let mut exact = HnswIndex::new(384);
         let mut quantized = HnswIndex::new_quantized(384);
-        for (id, embedding) in &exact.embeddings {
-            quantized.insert(*id, &embedding.to_f32()).unwrap();
+        for (row, vector) in corpus.iter().enumerate() {
+            exact.insert(row as RowId + 1, vector).unwrap();
+            quantized.insert(row as RowId + 1, vector).unwrap();
         }
+        exact.commit().unwrap();
         quantized.commit().unwrap();
 
         let exact_bytes = exact.resident_vector_bytes();
@@ -1829,15 +2069,20 @@ mod tests {
             exact_bytes * 100 >= q8_bytes * 390,
             "exact={exact_bytes} q8={q8_bytes}"
         );
+        // One copy of each vector and no more — the property this whole
+        // structure was rearranged for. It used to be twice this.
+        assert_eq!(exact_bytes, 256 * 384 * size_of::<f32>());
 
         let saved = quantized.save().unwrap();
-        assert_eq!(saved[0], FORMAT_VERSION_Q8);
+        assert_eq!(saved[0], FORMAT_VERSION_INLINE);
+        // The encoding is a tag of its own now rather than a version byte
+        // that implies one, so an int8 index has to be saying so here.
+        assert_eq!(saved[2], 1);
         let mut restored = HnswIndex::new_quantized(384);
         restored.load(&saved).unwrap();
-        let query = exact.embeddings[&1].to_f32();
         assert_eq!(
-            quantized.search(&query, 10, None).unwrap(),
-            restored.search(&query, 10, None).unwrap()
+            quantized.search(&corpus[0], 10, None).unwrap(),
+            restored.search(&corpus[0], 10, None).unwrap()
         );
     }
 
@@ -1865,13 +2110,160 @@ mod tests {
         ));
     }
 
+    /// An index over `corpus` under an explicit metric and encoding, rows
+    /// numbered from one.
+    fn built_from(
+        corpus: &[Vec<f32>],
+        metric: VectorMetric,
+        encoding: VectorEncoding,
+    ) -> HnswIndex {
+        let dim = corpus[0].len();
+        let mut index = match encoding {
+            VectorEncoding::Exact => HnswIndex::with_metric(dim, metric),
+            VectorEncoding::Q8 => HnswIndex::quantized_with_metric(dim, metric),
+        };
+        for (row, vector) in corpus.iter().enumerate() {
+            index.insert(row as RowId + 1, vector).unwrap();
+        }
+        index.commit().unwrap();
+        index
+    }
+
+    /// `index` in the pre-[`FORMAT_VERSION_INLINE`] encoding: a section of raw
+    /// embeddings, and live nodes with no vector of their own for the decoder
+    /// to re-derive from them.
+    ///
+    /// Test-only, and the only way left to produce those bytes — the index
+    /// keeps no raw embedding, so nothing in the shipped code can write that
+    /// section. It exists so "an existing database is read, not rebuilt" is a
+    /// test rather than a sentence in a doc comment. `raw` must be in row-id
+    /// order, which is the order the old `BTreeMap` emitted.
+    fn legacy_encode(index: &HnswIndex, raw: &[(RowId, Vec<f32>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        match (index.metric, index.encoding) {
+            (VectorMetric::Cosine, VectorEncoding::Exact) => out.push(FORMAT_VERSION_EXACT),
+            (VectorMetric::Cosine, VectorEncoding::Q8) => out.push(FORMAT_VERSION_Q8),
+            (metric, encoding) => {
+                out.push(FORMAT_VERSION_METRIC);
+                out.push(metric.tag());
+                out.push(match encoding {
+                    VectorEncoding::Exact => 0,
+                    VectorEncoding::Q8 => 1,
+                });
+            }
+        }
+        put_len(&mut out, index.dim);
+
+        put_len(&mut out, raw.len());
+        for (id, embedding) in raw {
+            out.extend_from_slice(&id.to_le_bytes());
+            encode_stored_vector(&mut out, &StoredVector::from_f32(embedding, index.encoding));
+        }
+
+        put_len(&mut out, index.nodes.len());
+        for node in &index.nodes {
+            out.push(node.deleted as u8);
+            out.extend_from_slice(&node.id.to_le_bytes());
+            put_len(&mut out, node.neighbors.len());
+            for layer in &node.neighbors {
+                put_len(&mut out, layer.len());
+                for neighbor in layer {
+                    put_len(&mut out, *neighbor);
+                }
+            }
+            if node.deleted {
+                encode_stored_vector(&mut out, &node.vector);
+            }
+        }
+
+        match index.entry {
+            Some(entry) => {
+                out.push(1);
+                put_len(&mut out, entry);
+                put_len(&mut out, index.entry_level);
+            }
+            None => {
+                out.push(0);
+                put_len(&mut out, 0);
+                put_len(&mut out, 0);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_file_from_before_the_node_inline_format_still_loads() {
+        // The compatibility claim in `decode`'s docs, measured. A file written
+        // by any build back to version 3 has to come back as the *same* graph
+        // — same rows, same order, same scores, not merely close — because the
+        // decoder re-derives each live node's vector with the identical
+        // `prepared` call the index now makes at `insert`, on identical bytes.
+        //
+        // With three rows removed, so the tombstone path is exercised too:
+        // that is where the old format did store a vector inline, and it is
+        // the one node record whose meaning did not change.
+        for (metric, encoding) in [
+            (VectorMetric::Cosine, VectorEncoding::Exact),
+            (VectorMetric::Cosine, VectorEncoding::Q8),
+            (VectorMetric::L2, VectorEncoding::Exact),
+        ] {
+            let corpus = vectors(64, 8);
+            let mut index = built_from(&corpus, metric, encoding);
+            for id in [3, 9, 17] {
+                index.remove(id).unwrap();
+            }
+            index.commit().unwrap();
+            assert!(index.tombstones > 0, "no tombstone to test the old path");
+
+            let raw: Vec<(RowId, Vec<f32>)> = corpus
+                .iter()
+                .enumerate()
+                .map(|(row, vector)| (row as RowId + 1, vector.clone()))
+                .filter(|(id, _)| index.rows.contains_key(id))
+                .collect();
+            let bytes = legacy_encode(&index, &raw);
+            assert_ne!(bytes[0], FORMAT_VERSION_INLINE);
+
+            let restored = HnswIndex::decode(&bytes).unwrap();
+            assert_eq!(restored.len(), index.len());
+            for seed in 0..8 {
+                let query: Vec<f32> = (0..8).map(|i| ((seed * 8 + i) as f32).sin()).collect();
+                assert_eq!(
+                    index.search(&query, 10, None).unwrap(),
+                    restored.search(&query, 10, None).unwrap(),
+                    "a {:?}/{encoding:?} graph from an old file diverged on query {seed}",
+                    metric
+                );
+            }
+            // And it holds one copy of each vector, not the two the file it
+            // came from was written by.
+            assert_eq!(
+                restored.resident_vector_bytes(),
+                index.resident_vector_bytes()
+            );
+            assert_eq!(restored.save().unwrap()[0], FORMAT_VERSION_INLINE);
+        }
+    }
+
     #[test]
     fn a_node_without_an_embedding_is_refused() {
-        let mut index = built(8, 4);
+        // A pre-version-6 file's live nodes carry no vector; the embedding
+        // section is where the decoder gets them, and a node that section does
+        // not cover would decode into a graph with a hole in it. Version 6
+        // cannot express this at all — every node carries its own vector — so
+        // the guard now lives on the legacy path, which is the only one that
+        // still needs it.
+        let corpus = vectors(8, 4);
+        let index = built_from(&corpus, VectorMetric::Cosine, VectorEncoding::Exact);
         let orphan = index.nodes[0].id;
-        index.embeddings.remove(&orphan);
+        let raw: Vec<(RowId, Vec<f32>)> = corpus
+            .iter()
+            .enumerate()
+            .map(|(row, vector)| (row as RowId + 1, vector.clone()))
+            .filter(|(id, _)| *id != orphan)
+            .collect();
         assert!(matches!(
-            HnswIndex::decode(&index.encode()),
+            HnswIndex::decode(&legacy_encode(&index, &raw)),
             Err(Error::Corrupt(_))
         ));
     }
@@ -1896,18 +2288,18 @@ mod tests {
     #[test]
     fn a_future_format_version_is_refused() {
         let mut bytes = built(4, 4).encode();
-        bytes[0] = FORMAT_VERSION_METRIC + 1;
+        bytes[0] = FORMAT_VERSION_INLINE + 1;
         assert!(matches!(HnswIndex::decode(&bytes), Err(Error::Corrupt(_))));
     }
 
     #[test]
     fn a_metric_tag_this_build_does_not_know_is_refused() {
-        // The version-5 header's own failure mode: a file written by a build
+        // The versioned header's own failure mode: a file written by a build
         // with a third metric decodes into a graph whose links this one would
         // walk under the wrong distance. It has to be caught at the tag, not
         // by falling back to the default.
         let mut bytes = built_under(4, 4, VectorMetric::L2).encode();
-        assert_eq!(bytes[0], FORMAT_VERSION_METRIC);
+        assert_eq!(bytes[0], FORMAT_VERSION_INLINE);
         bytes[1] = VectorMetric::L2.tag() + 1;
         assert!(matches!(HnswIndex::decode(&bytes), Err(Error::Corrupt(_))));
     }
@@ -1988,12 +2380,16 @@ mod tests {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             ((state >> 33) as f32 / u32::MAX as f32) - 0.5
         };
-        // The oracle prepares once, not once per query: this runs on every
-        // push and the brute-force pass is most of it.
+        // The corpus as the graph holds it — already prepared, and prepared
+        // once, which this used to have to do for itself out of the raw
+        // embeddings the index kept beside the graph. Reading the graph's own
+        // vectors is not the index grading itself: the scan below is
+        // exhaustive where the walk is greedy, and what recall measures is
+        // exactly the difference between those two.
         let oracle: Vec<(RowId, Vec<f32>)> = index
-            .embeddings
-            .iter()
-            .map(|(id, embedding)| (*id, metric.prepare(&embedding.to_f32())))
+            .prepared_vectors()
+            .into_iter()
+            .map(|(id, vector)| (id, vector.to_f32()))
             .collect();
 
         // The oracle's own distance computations are not part of what the index
@@ -2043,8 +2439,14 @@ mod tests {
     /// guard rails above are about, and this one measures what happens when a
     /// caller overrides the tuning — two different questions that happen to
     /// share an oracle.
+    ///
+    /// `corpus` is handed in rather than read back out of the index because
+    /// the oracle here is the brute-force backend, which prepares for itself
+    /// and wants the vectors as the caller gave them — the index keeps only
+    /// the prepared form, and feeding those back would be normalising twice.
     fn measured_recall_at_ef(
         index: &HnswIndex,
+        corpus: &[Vec<f32>],
         dim: usize,
         k: usize,
         queries: usize,
@@ -2060,8 +2462,8 @@ mod tests {
         // filtered-recall tests measure against, so "the true nearest
         // neighbours" means one thing in this file.
         let mut oracle = crate::mem::BruteForceVectorIndex::new(dim);
-        for (id, embedding) in &index.embeddings {
-            oracle.insert(*id, &embedding.to_f32()).unwrap();
+        for (row, vector) in corpus.iter().enumerate() {
+            oracle.insert(row as RowId + 1, vector).unwrap();
         }
 
         let mut total = 0.0;
@@ -2102,6 +2504,9 @@ mod tests {
     #[test]
     fn a_wider_ef_search_finds_more_of_the_true_neighbours() {
         let (dim, k, queries) = (64, 10, 24);
+        // `built` inserts exactly this sequence — same generator, same seed —
+        // so the oracle and the graph see one corpus.
+        let corpus = vectors(1_000, dim);
         let index = built(1_000, dim);
 
         // `ef = k` is the floor the engine enforces; nothing narrower can be
@@ -2109,7 +2514,12 @@ mod tests {
         // give.
         let curve: Vec<(usize, f64)> = [k, 16, 32, 1_024]
             .into_iter()
-            .map(|ef| (ef, measured_recall_at_ef(&index, dim, k, queries, ef)))
+            .map(|ef| {
+                (
+                    ef,
+                    measured_recall_at_ef(&index, &corpus, dim, k, queries, ef),
+                )
+            })
             .collect();
 
         // The premises. Either one failing means the corpus stopped being able
@@ -2194,10 +2604,10 @@ mod tests {
             ((state >> 33) as f32 / u32::MAX as f32) - 0.5
         };
         let oracle: Vec<(RowId, Vec<f32>)> = index
-            .embeddings
-            .iter()
-            .filter(|(id, _)| filter(**id))
-            .map(|(id, embedding)| (*id, metric.prepare(&embedding.to_f32())))
+            .prepared_vectors()
+            .into_iter()
+            .filter(|(id, _)| filter(*id))
+            .map(|(id, vector)| (id, vector.to_f32()))
             .collect();
 
         let counter = Cell::new(0);
@@ -2690,18 +3100,32 @@ mod tests {
     }
 
     #[test]
-    fn a_cosine_index_writes_the_format_it_always_did() {
-        // The metric tags are only written by an index that needs them, so
-        // every database that exists today encodes byte for byte what it did
-        // before metrics existed — the same rule the catalog follows.
-        assert_eq!(built(32, 8).encode()[0], FORMAT_VERSION_EXACT);
+    fn every_index_writes_the_node_inline_format_with_explicit_tags() {
+        // This used to assert the opposite — that a cosine index encoded byte
+        // for byte what it did before metrics existed, with the encoding
+        // implied by the version byte and the metric implied by its absence.
+        // That rule could not survive holding each embedding once: with no raw
+        // embedding left to write, the layout itself changed, so the version
+        // moves for every index and the two tags are now always present rather
+        // than present only when the version could not imply them. What
+        // protects the databases is the *reading* side —
+        // `a_file_from_before_the_node_inline_format_still_loads`.
+        let cosine = built(32, 8).encode();
+        assert_eq!(
+            cosine[..3],
+            [FORMAT_VERSION_INLINE, VectorMetric::Cosine.tag(), 0]
+        );
+
         let mut quantized = HnswIndex::new_quantized(8);
         quantized.insert(1, &[0.5; 8]).unwrap();
         quantized.commit().unwrap();
-        assert_eq!(quantized.encode()[0], FORMAT_VERSION_Q8);
+        assert_eq!(
+            quantized.encode()[..3],
+            [FORMAT_VERSION_INLINE, VectorMetric::Cosine.tag(), 1]
+        );
 
-        let l2 = built_under(32, 8, VectorMetric::L2);
-        assert_eq!(l2.encode()[0], FORMAT_VERSION_METRIC);
+        let l2 = built_under(32, 8, VectorMetric::L2).encode();
+        assert_eq!(l2[..3], [FORMAT_VERSION_INLINE, VectorMetric::L2.tag(), 0]);
     }
 
     #[test]
@@ -2860,7 +3284,10 @@ mod tests {
         );
 
         let saved = quantized.save().unwrap();
-        assert_eq!(saved[0], FORMAT_VERSION_METRIC);
+        assert_eq!(
+            saved[..3],
+            [FORMAT_VERSION_INLINE, VectorMetric::L2.tag(), 1]
+        );
         let mut restored = HnswIndex::quantized_with_metric(dim, VectorMetric::L2);
         restored.load(&saved).unwrap();
         let query = rows[0].clone();

@@ -68,6 +68,34 @@ impl Statement {
         self.inner.is_read_only()
     }
 
+    /// Per placeholder, in `?` order: the embedding dimension this statement
+    /// pins it to, or `None` where it pins none.
+    ///
+    /// What it is for: a wire protocol that has no `VECTOR` type code — the
+    /// MySQL one — cannot tell a bound embedding from a bound `BLOB` carrying
+    /// the same bytes. The *statement* knows, because the target column's
+    /// width is part of its shape, so a server decoding parameters reads the
+    /// answer here instead of guessing it from the payload.
+    ///
+    /// ```
+    /// use inlaysql::Database;
+    ///
+    /// let mut db = Database::open_in_memory()?;
+    /// db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR(4))", &[])?;
+    ///
+    /// let insert = db.prepare("INSERT INTO docs (id, embedding) VALUES (?, ?)")?;
+    /// assert_eq!(insert.parameter_vector_dims(), &[None, Some(4)]);
+    ///
+    /// let search = db.prepare(
+    ///     "SELECT id, vector_score(embedding, ?) AS score FROM docs ORDER BY score DESC LIMIT 5",
+    /// )?;
+    /// assert_eq!(search.parameter_vector_dims(), &[Some(4)]);
+    /// # Ok::<(), inlaysql::Error>(())
+    /// ```
+    pub fn parameter_vector_dims(&self) -> &[Option<usize>] {
+        self.inner.parameter_vector_dims()
+    }
+
     /// This statement's output columns, in projection order.
     ///
     /// Empty for a statement that produces no rows (`CREATE TABLE`, an

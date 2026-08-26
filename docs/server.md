@@ -929,6 +929,65 @@ down. A column with no values to unify — an empty result set, or one that is
 so `SELECT id FROM t` reports `LONGLONG` whether or not `t` happens to have
 rows in it, and agrees with the `COM_STMT_PREPARE` that preceded it.
 
+#### Binding a `VECTOR` parameter
+
+An embedding is bound as **`dim` little-endian IEEE-754 `binary32` values in a
+string parameter** — `4 * dim` bytes, no header, no separators. That is MySQL
+9's own `VECTOR` storage format and it is what every driver already has a way to
+send: Python `bytes`, Go `[]byte`, Java `byte[]`, PHP a binary string.
+
+```python
+cursor = connection.cursor(prepared=True)
+cursor.execute(
+    "INSERT INTO items (id, embedding) VALUES (?, ?)",
+    (1, numpy.asarray(v, dtype=numpy.float32).tobytes()),
+)
+cursor.execute(
+    "SELECT id, vector_score(embedding, ?) AS score "
+    "FROM items ORDER BY score DESC LIMIT 10",
+    (query.astype(numpy.float32).tobytes(),),
+)
+```
+
+**Which `?` is an embedding comes from the statement, not from the packet.** The
+MySQL protocol grew `MYSQL_TYPE_VECTOR` only in 9.0 and no driver in the field
+emits it for a bound value — `mysql-connector-python` tags both `str` and
+`bytes` as `MYSQL_TYPE_STRING` — so the type byte cannot tell an embedding from
+any other string. The *plan* can: a `?` written into a `VECTOR(dim)` column, or
+scored against one by `vector_score`, has its width fixed by the statement's
+shape. Those are the slots that decode as packed floats, and only those. A `?`
+bound to a `BLOB` or `TEXT` column is untouched, and a `?` in a projection or a
+`WHERE` comparison — where nothing names a width — stays the bytes it was sent
+as. Guessing from the payload instead would misread a decimal-text embedding
+whose length happened to be `4 * dim` as garbage floats and index it silently.
+
+The four ways to get it wrong, and what each returns:
+
+| Bound value | Result |
+| --- | --- |
+| Not `4 * dim` bytes | `1366`, naming the byte count expected and the one received |
+| Any component NaN or infinite | `1366`, naming the component's index |
+| Bound under a fixed-width type code (an integer, a `DOUBLE`, a datetime) | `1366`, naming the type code |
+| The decimal text `'[0.1, 0.2, ...]'` | `1366`, saying to pack the floats |
+
+None of these is accepted, because an HNSW graph is built once and queried for
+the life of the table: a NaN in it makes its own node unreachable from every
+neighbour and drops that row out of every search from then on, and a short
+payload is a *different* embedding rather than a shorter one. Neither announces
+itself later.
+
+`vector('[...]')` in SQL text is unchanged and still takes decimal text only.
+The two spellings are deliberately separate: it exists so a small example can be
+written by hand, and the parameter path does not accept it — nor does the text
+path accept packed bytes, since `X'...'` into a `VECTOR` column is still the
+type error it always was.
+
+Coming *back*, a `VECTOR` column is a `VAR_STRING` holding the JSON array
+`vector()` accepts, in both the text and binary protocols, rendered with `f32`'s
+shortest round-tripping decimal form. So what a client reads back parses to
+exactly the floats it bound, and a driver with no vector type of its own still
+gets something it can print.
+
 #### Result sets are streamed where they can be
 
 A `SELECT` whose every projected column has a declared type is written to the
@@ -2127,7 +2186,12 @@ than the zero `COM_STMT_PREPARE` used to report, alongside a shim-answered
 prepared statement still reporting zero (AHL-466); error codes for missing
 table, duplicate key, syntax error, unsupported feature and missing column;
 the shim's `SHOW`/`information_schema` answers, including through a prepared
-statement with bound parameters; a metadata filter that must fail rather than
+statement with bound parameters; a **bound embedding** round-tripping through
+`INSERT`, `UPDATE`, `ON CONFLICT DO UPDATE` and `vector_score` and read back
+component for component, with each of the ways to bind one wrongly refused and
+the table checked afterwards to prove none of them reached the index, and the
+SQL text path checked to have *not* widened alongside it (AHL-478); a metadata
+filter that must fail rather than
 answer wrongly; transactions including a rollback that really rolls back and
 `autocommit=0`; savepoints being refused; wrong password (under every plugin
 this server completes), wrong user and a forged token; the connection cap;

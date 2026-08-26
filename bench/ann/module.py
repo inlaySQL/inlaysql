@@ -20,8 +20,8 @@ MySQL client connection, running ordinary SQL:
 
     CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(<dim>))
     CREATE INDEX items_embedding ON items (embedding vector_cosine_ops)
-    INSERT INTO items (id, embedding) VALUES (0, vector('[...]')), ...
-    SELECT id, vector_score(embedding, vector('[...]')) AS score
+    INSERT INTO items (id, embedding) VALUES (?, ?), (?, ?), ...
+    SELECT id, vector_score(embedding, ?) AS score
       FROM items ORDER BY score DESC LIMIT <n>
 
 There is no private API here and no Rust written for the benchmark. That is the
@@ -68,13 +68,24 @@ What the engine does not expose, and what this file does about it
   rather than one query, so surfacing them needs a catalog format change to
   record them per index. That is why there is no graph-shape grid below, where
   pgvector's config varies `M`.
-* **No parameter binding for embeddings.** The MySQL wire refuses a bound
-  embedding — a string parameter into a `VECTOR` column fails with 1366
-  (`column is VECTOR(4) but the value is TEXT`), and `vector_score(embedding,
-  ?)` fails the same way. Every embedding therefore crosses the wire as a
-  `vector('[...]')` decimal-text literal that the server re-parses. That is
-  inside the timed region on purpose, because it is inside a user's timed
-  region too, and `get_additional()` reports how much of the query time it is.
+* **Embeddings are bound, not inlined.** Every embedding crosses as a bound
+  parameter carrying `dim` little-endian `f32`s — `numpy`'s own buffer, sent
+  as a `bytes` parameter, which is MySQL 9's `VECTOR` storage format and what
+  `mysql.connector` puts on the wire for any `bytes` value. The server knows
+  which `?` is an embedding from the statement rather than from the packet
+  (`Statement::parameter_vector_dims`), because the MySQL protocol has no
+  vector type code a driver in the field emits.
+
+  This file used to inline every embedding as a `vector('[...]')` decimal-text
+  literal, because a bound one was refused with 1366 whatever was bound to it.
+  That cost **363.9 MiB of SQL for a 112.9 MiB corpus — 3.22x** on glove-25,
+  plus 11-18 µs per query formatting the query vector as text. Binding it is
+  **127.9 MiB — 1.13x** and about 0.3 µs, and takes the load from 41.20 s to
+  19.77 s. `get_additional()` reports both the bytes the server received during
+  the load — read off its own `Bytes_received`, not estimated here — and the
+  packing time per query, so the claim stays measured rather than asserted. The
+  packing stays inside the timed region for the same reason the formatting did:
+  it is inside a user's timed region too.
 
 Nothing here is tuned to flatter the engine. If a number is bad it is reported.
 """
@@ -122,16 +133,14 @@ except ImportError:  # standalone, driven by bench/ann/run.py
             return self.name
 
 
-# `%.9g` is the shortest decimal form that round-trips every `f32` exactly, so
-# the corpus the engine indexes is bit-for-bit the corpus the ground truth was
-# computed over. `repr()` would also round-trip but writes the `f64` widening
-# (488 bytes/row at dim 25 against 300), and every one of those bytes is wire
-# traffic the server then re-parses.
-FLOAT_FORMAT = "%.9g"
-
-# How much SQL text one `INSERT` carries. The server reports
+# How much payload one `INSERT` carries. The server reports
 # `max_allowed_packet` = 64 MiB; this is far below it, and large enough that
 # per-statement overhead is not what the build measures.
+#
+# There is no float formatting left to round-trip: a bound embedding is
+# `numpy`'s own `f32` buffer, so the corpus the engine indexes is bit-for-bit
+# the corpus the ground truth was computed over by construction rather than by
+# choosing a decimal format careful enough to survive the trip.
 BATCH_BYTES = 2 * 1024 * 1024
 
 # How much a single transaction may *write*. This is an engine limit, not a
@@ -235,6 +244,15 @@ class InlaySQL(BaseANN):
         self._directory = None
         self._connection = None
         self._cursor = None
+        # A second cursor, in the binary protocol. Everything that carries an
+        # embedding goes through this one; DDL and the metadata reads stay on
+        # the text cursor, because preparing a statement that runs once is a
+        # round trip spent to save nothing.
+        self._bound = None
+        # `INSERT ... VALUES (?,?),(?,?),...` keyed by row count. A prepared
+        # cursor re-prepares whenever the statement text changes, so the tail
+        # batch and any halved one would otherwise re-prepare on every call.
+        self._insert_sql = {}
         self._dim = None
         self._plan = None
         self._baseline_rss = None
@@ -242,11 +260,17 @@ class InlaySQL(BaseANN):
         # which half dominates. Filled in by `fit`.
         self.load_seconds = 0.0
         self.graph_seconds = 0.0
+        # Bytes the *server* framed in during the load, read off its own
+        # `Bytes_received` counter rather than estimated from the SQL this side
+        # built — the amplification this adapter used to pay is the reason it
+        # is reported at all. `None` when the counter could not be read.
+        self.load_wire_bytes = None
+        self.corpus_bytes = 0
         # True when INLAYSQL_HOST/PORT point at a server this object did not
         # start: there is no pid to read, so memory is reported as unknown
         # rather than as zero.
         self._external = False
-        self._format_seconds = 0.0
+        self._pack_seconds = 0.0
         self._queries = 0
 
     # ------------------------------------------------------------------ server
@@ -303,6 +327,7 @@ class InlaySQL(BaseANN):
                     autocommit=True,  # DDL is refused inside a transaction
                 )
                 self._cursor = self._connection.cursor()
+                self._bound = self._connection.cursor(prepared=True)
                 # What an empty server costs, so `get_memory_usage` can report
                 # what the *index* costs rather than that plus a fixed process.
                 if self._process is not None:
@@ -355,35 +380,39 @@ class InlaySQL(BaseANN):
             f"CREATE INDEX items_embedding ON items (embedding {self.operator_class})"
         )
 
-        # Rows per statement, bounded by both the wire (SQL text) and the
-        # engine (WAL bytes per transaction — see WAL_BUDGET_BYTES). The
-        # per-row page cost is the payload plus the row header and the primary
-        # key's B-tree entry; measured at ~1.75x the raw `f32` payload at dim
-        # 20, so the estimate is deliberately generous and `_flush` halves if
-        # it is still wrong.
+        # Rows per statement, bounded by three things at once: the engine (WAL
+        # bytes per transaction — see WAL_BUDGET_BYTES), the payload
+        # (BATCH_BYTES), and the protocol, whose `COM_STMT_PREPARE_OK` carries
+        # the placeholder count in a `u16` and so cannot describe more than
+        # 65535 of them — two per row here.
+        #
+        # The per-row page cost is the payload plus the row header and the
+        # primary key's B-tree entry; measured at ~1.75x the raw `f32` payload
+        # at dim 20, so the estimate is deliberately generous and `_flush`
+        # halves if it is still wrong.
         per_row_written = self._dim * 4 * 2 + 128
-        rows_per_batch = max(1, WAL_BUDGET_BYTES // per_row_written)
+        rows_per_batch = max(
+            1,
+            min(
+                WAL_BUDGET_BYTES // per_row_written,
+                BATCH_BYTES // (self._dim * 4 + 16),
+                65535 // 2,
+            ),
+        )
 
         # The load and the graph build are timed apart because they are two
         # different costs with two different fixes, and ann-benchmarks' single
         # `build_time` hides which one dominates.
+        self.corpus_bytes = int(X.nbytes)
+        before = self._bytes_received()
         loading = time.perf_counter()
-        pending: list[str] = []
-        size = 0
-        for start in range(0, len(X), 4096):
-            block = X[start : start + 4096]
-            # One C-level pass per block rather than tens of millions of Python
-            # format calls. Exact for f32 — see FLOAT_FORMAT.
-            literals = numpy.char.mod(FLOAT_FORMAT, block)
-            for offset, row in enumerate(literals):
-                value = f"({start + offset},vector('[{','.join(row)}]'))"
-                pending.append(value)
-                size += len(value) + 1
-                if len(pending) >= rows_per_batch or size >= BATCH_BYTES:
-                    self._flush(pending)
-                    pending, size = [], 0
-        self._flush(pending)
+        for start in range(0, len(X), rows_per_batch):
+            block = X[start : start + rows_per_batch]
+            self._flush(start, block)
         self.load_seconds = time.perf_counter() - loading
+        after = self._bytes_received()
+        if before is not None and after is not None:
+            self.load_wire_bytes = after - before
 
         # The engine builds the graph on the first *read*, not on insert. Left
         # out of `fit`, the whole build would land on ann-benchmarks' first
@@ -392,29 +421,47 @@ class InlaySQL(BaseANN):
         # what an application has to do too, because there is no SQL that asks
         # for the build explicitly.
         building = time.perf_counter()
-        probe = ",".join(numpy.char.mod(FLOAT_FORMAT, X[0]))
-        self._cursor.execute(
-            f"SELECT id, vector_score(embedding, vector('[{probe}]')) AS score "
-            f"FROM items ORDER BY score DESC LIMIT 10"
+        probe = X[0].tobytes()
+        self._bound.execute(
+            "SELECT id, vector_score(embedding, ?) AS score "
+            "FROM items ORDER BY score DESC LIMIT 10",
+            (probe,),
         )
-        self._cursor.fetchall()
+        self._bound.fetchall()
         self.graph_seconds = time.perf_counter() - building
 
         # A row labelled HNSW that was actually a table scan is the most
         # misleading number a vector benchmark can publish, so the plan is read
         # rather than assumed — the check `bench/external/pgvector_driver.py`
-        # already makes against PostgreSQL's planner.
-        self._cursor.execute(
-            f"EXPLAIN SELECT id, vector_score(embedding, vector('[{probe}]')) AS score "
-            f"FROM items ORDER BY score DESC LIMIT 10"
+        # already makes against PostgreSQL's planner. `EXPLAIN` is run over the
+        # *bound* form, not a literal one: an index the planner picks for a
+        # literal and abandons for a `?` would be exactly the regression this
+        # check exists to catch.
+        self._bound.execute(
+            "EXPLAIN SELECT id, vector_score(embedding, ?) AS score "
+            "FROM items ORDER BY score DESC LIMIT 10",
+            (probe,),
         )
-        self._plan = " / ".join(str(row[-1]) for row in self._cursor.fetchall())
+        self._plan = " / ".join(str(row[-1]) for row in self._bound.fetchall())
         if "VECTOR INDEX" not in self._plan:
             raise RuntimeError(
                 f"the vector index exists but the planner did not use it: {self._plan}"
             )
 
-    def _flush(self, pending: list[str]) -> None:
+    def _insert_for(self, rows: int) -> str:
+        """`INSERT ... VALUES (?,?),(?,?),...` for a batch of `rows` rows.
+
+        Cached because a prepared cursor re-prepares whenever the statement
+        text changes: without this, the tail batch and every halved one would
+        pay a `COM_STMT_PREPARE` round trip they do not need.
+        """
+        if rows not in self._insert_sql:
+            self._insert_sql[rows] = "INSERT INTO items (id, embedding) VALUES " + ",".join(
+                ["(?,?)"] * rows
+            )
+        return self._insert_sql[rows]
+
+    def _flush(self, first_id: int, block: numpy.ndarray) -> None:
         """One `INSERT`, split until it fits the write-ahead log.
 
         The engine refuses a transaction larger than one WAL region with 1030
@@ -422,20 +469,43 @@ class InlaySQL(BaseANN):
         correct, not a failure to report. `crates/inlaysql-bench`'s `batched()`
         does the same thing in Rust by catching `Error::Transaction` and
         committing early; this is that, over the wire.
+
+        Each embedding is `row.tobytes()` — the `f32` buffer numpy already
+        holds, handed to the driver as a `bytes` parameter. Nothing is
+        formatted, nothing is re-parsed, and the row the engine stores is the
+        row the ground truth was computed over, bit for bit.
         """
-        if not pending:
+        if len(block) == 0:
             return
         import mysql.connector
 
+        params = []
+        for offset, row in enumerate(block):
+            params.append(first_id + offset)
+            params.append(row.tobytes())
         try:
-            self._cursor.execute("INSERT INTO items (id, embedding) VALUES " + ",".join(pending))
+            self._bound.execute(self._insert_for(len(block)), tuple(params))
         except mysql.connector.errors.DatabaseError as error:
             fits = "write-ahead log" in str(error)
-            if not fits or len(pending) == 1:
+            if not fits or len(block) == 1:
                 raise
-            middle = len(pending) // 2
-            self._flush(pending[:middle])
-            self._flush(pending[middle:])
+            middle = len(block) // 2
+            self._flush(first_id, block[:middle])
+            self._flush(first_id + middle, block[middle:])
+
+    def _bytes_received(self):
+        """The server's own `Bytes_received`, or None if it cannot be read.
+
+        Read from the server rather than counted here on purpose: this number
+        is the evidence for the wire cost, and a client-side estimate of it
+        would be the adapter marking its own homework.
+        """
+        try:
+            self._cursor.execute("SHOW GLOBAL STATUS LIKE 'Bytes_received'")
+            rows = self._cursor.fetchall()
+            return int(rows[0][1]) if rows else None
+        except Exception:  # noqa: BLE001 — a missing number is reported as missing
+            return None
 
     # ------------------------------------------------------------------ query
 
@@ -459,7 +529,7 @@ class InlaySQL(BaseANN):
             f"InlaySQL({self.operator_class}, quantization={self.quantization}, "
             f"ef_search={self.ef_search})"
         )
-        self._format_seconds = 0.0
+        self._pack_seconds = 0.0
         self._queries = 0
 
     def query(self, v: numpy.ndarray, n: int):
@@ -475,17 +545,24 @@ class InlaySQL(BaseANN):
                 f"candidate list narrower than the answer. Sweep values >= k."
             )
         started = time.perf_counter()
-        literal = ",".join(numpy.char.mod(FLOAT_FORMAT, numpy.asarray(v, dtype=numpy.float32)))
-        self._format_seconds += time.perf_counter() - started
+        # What formatting the query embedding costs now: one contiguity check
+        # and a buffer copy, against 11-18 µs of decimal formatting before.
+        packed = numpy.ascontiguousarray(v, dtype=numpy.float32).tobytes()
+        self._pack_seconds += time.perf_counter() - started
         self._queries += 1
-        self._cursor.execute(
-            f"SELECT id, vector_score(embedding, vector('[{literal}]')) AS score "
-            f"FROM items ORDER BY score DESC LIMIT {n}"
+        # `LIMIT` is interpolated rather than bound because it is fixed for a
+        # whole run: one prepared statement per `n` and no re-preparing, where
+        # a bound `LIMIT` would still be one statement but a placeholder the
+        # engine cannot use to size the walk.
+        self._bound.execute(
+            f"SELECT id, vector_score(embedding, ?) AS score "
+            f"FROM items ORDER BY score DESC LIMIT {n}",
+            (packed,),
         )
         # Exactly `n`, and no truncation needed: the recall/latency dial is now
         # `ef_search` rather than an inflated `LIMIT`, so the query asks for the
         # answer it is scored on.
-        return [row[0] for row in self._cursor.fetchall()]
+        return [row[0] for row in self._bound.fetchall()]
 
     def batch_query(self, X: numpy.ndarray, n: int) -> None:
         """Serial, overriding `BaseANN`'s ThreadPool.
@@ -530,14 +607,24 @@ class InlaySQL(BaseANN):
         return _rss_kb(self._process.pid) if self._process is not None else None
 
     def get_additional(self) -> dict:
-        formatting = (
-            self._format_seconds / self._queries * 1e6 if self._queries else 0.0
+        packing = self._pack_seconds / self._queries * 1e6 if self._queries else 0.0
+        amplification = (
+            self.load_wire_bytes / self.corpus_bytes
+            if self.load_wire_bytes and self.corpus_bytes
+            else 0.0
         )
         return {
             # How much of each query was spent turning the embedding into the
-            # decimal text the wire requires, since the engine will not bind
-            # one. Reported, not subtracted: a user pays it.
-            "inlaysql_literal_format_us": round(formatting, 3),
+            # bytes the wire carries. Reported, not subtracted: a user pays it.
+            # This was `inlaysql_literal_format_us` and measured decimal
+            # formatting at 11-18 µs, back when a bound embedding was refused.
+            "inlaysql_embedding_pack_us": round(packing, 3),
+            # What the load actually cost on the socket, counted by the server
+            # (`Bytes_received`), against the raw `f32` corpus it carried. The
+            # ratio was 3.22x when every embedding was inlined as decimal text.
+            "inlaysql_load_wire_bytes": int(self.load_wire_bytes or 0),
+            "inlaysql_corpus_bytes": int(self.corpus_bytes),
+            "inlaysql_wire_amplification": round(amplification, 3),
             "inlaysql_ef_search": self.ef_search,
             # `build_time`, split. The load is the wire and the storage engine;
             # the graph is one single-threaded HNSW build the engine defers to
@@ -550,13 +637,13 @@ class InlaySQL(BaseANN):
         }
 
     def done(self) -> None:
-        for closer in (self._cursor, self._connection):
+        for closer in (self._bound, self._cursor, self._connection):
             try:
                 if closer is not None:
                     closer.close()
             except Exception:  # noqa: BLE001
                 pass
-        self._cursor = self._connection = None
+        self._bound = self._cursor = self._connection = None
         if self._process is not None:
             self._process.terminate()
             try:
