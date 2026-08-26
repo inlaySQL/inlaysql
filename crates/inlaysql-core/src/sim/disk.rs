@@ -14,6 +14,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use core::cell::Cell;
 
 use crate::btree::Device;
 use crate::error::{Error, Result};
@@ -112,6 +113,8 @@ pub struct SimDisk {
     trace: Vec<TraceEvent>,
     writes: u64,
     syncs: u64,
+    /// Whether a core handle has opted this shared device into page reuse.
+    reuse_enabled: Cell<bool>,
 }
 
 impl SimDisk {
@@ -136,6 +139,7 @@ impl SimDisk {
             trace: Vec::new(),
             writes: 0,
             syncs: 0,
+            reuse_enabled: Cell::new(false),
         }
     }
 
@@ -157,6 +161,7 @@ impl SimDisk {
             trace: Vec::new(),
             writes: 0,
             syncs: 0,
+            reuse_enabled: Cell::new(false),
         }
     }
 
@@ -304,6 +309,17 @@ impl Device for SimDisk {
     fn sync(&mut self) -> Result<()> {
         SimDisk::sync(self, Fault::None);
         Ok(())
+    }
+
+    fn note_page_reuse_enabled(&self) {
+        // `SimDisk` is normally wrapped in `Rc<RefCell<_>>` when multiple
+        // handles share it, so the trait's shared-reference hook needs
+        // interior mutability only for this one process-wide flag.
+        self.reuse_enabled.set(true);
+    }
+
+    fn page_reuse_enabled(&self) -> bool {
+        self.reuse_enabled.get()
     }
 }
 

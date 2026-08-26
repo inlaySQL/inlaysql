@@ -826,6 +826,12 @@ impl Device for FileDevice {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
     }
+
+    fn page_reuse_enabled(&self) -> bool {
+        self.coordinator
+            .as_ref()
+            .is_none_or(|coordinator| coordinator.reuse_enabled.load(Ordering::Acquire))
+    }
 }
 
 fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator>> {

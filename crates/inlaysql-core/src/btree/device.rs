@@ -294,6 +294,17 @@ pub trait Device {
     /// id, so "check this flag before serving, set it before reuse is
     /// possible" is enough of an ordering proof to need no per-entry version.
     fn note_page_reuse_enabled(&self) {}
+
+    /// Whether page ids may already be reused on this device.
+    ///
+    /// The conservative default is `true`: a device that cannot report a
+    /// file-wide reuse state must not let a handle trust a decoded page cache
+    /// or retained cursor across another handle's page reuse. Implementations
+    /// that own or coordinate the device may return `false` until
+    /// [`Device::note_page_reuse_enabled`] is called.
+    fn page_reuse_enabled(&self) -> bool {
+        true
+    }
 }
 
 /// A device shared by many trees through reference counting and interior
@@ -364,5 +375,9 @@ impl<T: Device> Device for Rc<RefCell<T>> {
 
     fn note_page_reuse_enabled(&self) {
         self.borrow().note_page_reuse_enabled();
+    }
+
+    fn page_reuse_enabled(&self) -> bool {
+        self.borrow().page_reuse_enabled()
     }
 }

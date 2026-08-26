@@ -20,6 +20,8 @@ pub struct MemoryDevice {
     /// Commits that have completed on this device. See
     /// [`MemoryDevice::commit_generation`].
     generation: Cell<u64>,
+    /// Whether a core handle has opted this device into page reuse.
+    reuse_enabled: Cell<bool>,
 }
 
 impl MemoryDevice {
@@ -33,6 +35,7 @@ impl MemoryDevice {
         Self {
             bytes: bytes.to_vec(),
             generation: Cell::new(0),
+            reuse_enabled: Cell::new(false),
         }
     }
 
@@ -92,6 +95,14 @@ impl Device for MemoryDevice {
     /// for what would have to change if this device were ever shared.
     fn commit_generation(&self) -> Option<u64> {
         Some(self.generation.get())
+    }
+
+    fn note_page_reuse_enabled(&self) {
+        self.reuse_enabled.set(true);
+    }
+
+    fn page_reuse_enabled(&self) -> bool {
+        self.reuse_enabled.get()
     }
 }
 

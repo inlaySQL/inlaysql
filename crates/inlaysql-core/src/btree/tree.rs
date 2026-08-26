@@ -204,6 +204,10 @@ pub struct CowBTree<D: Device> {
     /// falls back to the ordinary traversal. Kept separate from the point
     /// cursor because the two read patterns have different locality.
     range_cursor: RefCell<Option<RangeCursor>>,
+    /// The last committed raw table-scan leaf, including its page bytes. A
+    /// bounded resume that still fits in that leaf can avoid both the descent
+    /// and the page read; a scan that needs another leaf falls back.
+    row_scan_cursor: RefCell<Option<RawScanCursor>>,
     /// Whether [`CowBTree::alloc_page`] may hand out a page id the free list
     /// (Phase 2 item 6) has recorded as reclaimable. `false` by default and
     /// for every existing caller: with this off, allocation is exactly the
@@ -444,6 +448,7 @@ impl<D: Device> CowBTree<D> {
             scratch: RefCell::new(vec![0u8; page_size]),
             cursor: RefCell::new(None),
             range_cursor: RefCell::new(None),
+            row_scan_cursor: RefCell::new(None),
             reuse_enabled: false,
             free_candidates: Vec::new(),
             freed_this_txn: Vec::new(),
@@ -492,6 +497,7 @@ impl<D: Device> CowBTree<D> {
             self.device.note_page_reuse_enabled();
         }
         self.reuse_enabled = enabled;
+        self.invalidate_for_reuse();
     }
 
     /// Whether this handle will draw on the free list. See
@@ -528,10 +534,11 @@ impl<D: Device> CowBTree<D> {
     /// `CowBTree::set_page_reuse`'s doc comment for the cost this puts only
     /// on a handle that opted in.
     fn invalidate_for_reuse(&self) {
-        if self.reuse_enabled {
+        if self.reuse_enabled || self.device.page_reuse_enabled() {
             self.cache.borrow_mut().clear();
             *self.cursor.borrow_mut() = None;
             *self.range_cursor.borrow_mut() = None;
+            *self.row_scan_cursor.borrow_mut() = None;
         }
     }
 
@@ -695,7 +702,7 @@ impl<D: Device> CowBTree<D> {
     /// descent this function does becomes the new retained leaf for next
     /// time.
     fn get_from(&self, root: PageId, key: &[u8], pending: bool) -> Result<Option<RowBuf>> {
-        if !pending {
+        if !pending && !self.device.page_reuse_enabled() {
             if let Some(hit) = self.reseek(root, key)? {
                 return Ok(hit);
             }
@@ -729,7 +736,7 @@ impl<D: Device> CowBTree<D> {
                             .map(Some)?,
                         Err(_) => None,
                     };
-                    if !pending {
+                    if !pending && !self.device.page_reuse_enabled() {
                         self.retain_cursor(root, id, low_source, high_source);
                     }
                     return Ok(result);
@@ -879,6 +886,26 @@ impl<D: Device> CowBTree<D> {
                 generation,
                 low,
                 high,
+            });
+        }
+    }
+
+    /// Retain a raw table leaf, including the page bytes its rows borrow.
+    fn retain_raw_scan_cursor(
+        &self,
+        root: PageId,
+        generation: u64,
+        candidate: RawScanCursorCandidate,
+    ) {
+        let low = bound_key(candidate.low_source);
+        let high = bound_key(candidate.high_source);
+        if let Ok(mut slot) = self.row_scan_cursor.try_borrow_mut() {
+            *slot = Some(RawScanCursor {
+                root,
+                generation,
+                low,
+                high,
+                bytes: candidate.bytes,
             });
         }
     }
@@ -1541,7 +1568,7 @@ impl<D: Device> CowBTree<D> {
         };
         let root = self.read_root();
         let pending = self.has_pending;
-        let generation = (!pending)
+        let generation = (!pending && !self.device.page_reuse_enabled())
             .then(|| self.device.commit_generation())
             .flatten();
         if let Some(generation) = generation {
@@ -1690,7 +1717,38 @@ impl<D: Device> CowBTree<D> {
             after,
             limit,
         };
-        self.walk_raw_row_values(self.read_root(), &bounds, self.has_pending, &mut out)?;
+        let root = self.read_root();
+        let pending = self.has_pending;
+        let generation = (!pending && !self.device.page_reuse_enabled())
+            .then(|| self.device.commit_generation())
+            .flatten();
+        if let Some(generation) = generation {
+            if let Ok(slot) = self.row_scan_cursor.try_borrow() {
+                if let Some(cursor) = slot.as_ref() {
+                    if cursor.root == root
+                        && cursor.generation == generation
+                        && cursor.lower_is_in_leaf(&bounds)
+                        && self.scan_row_values_from_cursor(cursor, &bounds, &mut out)?
+                    {
+                        return Ok(out);
+                    }
+                }
+            }
+        }
+        let mut candidate = None;
+        self.walk_raw_row_values(
+            root,
+            &bounds,
+            pending,
+            &mut out,
+            RangeSpanSources::default(),
+            &mut candidate,
+        )?;
+        if let Some(generation) = generation {
+            if let Some(candidate) = candidate {
+                self.retain_raw_scan_cursor(root, generation, candidate);
+            }
+        }
         Ok(out)
     }
 
@@ -2373,6 +2431,9 @@ impl<D: Device> CowBTree<D> {
         if !cache::data_area_page(self.page_size, self.format_version, id) {
             return Ok(Rc::new(self.read_committed_node(id)?));
         }
+        if self.device.page_reuse_enabled() {
+            return Ok(Rc::new(self.read_committed_node(id)?));
+        }
         if let Ok(mut cache) = self.cache.try_borrow_mut() {
             if let Some(node) = cache.get(id) {
                 return Ok(node);
@@ -2403,6 +2464,9 @@ impl<D: Device> CowBTree<D> {
         if pending && self.dirty.contains_key(&id) {
             return None;
         }
+        if self.device.page_reuse_enabled() {
+            return None;
+        }
         if !cache::data_area_page(self.page_size, self.format_version, id) {
             return None;
         }
@@ -2413,6 +2477,9 @@ impl<D: Device> CowBTree<D> {
     /// [`CowBTree::cached_page`] reads it back by.
     fn cache_committed(&self, id: PageId, pending: bool, node: &Rc<Node>) {
         if pending && self.dirty.contains_key(&id) {
+            return;
+        }
+        if self.device.page_reuse_enabled() {
             return;
         }
         if !cache::data_area_page(self.page_size, self.format_version, id) {
@@ -2501,6 +2568,27 @@ impl<D: Device> CowBTree<D> {
                 other => Err(Error::Corrupt(alloc::format!("unknown node kind {other}"))),
             }
         })
+    }
+
+    /// Reuse a retained raw table leaf for a bounded scan or resume.
+    ///
+    /// When the requested upper bound extends beyond the leaf, the temporary
+    /// result is committed only if the caller's limit was filled. Otherwise
+    /// the caller still needs a later leaf and the normal walk must start from
+    /// the original bounds without any partial rows having been appended.
+    fn scan_row_values_from_cursor(
+        &self,
+        cursor: &RawScanCursor,
+        bounds: &WalkBounds<'_>,
+        out: &mut Vec<(RowId, RowBuf)>,
+    ) -> Result<bool> {
+        let mut rows = Vec::new();
+        self.scan_leaf_into(&cursor.bytes, bounds, false, &mut rows)?;
+        if cursor.end_is_in_leaf(bounds.end) || rows.len() >= bounds.limit {
+            out.extend(rows);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Read one page into the reusable scratch buffer and hand it to `f`.
@@ -3001,6 +3089,8 @@ impl<D: Device> CowBTree<D> {
         bounds: &WalkBounds<'_>,
         pending: bool,
         out: &mut Vec<(RowId, RowBuf)>,
+        span: RangeSpanSources,
+        last_leaf: &mut Option<RawScanCursorCandidate>,
     ) -> Result<()> {
         if id == 0 || out.len() >= bounds.limit {
             return Ok(());
@@ -3020,6 +3110,11 @@ impl<D: Device> CowBTree<D> {
             Some(node) => match &*node {
                 Node::Leaf { bytes, .. } => {
                     let shared = Rc::clone(bytes);
+                    *last_leaf = Some(RawScanCursorCandidate {
+                        low_source: span.low.clone(),
+                        high_source: span.high.clone(),
+                        bytes: Rc::clone(&shared),
+                    });
                     self.scan_leaf_into(&shared, bounds, pending, out)?;
                     return Ok(());
                 }
@@ -3047,6 +3142,11 @@ impl<D: Device> CowBTree<D> {
                             // `RowBuf::Shared` that clones it, so the rows can
                             // safely outlive this callback.
                             let shared: Rc<[u8]> = Rc::from(bytes);
+                            *last_leaf = Some(RawScanCursorCandidate {
+                                low_source: span.low.clone(),
+                                high_source: span.high.clone(),
+                                bytes: Rc::clone(&shared),
+                            });
                             self.scan_leaf_into(&shared, bounds, pending, out)?;
                             Ok(None)
                         }
@@ -3078,7 +3178,20 @@ impl<D: Device> CowBTree<D> {
             };
             let (leftmost, cells) = (*leftmost, cells);
             if cells.is_empty() || bounds.starts_below(cells[0].key.resolve(bytes)) {
-                self.walk_raw_row_values(leftmost, bounds, pending, out)?;
+                self.walk_raw_row_values(
+                    leftmost,
+                    bounds,
+                    pending,
+                    out,
+                    RangeSpanSources {
+                        low: span.low.clone(),
+                        high: cells
+                            .first()
+                            .map(|_| (Rc::clone(&node), 0))
+                            .or_else(|| span.high.clone()),
+                    },
+                    last_leaf,
+                )?;
             }
             for (i, separator) in cells.iter().enumerate() {
                 if out.len() >= bounds.limit {
@@ -3093,7 +3206,20 @@ impl<D: Device> CowBTree<D> {
                     None => true,
                 };
                 if below_upper && above_lower {
-                    self.walk_raw_row_values(separator.child, bounds, pending, out)?;
+                    self.walk_raw_row_values(
+                        separator.child,
+                        bounds,
+                        pending,
+                        out,
+                        RangeSpanSources {
+                            low: Some((Rc::clone(&node), i)),
+                            high: cells
+                                .get(i + 1)
+                                .map(|_| (Rc::clone(&node), i + 1))
+                                .or_else(|| span.high.clone()),
+                        },
+                        last_leaf,
+                    )?;
                 }
             }
         }
@@ -3143,6 +3269,14 @@ struct WalkBounds<'a> {
 }
 
 impl WalkBounds<'_> {
+    /// The lower edge that actually matters for this invocation.
+    fn effective_lower(&self) -> &[u8] {
+        match self.after {
+            Some(after) if after > self.start => after,
+            _ => self.start,
+        }
+    }
+
     /// Whether one leaf entry belongs in the answer.
     fn admits(&self, key: &[u8]) -> bool {
         if key < self.start {
@@ -3230,10 +3364,7 @@ struct RangeCursor {
 impl RangeCursor {
     /// Whether `bounds` cannot need a key outside this leaf.
     fn covers(&self, bounds: &WalkBounds<'_>) -> bool {
-        let lower = bounds
-            .after
-            .filter(|after| *after > bounds.start)
-            .unwrap_or(bounds.start);
+        let lower = bounds.effective_lower();
         if self.low.as_ref().is_some_and(|low| lower < low.as_slice()) {
             return false;
         }
@@ -3253,6 +3384,42 @@ impl RangeCursor {
     }
 }
 
+/// A committed raw table-scan leaf and the bytes its rows borrow from.
+struct RawScanCursor {
+    /// The committed root under which `leaf` was reached.
+    root: PageId,
+    /// The device generation at which the leaf was retained.
+    generation: u64,
+    /// Inclusive lower edge of the leaf span, or unbounded for the first leaf.
+    low: Option<Vec<u8>>,
+    /// Exclusive upper edge of the leaf span, or unbounded for the last leaf.
+    high: Option<Vec<u8>>,
+    /// Raw page bytes shared by the cursor and any returned [`RowBuf`]s.
+    bytes: Rc<[u8]>,
+}
+
+impl RawScanCursor {
+    /// Whether the effective lower bound falls inside this leaf.
+    fn lower_is_in_leaf(&self, bounds: &WalkBounds<'_>) -> bool {
+        let lower = bounds.effective_lower();
+        if self.low.as_ref().is_some_and(|low| lower < low.as_slice()) {
+            return false;
+        }
+        self.high
+            .as_ref()
+            .is_none_or(|high| lower < high.as_slice())
+    }
+
+    /// Whether the requested range ends inside this leaf.
+    fn end_is_in_leaf(&self, end: Option<&[u8]>) -> bool {
+        match (end, self.high.as_deref()) {
+            (None, Some(_)) => false,
+            (Some(end), Some(high)) => end <= high,
+            _ => true,
+        }
+    }
+}
+
 /// A range walk's last leaf plus the separator sources that define its span.
 ///
 /// `Rc<Node>` keeps the source pages alive until [`CowBTree::retain_range_cursor`]
@@ -3261,6 +3428,13 @@ struct RangeCursorCandidate {
     leaf: PageId,
     low_source: Option<(Rc<Node>, usize)>,
     high_source: Option<(Rc<Node>, usize)>,
+}
+
+/// A raw table leaf plus the separator sources that define its span.
+struct RawScanCursorCandidate {
+    low_source: Option<(Rc<Node>, usize)>,
+    high_source: Option<(Rc<Node>, usize)>,
+    bytes: Rc<[u8]>,
 }
 
 /// Separator sources describing one child span during a range walk.
@@ -3760,6 +3934,10 @@ mod tests {
         fn commit_generation(&self) -> Option<u64> {
             self.counts_commits.then(|| self.generation.get())
         }
+
+        fn page_reuse_enabled(&self) -> bool {
+            false
+        }
     }
 
     /// Reads made since the last call, so an assertion reads as "this operation
@@ -3869,6 +4047,10 @@ mod tests {
 
         fn commit_generation(&self) -> Option<u64> {
             Some(self.generation.get())
+        }
+
+        fn page_reuse_enabled(&self) -> bool {
+            false
         }
 
         fn commit_point(&self, region: usize) -> Option<CommitPoint> {
@@ -4603,6 +4785,46 @@ mod tests {
         assert_eq!(dirty_raw.len(), direct.len() - 1);
         assert!(!dirty_raw.contains(&101));
         db.rollback();
+    }
+
+    #[test]
+    fn a_raw_table_scan_cursor_reuses_page_bytes_for_a_bounded_resume() {
+        let row_key = |id: u64| {
+            let mut key = b"\x01tbl\0".to_vec();
+            key.extend_from_slice(&id.to_be_bytes());
+            key
+        };
+        let prefix = b"\x01tbl\0";
+        let device = Rc::new(RefCell::new(CountingDisk::new(true)));
+        let mut db = CowBTree::create(device, PAGE).unwrap();
+        for id in 0..400u64 {
+            db.put(&row_key(id), &id.to_le_bytes()).unwrap();
+            if id % 32 == 31 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+        db.set_page_cache_bytes(0);
+
+        let first = db.scan_prefix_row_values_raw_from(prefix, None, 3).unwrap();
+        assert_eq!(first.len(), 3);
+        let after = row_key(2);
+        assert!(db.row_scan_cursor.borrow().is_some());
+
+        reads_since(&db);
+        let resumed = db
+            .scan_prefix_row_values_raw_from(prefix, Some(&after), 3)
+            .unwrap();
+        assert_eq!(
+            reads_since(&db),
+            0,
+            "a bounded resume in the retained leaf should reuse its raw bytes"
+        );
+        assert_eq!(
+            resumed,
+            db.scan_prefix_row_values_from(prefix, Some(&after), 3)
+                .unwrap()
+        );
     }
 
     fn direct_row_ids_for_span(

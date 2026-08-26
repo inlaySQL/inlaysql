@@ -166,6 +166,14 @@ impl Device for Simulator {
         Simulator::sync(self);
         Ok(())
     }
+
+    fn note_page_reuse_enabled(&self) {
+        self.disk.note_page_reuse_enabled();
+    }
+
+    fn page_reuse_enabled(&self) -> bool {
+        self.disk.page_reuse_enabled()
+    }
 }
 
 #[cfg(test)]

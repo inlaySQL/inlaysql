@@ -1,7 +1,7 @@
 //! The Linux implementation. See the crate documentation for the safety
 //! argument covering the single `unsafe` block below.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::io::AsRawFd;
@@ -25,6 +25,8 @@ pub struct UringDevice {
     /// InlaySQL's I/O thread), so a `RefCell` is the whole synchronisation
     /// story.
     ring: RefCell<IoUring>,
+    /// Whether a core handle has opted this device into page reuse.
+    reuse_enabled: Cell<bool>,
 }
 
 impl UringDevice {
@@ -50,6 +52,7 @@ impl UringDevice {
         Ok(Self {
             file,
             ring: RefCell::new(ring),
+            reuse_enabled: Cell::new(false),
         })
     }
 
@@ -139,6 +142,14 @@ impl Device for UringDevice {
     fn sync(&mut self) -> Result<()> {
         let entry = opcode::Fsync::new(types::Fd(self.file.as_raw_fd())).build();
         self.run(entry).map(|_| ())
+    }
+
+    fn note_page_reuse_enabled(&self) {
+        self.reuse_enabled.set(true);
+    }
+
+    fn page_reuse_enabled(&self) -> bool {
+        self.reuse_enabled.get()
     }
 }
 
