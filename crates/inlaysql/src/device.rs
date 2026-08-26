@@ -58,7 +58,12 @@ pub struct FileDevice {
 /// so locking per-`FileDevice` would deadlock same-process handles against
 /// each other).
 struct CommitCoordinator {
-    reserved: AtomicBool,
+    /// Whether one handle is currently preparing and appending a commit.
+    /// Waiters sleep on `reservation_done` instead of spinning while the
+    /// owner writes its WAL record.
+    reserved: Mutex<bool>,
+    /// Wakes one waiter when the reservation gate becomes available.
+    reservation_done: Condvar,
     next_region: AtomicUsize,
     /// How many commits have left the reservation gate on this file.
     ///
@@ -633,13 +638,17 @@ impl Device for FileDevice {
         let Some(coordinator) = &self.coordinator else {
             return Err(self.read_only_error("begin a commit"));
         };
-        while coordinator
+        let mut reserved = coordinator
             .reserved
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            std::thread::yield_now();
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *reserved {
+            reserved = coordinator
+                .reservation_done
+                .wait(reserved)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
+        *reserved = true;
         Ok(())
     }
 
@@ -671,7 +680,13 @@ impl Device for FileDevice {
             );
         };
         let generation = coordinator.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        coordinator.reserved.store(false, Ordering::Release);
+        let mut reserved = coordinator
+            .reserved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *reserved = false;
+        drop(reserved);
+        coordinator.reservation_done.notify_one();
         Some(generation)
     }
 
@@ -896,7 +911,8 @@ fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator
     }
 
     let coordinator = Arc::new(CommitCoordinator {
-        reserved: AtomicBool::new(false),
+        reserved: Mutex::new(false),
+        reservation_done: Condvar::new(),
         next_region: AtomicUsize::new(0),
         generation: AtomicU64::new(0),
         writes_completed: AtomicU64::new(0),
@@ -971,7 +987,8 @@ mod group_commit_tests {
             .unwrap();
         let _ = std::fs::remove_file(&path);
         CommitCoordinator {
-            reserved: AtomicBool::new(false),
+            reserved: Mutex::new(false),
+            reservation_done: Condvar::new(),
             next_region: AtomicUsize::new(0),
             generation: AtomicU64::new(0),
             writes_completed: AtomicU64::new(0),
