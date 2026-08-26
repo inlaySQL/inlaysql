@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use inlaysql::{Cancel, Stopped};
+use inlaysql::{Cancel, Stopped, VectorTuning};
 
 use crate::errors::MysqlError;
 
@@ -246,6 +246,26 @@ pub struct Control {
     info: Mutex<Option<String>>,
     /// Whether `info` is maintained at all. See it.
     record_info: bool,
+    /// The candidate list size every vector search on this connection runs at;
+    /// `0` means "whatever the index itself is tuned for", which is the
+    /// default and what every connection had before this existed. Set from
+    /// `SET inlaysql_hnsw_ef_search`.
+    ///
+    /// **Here for exactly the reason `timeout_ms` is here.** It is a number the
+    /// session chooses, the engine applies and `@@inlaysql_hnsw_ef_search`
+    /// reports, and those three have to be one number: a copy recorded beside
+    /// the engine's own is how a server ends up telling a client it is
+    /// searching at an `ef` it is not searching at. [`Session::variable`] reads
+    /// this atomic and [`Tuning`] — the handle the engine holds — reads the
+    /// same one.
+    ///
+    /// `AtomicU64` rather than `AtomicUsize` for the same reason `timeout_ms`
+    /// is: it is set from a client-supplied number that is parsed as a `u64`,
+    /// and narrowing at the store rather than at the parse would silently
+    /// truncate on a 32-bit build.
+    ///
+    /// [`Session::variable`]: crate::session::Session::variable
+    vector_ef_search: AtomicU64,
 }
 
 impl Control {
@@ -270,6 +290,7 @@ impl Control {
             doing_since: AtomicU64::new(0),
             info: Mutex::new(None),
             record_info,
+            vector_ef_search: AtomicU64::new(0),
         }
     }
 
@@ -398,6 +419,30 @@ impl Control {
         self.timeout_ms.store(millis, Ordering::Relaxed);
     }
 
+    /// The candidate list size this session's vector searches run at, or
+    /// `None` when each index's own tuning is in force — which is the default,
+    /// and the operating point every query on this server had before the
+    /// variable existed.
+    ///
+    /// The number `@@inlaysql_hnsw_ef_search` reports *and* the number
+    /// [`Tuning`] hands the engine, from this one load, for the reason the
+    /// field documents.
+    pub fn vector_ef_search(&self) -> Option<usize> {
+        match self.vector_ef_search.load(Ordering::Relaxed) {
+            0 => None,
+            ef => Some(usize::try_from(ef).unwrap_or(usize::MAX)),
+        }
+    }
+
+    /// Change the candidate list size for this session; `0` restores each
+    /// index's own tuning.
+    ///
+    /// Takes effect on the next vector search, which is the next statement:
+    /// the statement in flight is the `SET` itself.
+    pub fn set_vector_ef_search(&self, ef: u64) {
+        self.vector_ef_search.store(ef, Ordering::Relaxed);
+    }
+
     /// Whether the connection has been told to close.
     pub fn is_closing(&self) -> bool {
         self.closing.load(Ordering::Relaxed)
@@ -516,6 +561,32 @@ impl Signal {
     /// The engine-side half of `control`.
     pub fn new(control: Arc<Control>) -> Self {
         Self(control)
+    }
+}
+
+/// The engine's view of a [`Control`]'s vector tuning — the `ef_search` half of
+/// what [`Signal`] is for cancellation, and a separate type for the same
+/// orphan-rule reason.
+///
+/// One handle onto the connection's own atomic rather than a number pushed into
+/// the engine on every `SET`. That is the whole point: `@@inlaysql_hnsw_ef_search`
+/// answers from [`Control::vector_ef_search`] and every vector search asks this
+/// for the same field, so the number reported and the number searched with are
+/// one load of one atomic and cannot be two different values. The server has
+/// twice shipped a variable it reported and did not apply; this is the shape
+/// that makes that unrepresentable rather than merely tested for.
+pub struct Tuning(Arc<Control>);
+
+impl Tuning {
+    /// The engine-side half of `control`'s vector tuning.
+    pub fn new(control: Arc<Control>) -> Self {
+        Self(control)
+    }
+}
+
+impl VectorTuning for Tuning {
+    fn ef_search(&self) -> Option<usize> {
+        self.0.vector_ef_search()
     }
 }
 

@@ -2574,14 +2574,12 @@ mod tests {
     /// unnamed index on the same first column would collide.
     #[test]
     fn an_unnamed_index_is_disambiguated_against_the_catalog() {
-        let catalog = catalog_with_users_table(vec![Index {
-            name: "email".to_string(),
-            table: "users".to_string(),
-            columns: vec!["email".to_string()],
-            kind: IndexKind::FullText,
-            unique: false,
-            collations: vec![Collation::Binary],
-        }]);
+        let catalog = catalog_with_users_table(vec![Index::single(
+            "email".to_string(),
+            "users".to_string(),
+            "email".to_string(),
+            IndexKind::FullText,
+        )]);
         assert_eq!(
             statements_against("alter table users add index (email)", &catalog),
             vec!["CREATE INDEX `email_2` ON users (`email`)"]
@@ -3095,12 +3093,13 @@ mod tests {
     #[test]
     fn a_table_with_several_unique_constraints_gets_no_target_and_no_refusal() {
         let catalog = catalog_with_users_table(vec![Index {
-            name: "users_email".to_string(),
-            table: "users".to_string(),
-            columns: vec!["email".to_string()],
-            kind: IndexKind::BTree,
             unique: true,
-            collations: vec![Collation::Binary],
+            ..Index::single(
+                "users_email".to_string(),
+                "users".to_string(),
+                "email".to_string(),
+                IndexKind::BTree,
+            )
         }]);
 
         assert_eq!(

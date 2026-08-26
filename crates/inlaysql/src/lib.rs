@@ -80,12 +80,12 @@ pub use inlaysql_core::bm25_paged::PagedBm25Index;
 /// exactly as the CLI that seeded the file did. Re-exported here so
 /// `inlaysql::embedding::hashed_embedding` keeps working.
 pub use inlaysql_core::embedding;
-pub use inlaysql_core::hnsw::HnswIndex;
+pub use inlaysql_core::hnsw::{HnswIndex, VectorMetric};
 pub use inlaysql_core::TreeStorage;
 pub use inlaysql_core::{
     is_reserved_table_name, Cancel, Catalog, Change, ChangeKind, Changes, Collation, Column,
     ColumnInfo, DataType, Error, Index, IndexKind, Outcome, Result, ResultSet, Stopped, Table,
-    TableAccess, Value, RESERVED_TABLE_PREFIX,
+    TableAccess, Value, VectorTuning, RESERVED_TABLE_PREFIX,
 };
 pub use statement::Statement;
 pub use storage::RedbStorage;
@@ -449,6 +449,54 @@ impl Database {
         self.engine.set_cancel(cancel);
     }
 
+    /// Install the handle every vector search on this database asks for its
+    /// candidate-list size. See [`VectorTuning`].
+    ///
+    /// For a host whose value moves — the MySQL-wire server, where any session
+    /// may `SET inlaysql_hnsw_ef_search` between two statements and
+    /// `@@inlaysql_hnsw_ef_search` has to report the number the *next* search
+    /// will use. One handle onto the connection's own state means the reported
+    /// number and the enforced one are the same load, not two copies that can
+    /// drift. An embedded caller with a value that does not move wants
+    /// [`Database::set_vector_ef_search`] instead.
+    pub fn set_vector_tuning(&mut self, tuning: Box<dyn VectorTuning>) {
+        self.engine.set_vector_tuning(tuning);
+    }
+
+    /// Pin the candidate-list size (`ef`) every vector search on this handle
+    /// runs at, or `None` to leave each index's own `ef_search` in force.
+    ///
+    /// This is the recall/latency trade, and it is the only knob that offers
+    /// it at query time: a larger `ef` holds more of the graph in the walk's
+    /// beam and finds more of the true nearest neighbours, a smaller one
+    /// returns sooner and finds fewer. `None` — the default, and what every
+    /// query did before this existed — leaves the tuning the index was built
+    /// with, which is [`inlaysql_core::hnsw::HnswParams::DEFAULT`].
+    ///
+    /// A value below the number of rows a query asks for is **refused when
+    /// that query runs**, not clamped up to fit; see
+    /// [`Database::vector_ef_search`] for reading back what is in force.
+    ///
+    /// `Some(0)` means `None`. Zero is not a candidate list — a walk that may
+    /// hold nothing finds nothing — so the only reading that is not a
+    /// contradiction is the one the MySQL server gives it, where
+    /// `SET inlaysql_hnsw_ef_search = 0` is how a session goes back to the
+    /// index's own tuning. Treating it as a beam of zero instead would refuse
+    /// every query on this handle and tell the caller to "set it to 0".
+    pub fn set_vector_ef_search(&mut self, ef: Option<usize>) {
+        self.engine
+            .set_vector_tuning(Box::new(FixedEfSearch(ef.filter(|ef| *ef > 0))));
+    }
+
+    /// The candidate-list size vector searches on this handle run at, or
+    /// `None` when each index's own `ef_search` is in force.
+    ///
+    /// Read through the installed handle, so this is the same number the next
+    /// search will use rather than a copy of what was last set.
+    pub fn vector_ef_search(&self) -> Option<usize> {
+        self.engine.vector_ef_search()
+    }
+
     /// Start an explicit transaction.
     ///
     /// See [`inlaysql_core::Engine::begin`]. Statements between this and
@@ -583,6 +631,17 @@ fn first_words(sql: &str) -> String {
     sql.split_whitespace().take(6).collect::<Vec<_>>().join(" ")
 }
 
+/// A candidate-list size that does not move, for an embedded caller that set
+/// one number and is not a session. See [`Database::set_vector_ef_search`].
+#[derive(Debug, Clone, Copy)]
+struct FixedEfSearch(Option<usize>);
+
+impl VectorTuning for FixedEfSearch {
+    fn ef_search(&self) -> Option<usize> {
+        self.0
+    }
+}
+
 /// Builds the production index backends.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NativeIndexFactory;
@@ -592,8 +651,14 @@ impl IndexFactory for NativeIndexFactory {
         Ok(Box::new(Bm25Index::new()))
     }
 
-    fn vector(&self, _table: &str, _column: &str, dim: usize) -> Result<Box<dyn VectorIndex>> {
-        Ok(Box::new(HnswIndex::new(dim)))
+    fn vector(
+        &self,
+        _table: &str,
+        _column: &str,
+        dim: usize,
+        metric: VectorMetric,
+    ) -> Result<Box<dyn VectorIndex>> {
+        Ok(Box::new(HnswIndex::with_metric(dim, metric)))
     }
 
     fn quantized_vector(
@@ -601,8 +666,9 @@ impl IndexFactory for NativeIndexFactory {
         _table: &str,
         _column: &str,
         dim: usize,
+        metric: VectorMetric,
     ) -> Result<Box<dyn VectorIndex>> {
-        Ok(Box::new(HnswIndex::new_quantized(dim)))
+        Ok(Box::new(HnswIndex::quantized_with_metric(dim, metric)))
     }
 }
 

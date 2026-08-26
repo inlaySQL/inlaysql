@@ -430,7 +430,12 @@ fn a_retrieval_query_names_the_index_that_answers_it() {
             "EXPLAIN SELECT id, vector_score(embedding, ?) AS score FROM docs ORDER BY score DESC",
             &[Value::Vector(vec![1.0, 0.0, 0.0, 0.0])],
         ),
-        "SEARCH docs USING VECTOR INDEX docs_embedding (embedding) FOR vector_score",
+        // The column list is rendered the way `CREATE INDEX` spells it,
+        // operator class included: which distance ranked the rows decides
+        // which rows came back, so a plan that named the index but not its
+        // metric described two different queries with one line.
+        "SEARCH docs USING VECTOR INDEX docs_embedding (embedding vector_cosine_ops) \
+         FOR vector_score",
     );
 }
 

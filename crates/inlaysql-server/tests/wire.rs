@@ -5629,6 +5629,152 @@ fn the_statement_timeout_is_off_unless_it_is_asked_for() {
     client.quit();
 }
 
+// --------------------------------------------------- ANN recall/latency knob
+
+/// A server with a four-dimensional vector column and a graph over it.
+fn vector_fixture(name: &str) -> (TestServer, Client) {
+    let server = TestServer::start(name);
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE docs (id INTEGER PRIMARY KEY, embedding VECTOR(4))");
+    client.ok_query("CREATE INDEX docs_embedding ON docs (embedding)");
+    for id in 1..=32 {
+        let value = id as f32 / 32.0;
+        client.ok_query(&format!(
+            "INSERT INTO docs (id, embedding) VALUES ({id}, \
+             vector('[{value}, {a}, {b}, 1.0]'))",
+            a = 1.0 - value,
+            b = value * value
+        ));
+    }
+    (server, client)
+}
+
+/// The `EXPLAIN` line describing the vector search, which is where the
+/// operating point is reported.
+fn vector_plan(client: &mut Client, limit: usize) -> String {
+    client
+        .ok_query(&format!(
+            "EXPLAIN SELECT id, vector_score(embedding, vector('[1,0,0,1]')) AS score \
+             FROM docs ORDER BY score DESC LIMIT {limit}"
+        ))
+        .rows()
+        .cell(0, 2)
+}
+
+/// Every number this server reports has to be one it applies — and this one is
+/// the recall of the rows a client gets back, not just how long it waits for
+/// them. `@@inlaysql_hnsw_ef_search` is read off the connection's own
+/// [`Control`], and `EXPLAIN` reports the `ef` the *engine* will search with;
+/// asserting the pair is what makes the two one number rather than two that
+/// happen to agree today.
+///
+/// pgvector spells this `SET hnsw.ef_search`. A MySQL system variable cannot
+/// hold a dot, and a bare `ef_search` would be a name MySQL does not have
+/// sitting in MySQL's own namespace, so it carries this server's prefix — the
+/// same decision `inlaysql_statement_text` records.
+#[test]
+fn the_reported_ef_search_is_the_one_the_engine_searches_with() {
+    let (_server, mut client) = vector_fixture("ef-search-reported");
+
+    // The default: nothing imposed, reported as `0`, and the plan shows the
+    // index's own tuning — `max(ef_search = 64, 40 candidates * 2)`.
+    assert_eq!(value(&mut client, "@@inlaysql_hnsw_ef_search"), "0");
+    assert_eq!(
+        client
+            .ok_query("SHOW VARIABLES LIKE 'inlaysql_hnsw_ef_search'")
+            .rows()
+            .cell(0, 1),
+        "0"
+    );
+    let untuned = vector_plan(&mut client, 10);
+    assert!(
+        untuned.contains("(ef=80)"),
+        "the default operating point was not reported: {untuned}"
+    );
+
+    // Set by the session, reported as set, and *applied*: the plan now names
+    // the session's number and not the index's.
+    client.ok_query("SET inlaysql_hnsw_ef_search = 200");
+    assert_eq!(value(&mut client, "@@inlaysql_hnsw_ef_search"), "200");
+    assert_eq!(
+        client
+            .ok_query("SHOW VARIABLES LIKE 'inlaysql_hnsw_ef_search'")
+            .rows()
+            .cell(0, 1),
+        "200"
+    );
+    let tuned = vector_plan(&mut client, 10);
+    assert!(
+        tuned.contains("(ef=200)"),
+        "the session's ef_search did not reach the engine: {tuned}"
+    );
+
+    // `SET SESSION` is the same variable, and `DEFAULT` puts the index's own
+    // tuning back — which is the only way out of a tuned session short of
+    // reconnecting, and what a pool sends when it hands a connection on.
+    client.ok_query("SET SESSION inlaysql_hnsw_ef_search = 512");
+    assert_eq!(value(&mut client, "@@inlaysql_hnsw_ef_search"), "512");
+    client.ok_query("SET inlaysql_hnsw_ef_search = DEFAULT");
+    assert_eq!(value(&mut client, "@@inlaysql_hnsw_ef_search"), "0");
+    assert_eq!(vector_plan(&mut client, 10), untuned);
+
+    client.quit();
+}
+
+/// Two refusals, both of which the alternative would have made silent.
+///
+/// A value that is not a number is refused at the `SET` rather than recorded
+/// as an inert session variable — recorded, a client would read `'wide'` back
+/// as if it had taken effect while every search went on using something else.
+/// A value narrower than the candidate list the query needs is refused when
+/// that query runs, because a beam narrower than the answer cannot hold it and
+/// the two silent alternatives are searching at a number the client did not
+/// choose, or returning fewer rows than were asked for without saying so.
+#[test]
+fn an_ef_search_that_cannot_be_honoured_is_refused() {
+    let (_server, mut client) = vector_fixture("ef-search-refused");
+
+    client.ok_query("SET inlaysql_hnsw_ef_search = 128");
+    let error = client
+        .query("SET inlaysql_hnsw_ef_search = 'wide'")
+        .expect_err("not a candidate-list size");
+    assert_eq!(error.code, 1232, "{error:?}");
+    // And the refusal left the previous value standing, rather than half
+    // applying the statement.
+    assert_eq!(value(&mut client, "@@inlaysql_hnsw_ef_search"), "128");
+
+    // Five against a `LIMIT 10`. The `SET` is accepted — on its own it is a
+    // perfectly good number, and which queries it can answer is not knowable
+    // until one arrives — and the query is refused, naming the smallest value
+    // that would have worked.
+    client.ok_query("SET inlaysql_hnsw_ef_search = 5");
+    assert_eq!(value(&mut client, "@@inlaysql_hnsw_ef_search"), "5");
+    let error = client
+        .query(
+            "SELECT id, vector_score(embedding, vector('[1,0,0,1]')) AS score \
+             FROM docs ORDER BY score DESC LIMIT 10",
+        )
+        .expect_err("a beam narrower than the answer must not be answered");
+    assert!(
+        error.message.contains("10"),
+        "the refusal did not name the minimum that would work: {error:?}"
+    );
+    // The connection is unharmed: this is a statement error, not a protocol
+    // one, and the next statement works.
+    assert_eq!(value(&mut client, "@@inlaysql_hnsw_ef_search"), "5");
+
+    // A beam exactly as wide as the answer is legal — the floor is the query's
+    // `LIMIT`, not the candidate count, so the cheap end of the recall/latency
+    // trade stays reachable.
+    client.ok_query("SET inlaysql_hnsw_ef_search = 10");
+    client.ok_query(
+        "SELECT id, vector_score(embedding, vector('[1,0,0,1]')) AS score \
+         FROM docs ORDER BY score DESC LIMIT 10",
+    );
+
+    client.quit();
+}
+
 /// `KILL QUERY` stops the statement and leaves the connection standing — which
 /// is the whole difference between it and `KILL CONNECTION`, and the reason a
 /// pool can use it.

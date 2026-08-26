@@ -252,12 +252,26 @@ impl<'e> Explainer<'e> {
         let shape = scan_shape(plan, &self.env, cap)?;
         let driving = &plan.from[0];
 
+        // How many candidates a retrieval leaf will be asked for, derived the
+        // one way the executor derives it (`Engine::candidate_limit`) rather
+        // than re-implemented here — it is what decides the `ef` reported
+        // below, and a plan that named an operating point the search does not
+        // use would be describing a query nobody ran. The filtered arm applies
+        // only to a single-table query: with a join the `WHERE` can reference
+        // the inner side, so it is applied after the retrieval instead of
+        // inside its walk, exactly as `Engine::run_select_to` chooses.
+        let candidates = crate::engine::candidate_limit(
+            shape.fetch,
+            plan.joins.is_empty() && plan.filter.is_some(),
+        );
+        let wanted = crate::engine::rows_wanted(shape.fetch);
+
         // The driving table: the one a retrieval index, a point lookup or a
         // range probe can answer for. Everything after it is a join.
         let detail = match (&driving.derived, &plan.score) {
             (Some(_), _) => alloc::format!("SCAN {} (SUBQUERY, MATERIALISED)", driving.table.name),
             (None, Some(score)) => {
-                let mut detail = self.score_access(&driving.table, score)?;
+                let mut detail = self.score_access(&driving.table, score, candidates, wanted)?;
                 if plan.filter.is_some() {
                     // `Engine::retrieve_filtered`: the `WHERE` runs inside the
                     // index walk, so a selective filter keeps searching rather
@@ -275,7 +289,7 @@ impl<'e> Explainer<'e> {
             self.body(body, first, None)?;
         }
         if let (None, Some(score)) = (&driving.derived, &plan.score) {
-            self.score_children(&driving.table, score, first)?;
+            self.score_children(&driving.table, score, first, candidates, wanted)?;
         }
 
         // Joins, in the order the executor nests them: `from[i + 1]` is the
@@ -394,7 +408,13 @@ impl<'e> Explainer<'e> {
     /// query with no matching index fails here with the same error it would
     /// have failed with when run — an `EXPLAIN` that described a plan the
     /// engine refuses would be describing nothing.
-    fn score_access(&self, table: &Table, score: &ScoreExpr) -> Result<String> {
+    fn score_access(
+        &self,
+        table: &Table,
+        score: &ScoreExpr,
+        candidates: usize,
+        wanted: usize,
+    ) -> Result<String> {
         Ok(match score {
             ScoreExpr::Text { columns, .. } => {
                 let index = self.engine.resolve_full_text_index(table, columns)?;
@@ -407,11 +427,20 @@ impl<'e> Explainer<'e> {
             }
             ScoreExpr::Vector { column, .. } => {
                 let index = self.engine.resolve_vector_index(table, *column)?;
+                // The column list is rendered the way `CREATE INDEX` spells
+                // it, operator class included, and the metric is printed even
+                // when it is the default. Which distance an index was built
+                // under decides which rows come back, and it was previously
+                // invisible from SQL entirely — a plan that named the index
+                // but not its metric described two different queries with the
+                // same line.
                 alloc::format!(
-                    "SEARCH {} USING VECTOR INDEX {} ({}) FOR vector_score",
+                    "SEARCH {} USING VECTOR INDEX {} ({} {}) FOR vector_score{}",
                     table.name,
                     index.name,
-                    index.columns.join(", ")
+                    index.columns.join(", "),
+                    index.metric.ops_name(),
+                    self.vector_operating_point(table, *column, candidates, wanted)?
                 )
             }
             ScoreExpr::Fuse { parts, k } => alloc::format!(
@@ -421,17 +450,60 @@ impl<'e> Explainer<'e> {
         })
     }
 
+    /// The recall/latency point one vector search will actually run at, as
+    /// ` (ef=N)`, or an empty string for a backend that has no candidate list.
+    ///
+    /// This is the point of the whole knob: `ef` is the only thing that trades
+    /// recall against latency in an HNSW walk, and a value nobody can see is a
+    /// value nobody can choose. The number here is the one the search makes,
+    /// not a restatement of what was `SET` — a session that set nothing sees
+    /// the index's own `ef_for(k)`, which is not a constant because it widens
+    /// with the candidate count.
+    ///
+    /// A session `ef_search` too narrow for the candidate count fails *here*,
+    /// with the same refusal the query itself would raise, because an `EXPLAIN`
+    /// that described a plan the engine refuses would be describing nothing.
+    fn vector_operating_point(
+        &self,
+        table: &Table,
+        column: usize,
+        candidates: usize,
+        wanted: usize,
+    ) -> Result<String> {
+        let effective = match self.engine.vector_ef_search() {
+            Some(ef) => {
+                crate::engine::check_ef_search(ef, wanted)?;
+                Some(ef)
+            }
+            None => self.engine.vector_index_ef_for(table, column, candidates)?,
+        };
+        Ok(match effective {
+            Some(ef) => alloc::format!(" (ef={ef})"),
+            None => alloc::string::String::new(),
+        })
+    }
+
     /// A `fuse(...)`'s children — one node per ranked list it combines, which
     /// is the only way to see that a hybrid query really did run both
     /// retrievers.
-    fn score_children(&mut self, table: &Table, score: &ScoreExpr, parent: i64) -> Result<()> {
+    fn score_children(
+        &mut self,
+        table: &Table,
+        score: &ScoreExpr,
+        parent: i64,
+        candidates: usize,
+        wanted: usize,
+    ) -> Result<()> {
         let ScoreExpr::Fuse { parts, .. } = score else {
             return Ok(());
         };
         for part in parts {
-            let detail = self.score_access(table, part)?;
+            // Every leaf of a fusion is asked for the same candidate count the
+            // fusion itself was — `Engine::evaluate_score` passes `k` down
+            // unchanged — so each one reports the `ef` that count implies.
+            let detail = self.score_access(table, part, candidates, wanted)?;
             let id = self.push(parent, detail);
-            self.score_children(table, part, id)?;
+            self.score_children(table, part, id, candidates, wanted)?;
         }
         Ok(())
     }

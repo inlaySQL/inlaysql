@@ -19,7 +19,7 @@ The seam: the MySQL wire protocol
 MySQL client connection, running ordinary SQL:
 
     CREATE TABLE items (id INTEGER PRIMARY KEY, embedding VECTOR(<dim>))
-    CREATE INDEX items_embedding ON items (embedding)
+    CREATE INDEX items_embedding ON items (embedding vector_cosine_ops)
     INSERT INTO items (id, embedding) VALUES (0, vector('[...]')), ...
     SELECT id, vector_score(embedding, vector('[...]')) AS score
       FROM items ORDER BY score DESC LIMIT <n>
@@ -38,21 +38,36 @@ an in-process index does not. See `bench/README.md` for what that costs here.
 What the engine does not expose, and what this file does about it
 ----------------------------------------------------------------
 
-* **Cosine only.** `vector_score` is cosine similarity and the SQL surface has
-  no Euclidean or inner-product scorer. So of the standard datasets only the
-  `-angular` ones can be answered at all; `sift-128-euclidean` and
-  `fashion-mnist-784-euclidean` — the two usual starters — are refused here
-  rather than run against a ground truth built with a metric the engine does
-  not implement.
-* **No `ef_search` knob.** pgvector's module sweeps `SET hnsw.ef_search`.
-  InlaySQL has `HnswParams` in Rust but does not surface `m`,
-  `ef_construction` or `ef_search` in SQL, in DDL, or as a session variable.
-  The *one* query-time dial a SQL user has is the `LIMIT`, because the search
-  width is `max(ef_search, k * ef_search_multiplier)` = `max(64, 2k)`
-  (`inlaysql_core::hnsw::HnswParams::ef_for`). So `set_query_arguments` sweeps
-  an **over-fetch factor**: ask for `n * over_fetch` rows, keep the first `n`.
-  That is a real recall/latency curve and it is the only one reachable without
-  recompiling, which is a finding about the engine, not about this file.
+* **Two metrics, not three.** `vector_score` scores with the metric the index
+  was built under, chosen at `CREATE INDEX` with pgvector's operator-class
+  spelling: `vector_cosine_ops` (the default) and `vector_l2_ops`. So the
+  `-angular` datasets and the `-euclidean` ones both run, which is
+  `sift-128-euclidean` and `fashion-mnist-784-euclidean` — the two usual
+  starters — as well as `glove-*-angular`. There is no `vector_ip_ops`: inner
+  product is not a metric, so an HNSW graph on it is an approximation whose
+  error the engine cannot bound, and it is refused with that reason rather
+  than shipped quietly. Any *other* metric — `hamming`, `jaccard` — is still
+  refused here rather than run against a ground truth built for a question the
+  engine does not answer.
+* **`ef_search`, but not `m` or `ef_construction`.** `set_query_arguments`
+  sweeps `SET inlaysql_hnsw_ef_search`, which is the same dial pgvector's
+  module sweeps as `SET hnsw.ef_search` — the candidate list the graph walk
+  holds, and the only thing that trades recall against latency at query time.
+  It is spelled under this server's own prefix because a MySQL system variable
+  cannot hold a dot. `0` restores the index's own tuning.
+
+  This file used to sweep an **over-fetch factor** instead — ask for
+  `n * over_fetch` rows, keep the first `n` — because `ef_search` existed only
+  in Rust and the `LIMIT` was the one query-time dial SQL had. That curve was
+  real but blunt: the walk width was `max(64, 2k)`, so at `n = 10` the first
+  three sweep points (`1`, `2`, `4`) all ran the identical walk at `ef = 64`
+  and produced three copies of one recall number. The values below are `ef`
+  itself, so every point is a different walk.
+
+  `m` and `ef_construction` are still Rust-only: they shape the stored graph
+  rather than one query, so surfacing them needs a catalog format change to
+  record them per index. That is why there is no graph-shape grid below, where
+  pgvector's config varies `M`.
 * **No parameter binding for embeddings.** The MySQL wire refuses a bound
   embedding — a string parameter into a `VECTOR` column fails with 1366
   (`column is VECTOR(4) but the value is TEXT`), and `vector_score(embedding,
@@ -179,16 +194,24 @@ def _rss_kb(pid: int):
 class InlaySQL(BaseANN):
     """InlaySQL's HNSW index, reached over its own MySQL wire protocol."""
 
+    # ann-benchmarks' dataset metric -> the operator class that names the same
+    # distance in `CREATE INDEX`. `angular` is Euclidean distance between
+    # L2-normalised vectors, which is monotone in `1 - cos` and therefore ranks
+    # exactly as `vector_cosine_ops` does; `euclidean` is plain L2, which is
+    # what `vector_l2_ops` computes.
+    OPERATOR_CLASSES = {"angular": "vector_cosine_ops", "euclidean": "vector_l2_ops"}
+
     def __init__(self, metric: str, method_param: dict | None = None):
-        if metric != "angular":
-            # Refused rather than approximated. `vector_score` is cosine
-            # similarity; a euclidean dataset's `neighbors` array is the truth
-            # for a different question, and scoring one against the other
-            # would produce a number that looks like recall and is not.
+        if metric not in self.OPERATOR_CLASSES:
+            # Refused rather than approximated. A `hamming` dataset's
+            # `neighbors` array is the truth for a question this engine does
+            # not answer, and scoring one against the other would produce a
+            # number that looks like recall and is not.
             raise NotImplementedError(
-                f"InlaySQL scores vectors with cosine similarity only, so it cannot answer a "
-                f"'{metric}' dataset. Use an -angular dataset (glove-*-angular, "
-                f"nytimes-256-angular, random-*-angular)."
+                f"InlaySQL has no scorer for a '{metric}' dataset. It answers "
+                f"{sorted(self.OPERATOR_CLASSES)} — an -angular dataset (glove-*-angular, "
+                f"nytimes-256-angular, random-*-angular) or a -euclidean one "
+                f"(sift-128-euclidean, fashion-mnist-784-euclidean)."
             )
         method_param = method_param or {}
         unknown = set(method_param) - {"quantization"}
@@ -200,8 +223,13 @@ class InlaySQL(BaseANN):
         if self.quantization not in ("exact", "int8"):
             raise ValueError("quantization must be 'exact' or 'int8'")
         self.metric = metric
-        self.over_fetch = 1
-        self.name = f"InlaySQL(quantization={self.quantization}, over_fetch=1)"
+        self.operator_class = self.OPERATOR_CLASSES[metric]
+        # `0` is the engine's spelling of "leave the index's own tuning in
+        # force", which is the operating point a user who sets nothing gets.
+        self.ef_search = 0
+        self.name = (
+            f"InlaySQL({self.operator_class}, quantization={self.quantization}, ef_search=0)"
+        )
 
         self._process = None
         self._directory = None
@@ -320,7 +348,12 @@ class InlaySQL(BaseANN):
         )
         self._cursor.execute("DROP TABLE IF EXISTS items")
         self._cursor.execute(f"CREATE TABLE items (id INTEGER PRIMARY KEY, embedding {column})")
-        self._cursor.execute("CREATE INDEX items_embedding ON items (embedding)")
+        # The operator class is what makes a euclidean dataset answerable at
+        # all: the graph is built under the metric the ground truth was
+        # computed with, rather than under whatever the default happens to be.
+        self._cursor.execute(
+            f"CREATE INDEX items_embedding ON items (embedding {self.operator_class})"
+        )
 
         # Rows per statement, bounded by both the wire (SQL text) and the
         # engine (WAL bytes per transaction — see WAL_BUDGET_BYTES). The
@@ -406,26 +439,53 @@ class InlaySQL(BaseANN):
 
     # ------------------------------------------------------------------ query
 
-    def set_query_arguments(self, over_fetch: int) -> None:
-        """The only query-time dial a SQL user has. See the module docstring."""
-        self.over_fetch = int(over_fetch)
-        self.name = f"InlaySQL(quantization={self.quantization}, over_fetch={self.over_fetch})"
+    def set_query_arguments(self, ef_search: int) -> None:
+        """Move the graph walk's candidate list. See the module docstring.
+
+        Applied on the connection rather than remembered here, so the number
+        this reports as part of `self.name` is the number the engine searches
+        with. `@@inlaysql_hnsw_ef_search` reads back off the same field the
+        walk does, which is what makes that true rather than hoped.
+        """
+        if self._cursor is None:
+            raise RuntimeError(
+                "set_query_arguments needs a connection, so it must be called after fit(). "
+                "The value is applied on the connection rather than remembered here, on "
+                "purpose — see this method's docstring."
+            )
+        self.ef_search = int(ef_search)
+        self._cursor.execute(f"SET inlaysql_hnsw_ef_search = {self.ef_search}")
+        self.name = (
+            f"InlaySQL({self.operator_class}, quantization={self.quantization}, "
+            f"ef_search={self.ef_search})"
+        )
         self._format_seconds = 0.0
         self._queries = 0
 
     def query(self, v: numpy.ndarray, n: int):
+        if self.ef_search and self.ef_search < n:
+            # Raised once, before the first query, rather than letting the
+            # engine refuse every one of them: a candidate list narrower than
+            # the answer cannot hold it, and this engine refuses that rather
+            # than returning a short list the way pgvector does. Which
+            # operating points an engine cannot be *asked* for is part of what
+            # a benchmark measures, so this says so instead of clamping.
+            raise ValueError(
+                f"ef_search={self.ef_search} is below the run's k={n}; InlaySQL refuses a "
+                f"candidate list narrower than the answer. Sweep values >= k."
+            )
         started = time.perf_counter()
         literal = ",".join(numpy.char.mod(FLOAT_FORMAT, numpy.asarray(v, dtype=numpy.float32)))
         self._format_seconds += time.perf_counter() - started
         self._queries += 1
         self._cursor.execute(
             f"SELECT id, vector_score(embedding, vector('[{literal}]')) AS score "
-            f"FROM items ORDER BY score DESC LIMIT {n * self.over_fetch}"
+            f"FROM items ORDER BY score DESC LIMIT {n}"
         )
-        # `[:n]` because the over-fetch is a way to widen the graph walk, not a
-        # licence to return more than `n` answers: ann-benchmarks scores the
-        # first `n` and a longer list would be scored as extra free guesses.
-        return [row[0] for row in self._cursor.fetchall()[:n]]
+        # Exactly `n`, and no truncation needed: the recall/latency dial is now
+        # `ef_search` rather than an inflated `LIMIT`, so the query asks for the
+        # answer it is scored on.
+        return [row[0] for row in self._cursor.fetchall()]
 
     def batch_query(self, X: numpy.ndarray, n: int) -> None:
         """Serial, overriding `BaseANN`'s ThreadPool.
@@ -478,7 +538,7 @@ class InlaySQL(BaseANN):
             # decimal text the wire requires, since the engine will not bind
             # one. Reported, not subtracted: a user pays it.
             "inlaysql_literal_format_us": round(formatting, 3),
-            "inlaysql_over_fetch": self.over_fetch,
+            "inlaysql_ef_search": self.ef_search,
             # `build_time`, split. The load is the wire and the storage engine;
             # the graph is one single-threaded HNSW build the engine defers to
             # the first read.

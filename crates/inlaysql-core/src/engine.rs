@@ -36,6 +36,7 @@ use crate::exec::{
     JoinInner, NestedLoopJoin, ProbeKind, RowBytes, RowStream,
 };
 use crate::fusion::{reciprocal_rank_fusion, sort_by_score_desc};
+use crate::hnsw::VectorMetric;
 use crate::hnsw_paged::PagedHnswIndex;
 use crate::plan::{
     Aggregate, AlterAction, AlterTablePlan, ConflictAction, ConflictUpdate, CreateTablePlan,
@@ -51,7 +52,7 @@ use crate::sql::{self, TableRules};
 use crate::statement::Statement;
 use crate::traits::{
     Cancel, Clock, FullTextIndex, IndexFactory, Interrupt, Rng, RowId, RowScan, Scored, Storage,
-    VectorIndex,
+    VectorIndex, VectorTuning,
 };
 use crate::value::{DataType, Value};
 
@@ -127,6 +128,85 @@ const DEFAULT_QUERY_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 /// over-fetch: a row that is 40th by vector similarity but 1st by BM25 should
 /// still be able to win.
 const CANDIDATE_OVERFETCH: usize = 4;
+
+/// How many candidates a retrieval query asks each index for.
+///
+/// The one place the rule lives, because three callers have to agree on it: the
+/// unfiltered fetch ([`Engine::retrieve_rows`]), the filtered one
+/// ([`Engine::retrieve_filtered`]), and [`crate::explain`], which reports the
+/// `ef` a vector search will run at and derives it from this number. An
+/// `EXPLAIN` that computed the candidate budget its own way would eventually
+/// report an operating point the executor does not use, which is the whole
+/// class of bug that module exists to rule out.
+///
+/// The two arms differ, and did before this was factored out: a query with no
+/// `LIMIT` is capped at [`DEFAULT_CANDIDATES`] outright, while a filtered one
+/// takes that cap as the *rows it wants* and over-fetches on top of it, because
+/// the filter is applied inside the walk and rejected rows do not consume the
+/// budget.
+pub(crate) fn candidate_limit(limit: Option<usize>, filtered: bool) -> usize {
+    if filtered {
+        limit
+            .unwrap_or(DEFAULT_CANDIDATES)
+            .saturating_mul(CANDIDATE_OVERFETCH)
+            .max(1)
+    } else {
+        limit
+            .map(|limit| limit.saturating_mul(CANDIDATE_OVERFETCH))
+            .unwrap_or(DEFAULT_CANDIDATES)
+            .max(1)
+    }
+}
+
+/// How many rows a retrieval query can return: its `LIMIT`, or the same cap an
+/// unbounded one is held to.
+///
+/// The floor a session's `ef_search` is checked against — see
+/// [`check_ef_search`] — and therefore worth naming rather than repeating.
+pub(crate) fn rows_wanted(limit: Option<usize>) -> usize {
+    limit.unwrap_or(DEFAULT_CANDIDATES)
+}
+
+/// Refuse a session `ef_search` narrower than the answer the query asked for.
+///
+/// `ef` is how many candidates the graph walk may hold at once, so a walk with
+/// `ef < wanted` cannot come back holding `wanted` rows: it would return a
+/// short answer while more rows existed, without saying so. Widening it to fit
+/// is the other silent option and is worse — the search would run at a number
+/// the caller did not choose while `@@inlaysql_hnsw_ef_search` and `EXPLAIN`
+/// reported the one they did. So the query is refused and names the smallest
+/// value that works, which is pgvector's rule for `hnsw.ef_search` too.
+///
+/// **The floor is the query's row budget, not the candidate count.** The engine
+/// asks each retriever for [`CANDIDATE_OVERFETCH`] times as many candidates as
+/// the query can return, so that a fused ranking has more than the bare
+/// minimum to work with; an `ef` below *that* is merely a narrower beam, which
+/// is exactly what a caller asking for less latency is asking for, and
+/// refusing it would put the cheap half of the recall/latency trade out of
+/// reach for no correctness gain. A short candidate list is what the index's
+/// contract already allows ("up to `k`").
+///
+/// One consequence worth knowing at the very bottom of the range: at `ef`
+/// close to `wanted`, a walk that spends its beam on tombstoned rows can still
+/// come back with fewer than `wanted`. That is what a beam barely wide enough
+/// means, and it is why the shipped tuning holds `ef >= 2k`.
+///
+/// Only reachable when a session has set `ef_search` at all: a query that asked
+/// for nothing gets [`crate::hnsw::HnswParams::ef_for`], whose own `max(k)`
+/// clause puts it above this floor by construction.
+pub(crate) fn check_ef_search(ef: usize, wanted: usize) -> Result<()> {
+    if ef >= wanted {
+        return Ok(());
+    }
+    Err(Error::Unsupported(alloc::format!(
+        "ef_search = {ef} is narrower than the {wanted} rows this query asks for, so the \
+         search could not return them all: a candidate list is the beam the graph walk \
+         holds at once, and one narrower than the answer cannot hold it. The row budget is \
+         the query's LIMIT, or {DEFAULT_CANDIDATES} when it has none. Raise ef_search to \
+         at least {wanted}, lower the LIMIT, or clear it to restore the index's own tuning \
+         (`SET inlaysql_hnsw_ef_search = 0` on the MySQL server)"
+    )))
+}
 
 /// What a statement produced.
 #[derive(Debug, Clone, PartialEq)]
@@ -362,6 +442,15 @@ pub struct Engine {
     /// that lets whoever can say so. Armed once per statement, beside
     /// `statement_now`, so a deadline covers exactly one statement.
     interrupt: Interrupt,
+    /// Where the candidate-list size a session chose for its vector searches is
+    /// read from.
+    ///
+    /// Empty unless a host installs one ([`Engine::set_vector_tuning`]), and
+    /// then every vector search asks it once — see [`VectorTuning`] for why it
+    /// is a handle rather than a number copied in here. `None` from it, and no
+    /// handle at all, both mean the same thing and both take exactly the path
+    /// every query took before this existed.
+    vector_tuning: Option<Box<dyn VectorTuning>>,
     catalog: Catalog,
     /// Declared constraints, resolved against the catalog and kept until the
     /// catalog moves.
@@ -519,6 +608,7 @@ impl Engine {
             )),
             statement_now: Cell::new(0),
             interrupt: Interrupt::none(),
+            vector_tuning: None,
             clock,
             catalog,
             rules: BTreeMap::new(),
@@ -578,6 +668,28 @@ impl Engine {
     /// does not pays a null branch per few thousand rows.
     pub fn set_cancel(&mut self, cancel: Box<dyn Cancel>) {
         self.interrupt = Interrupt::with(cancel);
+    }
+
+    /// Install the handle every vector search asks for its candidate-list size.
+    /// See [`VectorTuning`].
+    ///
+    /// Until this is called — and whenever the installed handle answers `None`
+    /// — every vector search uses the `ef` its own index would have chosen,
+    /// which is the behaviour and the recall of every build before this one.
+    pub fn set_vector_tuning(&mut self, tuning: Box<dyn VectorTuning>) {
+        self.vector_tuning = Some(tuning);
+    }
+
+    /// The candidate-list size imposed on this engine's vector searches, or
+    /// `None` when each index's own `ef_search` is in force.
+    ///
+    /// Read through the installed handle rather than out of a field, so a host
+    /// that reports this number to a client is reporting the same load the
+    /// search itself makes. See [`VectorTuning`].
+    pub fn vector_ef_search(&self) -> Option<usize> {
+        self.vector_tuning
+            .as_ref()
+            .and_then(|tuning| tuning.ef_search())
     }
 
     /// A cancellable sequential scan of `table`. Every scan the engine starts
@@ -1795,6 +1907,8 @@ impl Engine {
                 kind: IndexKind::BTree,
                 unique: true,
                 collations,
+                // A B-tree index has no distance to be built under.
+                metric: VectorMetric::default(),
             })?;
         }
         Ok(())
@@ -1890,13 +2004,26 @@ impl Engine {
                     )));
                 };
                 let quantized = column.ty.is_quantized_vector();
+                // The declaration's metric, not a default: it decides both
+                // what the graph stores (cosine normalises, L2 does not) and
+                // how two stored vectors are compared, and a backend opened
+                // under the wrong one answers with the wrong neighbours and no
+                // error. See `catalog::Index::metric`.
+                let metric = index.metric;
                 let backend = if self.options.paged_vector_indexes {
-                    self.open_paged_vector_index(&index.table, index.column(), dim, quantized)?
+                    self.open_paged_vector_index(
+                        &index.table,
+                        index.column(),
+                        dim,
+                        quantized,
+                        metric,
+                    )?
                 } else if quantized {
                     self.factory
-                        .quantized_vector(&index.table, index.column(), dim)?
+                        .quantized_vector(&index.table, index.column(), dim, metric)?
                 } else {
-                    self.factory.vector(&index.table, index.column(), dim)?
+                    self.factory
+                        .vector(&index.table, index.column(), dim, metric)?
                 };
                 self.vector_indexes.insert(key, backend);
             }
@@ -1942,12 +2069,18 @@ impl Engine {
         column: &str,
         dim: usize,
         quantized: bool,
+        metric: VectorMetric,
     ) -> Result<Box<dyn VectorIndex>> {
         let namespace = vector_index_namespace(table, column);
         let index = if quantized {
-            PagedHnswIndex::open_quantized(self.storage.clone(), namespace, dim)?
+            PagedHnswIndex::open_quantized_with_metric(
+                self.storage.clone(),
+                namespace,
+                dim,
+                metric,
+            )?
         } else {
-            PagedHnswIndex::open(self.storage.clone(), namespace, dim)?
+            PagedHnswIndex::open_with_metric(self.storage.clone(), namespace, dim, metric)?
         }
         .joined_to_caller_transaction();
         Ok(Box::new(index))
@@ -1985,6 +2118,7 @@ impl Engine {
             kind: create.kind,
             unique: create.unique,
             collations: create.collations.clone(),
+            metric: create.metric,
         };
         // A unique index is a constraint as well as an access path, and the
         // constraint half is the half that changes answers. It is recorded
@@ -4688,12 +4822,10 @@ impl Engine {
         mask: &ColumnMask,
         env: &Env<'_>,
     ) -> Result<Vec<ExecRow>> {
-        let candidate_limit = limit
-            .map(|limit| limit.saturating_mul(CANDIDATE_OVERFETCH))
-            .unwrap_or(DEFAULT_CANDIDATES)
-            .max(1);
+        let candidate_limit = candidate_limit(limit, false);
+        let wanted = rows_wanted(limit);
         let mut rows = Vec::new();
-        for scored in self.evaluate_score(table, score, candidate_limit, None, env)? {
+        for scored in self.evaluate_score(table, score, candidate_limit, wanted, None, env)? {
             if let Some(bytes) = self.storage.get_row(&table.name, scored.id)? {
                 rows.push(ExecRow {
                     id: scored.id,
@@ -4853,7 +4985,7 @@ impl Engine {
         // unfiltered query gets, in filter-passing rows rather than plain
         // rows, so a permissive filter sees exactly the candidate set (and
         // recall) an unfiltered query would.
-        let candidate_limit = want.saturating_mul(CANDIDATE_OVERFETCH).max(1);
+        let candidate_limit = candidate_limit(Some(want), true);
 
         // The index stays ignorant of SQL: it only knows row ids, and this
         // closure is where they become rows and a `WHERE`. It runs inside the
@@ -4883,7 +5015,8 @@ impl Engine {
             }
         };
 
-        let hits = self.evaluate_score(table, score, candidate_limit, Some(predicate), env)?;
+        let hits =
+            self.evaluate_score(table, score, candidate_limit, want, Some(predicate), env)?;
         let mut matched = Vec::with_capacity(hits.len().min(want));
         for hit in hits.into_iter().take(want) {
             if let Some(bytes) = self.storage.get_row(&table.name, hit.id)? {
@@ -4909,11 +5042,22 @@ impl Engine {
     /// `filter`, when present, is pushed into every underlying retriever —
     /// for a [`ScoreExpr::Fuse`], into each part's search, so the fused
     /// ranking only ever sees rows that passed it.
+    ///
+    /// `k` is how many candidates each retriever is asked for and `wanted` is
+    /// how many rows the query can return. They differ by
+    /// [`CANDIDATE_OVERFETCH`], and both are needed: `k` sizes the fetch, and
+    /// `wanted` is the floor a session's `ef_search` is checked against —
+    /// which has to be the *answer* rather than the over-fetch, or the
+    /// cheapest half of the recall/latency trade would be unreachable. Checked
+    /// only in the vector arm, because `ef_search` means nothing to a BM25
+    /// index and a text-only query must not be refused by a variable that
+    /// cannot affect it.
     fn evaluate_score(
         &self,
         table: &Table,
         expr: &ScoreExpr,
         k: usize,
+        wanted: usize,
         filter: Option<&dyn Fn(RowId) -> Result<bool>>,
         env: &Env<'_>,
     ) -> Result<Vec<Scored>> {
@@ -4921,7 +5065,13 @@ impl Engine {
             ScoreExpr::Vector { column, query } => {
                 let index = self.vector_index(table, *column)?;
                 let query = bind_embedding(table, *column, query, env)?;
-                let mut hits = index.search(&query, k, filter)?;
+                let mut hits = match self.vector_ef_search() {
+                    None => index.search(&query, k, filter)?,
+                    Some(ef) => {
+                        check_ef_search(ef, wanted)?;
+                        index.search_with_ef(&query, k, ef, filter)?
+                    }
+                };
                 sort_by_score_desc(&mut hits);
                 Ok(hits)
             }
@@ -4939,7 +5089,7 @@ impl Engine {
             ScoreExpr::Fuse { parts, k: rrf_k } => {
                 let mut lists = Vec::with_capacity(parts.len());
                 for part in parts {
-                    lists.push(self.evaluate_score(table, part, k, filter, env)?);
+                    lists.push(self.evaluate_score(table, part, k, wanted, filter, env)?);
                 }
                 let mut fused = reciprocal_rank_fusion(&lists, *rrf_k);
                 fused.truncate(k);
@@ -5015,6 +5165,22 @@ impl Engine {
             )));
         }
         Ok(found)
+    }
+
+    /// The candidate-list size the backend answering `table.column` would
+    /// search `k` neighbours with, or `None` for a backend that has no
+    /// candidate list at all.
+    ///
+    /// Asked of the *backend* rather than derived from a default, because that
+    /// is the object the search will make the same call on — see
+    /// [`crate::explain`], which reports it.
+    pub(crate) fn vector_index_ef_for(
+        &self,
+        table: &Table,
+        column: usize,
+        k: usize,
+    ) -> Result<Option<usize>> {
+        Ok(self.vector_index(table, column)?.ef_for(k))
     }
 
     fn vector_index(&self, table: &Table, column: usize) -> Result<&dyn VectorIndex> {

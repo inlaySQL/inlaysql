@@ -315,6 +315,7 @@ applies, because a client tunes against them — a pool sizes itself on
 | `slow_query_log` | `ON` when `--slow-query-log` is non-zero, `OFF` otherwise. |
 | `long_query_time` | `--slow-query-log`, converted to MySQL's unit — seconds with a fractional part, so a 500 ms threshold reports `0.500000` rather than rounding to `0`. Read off the milliseconds actually compared against. |
 | `inlaysql_statement_text` | `ON`/`OFF` for `--statement-text`. Under this server's own name, not one of MySQL's: MySQL has no variable that means this, and borrowing `general_log` would claim a feature that does not exist here. |
+| `inlaysql_hnsw_ef_search` | The candidate-list size every vector search on this session runs at, or `0` for the index's own tuning. Read off the same field the engine reads. See below. |
 
 All three read timeouts report one number because one `SO_RCVTIMEO` is what
 enforces them: the same timer covers waiting for the next command and reading
@@ -394,6 +395,52 @@ Four things to know before setting the timeout:
   the walk is called once per candidate and is where the check lives. Closing
   the unfiltered case means widening those two traits, which is a change to
   everybody's backend, not to this server.
+
+### Choosing the ANN operating point: `SET inlaysql_hnsw_ef_search`
+
+An HNSW index has exactly one knob that trades recall against latency at query
+time: `ef`, the number of candidates the graph walk may hold at once. A wider
+beam visits more of the graph and finds more of the true nearest neighbours; a
+narrower one returns sooner and finds fewer. Until this existed the number was
+fixed at build time, so a session had one operating point and no way to ask for
+more recall on the query that matters or less latency on the one that does not.
+
+```sql
+SET inlaysql_hnsw_ef_search = 400;   -- more recall, more work
+SET inlaysql_hnsw_ef_search = 0;     -- back to the index's own tuning
+SET inlaysql_hnsw_ef_search = DEFAULT;  -- the same thing, MySQL's spelling
+```
+
+pgvector spells this `SET hnsw.ef_search`. A MySQL system variable cannot hold a
+dot, and a bare `ef_search` would be a name MySQL does not have sitting in
+MySQL's own namespace, so it carries this server's prefix — the same decision
+`inlaysql_statement_text` records.
+
+Four things to know:
+
+* **The default is unchanged, and unset means unchanged.** `0` is the default
+  and means "leave every index's own `ef_search` in force", which is the
+  operating point every query on this server has always had. Nothing about an
+  existing query moves unless a session sets this.
+* **It is per session, not per statement or per index.** It applies to every
+  vector search the connection makes until it is set again or the connection
+  ends. It is not a property of the graph — the graph-shaping parameters `m`
+  and `ef_construction` are, and those are fixed at build time.
+* **A value the query cannot use is refused, not widened.** `ef` must be at
+  least the query's `LIMIT` — pgvector's rule for `hnsw.ef_search` as well —
+  because a walk holding fewer candidates than the answer cannot come back with
+  the answer. `SET inlaysql_hnsw_ef_search = 5` then `LIMIT 10` fails, naming
+  both numbers. Silently widening it would report one number and search at
+  another; silently returning a short list would drop rows the query asked for.
+  At the very bottom of the range — `ef` equal to the `LIMIT` — a walk that
+  spends its beam on tombstoned rows can still come back with fewer rows than
+  asked for. That is what a beam barely wide enough means, and it is why the
+  default is not down there.
+* **`EXPLAIN` reports the number in force**, per query, as `(ef=N)` on the
+  vector-search node. That matters because the untuned point is not a constant:
+  the index's own tuning widens the beam with the candidate count, so
+  `LIMIT 10` runs at `ef=80` and `LIMIT 100` at `ef=800`. `@@inlaysql_hnsw_ef_search`
+  can only report what was imposed; `EXPLAIN` reports what will run.
 
 ## Observability: what this server will tell you about itself
 

@@ -27,7 +27,9 @@ cargo test --workspace          # everything below except the sweeps and the fuz
 | Coverage-guided fuzzing | `fuzz/` | nightly, 5 min per target, artifacts published |
 | Concurrent writers: conflicts reported, nothing lost | `crates/inlaysql/tests/concurrent_writers.rs` | every push |
 | An index larger than one transaction | `crates/inlaysql/tests/large_index.rs` | every push (the 5,000-row case nightly) |
-| ANN recall does not slide as the corpus grows | `crates/inlaysql-core/src/hnsw.rs` | every push (the 25,600-node case nightly) |
+| ANN recall does not slide as the corpus grows, **per metric** | `crates/inlaysql-core/src/hnsw.rs` | every push (the 25,600-node case nightly) |
+| A vector index's distance metric, end to end | `crates/inlaysql-core/tests/vector_metrics.rs`, `crates/inlaysql/tests/vector_metrics.rs` | every push |
+| Raising `ef_search` really does raise recall, and the reported `ef` is the enforced one | `crates/inlaysql/tests/ef_search.rs`, `crates/inlaysql-core/src/hnsw.rs` | every push |
 | Cross-backend equivalence (blocking / io_uring / memory) | `crates/inlaysql/tests/backends.rs` | every push |
 | Format portability (native ↔ WASM) | `crates/inlaysql-wasm/tests/portability.rs` | every push |
 | The demo page in headless Chromium, incl. OPFS | `crates/inlaysql-wasm/browser/smoke.mjs` | every pull request |
@@ -763,6 +765,17 @@ between them; the ignored one runs the same assertion over a 64x range, to
 at dim 384 and 100,000 rows. They exist so that a change which reintroduces the
 slope fails a pull request instead of a nightly benchmark nobody reads until
 Monday.
+
+**Once per metric, not once.** Recall is a comparison against the right answer,
+and the right answer is only defined once a distance is — so `vector_l2_ops`
+has its own run of the same assertion against its own exhaustive L2 oracle,
+and the int8 and paged L2 paths have theirs. A number measured under cosine
+says nothing about an L2 graph, which is why the oracle takes its metric from
+the index rather than from an argument. `-- --nocapture` prints the table:
+
+```sh
+cargo test --release -p inlaysql-core --lib -- --nocapture recall
+```
 
 The benchmark also gained `--suite sweep`, which walks the `M` /
 `ef_construction` / `ef_search` grid and prints the recall-latency curve behind

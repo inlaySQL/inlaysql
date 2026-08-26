@@ -69,5 +69,6 @@ pub use statement::Statement;
 pub use storage::TreeStorage;
 pub use traits::{
     Cancel, Clock, FullTextIndex, IndexFactory, Rng, RowId, Scored, Stopped, Storage, VectorIndex,
+    VectorTuning,
 };
 pub use value::{DataType, Value};

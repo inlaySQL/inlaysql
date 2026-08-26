@@ -227,10 +227,20 @@ is the first number on this page that somebody who has never seen this
 repository can check.
 
 Three things the adapter could not do, and they are engine limitations rather
-than harness ones: `vector_score` is cosine-only, so `sift-128-euclidean` and
-`fashion-mnist-784-euclidean` cannot be answered at all; `ef_search` is not
-reachable from SQL, so the sweep above is an over-fetched `LIMIT` rather than
-the `SET hnsw.ef_search` pgvector's own plugin uses; and an embedding cannot be
+than harness ones: ~~`vector_score` is cosine-only, so `sift-128-euclidean` and
+`fashion-mnist-784-euclidean` cannot be answered at all~~ — **closed.** A
+vector index now carries the distance it was built under, written at
+`CREATE INDEX` with pgvector's operator-class spelling
+(`CREATE INDEX ... ON items USING hnsw (embedding vector_l2_ops)`), and the
+adapter maps the dataset's own metric onto it, so both `-euclidean` starters
+run. The numbers in the table above are `glove-25-angular` and predate that
+change; they are unaffected by it, because a cosine index writes and scores
+exactly the bytes and the arithmetic it always did. `vector_ip_ops` is
+deliberately absent — inner product is not a metric, and the reasoning is in
+`crates/inlaysql-core/src/hnsw.rs`. The sweep above is an over-fetched `LIMIT`
+and predates `SET inlaysql_hnsw_ef_search`, which the adapter now sweeps
+instead — the same dial pgvector's own plugin sweeps as `SET hnsw.ef_search`;
+`m` and `ef_construction` are still Rust-only. An embedding still cannot be
 bound as a parameter over the wire, so every one crosses as decimal text.
 
 ## Retrieval — BM25 is no longer the expensive half

@@ -371,9 +371,13 @@ a query and 12 minutes of build at 100,000 rows — detuning every real workload
 by 30x to chase a corpus nobody has. `ef_construction` above 200 moved recall by
 less than 0.02 on either corpus while costing 15% more build time.
 
-Anyone who *does* have uniformly random vectors can buy the recall back:
-`HnswIndex::with_params` and `set_params` take all four knobs, and `ef_search`
-is the query-time dial.
+Anyone who *does* have uniformly random vectors can buy the recall back.
+`ef_search` is the query-time dial and is reachable from SQL —
+`SET inlaysql_hnsw_ef_search = 2048`, or `Database::set_vector_ef_search`
+embedded — so the recall column of this grid is choosable per query without
+rebuilding anything. `M` and `ef_construction` shape the stored graph and are
+still Rust-only (`HnswIndex::with_params`, `set_params`), which is why the
+other two columns are not.
 
 `ef_search` scales with `k` because a fixed candidate list is a different amount
 of headroom for `k = 1` than for `k = 100`. The engine also over-fetches
@@ -1090,25 +1094,53 @@ it on their own machine and put both on the same axes.
 Every one of these is a finding about the engine, reported rather than routed
 around.
 
-* **Cosine only, so most of the standard datasets cannot be run at all.**
-  `vector_score` is cosine similarity and the SQL surface has no Euclidean or
-  inner-product scorer. `sift-128-euclidean` and `fashion-mnist-784-euclidean`
-  — the two datasets everyone starts with — are refused by the constructor
-  rather than scored against a ground truth built with a metric the engine does
-  not implement. Only the `-angular` datasets are answerable, which is why
+* ~~**Cosine only, so most of the standard datasets cannot be run at all.**~~
+  **Closed.** It was true when this was written: `vector_score` was cosine
+  similarity and the SQL surface had no other scorer, so
+  `sift-128-euclidean` and `fashion-mnist-784-euclidean` — the two datasets
+  everyone starts with — were refused by the constructor rather than scored
+  against a ground truth built with a metric the engine did not implement,
+  and only the `-angular` datasets were answerable. That is why
   `glove-25-angular` is the headline here.
-* **No `ef_search` knob outside Rust.** `ann-benchmarks` expects
-  `set_query_arguments` to sweep the index's query-time parameter, the way the
-  `pgvector` plugin sweeps `SET hnsw.ef_search`. InlaySQL's `HnswParams` has
-  `m`, `ef_construction`, `ef_search` and `ef_search_multiplier`, and **none of
-  them is reachable from SQL** — not in DDL, not as a session variable
-  ("Tuning, and the curve behind the defaults" above points at
-  `HnswIndex::with_params`, which is a Rust API). The one dial a SQL user has
-  is the `LIMIT`, because the graph walk is `max(ef_search, k *
-  ef_search_multiplier)` = `max(64, 2k)`. So the sweep is an **over-fetch
-  factor**: ask for `k * over_fetch` rows, keep the first `k`. It produces a
-  real curve, and `over_fetch` 1 and 2 land on the same graph walk at `k = 10`
-  because both clamp to `ef = 64` — the floor showing through.
+
+  A vector index now carries the distance it was built under, chosen at
+  `CREATE INDEX` with pgvector's operator class
+  (`... ON items USING hnsw (embedding vector_l2_ops)`), and `module.py` maps
+  the dataset's own metric onto it — so the `-euclidean` datasets run. The
+  headline number above is unchanged and was not re-run: a cosine index writes
+  the same graph format and computes the same score, bit for bit, that it did
+  before the metric existed. There is still no `vector_ip_ops`: inner product
+  is not a metric, an HNSW graph on it is a known approximation, and this
+  engine refuses it with that reason rather than shipping it quietly. Anything
+  that is neither angular nor euclidean — `hamming`, `jaccard` — is still
+  refused by the constructor.
+* ~~**No `ef_search` knob outside Rust.**~~ **Closed for `ef_search`; still
+  open for `m` and `ef_construction`.** It was true when this was written:
+  `HnswParams` had all four knobs and **none of them was reachable from SQL**,
+  so the sweep had to be an **over-fetch factor** — ask for `k * over_fetch`
+  rows, keep the first `k`. That produced a real curve but a blunt one, and the
+  tables above show why: `over_fetch` 1 and 2 land on the same graph walk at
+  `k = 10`, because the walk is `max(ef_search, 2k)` and both clamp to
+  `ef = 64`. Two sweep points, one measurement.
+
+  `set_query_arguments` now sweeps `SET inlaysql_hnsw_ef_search`, which is the
+  same dial the `pgvector` plugin sweeps as `SET hnsw.ef_search`, at the same
+  values, so every point is a different walk and the two engines' curves are
+  sampled at the same operating points. `EXPLAIN` reports the `ef` each query
+  will run at, so the number in the results is checkable against the engine
+  rather than derived from a formula in the harness — which is what the `ef`
+  column above was.
+
+  **The tables above were measured with the old over-fetch sweep and have not
+  been re-run.** They are still true readings of the engine at those operating
+  points; they are indexed by a factor rather than by `ef`, and the `ef` column
+  is the harness's arithmetic rather than the engine's answer.
+
+  `m` and `ef_construction` remain Rust-only. Unlike `ef_search` they shape the
+  stored graph rather than one query, so reaching them from `CREATE INDEX`
+  needs a catalog format change to record them per index and a rebuild to
+  apply them. That is why there is still no graph-shape grid in `config.yml`,
+  where pgvector's varies `M`.
 * **Embeddings cannot be bound as parameters.** Over the wire, a string
   parameter into a `VECTOR` column is `1366: column is VECTOR(n) but the value
   is TEXT`, and `vector_score(embedding, ?)` fails the same way. Every

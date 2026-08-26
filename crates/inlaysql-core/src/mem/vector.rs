@@ -5,27 +5,43 @@ use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
 use crate::fusion::sort_by_score_desc;
+use crate::hnsw::VectorMetric;
 use crate::row::{put_len, Cursor};
 use crate::traits::{RowFilter, RowId, Scored, VectorIndex};
 
-/// Exhaustive cosine-similarity search.
+/// Exhaustive search under one [`VectorMetric`].
 ///
 /// This is the oracle the approximate index is judged against: an HNSW index
 /// is allowed to miss neighbours, so a test that wants to assert on *exact*
-/// ranking uses this instead.
+/// ranking uses this instead. It carries a metric for the same reason the
+/// graph does — a recall number is only meaningful against an oracle scoring
+/// the same distance, and an L2 index measured against a cosine oracle would
+/// report a recall that is not about anything.
 #[derive(Debug, Default, Clone)]
 pub struct BruteForceVectorIndex {
     dim: usize,
+    metric: VectorMetric,
     embeddings: BTreeMap<RowId, Vec<f32>>,
 }
 
 impl BruteForceVectorIndex {
-    /// An empty index over vectors of the given dimension.
+    /// An empty cosine index over vectors of the given dimension.
     pub fn new(dim: usize) -> Self {
+        Self::with_metric(dim, VectorMetric::Cosine)
+    }
+
+    /// An empty index over vectors of the given dimension, under `metric`.
+    pub fn with_metric(dim: usize, metric: VectorMetric) -> Self {
         Self {
             dim,
+            metric,
             embeddings: BTreeMap::new(),
         }
+    }
+
+    /// The distance this oracle ranks by.
+    pub fn metric(&self) -> VectorMetric {
+        self.metric
     }
 
     /// Number of indexed embeddings.
@@ -63,7 +79,11 @@ impl VectorIndex for BruteForceVectorIndex {
 
     // The reference index persists too, so a simulation exercises the same
     // save/load path the production index takes. There is no graph here, so the
-    // encoding is the embeddings and nothing else.
+    // encoding is the embeddings and nothing else — and, unlike
+    // `HnswIndex::encode`, it carries no metric, because there is no
+    // precomputed structure for a metric to have shaped. Every score is
+    // recomputed from the raw embeddings at search time, so the same bytes are
+    // correct under either metric.
     fn save(&self) -> Option<Vec<u8>> {
         let mut out = Vec::new();
         put_len(&mut out, self.dim);
@@ -115,7 +135,7 @@ impl VectorIndex for BruteForceVectorIndex {
                     continue;
                 }
             }
-            hits.push(Scored::new(*id, cosine_similarity(query, embedding)));
+            hits.push(Scored::new(*id, self.metric.exact_score(query, embedding)));
         }
         sort_by_score_desc(&mut hits);
         hits.truncate(k);

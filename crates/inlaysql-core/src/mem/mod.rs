@@ -23,6 +23,7 @@ use alloc::boxed::Box;
 
 use crate::engine::Engine;
 use crate::error::Result;
+use crate::hnsw::VectorMetric;
 use crate::traits::{FullTextIndex, IndexFactory, VectorIndex};
 
 /// Builds the in-memory index implementations.
@@ -34,8 +35,14 @@ impl IndexFactory for MemIndexFactory {
         Ok(Box::new(MemFullTextIndex::new()))
     }
 
-    fn vector(&self, _table: &str, _column: &str, dim: usize) -> Result<Box<dyn VectorIndex>> {
-        Ok(Box::new(BruteForceVectorIndex::new(dim)))
+    fn vector(
+        &self,
+        _table: &str,
+        _column: &str,
+        dim: usize,
+        metric: VectorMetric,
+    ) -> Result<Box<dyn VectorIndex>> {
+        Ok(Box::new(BruteForceVectorIndex::with_metric(dim, metric)))
     }
 }
 

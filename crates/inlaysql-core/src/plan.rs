@@ -509,6 +509,12 @@ pub struct CreateIndexPlan {
     pub columns: Vec<usize>,
     /// The index kind, inferred from the column's type unless `USING` said so.
     pub kind: IndexKind,
+    /// The distance an [`IndexKind::Vector`] index's graph will be built and
+    /// searched under, from the operator class the column list wrote
+    /// (`vector_l2_ops`) or the default when it wrote none. Always
+    /// [`crate::hnsw::VectorMetric::Cosine`] for every other kind, which the
+    /// front end refuses to let a statement contradict.
+    pub metric: crate::hnsw::VectorMetric,
     /// `CREATE UNIQUE INDEX`. Only a B-tree index can carry it.
     pub unique: bool,
     /// The collating sequence each indexed column is keyed under, in written

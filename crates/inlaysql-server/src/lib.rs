@@ -755,6 +755,12 @@ fn serve_connection(
     // serving and cannot be killed.
     db.set_cancel(Box::new(control::Signal::new(Arc::clone(&control))));
 
+    // The other half of the same state: what `SET inlaysql_hnsw_ef_search`
+    // writes and `@@inlaysql_hnsw_ef_search` reads. Installed here, once, so
+    // there is no per-statement push of a session setting into the engine and
+    // no second copy of it to fall out of step — see [`control::Tuning`].
+    db.set_vector_tuning(Box::new(control::Tuning::new(Arc::clone(&control))));
+
     let result = connection::Connection::new(
         stream, write_half, db, control, limits, bootstrap, registry, counters,
     )

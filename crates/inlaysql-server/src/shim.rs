@@ -588,6 +588,40 @@ fn handle_set(sql: &str, session: &mut Session) -> Intercepted {
             session.control.set_timeout_ms(millis);
             continue;
         }
+        // Applied, not recorded, for exactly the reason above — and this one
+        // is the recall of the answers a client gets back, not just how long
+        // it waits for them. `0` and `DEFAULT` both mean "leave the index's own
+        // tuning alone", which is how a session gets back to the shipped
+        // operating point without reconnecting; MySQL spells the second one
+        // and pools send it.
+        //
+        // A value that is not a whole number is refused rather than recorded,
+        // because the fallthrough below would store `'wide'` as an inert
+        // session variable and the client would read it back while every
+        // search went on using something else.
+        if name.eq_ignore_ascii_case("inlaysql_hnsw_ef_search") {
+            let written = value.trim();
+            let ef = if written.eq_ignore_ascii_case("default") {
+                0
+            } else {
+                match written.parse::<u64>() {
+                    Ok(ef) => ef,
+                    Err(_) => {
+                        return Intercepted::Failed(MysqlError::new(
+                            1232,
+                            "42000",
+                            format!(
+                                "Incorrect argument type to variable '{name}': expected a \
+                                 whole candidate-list size, got '{value}' (0 or DEFAULT \
+                                 leaves the index's own ef_search in force)"
+                            ),
+                        ))
+                    }
+                }
+            };
+            session.control.set_vector_ef_search(ef);
+            continue;
+        }
         if name.eq_ignore_ascii_case("autocommit") {
             match parse_bool(&value) {
                 Some(on) => autocommit = Some(on),
@@ -1141,25 +1175,32 @@ fn show_keys(rest: &str, catalog: &Catalog) -> Intercepted {
     };
 
     let mut data = Vec::new();
-    let key_row = |key_name: &str, non_unique: i64, column: &str, index_type: &str| {
-        vec![
-            Value::Text(table.name.clone().into()),
-            Value::Integer(non_unique),
-            Value::Text(key_name.to_string().into()),
-            Value::Integer(1),
-            Value::Text(column.to_string().into()),
-            Value::Text("A".to_string().into()),
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Text("YES".to_string().into()),
-            Value::Text(index_type.to_string().into()),
-            Value::Text(String::new().into()),
-            Value::Text(String::new().into()),
-            Value::Text("YES".to_string().into()),
-            Value::Null,
-        ]
-    };
+    // `comment` lands in `Index_comment`, which is where MySQL puts whatever
+    // an index declared about itself that its `Index_type` cannot carry. For a
+    // vector index that is the distance it was built under: two indexes with
+    // `Index_type` VECTOR can rank the same rows differently, and a client
+    // that could not tell them apart would be reading a schema that is missing
+    // the one field which decides what the index answers.
+    let key_row =
+        |key_name: &str, non_unique: i64, column: &str, index_type: &str, comment: &str| {
+            vec![
+                Value::Text(table.name.clone().into()),
+                Value::Integer(non_unique),
+                Value::Text(key_name.to_string().into()),
+                Value::Integer(1),
+                Value::Text(column.to_string().into()),
+                Value::Text("A".to_string().into()),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Text("YES".to_string().into()),
+                Value::Text(index_type.to_string().into()),
+                Value::Text(String::new().into()),
+                Value::Text(comment.to_string().into()),
+                Value::Text("YES".to_string().into()),
+                Value::Null,
+            ]
+        };
 
     // The INTEGER PRIMARY KEY is the row id rather than a separate structure,
     // but it is the one unique key there is, and it is what an ORM looks for.
@@ -1169,6 +1210,7 @@ fn show_keys(rest: &str, catalog: &Catalog) -> Intercepted {
             0,
             &table.columns[position].name,
             "BTREE",
+            "",
         ));
     }
     for index in catalog.indexes_for(&table.name) {
@@ -1181,8 +1223,18 @@ fn show_keys(rest: &str, catalog: &Catalog) -> Intercepted {
         // invite an ORM to build an upsert on one. A B-tree index may be one,
         // and then it is reported as one.
         let non_unique = i64::from(!index.unique);
+        let comment = match index.kind {
+            inlaysql::IndexKind::Vector => index.metric.ops_name(),
+            _ => "",
+        };
         for column in &index.columns {
-            data.push(key_row(&index.name, non_unique, column, index_type));
+            data.push(key_row(
+                &index.name,
+                non_unique,
+                column,
+                index_type,
+                comment,
+            ));
         }
     }
 
@@ -1592,14 +1644,12 @@ mod tests {
             })
             .unwrap();
         catalog
-            .create_index(Index {
-                name: "docs_body".to_string(),
-                table: "docs".to_string(),
-                columns: vec!["body".to_string()],
-                kind: IndexKind::FullText,
-                unique: false,
-                collations: vec![inlaysql::Collation::Binary],
-            })
+            .create_index(Index::single(
+                "docs_body".to_string(),
+                "docs".to_string(),
+                "body".to_string(),
+                IndexKind::FullText,
+            ))
             .unwrap();
         catalog
     }

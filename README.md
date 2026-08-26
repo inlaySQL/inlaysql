@@ -357,7 +357,9 @@ SQLite's dialect is the baseline. Stage 1 implements a slice of it, plus:
 | `VECTOR(n, INT8)` | The same SQL value with deterministic per-vector int8 scalar quantisation in rows and ANN storage (about 4x smaller, with measured recall loss). |
 | `INTEGER PRIMARY KEY` | SQLite's row-id alias: the key *is* the row's address, so `WHERE id = 42` is one tree descent, not a scan. |
 | `CREATE [UNIQUE] INDEX` / `DROP INDEX` | Declares an index. On `TEXT` it is a BM25 index by default (`USING BTREE` asks for a scalar one instead); on `VECTOR` it is ANN; on `INTEGER`/`REAL` it is a scalar B-tree, which may span more than one column and may be declared `UNIQUE`. |
-| `vector_score(column, embedding)` | Approximate nearest neighbours over a `VECTOR` column. |
+| `vector_score(column, embedding)` | Approximate nearest neighbours over a `VECTOR` column, under the distance its index was built with. |
+| `CREATE INDEX ... (embedding vector_l2_ops)` | pgvector's operator-class spelling, choosing the distance an ANN index is built and searched under: `vector_cosine_ops` (the default) or `vector_l2_ops`. |
+| `SET inlaysql_hnsw_ef_search = <n>` | The ANN recall/latency trade, per session. `0` (the default) leaves the index's own tuning in force; `EXPLAIN` reports the `ef` each query will run at. |
 | `bm25_score(column, 'terms')` | BM25 relevance over a `TEXT` column. |
 | `fuse(a, b, ...)` (alias `rrf`) | Reciprocal rank fusion over the retrieval expressions inside it. |
 
@@ -385,6 +387,89 @@ there — there is no cost model, so a join or a predicate the rule does not
 cover still runs nested-loop over a full scan; see
 [What this is not](#what-this-is-not).
 
+### Which distance a vector index uses
+
+`vector_score` scores with the metric its index was built under, chosen once at
+`CREATE INDEX` and then fixed:
+
+```sql
+CREATE INDEX items_embedding ON items (embedding);                  -- cosine
+CREATE INDEX items_embedding ON items (embedding vector_l2_ops);    -- Euclidean
+CREATE INDEX items_embedding ON items USING hnsw (embedding vector_l2_ops);
+```
+
+The spelling is pgvector's **operator class**, and the third line is pgvector's
+own statement running unchanged. Writing nothing means `vector_cosine_ops`, so
+every database and every query that predates this is untouched, byte for byte
+— a cosine index writes the same graph format and computes the same score it
+always did.
+
+Under cosine the score is the cosine similarity in `[-1, 1]`; under
+`vector_l2_ops` it is the **negated** Euclidean distance, so `0` is an exact
+hit, further is more negative, and `ORDER BY score DESC LIMIT k` is still the
+`k` nearest. `EXPLAIN` names the metric, always — which distance ranked the
+rows decides which rows came back:
+
+```
+SEARCH items USING VECTOR INDEX items_embedding (embedding vector_l2_ops) FOR vector_score
+```
+
+**The metric belongs to the index, not to the query.** An HNSW graph's
+neighbour lists *are* the answer to "what is near what" under one distance, so
+a graph built one way and searched another returns plausible, wrong rows with
+no error anywhere. The metric therefore travels with the graph on disk, and a
+graph whose metric does not match its declaration is rebuilt rather than
+reused. It also decides what is stored: cosine L2-normalises on the way in so
+the comparison is a dot product, and `vector_l2_ops` does not, because the
+magnitude that would throw away is exactly what it measures. One column carries
+one vector index, because `vector_score(embedding, ?)` names the column and not
+the metric and could not say which of two it meant.
+
+**There is no `vector_ip_ops`.** Inner product is not a metric — no triangle
+inequality, and a vector is generally not its own nearest neighbour under it —
+and every argument HNSW makes for a greedy walk over a diversity-pruned
+neighbour list assumes one. pgvector and FAISS ship it as a known
+approximation; this refuses it and says so, with the transformation that is
+exact: for unit-length embeddings, cosine ranks identically to inner product.
+
+### Choosing the recall/latency point: `ef_search`
+
+The metric belongs to the index. The **candidate list** belongs to the query:
+`ef` is how many candidates the graph walk may hold at once, and it is the only
+thing that trades recall against latency at query time. pgvector spells it
+`SET hnsw.ef_search`; a MySQL system variable cannot hold a dot, so here it is
+
+```sql
+SET inlaysql_hnsw_ef_search = 400;      -- more recall on the query that matters
+SET inlaysql_hnsw_ef_search = 0;        -- back to the index's own tuning
+```
+
+and, embedded, `Database::set_vector_ef_search(Some(400))`. `EXPLAIN` reports
+the number that will actually be used, because an operating point nobody can
+see is one nobody can choose:
+
+```
+SEARCH items USING VECTOR INDEX items_embedding (embedding vector_cosine_ops) FOR vector_score (ef=400)
+```
+
+`0` is the default and means exactly what every query on this engine has always
+done. That untuned point is not a constant — the shipped tuning widens the beam
+with the number of candidates asked for, so the same index searches a
+`LIMIT 10` at `ef = 80` and a `LIMIT 100` at `ef = 800`, which is why `EXPLAIN`
+reports it per query rather than `@@inlaysql_hnsw_ef_search` reporting it once.
+
+**A beam narrower than the answer is refused, not widened.** `ef` must be at
+least the query's `LIMIT` — pgvector's rule for `hnsw.ef_search` as well —
+because a walk holding fewer candidates than the answer cannot come back with
+the answer. `SET inlaysql_hnsw_ef_search = 5` then `LIMIT 10` fails and names
+both numbers. Widening it silently would search at a number the caller did not
+choose while reporting the one they did; returning a short list would drop rows
+without saying so.
+
+`m` and `ef_construction` — the parameters that shape the stored graph rather
+than one query — are not settable per index yet; every index is built at the
+shipped `m = 16`, `ef_construction = 200`.
+
 ### What a retrieval function means in a join
 
 A retrieval index lives over one table's rows, so when a query joins tables the
@@ -399,8 +484,8 @@ combined in one query.
 
 ### Why fusion works on ranks, not scores
 
-Cosine similarity lives in `[-1, 1]`; BM25 is unbounded and depends on corpus
-statistics. Normalising one against the other needs calibration nobody has at
+Cosine similarity lives in `[-1, 1]`, a Euclidean score is an unbounded
+negative distance, and BM25 is unbounded and depends on corpus statistics. Normalising one against the other needs calibration nobody has at
 query time. Reciprocal rank fusion throws the raw scores away and combines
 *positions*:
 

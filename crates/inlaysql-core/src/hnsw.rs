@@ -8,8 +8,10 @@
 //! function of the inserted rows — which keeps the whole thing simulator-clean
 //! and makes two builds over the same rows agree byte for byte.
 //!
-//! Embeddings are L2-normalised on the way in, so cosine similarity reduces to
-//! a dot product and the graph distance is `1 - dot`.
+//! Which distance the graph is built and searched under is [`VectorMetric`],
+//! fixed when the index is constructed and persisted with the graph. Under the
+//! default, cosine, embeddings are L2-normalised on the way in, so cosine
+//! similarity reduces to a dot product and the graph distance is `1 - dot`.
 //!
 //! # Incremental maintenance
 //!
@@ -79,8 +81,19 @@ use crate::traits::{RowFilter, RowId, Scored, VectorIndex};
 /// Version 4 stores embeddings and tombstoned-node vectors as one `f32` scale
 /// plus `dim` signed bytes. Exact indexes continue to write and read version 3
 /// byte-for-byte; only an opted-in int8 column writes version 4.
+///
+/// Version 5 carries the graph's [`VectorMetric`] and its encoding as two tags
+/// after the version byte, because versions 3 and 4 can express only cosine.
+/// It is written **only** by an index whose metric is not cosine: a cosine
+/// index still writes version 3 or 4 byte for byte, so every database that
+/// exists today reads and writes exactly the bytes it did before. The reason
+/// the metric has to be in the file at all is the failure it prevents — a
+/// graph built under cosine and searched under L2 answers with the wrong
+/// neighbours and no error anywhere, because both metrics are defined on the
+/// same vectors and neither can tell it is looking at the other's graph.
 const FORMAT_VERSION_EXACT: u8 = 3;
 const FORMAT_VERSION_Q8: u8 = 4;
+const FORMAT_VERSION_METRIC: u8 = 5;
 
 /// Absolute ceiling on a node's layer, whatever the corpus size says.
 ///
@@ -146,6 +159,177 @@ impl Default for HnswParams {
     }
 }
 
+/// Which distance an ANN index's graph is built and searched under.
+///
+/// **Chosen once, at `CREATE INDEX`, and then fixed.** The metric is not a
+/// query-time argument and cannot be: HNSW's neighbour lists *are* the answer
+/// to "what is near what" under one particular distance, so searching a graph
+/// under a metric other than the one that built it returns whatever the wrong
+/// geometry happens to route to — plausible rows, wrong rows, and no error
+/// anywhere. That is why this travels with the graph on disk and why
+/// [`HnswIndex::load`] refuses a file whose metric is not the one the column
+/// declares.
+///
+/// It also decides what is *stored*, not only how two stored vectors are
+/// compared. Cosine normalises on the way in so that the comparison is a bare
+/// dot product ([`VectorMetric::prepare`]); L2 must not, because the magnitude
+/// it would throw away is exactly what L2 measures. One enum choosing both
+/// halves is what makes "normalised for cosine, compared as L2" unwritable.
+///
+/// # Why there is no inner-product variant
+///
+/// pgvector has `vector_ip_ops` and FAISS has `METRIC_INNER_PRODUCT`, so the
+/// absence is deliberate rather than an oversight. Inner product is not a
+/// metric: it has no triangle inequality, and worse for this structure, it is
+/// not reflexive — under `-<a,b>` a vector is generally *not* its own nearest
+/// neighbour, because any longer vector pointing roughly the same way scores
+/// higher. Every argument HNSW makes for why a greedy walk over a
+/// diversity-pruned neighbour list finds the true neighbours assumes a metric,
+/// and [`select_neighbors`]' diversity heuristic — "keep this candidate only
+/// if the new node is closer to it than any already-kept neighbour is" — is a
+/// direct application of the triangle inequality. Under inner product that
+/// test is comparing quantities that do not bound each other, so the graph it
+/// builds is not the graph the algorithm is reasoning about.
+///
+/// The engines that ship it ship a known approximation. This one refuses it,
+/// and says so at `CREATE INDEX` with the transformation that is exact:
+/// normalise the embeddings and use cosine, which *is* argmax inner product
+/// once every vector has the same length. What is refused is the case where
+/// the norms genuinely carry meaning — and there the honest answer is that
+/// this index cannot rank by it, not a graph that silently ranks by it badly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VectorMetric {
+    /// `1 - cos(a, b)`. Embeddings are L2-normalised on the way in, so the
+    /// comparison is a dot product. The default, and what every index written
+    /// before this existed uses.
+    #[default]
+    Cosine,
+    /// Squared Euclidean distance, `sum((a - b)^2)`, over the embeddings as
+    /// given.
+    ///
+    /// Squared, not rooted: the square root is monotone, so it changes no
+    /// ordering the graph makes, and skipping it inside the walk saves one
+    /// `sqrt` per distance computation — of which a build makes billions. It
+    /// is taken exactly once per returned row, in [`VectorMetric::score`], so
+    /// the number a query sees is a real Euclidean distance rather than a
+    /// squared one.
+    L2,
+}
+
+impl VectorMetric {
+    /// Whether embeddings are L2-normalised before they are stored or
+    /// compared.
+    pub fn normalises(self) -> bool {
+        matches!(self, Self::Cosine)
+    }
+
+    /// The pgvector operator class that names this metric — the spelling
+    /// `CREATE INDEX` accepts and `EXPLAIN` reports.
+    pub fn ops_name(self) -> &'static str {
+        match self {
+            Self::Cosine => "vector_cosine_ops",
+            Self::L2 => "vector_l2_ops",
+        }
+    }
+
+    /// Resolve a pgvector operator-class name.
+    ///
+    /// Exactly pgvector's three spellings and no synonyms of our own: a
+    /// `vector_l2_ops` that also answered to `l2` or `euclidean` would be this
+    /// engine inventing dialect, which is the opposite of the reason the
+    /// pgvector spelling was adopted. `vector_ip_ops` is recognised only so
+    /// that it can be refused with its reason rather than with "unknown
+    /// operator class" — see the type's own docs for why it is not
+    /// implemented.
+    ///
+    /// Case-insensitive, because SQL identifiers are.
+    pub fn from_ops_name(name: &str) -> Result<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "vector_cosine_ops" => Ok(Self::Cosine),
+            "vector_l2_ops" => Ok(Self::L2),
+            "vector_ip_ops" => Err(Error::Unsupported(alloc::string::String::from(
+                "vector_ip_ops is not supported: inner product is not a metric — it has no \
+                     triangle inequality and a vector is not its own nearest neighbour under it — \
+                     and an HNSW graph built on it is an approximation whose error this engine \
+                     cannot bound. If your embeddings are unit length, inner product and cosine \
+                     rank identically: use vector_cosine_ops. If their norms carry meaning, this \
+                     index cannot rank by them",
+            ))),
+            other => Err(Error::Unsupported(alloc::format!(
+                "`{other}` is not an operator class this engine has; a vector index takes \
+                 vector_cosine_ops (the default) or vector_l2_ops"
+            ))),
+        }
+    }
+
+    /// What goes into the graph for a raw embedding.
+    ///
+    /// The one place preparation happens, so a graph cannot be built out of
+    /// vectors prepared one way and queried with vectors prepared another —
+    /// which under cosine would silently rescale every score and under L2
+    /// would erase the magnitudes that are the whole answer.
+    pub(crate) fn prepare(self, embedding: &[f32]) -> Vec<f32> {
+        match self {
+            Self::Cosine => normalise(embedding),
+            Self::L2 => embedding.to_vec(),
+        }
+    }
+
+    /// Turn the graph's internal distance into the number `vector_score`
+    /// reports, where larger is always better.
+    ///
+    /// Cosine gives back the cosine similarity in `[-1, 1]`, bit for bit what
+    /// this index has always returned. L2 gives back the *negated* Euclidean
+    /// distance: `0` for an exact hit and more negative the further away, which
+    /// is monotone in closeness (so `ORDER BY score DESC LIMIT k` is still the
+    /// k nearest) and still carries the distance in its magnitude. Mapping it
+    /// onto `[0, 1]` with some `1/(1+d)` curve was the alternative and was
+    /// rejected: it would invent a scale nobody asked for and make two
+    /// databases with different embedding magnitudes look comparable when they
+    /// are not.
+    pub(crate) fn score(self, distance: f32) -> f32 {
+        match self {
+            Self::Cosine => 1.0 - distance,
+            Self::L2 => -libm::sqrtf(distance),
+        }
+    }
+
+    /// The score an *exhaustive* scan reports for two raw embeddings — the
+    /// oracle's half of what [`HnswIndex::search`] returns for the same pair.
+    ///
+    /// Separate from [`VectorMetric::score`] because a scan holds the
+    /// embeddings as the user gave them, where the graph holds
+    /// [`VectorMetric::prepare`]d ones and its kernel is written to assume
+    /// that. Cosine therefore goes through the general
+    /// [`crate::mem::cosine_similarity`], which normalises as it goes — bit for
+    /// bit what [`crate::mem::BruteForceVectorIndex`] has always reported.
+    pub(crate) fn exact_score(self, a: &[f32], b: &[f32]) -> f32 {
+        match self {
+            Self::Cosine => crate::mem::cosine_similarity(a, b),
+            Self::L2 => self.score(a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()),
+        }
+    }
+
+    /// Wire tag, for the graph formats that carry one.
+    pub(crate) fn tag(self) -> u8 {
+        match self {
+            Self::Cosine => 0,
+            Self::L2 => 1,
+        }
+    }
+
+    /// Parse a tag written by [`VectorMetric::tag`].
+    pub(crate) fn from_tag(tag: u8) -> Result<Self> {
+        match tag {
+            0 => Ok(Self::Cosine),
+            1 => Ok(Self::L2),
+            other => Err(Error::Corrupt(alloc::format!(
+                "vector index distance metric tag {other} is not one this build knows"
+            ))),
+        }
+    }
+}
+
 /// Which representation a vector column's index stores its embeddings in.
 ///
 /// `pub(crate)` rather than private: [`crate::hnsw_paged::PagedHnswIndex`] is
@@ -184,7 +368,17 @@ impl StoredVector {
         }
     }
 
-    pub(crate) fn normalised(&self, encoding: VectorEncoding) -> Self {
+    /// The form this vector takes inside a graph under `metric`.
+    ///
+    /// The non-normalising metrics return the vector unchanged rather than
+    /// round-tripping it through `to_f32`/`from_f32`: for `Q8` that round trip
+    /// is exactly idempotent (the reconstructed maximum is `127 * scale`, so
+    /// the recomputed scale is the same `scale` and every code is unchanged),
+    /// so the shortcut costs nothing and skips an allocation per node.
+    pub(crate) fn prepared(&self, metric: VectorMetric, encoding: VectorEncoding) -> Self {
+        if !metric.normalises() {
+            return self.clone();
+        }
         Self::from_f32(&normalise(&self.to_f32()), encoding)
     }
 
@@ -226,6 +420,11 @@ impl Node {
 pub struct HnswIndex {
     dim: usize,
     encoding: VectorEncoding,
+    /// The distance this graph was built under and is searched under. Set at
+    /// construction and never afterwards — there is deliberately no setter,
+    /// because a graph whose metric changed under it is a graph of the wrong
+    /// neighbours, and [`HnswIndex::load`] refuses a file that disagrees.
+    metric: VectorMetric,
     /// Source of truth: the embeddings, keyed by row id. Updated by insert and
     /// remove; the graph is reconciled to these on [`HnswIndex::commit`].
     embeddings: BTreeMap<RowId, StoredVector>,
@@ -261,26 +460,48 @@ pub struct HnswIndex {
 }
 
 impl HnswIndex {
-    /// An empty index over vectors of the given dimension, with
+    /// An empty cosine index over vectors of the given dimension, with
     /// [`HnswParams::DEFAULT`].
     pub fn new(dim: usize) -> Self {
         Self::with_params(dim, HnswParams::DEFAULT)
     }
 
-    /// An empty int8-quantised index over vectors of the given dimension.
+    /// An empty int8-quantised cosine index over vectors of the given
+    /// dimension.
     pub fn new_quantized(dim: usize) -> Self {
-        Self::with_encoding(dim, HnswParams::DEFAULT, VectorEncoding::Q8)
+        Self::with_encoding(
+            dim,
+            HnswParams::DEFAULT,
+            VectorEncoding::Q8,
+            Default::default(),
+        )
     }
 
-    /// An empty index with explicit tuning.
+    /// An empty index under an explicit [`VectorMetric`].
+    pub fn with_metric(dim: usize, metric: VectorMetric) -> Self {
+        Self::with_encoding(dim, HnswParams::DEFAULT, VectorEncoding::Exact, metric)
+    }
+
+    /// An empty int8-quantised index under an explicit [`VectorMetric`].
+    pub fn quantized_with_metric(dim: usize, metric: VectorMetric) -> Self {
+        Self::with_encoding(dim, HnswParams::DEFAULT, VectorEncoding::Q8, metric)
+    }
+
+    /// An empty cosine index with explicit tuning.
     pub fn with_params(dim: usize, params: HnswParams) -> Self {
-        Self::with_encoding(dim, params, VectorEncoding::Exact)
+        Self::with_encoding(dim, params, VectorEncoding::Exact, Default::default())
     }
 
-    fn with_encoding(dim: usize, params: HnswParams, encoding: VectorEncoding) -> Self {
+    fn with_encoding(
+        dim: usize,
+        params: HnswParams,
+        encoding: VectorEncoding,
+        metric: VectorMetric,
+    ) -> Self {
         Self {
             dim,
             encoding,
+            metric,
             embeddings: BTreeMap::new(),
             nodes: Vec::new(),
             node_ids: BTreeMap::new(),
@@ -310,6 +531,11 @@ impl HnswIndex {
     /// The tuning in force.
     pub fn params(&self) -> HnswParams {
         self.params
+    }
+
+    /// The distance this graph is built and searched under.
+    pub fn metric(&self) -> VectorMetric {
+        self.metric
     }
 
     /// Distance computations made since the last
@@ -351,7 +577,7 @@ impl HnswIndex {
     /// Serialise the index, graph included.
     ///
     /// ```text
-    /// index := u8 version, u32 dim,
+    /// index := u8 version, (u8 metric, u8 encoding)?, u32 dim,
     ///          u32 embedding_count, embedding*,
     ///          u32 node_count, node*,
     ///          u8 has_entry, u32 entry index, u32 entry level
@@ -360,18 +586,31 @@ impl HnswIndex {
     /// layer     := u32 neighbour_count, u32 * neighbour_count   (node indices)
     /// ```
     ///
+    /// The two tags are present only at [`FORMAT_VERSION_METRIC`], which only
+    /// a non-cosine index writes; versions 3 and 4 name the encoding in the
+    /// version byte itself and mean cosine. A cosine index therefore encodes
+    /// byte for byte what it always did.
+    ///
     /// The graph is stored rather than recomputed because building it is the
     /// expensive part — every insert walks the graph. A live node's vector is
-    /// *not* stored: it is the normalised form of the embedding, so
+    /// *not* stored: it is the metric's prepared form of the embedding, so
     /// [`HnswIndex::decode`] recomputes it and the file stays half the size. A
     /// tombstoned node has no embedding left to recompute from, so its vector
     /// is stored inline and it can still be traversed after a reload.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        out.push(match self.encoding {
-            VectorEncoding::Exact => FORMAT_VERSION_EXACT,
-            VectorEncoding::Q8 => FORMAT_VERSION_Q8,
-        });
+        match (self.metric, self.encoding) {
+            (VectorMetric::Cosine, VectorEncoding::Exact) => out.push(FORMAT_VERSION_EXACT),
+            (VectorMetric::Cosine, VectorEncoding::Q8) => out.push(FORMAT_VERSION_Q8),
+            (metric, encoding) => {
+                out.push(FORMAT_VERSION_METRIC);
+                out.push(metric.tag());
+                out.push(match encoding {
+                    VectorEncoding::Exact => 0,
+                    VectorEncoding::Q8 => 1,
+                });
+            }
+        }
         put_len(&mut out, self.dim);
 
         put_len(&mut out, self.embeddings.len());
@@ -421,9 +660,23 @@ impl HnswIndex {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut cursor = Cursor::new(bytes);
         let version = cursor.u8()?;
-        let encoding = match version {
-            FORMAT_VERSION_EXACT => VectorEncoding::Exact,
-            FORMAT_VERSION_Q8 => VectorEncoding::Q8,
+        let (metric, encoding) = match version {
+            // Versions 3 and 4 predate the metric and can only be cosine.
+            FORMAT_VERSION_EXACT => (VectorMetric::Cosine, VectorEncoding::Exact),
+            FORMAT_VERSION_Q8 => (VectorMetric::Cosine, VectorEncoding::Q8),
+            FORMAT_VERSION_METRIC => {
+                let metric = VectorMetric::from_tag(cursor.u8()?)?;
+                let encoding = match cursor.u8()? {
+                    0 => VectorEncoding::Exact,
+                    1 => VectorEncoding::Q8,
+                    other => {
+                        return Err(Error::Corrupt(alloc::format!(
+                            "vector index encoding tag {other} is not one this build knows"
+                        )))
+                    }
+                };
+                (metric, encoding)
+            }
             _ => {
                 return Err(Error::Corrupt(alloc::format!(
                     "vector index format version {version} is not supported"
@@ -431,7 +684,7 @@ impl HnswIndex {
             }
         };
         let dim = cursor.count(4)?;
-        let mut index = Self::with_encoding(dim, HnswParams::DEFAULT, encoding);
+        let mut index = Self::with_encoding(dim, HnswParams::DEFAULT, encoding, metric);
 
         let embedding_count = cursor.count(8)?;
         for _ in 0..embedding_count {
@@ -456,8 +709,8 @@ impl HnswIndex {
                 }
                 neighbors.push(layer);
             }
-            // A live node's vector is the normalised embedding and must be
-            // recomputable; a tombstoned node has no embedding left, so its
+            // A live node's vector is the metric's prepared embedding and must
+            // be recomputable; a tombstoned node has no embedding left, so its
             // vector was stored inline and is read back here.
             let vector = if deleted {
                 decode_stored_vector(&mut cursor, dim, encoding)?
@@ -465,7 +718,7 @@ impl HnswIndex {
                 index
                     .embeddings
                     .get(&id)
-                    .map(|embedding| embedding.normalised(encoding))
+                    .map(|embedding| embedding.prepared(metric, encoding))
                     .ok_or_else(|| {
                         Error::Corrupt(alloc::format!("graph node {id} has no stored embedding"))
                     })?
@@ -546,7 +799,7 @@ impl HnswIndex {
             .map(|(id, embedding)| {
                 (
                     *id,
-                    embedding.normalised(self.encoding),
+                    embedding.prepared(self.metric, self.encoding),
                     level_of(*id, shift, ceiling),
                 )
             })
@@ -587,6 +840,7 @@ impl HnswIndex {
         while current > level {
             let nearest = search_layer(
                 &self.nodes,
+                self.metric,
                 &vector,
                 ep,
                 1,
@@ -606,6 +860,7 @@ impl HnswIndex {
         for layer in (0..=current).rev() {
             let candidates = search_layer(
                 &self.nodes,
+                self.metric,
                 &vector,
                 ep,
                 self.params.ef_construction,
@@ -618,7 +873,13 @@ impl HnswIndex {
             ep = candidates[0].node;
 
             let degree = self.params.degree(layer);
-            let selected = select_neighbors(&self.nodes, &candidates, degree, &self.distance_calls);
+            let selected = select_neighbors(
+                &self.nodes,
+                self.metric,
+                &candidates,
+                degree,
+                &self.distance_calls,
+            );
             self.nodes[new_index].neighbors[layer] = selected.clone();
             for neighbor in selected {
                 self.link_back(neighbor, new_index, layer, degree);
@@ -650,6 +911,7 @@ impl HnswIndex {
             .iter()
             .map(|&other| Candidate {
                 distance: stored_distance(
+                    self.metric,
                     &self.distance_calls,
                     &self.nodes[neighbor].vector,
                     &self.nodes[other].vector,
@@ -658,8 +920,13 @@ impl HnswIndex {
             })
             .collect();
         candidates.sort_unstable();
-        self.nodes[neighbor].neighbors[layer] =
-            select_neighbors(&self.nodes, &candidates, degree, &self.distance_calls);
+        self.nodes[neighbor].neighbors[layer] = select_neighbors(
+            &self.nodes,
+            self.metric,
+            &candidates,
+            degree,
+            &self.distance_calls,
+        );
     }
 
     /// Mark a node deleted, leaving it in the graph for navigation but out of
@@ -741,6 +1008,7 @@ impl HnswIndex {
 #[allow(clippy::too_many_arguments)]
 fn search_layer(
     nodes: &[Node],
+    metric: VectorMetric,
     query: &StoredVector,
     entry: usize,
     ef: usize,
@@ -773,7 +1041,7 @@ fn search_layer(
     };
 
     let start = Candidate {
-        distance: stored_distance(distance_calls, query, &nodes[entry].vector),
+        distance: stored_distance(metric, distance_calls, query, &nodes[entry].vector),
         node: entry,
     };
     visited.visit(entry);
@@ -800,7 +1068,7 @@ fn search_layer(
                 continue;
             }
             let candidate = Candidate {
-                distance: stored_distance(distance_calls, query, &nodes[neighbor].vector),
+                distance: stored_distance(metric, distance_calls, query, &nodes[neighbor].vector),
                 node: neighbor,
             };
             // Enter the frontier when the results are not yet full or the
@@ -902,7 +1170,7 @@ impl VectorIndex for HnswIndex {
                 // Removed again before this commit ran: nothing to insert.
                 continue;
             };
-            let vector = embedding.normalised(self.encoding);
+            let vector = embedding.prepared(self.metric, self.encoding);
             let level = level_of(id, shift, ceiling);
             // A replace without an intervening remove retires the old node the
             // same way a remove would.
@@ -942,6 +1210,20 @@ impl VectorIndex for HnswIndex {
                 "persisted vector index encoding does not match its column",
             )));
         }
+        // The one mismatch that would otherwise be invisible. A cosine graph
+        // and an L2 graph over the same rows decode identically — same nodes,
+        // same adjacency, same vector widths — and differ only in which
+        // neighbours those links *are*. Searched under the other metric the
+        // index answers with plausible, wrong rows and reports no error at
+        // all, so it is refused here and the engine rebuilds from the rows.
+        if restored.metric != self.metric {
+            return Err(Error::Corrupt(alloc::format!(
+                "persisted vector index was built under {} but the index declares {}; its \
+                 neighbour lists answer a different question and cannot be reused",
+                restored.metric.ops_name(),
+                self.metric.ops_name()
+            )));
+        }
         // Tuning is not persisted, so the caller's stays in force. `params` is
         // the live configuration; the file only carries the graph. The loaded
         // graph is assumed to have been built under those parameters, so the
@@ -956,6 +1238,24 @@ impl VectorIndex for HnswIndex {
     }
 
     fn search(&self, query: &[f32], k: usize, filter: Option<&RowFilter>) -> Result<Vec<Scored>> {
+        // The tuning in force, which is what every query got before a session
+        // could ask for anything else. `ef_for` is the same function
+        // [`VectorIndex::ef_for`] reports to `EXPLAIN`, so the plan and the
+        // walk cannot disagree about the operating point.
+        self.search_with_ef(query, k, self.params.ef_for(k), filter)
+    }
+
+    fn ef_for(&self, k: usize) -> Option<usize> {
+        Some(self.params.ef_for(k))
+    }
+
+    fn search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        filter: Option<&RowFilter>,
+    ) -> Result<Vec<Scored>> {
         if query.len() != self.dim {
             return Err(Error::Type(alloc::format!(
                 "query has dimension {} but the index expects {}",
@@ -972,8 +1272,10 @@ impl VectorIndex for HnswIndex {
 
         // Keep the query in f32. Quantising the corpus is the declared storage
         // trade-off; throwing away query precision too would add recall loss
-        // without saving resident memory.
-        let query = StoredVector::Exact(normalise(query));
+        // without saving resident memory. The query is prepared by the same
+        // metric that prepared the corpus, which is what keeps the two sides
+        // of every comparison in the same space.
+        let query = StoredVector::Exact(self.metric.prepare(query));
         let mut visited = Visited::new(self.nodes.len());
         for layer in (1..=self.entry_level).rev() {
             // The descent is unfiltered: it only picks where layer 0 starts,
@@ -983,6 +1285,7 @@ impl VectorIndex for HnswIndex {
             // changing which rows the walk can reach.
             let nearest = search_layer(
                 &self.nodes,
+                self.metric,
                 &query,
                 ep,
                 1,
@@ -996,24 +1299,31 @@ impl VectorIndex for HnswIndex {
 
         let hits = search_layer(
             &self.nodes,
+            self.metric,
             &query,
             ep,
-            self.params.ef_for(k),
+            ef,
             0,
             filter,
             &mut visited,
             &self.distance_calls,
         )?;
-        // Tombstoned nodes still route the search but are not answers. They
-        // can be safely dropped here because `ef_for` over-fetches: the rebuild
-        // threshold keeps tombstones below half the graph and `ef >= 2k`, so
-        // there are always at least `k` live candidates among the hits.
+        // Tombstoned nodes still route the search but are not answers, so they
+        // are dropped here. Under the default tuning that costs nothing:
+        // `ef_for` holds `ef >= 2k` and the rebuild threshold keeps tombstones
+        // below half the graph, so `k` live candidates survive. A session that
+        // narrowed `ef` gets a shorter list, which is what a narrower beam
+        // *means* — and at the very bottom, `ef` equal to the query's own row
+        // budget (the floor `Engine::check_ef_search` enforces), a beam spent
+        // on tombstones can come back with fewer rows than the `LIMIT`. That
+        // is the cost of the cheapest operating point and is why the default
+        // is not down there.
         // Filter-rejected nodes never made it into `hits` at all — the walk
         // held them in the frontier only.
         Ok(hits
             .into_iter()
             .filter(|hit| !self.nodes[hit.node].deleted)
-            .map(|hit| Scored::new(self.nodes[hit.node].id, 1.0 - hit.distance))
+            .map(|hit| Scored::new(self.nodes[hit.node].id, self.metric.score(hit.distance)))
             .take(k)
             .collect())
     }
@@ -1187,64 +1497,99 @@ pub(crate) fn normalise(embedding: &[f32]) -> Vec<f32> {
     embedding.iter().map(|x| x / norm).collect()
 }
 
-/// How many accumulators the dot product carries. See [`distance`].
+/// How many accumulators a distance carries. See [`lane_sum`].
 const LANES: usize = 8;
 
-/// `1 - cosine` on already-normalised vectors, where the cosine is just a dot
-/// product.
+/// The reduction every exact-`f32` metric is built out of: `sum(term(a_i,
+/// b_i))`, accumulated into `LANES` independent lanes.
 ///
 /// This is the whole cost of the index — a 100,000-row build calls it in the
-/// billions — so it is written to be turned into SIMD, twice over:
+/// billions — and the lane structure is what makes it SIMD. Summing into one
+/// accumulator forbids vectorisation outright: float addition is not
+/// associative, so a compiler may not reorder `total += term(x, y)` into
+/// lanes — it has to emit the scalar loop it was given. Eight explicit
+/// accumulators state the reassociation in the source instead, which is both
+/// vectorisable and still a fixed summation order: the same inputs give the
+/// same bits on every run, which the simulation tests depend on.
 ///
-/// * The general [`crate::mem::cosine_similarity`] cannot assume normalised
-///   inputs, so it recomputes both norms: three passes and two square roots
-///   where one pass will do.
-/// * Summing into one accumulator forbids vectorisation outright. Float
-///   addition is not associative, so a compiler may not reorder
-///   `dot += x * y` into lanes — it has to emit the scalar loop it was
-///   given. Eight explicit accumulators state the reassociation in the source
-///   instead, which is both vectorisable and still a fixed summation order:
-///   the same inputs give the same bits on every run, which the simulation
-///   tests depend on.
-pub(crate) fn distance(counter: &Cell<u64>, a: &[f32], b: &[f32]) -> f32 {
-    counter.set(counter.get().saturating_add(1));
+/// `term` is a closure so that a second metric is a second *expression*, not a
+/// second copy of this loop. It is monomorphised and inlined, so each metric
+/// still compiles to its own straight-line NEON body (`fmul`/`fadd` for the
+/// dot product, `fsub`/`fmul`/`fadd` for the squared difference) — the shape
+/// PERF.md section 4 pins with `--emit asm`. Duplicating the loop per metric
+/// would have compiled to the same thing and then drifted, which is the reason
+/// the BM25 scorer was extracted for both its backends.
+#[inline]
+fn lane_sum(a: &[f32], b: &[f32], term: impl Fn(f32, f32) -> f32) -> f32 {
     let mut lanes = [0.0f32; LANES];
     let (left_chunks, left_rem) = a.as_chunks::<LANES>();
     let (right_chunks, right_rem) = b.as_chunks::<LANES>();
     for (x, y) in left_chunks.iter().zip(right_chunks) {
         for lane in 0..LANES {
-            lanes[lane] += x[lane] * y[lane];
+            lanes[lane] += term(x[lane], y[lane]);
         }
     }
 
-    let mut dot = 0.0f32;
+    let mut total = 0.0f32;
     for lane in lanes {
-        dot += lane;
+        total += lane;
     }
     // Whatever a dimension that is not a multiple of `LANES` leaves over.
     for (x, y) in left_rem.iter().zip(right_rem) {
-        dot += x * y;
+        total += term(*x, *y);
     }
-    1.0 - dot
+    total
 }
 
-/// Distance between two vectors, dispatching on which side (if either) is
-/// quantised. Shared with [`crate::hnsw_paged`].
-pub(crate) fn stored_distance(counter: &Cell<u64>, a: &StoredVector, b: &StoredVector) -> f32 {
-    match (a, b) {
-        (StoredVector::Exact(left), StoredVector::Exact(right)) => distance(counter, left, right),
-        (StoredVector::Q8(left), StoredVector::Exact(right)) => {
-            counter.set(counter.get().saturating_add(1));
+/// The graph distance between two exact vectors under `metric`.
+///
+/// Cosine assumes both sides are already normalised — [`VectorMetric::prepare`]
+/// is what guarantees that — so the cosine is a bare dot product and this is
+/// one pass with no square roots, where the general
+/// [`crate::mem::cosine_similarity`] cannot assume it and pays three passes and
+/// two roots. L2 is the *squared* Euclidean distance, for the reason
+/// [`VectorMetric::L2`] gives.
+pub(crate) fn distance(metric: VectorMetric, counter: &Cell<u64>, a: &[f32], b: &[f32]) -> f32 {
+    counter.set(counter.get().saturating_add(1));
+    match metric {
+        VectorMetric::Cosine => 1.0 - lane_sum(a, b, |x, y| x * y),
+        VectorMetric::L2 => lane_sum(a, b, |x, y| (x - y) * (x - y)),
+    }
+}
+
+/// Distance between two vectors under `metric`, dispatching on which side (if
+/// either) is quantised. Shared with [`crate::hnsw_paged`].
+pub(crate) fn stored_distance(
+    metric: VectorMetric,
+    counter: &Cell<u64>,
+    a: &StoredVector,
+    b: &StoredVector,
+) -> f32 {
+    if let (StoredVector::Exact(left), StoredVector::Exact(right)) = (a, b) {
+        return distance(metric, counter, left, right);
+    }
+    // Every quantised combination reconstructs `code * scale` inline rather
+    // than materialising a dequantised `Vec` — the allocation would dominate
+    // the arithmetic.
+    counter.set(counter.get().saturating_add(1));
+    match (metric, a, b) {
+        (_, StoredVector::Exact(_), StoredVector::Exact(_)) => unreachable!("returned above"),
+        (VectorMetric::Cosine, StoredVector::Q8(left), StoredVector::Exact(right)) => {
             1.0 - left.dot_f32(right)
         }
-        (StoredVector::Exact(left), StoredVector::Q8(right)) => {
-            counter.set(counter.get().saturating_add(1));
+        (VectorMetric::Cosine, StoredVector::Exact(left), StoredVector::Q8(right)) => {
             1.0 - right.dot_f32(left)
         }
-        (StoredVector::Q8(left), StoredVector::Q8(right)) => {
-            counter.set(counter.get().saturating_add(1));
+        (VectorMetric::Cosine, StoredVector::Q8(left), StoredVector::Q8(right)) => {
             1.0 - left.dot_q8(right)
         }
+        (VectorMetric::L2, StoredVector::Q8(left), StoredVector::Exact(right)) => {
+            left.l2_f32(right)
+        }
+        (VectorMetric::L2, StoredVector::Exact(left), StoredVector::Q8(right)) => {
+            right.l2_f32(left)
+        }
+        (VectorMetric::L2, StoredVector::Q8(left), StoredVector::Q8(right)) => left.l2_q8(right),
     }
 }
 
@@ -1263,6 +1608,7 @@ pub(crate) fn stored_distance(counter: &Cell<u64>, a: &StoredVector, b: &StoredV
 /// failure than a redundant edge.
 fn select_neighbors(
     nodes: &[Node],
+    metric: VectorMetric,
     candidates: &[Candidate],
     degree: usize,
     distance_calls: &Cell<u64>,
@@ -1274,6 +1620,7 @@ fn select_neighbors(
         }
         let diverse = selected.iter().all(|&kept| {
             stored_distance(
+                metric,
                 distance_calls,
                 &nodes[candidate.node].vector,
                 &nodes[kept].vector,
@@ -1430,9 +1777,14 @@ mod tests {
         );
     }
 
-    /// A graph over `count` deterministic pseudo-random vectors.
+    /// A cosine graph over `count` deterministic pseudo-random vectors.
     fn built(count: RowId, dim: usize) -> HnswIndex {
-        let mut index = HnswIndex::new(dim);
+        built_under(count, dim, VectorMetric::Cosine)
+    }
+
+    /// The same graph under an explicit metric.
+    fn built_under(count: RowId, dim: usize, metric: VectorMetric) -> HnswIndex {
+        let mut index = HnswIndex::with_metric(dim, metric);
         let mut state = 0x51ed_2701_u64;
         let mut next = || {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -1544,7 +1896,19 @@ mod tests {
     #[test]
     fn a_future_format_version_is_refused() {
         let mut bytes = built(4, 4).encode();
-        bytes[0] = FORMAT_VERSION_Q8 + 1;
+        bytes[0] = FORMAT_VERSION_METRIC + 1;
+        assert!(matches!(HnswIndex::decode(&bytes), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
+    fn a_metric_tag_this_build_does_not_know_is_refused() {
+        // The version-5 header's own failure mode: a file written by a build
+        // with a third metric decodes into a graph whose links this one would
+        // walk under the wrong distance. It has to be caught at the tag, not
+        // by falling back to the default.
+        let mut bytes = built_under(4, 4, VectorMetric::L2).encode();
+        assert_eq!(bytes[0], FORMAT_VERSION_METRIC);
+        bytes[1] = VectorMetric::L2.tag() + 1;
         assert!(matches!(HnswIndex::decode(&bytes), Err(Error::Corrupt(_))));
     }
 
@@ -1609,20 +1973,27 @@ mod tests {
         }
     }
 
-    /// Mean recall@k of the graph against exhaustive search, over `queries`
-    /// deterministic queries.
+    /// Mean recall@k of the graph against exhaustive search under **the
+    /// graph's own metric**, over `queries` deterministic queries.
+    ///
+    /// The metric comes from the index rather than from an argument on
+    /// purpose: a recall number is a comparison against the right answer, and
+    /// the right answer is only defined once a distance is. An L2 graph scored
+    /// against a cosine oracle would produce a number that looks like recall
+    /// and measures nothing.
     fn measured_recall(index: &HnswIndex, dim: usize, k: usize, queries: usize) -> f64 {
+        let metric = index.metric();
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = || {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
             ((state >> 33) as f32 / u32::MAX as f32) - 0.5
         };
-        // The oracle normalises once, not once per query: this runs on every
+        // The oracle prepares once, not once per query: this runs on every
         // push and the brute-force pass is most of it.
         let oracle: Vec<(RowId, Vec<f32>)> = index
             .embeddings
             .iter()
-            .map(|(id, embedding)| (*id, normalise(&embedding.to_f32())))
+            .map(|(id, embedding)| (*id, metric.prepare(&embedding.to_f32())))
             .collect();
 
         // The oracle's own distance computations are not part of what the index
@@ -1631,11 +2002,11 @@ mod tests {
         let mut total = 0.0;
         for _ in 0..queries {
             let query: Vec<f32> = (0..dim).map(|_| next()).collect();
-            let normalised = normalise(&query);
+            let prepared = metric.prepare(&query);
 
             let mut exact: Vec<(f32, RowId)> = oracle
                 .iter()
-                .map(|(id, embedding)| (distance(&counter, &normalised, embedding), *id))
+                .map(|(id, embedding)| (distance(metric, &counter, &prepared, embedding), *id))
                 .collect();
             exact.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
             let truth: Vec<RowId> = exact.into_iter().take(k).map(|(_, id)| id).collect();
@@ -1649,7 +2020,155 @@ mod tests {
 
     #[test]
     fn recall_does_not_fall_as_the_corpus_grows() {
-        recall_holds_across([400, 1_600]);
+        recall_holds_across(VectorMetric::Cosine, [400, 1_600]);
+    }
+
+    #[test]
+    fn recall_does_not_fall_as_the_corpus_grows_under_l2() {
+        // The same guard rail, measured against an *L2* oracle. A metric that
+        // was never measured is a metric nobody knows the recall of, and
+        // recall is not transferable between them: the two rank differently
+        // (see `l2_and_cosine_disagree_when_magnitude_carries_meaning`), so
+        // cosine's number says nothing about this one.
+        recall_holds_across(VectorMetric::L2, [400, 1_600]);
+    }
+
+    // ----------------------------------------------------- ef_search at query time
+
+    /// Mean recall@k of a search run at an explicit `ef`, against the
+    /// exhaustive oracle.
+    ///
+    /// Separate from [`measured_recall`] rather than a parameter on it: that
+    /// one measures the index *as tuned*, which is the property the recall
+    /// guard rails above are about, and this one measures what happens when a
+    /// caller overrides the tuning — two different questions that happen to
+    /// share an oracle.
+    fn measured_recall_at_ef(
+        index: &HnswIndex,
+        dim: usize,
+        k: usize,
+        queries: usize,
+        ef: usize,
+    ) -> f64 {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 33) as f32 / u32::MAX as f32) - 0.5
+        };
+        // The oracle is the brute-force index, not a second hand-rolled scan:
+        // it is the same public backend `mem` ships and the same one the
+        // filtered-recall tests measure against, so "the true nearest
+        // neighbours" means one thing in this file.
+        let mut oracle = crate::mem::BruteForceVectorIndex::new(dim);
+        for (id, embedding) in &index.embeddings {
+            oracle.insert(*id, &embedding.to_f32()).unwrap();
+        }
+
+        let mut total = 0.0;
+        for _ in 0..queries {
+            let query: Vec<f32> = (0..dim).map(|_| next()).collect();
+            let truth: Vec<RowId> = oracle
+                .search(&query, k, None)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.id)
+                .collect();
+            let found = index.search_with_ef(&query, k, ef, None).unwrap();
+            let hit = found.iter().filter(|s| truth.contains(&s.id)).count();
+            total += hit as f64 / k as f64;
+        }
+        total / queries as f64
+    }
+
+    /// **The assertion the query-time knob exists for.** Recall rises with
+    /// `ef` and falls with it — measured as a curve over one graph, one set of
+    /// queries and one oracle, with nothing moving but `ef`.
+    ///
+    /// Uniformly random vectors are what makes this measurable. They have no
+    /// cluster structure for the graph's upper layers to exploit, so the
+    /// greedy descent lands in a merely-good region and a narrow beam really
+    /// does miss neighbours; a clustered corpus recalls 1.0 at every `ef`, and
+    /// the test would then pass with the parameter wired to nothing at all,
+    /// which is exactly the failure it is here to catch. The premise
+    /// assertions below say so out loud rather than leaving it to be
+    /// rediscovered.
+    ///
+    /// The reference point is the *narrowest legal* beam rather than the
+    /// shipped default, because at `k = 10` the default's `ef` of 64 already
+    /// recalls exactly on any corpus small enough for a unit test. Where the
+    /// default itself falls short — the engine over-fetches candidates
+    /// fourfold, so a `LIMIT 10` is really a `k` of 40 — is measured through
+    /// SQL, in `inlaysql/tests/ef_search.rs`.
+    #[test]
+    fn a_wider_ef_search_finds_more_of_the_true_neighbours() {
+        let (dim, k, queries) = (64, 10, 24);
+        let index = built(1_000, dim);
+
+        // `ef = k` is the floor the engine enforces; nothing narrower can be
+        // asked for, so this is the cheapest answer the index can be made to
+        // give.
+        let curve: Vec<(usize, f64)> = [k, 16, 32, 1_024]
+            .into_iter()
+            .map(|ef| (ef, measured_recall_at_ef(&index, dim, k, queries, ef)))
+            .collect();
+
+        // The premises. Either one failing means the corpus stopped being able
+        // to tell a connected `ef_search` from a disconnected one, and this
+        // test would otherwise go on passing while saying nothing.
+        assert!(
+            curve[0].1 < 1.0,
+            "the narrowest legal beam already recalls {:.3}; this corpus is too easy",
+            curve[0].1
+        );
+        assert_eq!(
+            curve[curve.len() - 1].1,
+            1.0,
+            "a beam wider than the corpus did not reach the exact answer"
+        );
+
+        for pair in curve.windows(2) {
+            let ((narrow_ef, narrow), (wide_ef, wide)) = (pair[0], pair[1]);
+            assert!(
+                wide > narrow,
+                "recall@{k} did not rise from ef={narrow_ef} to ef={wide_ef}: \
+                 {narrow:.3} then {wide:.3}"
+            );
+        }
+    }
+
+    /// The `ef` a plan reports is the `ef` the search runs at.
+    ///
+    /// `EXPLAIN` reads [`VectorIndex::ef_for`] and the walk reads
+    /// [`HnswParams::ef_for`]; if those two ever stopped being the same
+    /// function, every plan this engine prints would name an operating point
+    /// nobody ran at, which is the one failure `EXPLAIN` cannot survive.
+    #[test]
+    fn the_reported_ef_is_the_one_an_untuned_search_uses() {
+        let index = built(64, 4);
+        for k in [1, 10, 100] {
+            assert_eq!(
+                VectorIndex::ef_for(&index, k),
+                Some(HnswParams::DEFAULT.ef_for(k)),
+                "at k={k}"
+            );
+        }
+    }
+
+    /// An index at the default tuning answers `search` and `search_with_ef`
+    /// identically when handed its own `ef` — which is what makes an unset
+    /// session variable a no-op rather than a different code path that happens
+    /// to agree today.
+    #[test]
+    fn imposing_the_default_ef_changes_nothing() {
+        let index = built(256, 8);
+        let query: Vec<f32> = (0..8).map(|i| (i as f32).sin()).collect();
+        let k = 10;
+        assert_eq!(
+            index.search(&query, k, None).unwrap(),
+            index
+                .search_with_ef(&query, k, HnswParams::DEFAULT.ef_for(k), None)
+                .unwrap()
+        );
     }
 
     // -------------------------------------------------------- filtered search
@@ -1668,6 +2187,7 @@ mod tests {
         queries: usize,
         filter: &dyn Fn(RowId) -> bool,
     ) -> f64 {
+        let metric = index.metric();
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = || {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -1677,18 +2197,18 @@ mod tests {
             .embeddings
             .iter()
             .filter(|(id, _)| filter(**id))
-            .map(|(id, embedding)| (*id, normalise(&embedding.to_f32())))
+            .map(|(id, embedding)| (*id, metric.prepare(&embedding.to_f32())))
             .collect();
 
         let counter = Cell::new(0);
         let mut total = 0.0;
         for _ in 0..queries {
             let query: Vec<f32> = (0..dim).map(|_| next()).collect();
-            let normalised = normalise(&query);
+            let prepared = metric.prepare(&query);
 
             let mut exact: Vec<(f32, RowId)> = oracle
                 .iter()
-                .map(|(id, embedding)| (distance(&counter, &normalised, embedding), *id))
+                .map(|(id, embedding)| (distance(metric, &counter, &prepared, embedding), *id))
                 .collect();
             exact.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
             let truth: Vec<RowId> = exact.into_iter().take(k).map(|(_, id)| id).collect();
@@ -1873,7 +2393,8 @@ mod tests {
     #[test]
     #[ignore = "expensive: builds a 25,600-node graph"]
     fn recall_holds_over_a_wide_range_of_corpus_sizes() {
-        recall_holds_across([400, 1_600, 6_400, 25_600]);
+        recall_holds_across(VectorMetric::Cosine, [400, 1_600, 6_400, 25_600]);
+        recall_holds_across(VectorMetric::L2, [400, 1_600, 6_400, 25_600]);
     }
 
     /// Assert that recall@10 clears 0.95 at every size and never slides as the
@@ -1889,19 +2410,28 @@ mod tests {
     /// the same property small enough to run on a push, so a change that
     /// reintroduces the slope is caught in CI rather than in the nightly
     /// benchmark. It is a guard rail, not the measurement.
-    fn recall_holds_across<const N: usize>(sizes: [RowId; N]) {
+    fn recall_holds_across<const N: usize>(metric: VectorMetric, sizes: [RowId; N]) {
         // Starts at zero so the first size only has the absolute bound to
         // clear; the second assertion is between successive sizes.
         let mut previous = 0.0;
         for count in sizes {
-            let recall = measured_recall(&built(count, 12), 12, 10, 15);
+            let recall = measured_recall(&built_under(count, 12, metric), 12, 10, 15);
+            // Printed, not only asserted: a guard rail says "not worse than
+            // this", and the number itself is what a reader wants when they
+            // are choosing a metric. `-- --nocapture` shows the table.
+            std::println!(
+                "recall@10 {:<18} {count:>6} vectors  {recall:.4}",
+                metric.ops_name(),
+            );
             assert!(
                 recall >= 0.95,
-                "recall@10 was {recall:.3} at {count} vectors"
+                "{} recall@10 was {recall:.3} at {count} vectors",
+                metric.ops_name()
             );
             assert!(
                 recall >= previous - 0.03,
-                "recall@10 fell from {previous:.3} to {recall:.3} by {count} vectors"
+                "{} recall@10 fell from {previous:.3} to {recall:.3} by {count} vectors",
+                metric.ops_name()
             );
             previous = recall;
         }
@@ -2042,6 +2572,347 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(build(), build());
+    }
+
+    // ------------------------------------------------------ distance metrics
+
+    /// The case the whole feature exists for: two vectors pointing the same
+    /// way but of different lengths are *identical* under cosine and far apart
+    /// under L2. An index that can only do cosine cannot answer this question
+    /// at all, and normalising first would not be a workaround — it would be
+    /// throwing the answer away.
+    #[test]
+    fn l2_and_cosine_disagree_when_magnitude_carries_meaning() {
+        let rows: [(RowId, [f32; 2]); 3] = [
+            (1, [1.0, 0.0]),  // same direction, same length as the query
+            (2, [8.0, 0.0]),  // same direction, eight times as long
+            (3, [0.7, 0.72]), // a different direction, but a similar length
+        ];
+        let query = [1.0, 0.0];
+
+        let mut cosine = HnswIndex::with_metric(2, VectorMetric::Cosine);
+        let mut l2 = HnswIndex::with_metric(2, VectorMetric::L2);
+        for (id, vector) in rows {
+            cosine.insert(id, &vector).unwrap();
+            l2.insert(id, &vector).unwrap();
+        }
+        cosine.commit().unwrap();
+        l2.commit().unwrap();
+
+        // Cosine cannot separate rows 1 and 2 at all: both are exactly the
+        // query's direction, so both score 1.0 and the tie is broken by row id.
+        let hits = cosine.search(&query, 3, None).unwrap();
+        assert_eq!(hits[0].id, 1);
+        assert_eq!(hits[1].id, 2);
+        assert!((hits[0].score - hits[1].score).abs() < 1e-6);
+
+        // L2 puts row 3 second, because it is nearer in the space even though
+        // it points somewhere else — and row 2, seven units away, last.
+        let hits = l2.search(&query, 3, None).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.id).collect::<Vec<_>>(),
+            alloc::vec![1, 3, 2]
+        );
+    }
+
+    #[test]
+    fn an_l2_score_is_the_negated_euclidean_distance() {
+        // The contract `vector_score` publishes for L2: larger is better, an
+        // exact hit is 0, and the magnitude is a real distance rather than a
+        // squared one or an invented [0, 1] curve.
+        let mut index = HnswIndex::with_metric(2, VectorMetric::L2);
+        index.insert(1, &[0.0, 0.0]).unwrap();
+        index.insert(2, &[3.0, 4.0]).unwrap();
+        index.commit().unwrap();
+
+        let hits = index.search(&[0.0, 0.0], 2, None).unwrap();
+        assert_eq!(hits[0].id, 1);
+        assert!(
+            hits[0].score.abs() < 1e-6,
+            "exact hit scored {}",
+            hits[0].score
+        );
+        assert_eq!(hits[1].id, 2);
+        // 3-4-5 triangle: five away, so -5.
+        assert!(
+            (hits[1].score + 5.0).abs() < 1e-5,
+            "score was {} not -5",
+            hits[1].score
+        );
+    }
+
+    #[test]
+    fn cosine_scoring_is_unchanged_bit_for_bit() {
+        // The kernel was restructured so both metrics share one lane-summed
+        // loop. Cosine's summation order is unchanged, so its scores must be
+        // *identical* — not close — to the ones computed the old way: one
+        // pass of eight accumulators over the normalised pair, reduced in
+        // lane order, then `1 - dot`.
+        let index = built(256, 12);
+        let counter = Cell::new(0);
+        let mut state = 0x1357_9bdfu64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 33) as f32 / u32::MAX as f32) - 0.5
+        };
+        for _ in 0..8 {
+            let query: Vec<f32> = (0..12).map(|_| next()).collect();
+            let normalised = normalise(&query);
+            for hit in index.search(&query, 10, None).unwrap() {
+                let node = index.node_ids[&hit.id];
+                let StoredVector::Exact(stored) = &index.nodes[node].vector else {
+                    unreachable!("an exact index stores exact vectors")
+                };
+                let mut lanes = [0.0f32; LANES];
+                let (left, left_rem) = normalised.as_chunks::<LANES>();
+                let (right, right_rem) = stored.as_chunks::<LANES>();
+                for (x, y) in left.iter().zip(right) {
+                    for lane in 0..LANES {
+                        lanes[lane] += x[lane] * y[lane];
+                    }
+                }
+                let mut dot = 0.0f32;
+                for lane in lanes {
+                    dot += lane;
+                }
+                for (x, y) in left_rem.iter().zip(right_rem) {
+                    dot += x * y;
+                }
+                assert_eq!(
+                    hit.score.to_bits(),
+                    (1.0f32 - (1.0f32 - dot)).to_bits(),
+                    "cosine score drifted for row {}",
+                    hit.id
+                );
+                let _ = &counter;
+            }
+        }
+    }
+
+    #[test]
+    fn a_cosine_index_writes_the_format_it_always_did() {
+        // The metric tags are only written by an index that needs them, so
+        // every database that exists today encodes byte for byte what it did
+        // before metrics existed — the same rule the catalog follows.
+        assert_eq!(built(32, 8).encode()[0], FORMAT_VERSION_EXACT);
+        let mut quantized = HnswIndex::new_quantized(8);
+        quantized.insert(1, &[0.5; 8]).unwrap();
+        quantized.commit().unwrap();
+        assert_eq!(quantized.encode()[0], FORMAT_VERSION_Q8);
+
+        let l2 = built_under(32, 8, VectorMetric::L2);
+        assert_eq!(l2.encode()[0], FORMAT_VERSION_METRIC);
+    }
+
+    #[test]
+    fn an_l2_graph_round_trips() {
+        let original = built_under(64, 8, VectorMetric::L2);
+        let mut restored = HnswIndex::with_metric(8, VectorMetric::L2);
+        restored.load(&original.save().unwrap()).unwrap();
+        assert_eq!(restored.metric(), VectorMetric::L2);
+        for seed in 0..8 {
+            let query: Vec<f32> = (0..8).map(|i| ((seed * 8 + i) as f32).sin()).collect();
+            assert_eq!(
+                original.search(&query, 10, None).unwrap(),
+                restored.search(&query, 10, None).unwrap(),
+                "restored L2 graph diverged on query {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_graph_built_under_one_metric_will_not_load_into_another() {
+        // The failure this whole design exists to make impossible. Both files
+        // decode — same nodes, same adjacency, same vector widths — and the
+        // only thing wrong with the wrong one is *which rows its links point
+        // at*, which nothing downstream could ever notice. So it is refused
+        // here, at the one boundary that can still tell them apart.
+        let cosine = built(64, 8).save().unwrap();
+        let l2 = built_under(64, 8, VectorMetric::L2).save().unwrap();
+
+        assert!(matches!(
+            HnswIndex::with_metric(8, VectorMetric::L2).load(&cosine),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(matches!(
+            HnswIndex::new(8).load(&l2),
+            Err(Error::Corrupt(_))
+        ));
+        // ...and each still loads into its own.
+        assert!(HnswIndex::new(8).load(&cosine).is_ok());
+        assert!(HnswIndex::with_metric(8, VectorMetric::L2)
+            .load(&l2)
+            .is_ok());
+    }
+
+    #[test]
+    fn an_l2_graph_answers_an_l2_query_where_a_cosine_graph_would_not() {
+        // The same rows in both graphs, searched with the same query, scored
+        // against the same exhaustive L2 oracle. The point is not that the
+        // cosine graph is a little worse — it is that it is answering a
+        // different question, and would have done so silently.
+        let dim = 12;
+        let count = 800u64;
+        let rows = vectors(count, dim);
+        // Norms spread over two orders of magnitude, which is what makes the
+        // two metrics disagree at all; uniformly-scaled random vectors would
+        // hide the difference and make this test prove nothing.
+        let rows: Vec<Vec<f32>> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut v)| {
+                let scale = 0.1 + (i % 40) as f32;
+                for x in v.iter_mut() {
+                    *x *= scale;
+                }
+                v
+            })
+            .collect();
+
+        let mut l2 = HnswIndex::with_metric(dim, VectorMetric::L2);
+        let mut cosine = HnswIndex::new(dim);
+        let mut oracle = crate::mem::BruteForceVectorIndex::with_metric(dim, VectorMetric::L2);
+        for (i, vector) in rows.iter().enumerate() {
+            let id = i as RowId + 1;
+            l2.insert(id, vector).unwrap();
+            cosine.insert(id, vector).unwrap();
+            oracle.insert(id, vector).unwrap();
+        }
+        l2.commit().unwrap();
+        cosine.commit().unwrap();
+        oracle.commit().unwrap();
+
+        let mut l2_recall = 0.0;
+        let mut cosine_recall = 0.0;
+        for seed in 0..12u64 {
+            let query: Vec<f32> = (0..dim)
+                .map(|i| (((seed * 31 + i as u64) as f32) * 0.7).sin() * 4.0)
+                .collect();
+            let truth: Vec<RowId> = oracle
+                .search(&query, 10, None)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.id)
+                .collect();
+            for (index, total) in [(&l2, &mut l2_recall), (&cosine, &mut cosine_recall)] {
+                let found = index.search(&query, 10, None).unwrap();
+                *total += found.iter().filter(|hit| truth.contains(&hit.id)).count() as f64 / 10.0;
+            }
+        }
+        l2_recall /= 12.0;
+        cosine_recall /= 12.0;
+        std::println!(
+            "against an L2 oracle: an L2 graph recalls {l2_recall:.4}, a cosine graph \
+             {cosine_recall:.4}"
+        );
+        assert!(
+            l2_recall >= 0.95,
+            "L2 recall@10 against the L2 oracle was {l2_recall:.3}"
+        );
+        assert!(
+            cosine_recall < 0.5,
+            "a cosine graph scored {cosine_recall:.3} against an L2 oracle; if the two agree \
+             this well the corpus no longer distinguishes them and this test proves nothing"
+        );
+    }
+
+    #[test]
+    fn an_int8_l2_index_round_trips_and_keeps_its_recall() {
+        // `VECTOR(n, INT8)` under L2 is a combination neither the quantiser
+        // nor the metric was written for on its own: unlike the dot products,
+        // squared distance is not scale-invariant, so the quantisation error
+        // rides directly on the answer. Measured rather than assumed.
+        let dim = 32;
+        let count = 400u64;
+        let rows = vectors(count, dim);
+        let mut exact = HnswIndex::with_metric(dim, VectorMetric::L2);
+        let mut quantized = HnswIndex::quantized_with_metric(dim, VectorMetric::L2);
+        let mut oracle = crate::mem::BruteForceVectorIndex::with_metric(dim, VectorMetric::L2);
+        for (i, vector) in rows.iter().enumerate() {
+            let id = i as RowId + 1;
+            exact.insert(id, vector).unwrap();
+            quantized.insert(id, vector).unwrap();
+            oracle.insert(id, vector).unwrap();
+        }
+        exact.commit().unwrap();
+        quantized.commit().unwrap();
+        oracle.commit().unwrap();
+
+        let mut recall = 0.0;
+        for seed in 0..12u64 {
+            let query: Vec<f32> = (0..dim)
+                .map(|i| (((seed * 17 + i as u64) as f32) * 0.4).cos() * 0.5)
+                .collect();
+            let truth: Vec<RowId> = oracle
+                .search(&query, 10, None)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.id)
+                .collect();
+            let found = quantized.search(&query, 10, None).unwrap();
+            recall += found.iter().filter(|hit| truth.contains(&hit.id)).count() as f64 / 10.0;
+        }
+        recall /= 12.0;
+        std::println!("recall@10 vector_l2_ops INT8  {count:>6} vectors  {recall:.4}");
+        assert!(
+            recall >= 0.90,
+            "int8 L2 recall@10 was {recall:.3}; the exact one is measured separately"
+        );
+
+        let saved = quantized.save().unwrap();
+        assert_eq!(saved[0], FORMAT_VERSION_METRIC);
+        let mut restored = HnswIndex::quantized_with_metric(dim, VectorMetric::L2);
+        restored.load(&saved).unwrap();
+        let query = rows[0].clone();
+        assert_eq!(
+            quantized.search(&query, 10, None).unwrap(),
+            restored.search(&query, 10, None).unwrap()
+        );
+    }
+
+    #[test]
+    fn inner_product_is_refused_with_its_reason() {
+        let refusal = VectorMetric::from_ops_name("vector_ip_ops").unwrap_err();
+        let Error::Unsupported(message) = refusal else {
+            panic!("expected a refusal, got {refusal:?}")
+        };
+        assert!(message.contains("not a metric"), "{message}");
+        assert!(message.contains("vector_cosine_ops"), "{message}");
+    }
+
+    #[test]
+    fn the_operator_class_names_round_trip() {
+        for metric in [VectorMetric::Cosine, VectorMetric::L2] {
+            assert_eq!(
+                VectorMetric::from_ops_name(metric.ops_name()).unwrap(),
+                metric
+            );
+            assert_eq!(VectorMetric::from_tag(metric.tag()).unwrap(), metric);
+        }
+        assert!(VectorMetric::from_ops_name("vector_hamming_ops").is_err());
+    }
+
+    #[test]
+    fn an_l2_index_does_not_normalise_what_it_stores() {
+        // The structural half of the metric: cosine erases magnitude on the
+        // way in, L2 must not. Asserted on the stored node rather than on a
+        // score, because a score could agree by coincidence on one query and
+        // this cannot.
+        let mut index = HnswIndex::with_metric(2, VectorMetric::L2);
+        index.insert(1, &[3.0, 4.0]).unwrap();
+        index.commit().unwrap();
+        assert_eq!(
+            index.nodes[0].vector,
+            StoredVector::Exact(alloc::vec![3.0, 4.0])
+        );
+
+        let mut cosine = HnswIndex::new(2);
+        cosine.insert(1, &[3.0, 4.0]).unwrap();
+        cosine.commit().unwrap();
+        assert_eq!(
+            cosine.nodes[0].vector,
+            StoredVector::Exact(alloc::vec![0.6, 0.8])
+        );
     }
 
     // ------------------------------------------------------------ deletion

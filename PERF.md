@@ -1028,6 +1028,34 @@ Eight floats per iteration, full-width NEON, with one scalar horizontal
 reduction at the end of the call. Hand-written intrinsics would be writing out
 what the compiler already emits.
 
+**This survived the second metric.** `vector_l2_ops` (AHL-4xx) added Euclidean
+distance, and the lane structure was extracted into one `lane_sum(a, b, term)`
+rather than copied — the same move the BM25 scorer made for its two backends.
+The closure is monomorphised and inlined, so re-running the check above finds
+the cosine loop **byte-identical** (same instructions, same register
+allocation, same `LBB` shape) and the L2 loop the same shape with the subtract
+folded in:
+
+```
+LBB327_10:
+	ldp	q2, q3, [x12], #32     ; 8 floats of a
+	ldp	q4, q5, [x13], #32     ; 8 floats of b
+	fsub.4s	v3, v3, v5
+	fsub.4s	v2, v2, v4
+	fmul.4s	v2, v2, v2
+	fmul.4s	v3, v3, v3
+	fadd.4s	v0, v0, v3
+	fadd.4s	v1, v1, v2
+	subs	x14, x14, #1
+	b.ne	LBB327_10
+```
+
+Measured on uniformly random vectors (the ANN worst case), L2 costs 2–5% more
+distance computations per query than cosine at the same `ef` — graph-shape
+noise, not kernel cost — and recalls within ±0.03 of it at every corpus size
+and dimension measured. The per-metric numbers are in `hnsw.rs`'s recall
+tests, which print them under `-- --nocapture`.
+
 `cargo test --release -p inlaysql-core --test vector_query_cost -- --nocapture
 --ignored` measures what that leaves. On 2,000 vectors at dim 384, `k = 10`,
 uniformly random directions (the ANN worst case) with held-out queries:

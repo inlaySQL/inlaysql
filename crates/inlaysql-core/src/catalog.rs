@@ -20,15 +20,17 @@
 //! (composite/multi-column retrieval indexes) also forces version 5 and
 //! needed no format change of its own. Version 6 adds declared
 //! collations ([`crate::collation::Collation`]) on a column and on each column
-//! of an index.
+//! of an index. Version 7 adds a vector index's distance metric
+//! ([`crate::hnsw::VectorMetric`]).
 //!
 //! **A catalog is written at the lowest version that can express it.** A
 //! database with exact vectors and no constraints is still written as version
 //! 2, so opening and editing it does not make it unreadable to the build that
 //! created it; only a table that actually declares a constraint (or uses
 //! `NUMERIC` or `VECTOR(n, INT8)`) forces the higher version, only a
-//! B-tree index forces version 5, and only a collation that is not `BINARY`
-//! forces version 6. The pre-1.0 policy is *recreate, not
+//! B-tree index forces version 5, only a collation that is not `BINARY`
+//! forces version 6, and only a vector index whose metric is not cosine
+//! forces version 7. The pre-1.0 policy is *recreate, not
 //! migrate*: a build that predates version 5 refuses a version-5 catalog with
 //! [`Error::FormatVersion`] and reads nothing, rather than decoding the table
 //! section and silently losing the index declarations that follow it — which
@@ -40,6 +42,12 @@
 //! ([`crate::index`]), so a build that read the declaration without the
 //! collation would probe the unfolded key, miss every entry, and answer
 //! `WHERE name = 'ADA'` with nothing while the table still held the row.
+//!
+//! Version 7 forces it for the vector equivalent: an index declared
+//! `vector_l2_ops` whose metric an older build did not read would be rebuilt
+//! as a cosine graph over unnormalised vectors and would answer `vector_score`
+//! with the wrong neighbours — again with no error anywhere, because both
+//! metrics are defined on the same embeddings.
 //!
 //! A version-1 catalog (written by an older binary) is decoded and
 //! **grandfathered**: every indexable column of every table it describes is
@@ -55,6 +63,7 @@ use alloc::vec::Vec;
 
 use crate::collation::Collation;
 use crate::error::{Error, Result};
+use crate::hnsw::VectorMetric;
 use crate::row::{put_len, put_string, Cursor};
 use crate::value::DataType;
 
@@ -71,6 +80,7 @@ const CATALOG_VERSION_QUANTIZED: u32 = 3;
 const CATALOG_VERSION_CONSTRAINTS: u32 = 4;
 const CATALOG_VERSION_BTREE: u32 = 5;
 const CATALOG_VERSION_COLLATION: u32 = 6;
+const CATALOG_VERSION_METRIC: u32 = 7;
 
 const TYPE_INTEGER: u8 = 1;
 const TYPE_REAL: u8 = 2;
@@ -363,10 +373,28 @@ pub struct Index {
     /// only thing those builds could write, and [`Catalog::create_index`]
     /// refuses a declaration whose two lists disagree rather than padding one.
     pub collations: Vec<Collation>,
+    /// The distance an [`IndexKind::Vector`] index's graph is built and
+    /// searched under, from the operator class the declaration wrote
+    /// (`vector_l2_ops`) or [`VectorMetric::Cosine`] when it wrote none.
+    ///
+    /// **This is part of what the index *is*, not decoration.** An HNSW
+    /// graph's neighbour lists are the answer to "what is near what" under one
+    /// distance; searched under another they route the walk by the wrong
+    /// geometry and return plausible, wrong rows with no error — so this
+    /// travels to the backend at open time and is checked against the graph on
+    /// disk there ([`crate::hnsw::HnswIndex::load`],
+    /// [`crate::hnsw_paged::PagedHnswIndex::restore`]).
+    ///
+    /// Every other kind carries [`VectorMetric::Cosine`] and means nothing by
+    /// it; [`Catalog::create_index`] refuses a declaration that says otherwise
+    /// rather than record a metric nothing will read.
+    pub metric: VectorMetric,
 }
 
 impl Index {
-    /// A single-column declaration, which is every retrieval index.
+    /// A single-column declaration, which is every retrieval index. Cosine,
+    /// which is the only metric a non-vector index can carry and the default
+    /// for one that is.
     pub fn single(name: String, table: String, column: String, kind: IndexKind) -> Self {
         Self {
             name,
@@ -375,6 +403,16 @@ impl Index {
             kind,
             unique: false,
             collations: alloc::vec![Collation::Binary],
+            metric: VectorMetric::Cosine,
+        }
+    }
+
+    /// A single-column [`IndexKind::Vector`] declaration under an explicit
+    /// metric.
+    pub fn vector(name: String, table: String, column: String, metric: VectorMetric) -> Self {
+        Self {
+            metric,
+            ..Self::single(name, table, column, IndexKind::Vector)
         }
     }
 
@@ -781,11 +819,30 @@ impl Catalog {
         // beside a `NOCASE` one, for the same reason: neither can answer the
         // other's comparison. What is refused is a second index that would key
         // the identical bytes under another name.
-        if self.indexes.values().any(|existing| {
+        //
+        // Two *vector* indexes over one column under two metrics are refused
+        // by this same rule, and deliberately: unlike a B-tree index, where
+        // the planner picks by the comparison's collation, `vector_score(col,
+        // ?)` names only the column, so a second graph over it would be one
+        // nobody could ask for and one the backend map — keyed by
+        // `(table, columns)` — could not hold beside the first anyway.
+        if let Some(existing) = self.indexes.values().find(|existing| {
             existing.kind == index.kind
                 && existing.table.eq_ignore_ascii_case(&index.table)
                 && existing.covers_collated(&index.columns, &index.collations)
         }) {
+            if index.kind == IndexKind::Vector && existing.metric != index.metric {
+                return Err(Error::Catalog(alloc::format!(
+                    "`{}`.`{}` already has a {} vector index (`{}`); one column carries one \
+                     vector index, because `vector_score` names the column and not the metric \
+                     and could not say which of two it meant. Drop `{}` first",
+                    index.table,
+                    index.column(),
+                    existing.metric.ops_name(),
+                    existing.name,
+                    existing.name
+                )));
+            }
             return Err(Error::Catalog(alloc::format!(
                 "`{}` already has an index of that kind on ({}) under {}",
                 index.table,
@@ -807,6 +864,16 @@ impl Catalog {
         if index.unique && index.kind != IndexKind::BTree {
             return Err(Error::Unsupported(String::from(
                 "only a B-tree index can be UNIQUE; a retrieval index is not a constraint",
+            )));
+        }
+        // Only a vector index has a distance to be built under. Recording one
+        // on any other kind would put a number in the catalog that nothing
+        // reads and that a later reader could mistake for a promise.
+        if index.kind != IndexKind::Vector && index.metric != VectorMetric::Cosine {
+            return Err(Error::Unsupported(alloc::format!(
+                "`{}` is not a vector index, so `{}` has nothing to apply to",
+                index.name,
+                index.metric.ops_name()
             )));
         }
         for name in &index.columns {
@@ -950,6 +1017,18 @@ impl Catalog {
     /// a table actually declares a constraint or uses an affinity older
     /// versions cannot name.
     fn required_version(&self) -> u32 {
+        // A non-cosine vector index forces version 7 for the reason the module
+        // docs give: an older build would read the declaration, miss the
+        // metric, and rebuild the graph as cosine over vectors L2 declared
+        // unnormalised. Refusing to open is the only answer that cannot
+        // silently answer with the wrong neighbours.
+        if self
+            .indexes
+            .values()
+            .any(|index| index.metric != VectorMetric::Cosine)
+        {
+            return CATALOG_VERSION_METRIC;
+        }
         // A declared collation forces version 6 for the reason the module docs
         // give: an older build would read the declaration, miss the collation,
         // and probe a `NOCASE` index with an unfolded key. Refusing to open is
@@ -1107,6 +1186,12 @@ impl Catalog {
                     out.push(index.collation(position).tag());
                 }
             }
+            if version >= CATALOG_VERSION_METRIC {
+                // Last, after the collation tags, so a version-6 index section
+                // is byte for byte what it was — the same reason the paged
+                // graph header appends rather than prepends its tags.
+                out.push(index.metric.tag());
+            }
         }
         out
     }
@@ -1138,10 +1223,11 @@ impl Catalog {
                 | CATALOG_VERSION_CONSTRAINTS
                 | CATALOG_VERSION_BTREE
                 | CATALOG_VERSION_COLLATION
+                | CATALOG_VERSION_METRIC
         ) {
             return Err(Error::FormatVersion(alloc::format!(
                 "catalog format version {version} is not supported (this build supports \
-                 {CATALOG_VERSION_EXACT} through {CATALOG_VERSION_COLLATION}); pre-1.0 the \
+                 {CATALOG_VERSION_EXACT} through {CATALOG_VERSION_METRIC}); pre-1.0 the \
                  policy is to recreate the database, not to migrate it"
             )));
         }
@@ -1187,6 +1273,13 @@ impl Catalog {
                     Collation::Binary
                 });
             }
+            // Absent before version 7, and every index those builds could
+            // write is cosine.
+            let metric = if version >= CATALOG_VERSION_METRIC {
+                VectorMetric::from_tag(cursor.u8()?)?
+            } else {
+                VectorMetric::Cosine
+            };
             catalog.indexes.insert(
                 name.to_ascii_lowercase(),
                 Index {
@@ -1196,6 +1289,7 @@ impl Catalog {
                     kind,
                     unique,
                     collations,
+                    metric,
                 },
             );
         }
@@ -1540,6 +1634,7 @@ mod tests {
                 kind: IndexKind::FullText,
                 unique: false,
                 collations: alloc::vec![Collation::Binary],
+                metric: VectorMetric::Cosine,
             })
             .unwrap();
         let decoded = Catalog::decode(&catalog.encode()).unwrap();
@@ -1558,6 +1653,7 @@ mod tests {
                 kind: IndexKind::Vector,
                 unique: false,
                 collations: alloc::vec![Collation::Binary],
+                metric: VectorMetric::Cosine,
             })
             .unwrap_err();
         assert!(matches!(err, Error::Type(_)), "got {err}");
@@ -1570,6 +1666,7 @@ mod tests {
                 kind: IndexKind::FullText,
                 unique: false,
                 collations: alloc::vec![Collation::Binary],
+                metric: VectorMetric::Cosine,
             })
             .unwrap_err();
         assert!(matches!(err, Error::Type(_)), "got {err}");
@@ -1603,6 +1700,7 @@ mod tests {
                 kind: IndexKind::FullText,
                 unique: false,
                 collations: vec![Collation::Binary, Collation::Binary],
+                metric: VectorMetric::Cosine,
             })
             .unwrap();
         let index = catalog.indexes_for("docs")[0];
@@ -1637,6 +1735,7 @@ mod tests {
                 kind: IndexKind::FullText,
                 unique: false,
                 collations: vec![Collation::Binary, Collation::Binary],
+                metric: VectorMetric::Cosine,
             })
             .unwrap();
         assert_eq!(catalog.indexes_for("docs").len(), 2);
@@ -1662,6 +1761,7 @@ mod tests {
                 kind: IndexKind::Vector,
                 unique: false,
                 collations: vec![Collation::Binary, Collation::Binary],
+                metric: VectorMetric::Cosine,
             })
             .unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got {err}");
@@ -1678,6 +1778,7 @@ mod tests {
                 kind: IndexKind::FullText,
                 unique: false,
                 collations: alloc::vec![Collation::Binary],
+                metric: VectorMetric::Cosine,
             })
             .unwrap();
         let err = catalog
@@ -1688,6 +1789,7 @@ mod tests {
                 kind: IndexKind::Vector,
                 unique: false,
                 collations: alloc::vec![Collation::Binary],
+                metric: VectorMetric::Cosine,
             })
             .unwrap_err();
         assert!(matches!(err, Error::Catalog(_)), "got {err}");
@@ -1704,6 +1806,7 @@ mod tests {
                 kind: IndexKind::FullText,
                 unique: false,
                 collations: alloc::vec![Collation::Binary],
+                metric: VectorMetric::Cosine,
             })
             .unwrap();
         let dropped = catalog.drop_index("IDX").unwrap();
@@ -1746,7 +1849,7 @@ mod tests {
     fn a_future_catalog_version_is_refused() {
         let mut bytes = sample().encode();
         // Magic is b"ISQL"; the version follows at offset 4.
-        bytes[4..8].copy_from_slice(&(CATALOG_VERSION_COLLATION + 1).to_le_bytes());
+        bytes[4..8].copy_from_slice(&(CATALOG_VERSION_METRIC + 1).to_le_bytes());
         let err = Catalog::decode(&bytes).unwrap_err();
         assert!(matches!(err, Error::FormatVersion(_)), "got {err}");
     }
@@ -1836,6 +1939,7 @@ mod tests {
                 kind: IndexKind::FullText,
                 unique: false,
                 collations: alloc::vec![Collation::Binary],
+                metric: VectorMetric::Cosine,
             })
             .unwrap();
         let (table, indexes) = catalog.drop_table("DOCS").unwrap();
@@ -1860,6 +1964,7 @@ mod tests {
                 kind: IndexKind::FullText,
                 unique: false,
                 collations: alloc::vec![Collation::Binary],
+                metric: VectorMetric::Cosine,
             })
             .unwrap();
         catalog.rename_table("docs", "Papers").unwrap();
@@ -1924,6 +2029,7 @@ mod tests {
                 kind: IndexKind::BTree,
                 unique: false,
                 collations: vec![Collation::NoCase],
+                metric: VectorMetric::Cosine,
             })
             .unwrap();
 
@@ -1958,6 +2064,7 @@ mod tests {
                 kind: IndexKind::BTree,
                 unique: false,
                 collations: vec![Collation::NoCase],
+                metric: VectorMetric::Cosine,
             })
             .unwrap();
         let bytes = catalog.encode();
@@ -1966,6 +2073,70 @@ mod tests {
             CATALOG_VERSION_COLLATION
         );
         assert_eq!(Catalog::decode(&bytes).unwrap(), catalog);
+    }
+
+    /// A vector index's metric forces version 7, and — the recreate-not-migrate
+    /// half — a cosine one forces nothing, so every database that exists today
+    /// still encodes at the version it always did.
+    ///
+    /// The bump has to happen for the same reason the collation one does. An
+    /// older build would read the declaration, miss the metric, and rebuild
+    /// the graph as cosine over vectors L2 declared unnormalised — answering
+    /// `vector_score` with the wrong neighbours, with no error anywhere,
+    /// because both metrics are defined on the same embeddings.
+    #[test]
+    fn a_vector_metric_forces_version_seven_and_cosine_forces_nothing() {
+        let mut cosine = sample();
+        cosine
+            .create_index(Index::single(
+                "docs_embedding".to_string(),
+                "docs".to_string(),
+                "embedding".to_string(),
+                IndexKind::Vector,
+            ))
+            .unwrap();
+        assert_eq!(
+            u32::from_le_bytes(cosine.encode()[4..8].try_into().unwrap()),
+            CATALOG_VERSION_EXACT,
+            "a cosine vector index must stay readable by an older build"
+        );
+
+        let mut l2 = sample();
+        l2.create_index(Index::vector(
+            "docs_embedding".to_string(),
+            "docs".to_string(),
+            "embedding".to_string(),
+            VectorMetric::L2,
+        ))
+        .unwrap();
+        let bytes = l2.encode();
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            CATALOG_VERSION_METRIC
+        );
+        let decoded = Catalog::decode(&bytes).unwrap();
+        assert_eq!(decoded, l2);
+        assert_eq!(decoded.indexes().next().unwrap().metric, VectorMetric::L2);
+    }
+
+    /// A metric on an index that has no distance is refused rather than
+    /// recorded: a number in the catalog that nothing reads is one a later
+    /// reader could mistake for a promise.
+    #[test]
+    fn only_a_vector_index_can_carry_a_metric() {
+        let mut catalog = sample();
+        let error = catalog
+            .create_index(Index {
+                metric: VectorMetric::L2,
+                ..Index::single(
+                    "docs_body".to_string(),
+                    "docs".to_string(),
+                    "body".to_string(),
+                    IndexKind::FullText,
+                )
+            })
+            .unwrap_err();
+        assert!(matches!(error, Error::Unsupported(_)), "got {error}");
     }
 
     /// Two indexes over one column under two collations are two indexes, and a
@@ -1980,6 +2151,7 @@ mod tests {
             kind: IndexKind::BTree,
             unique: false,
             collations: alloc::vec![collation],
+            metric: VectorMetric::Cosine,
         };
         catalog
             .create_index(declare("body_bin", Collation::Binary))
@@ -1997,6 +2169,7 @@ mod tests {
         let err = catalog
             .create_index(Index {
                 collations: alloc::vec![],
+                metric: VectorMetric::Cosine,
                 ..declare("body_empty", Collation::Binary)
             })
             .unwrap_err();

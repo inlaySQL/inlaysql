@@ -26,6 +26,94 @@ column of every existing table keeps an implicit index, materialised as an
 ordinary declaration. New tables created after that opt in like any other.
 Nothing is silently dropped.
 
+## A vector index's distance is part of what it is
+
+An ANN index is built and searched under one distance —
+`inlaysql_core::hnsw::VectorMetric` — chosen at `CREATE INDEX` with pgvector's
+operator-class spelling and fixed from then on:
+
+```sql
+CREATE INDEX items_embedding ON items (embedding);                 -- vector_cosine_ops
+CREATE INDEX items_embedding ON items (embedding vector_l2_ops);   -- Euclidean
+```
+
+**This is not a query-time argument and cannot be.** An HNSW graph's neighbour
+lists are the answer to "what is near what" under one particular distance;
+searched under another they route the greedy walk by the wrong geometry and
+return plausible, wrong rows with no error anywhere. So the metric is written
+in three places and checked at each boundary between them:
+
+| Where | What it is | What a mismatch does |
+| --- | --- | --- |
+| The catalog (version 7) | one tag per index declaration, written only when the metric is not cosine | an older build refuses the catalog outright (`Error::FormatVersion`) rather than rebuilding the graph as cosine |
+| `HnswIndex::encode` (version 5) | one tag after the version byte, written only by a non-cosine index | `HnswIndex::load` returns `Error::Corrupt`, and `Engine::load_saved_indexes` falls through to a rebuild from the rows |
+| The paged graph header | one trailing byte, appended only when the metric is not cosine | `PagedHnswIndex::restore` purges the namespace and comes back empty, so the caller's usual staleness handling rebuilds it — the same route a foreign *encoding* takes |
+
+Each of the three is written **only when the metric is not the default**, so a
+cosine database is byte for byte the database it was before any of this
+existed. That is the same "lowest version that can express it" rule the catalog
+already followed for constraints, B-tree indexes and collations.
+
+The metric also decides what is *stored*, not only how two stored vectors are
+compared: cosine L2-normalises on the way in so the comparison reduces to a
+dot product, and L2 does not, because the magnitude that would discard is what
+it measures. Both halves live on the one enum
+(`VectorMetric::prepare` and the `distance` kernel), which is what makes
+"normalised for cosine, compared as L2" unwritable rather than merely
+untested.
+
+One column carries one vector index. Unlike a B-tree index, where the planner
+picks by the comparison's collation, `vector_score(embedding, ?)` names the
+column and not the metric, so a second graph over the same column would be one
+nobody could ask for — and the backend map, keyed by `(table, columns)`, could
+not hold it beside the first. The catalog refuses it with that reason.
+
+## The candidate list *is* a query-time argument
+
+The distance is fixed for the life of the graph. The **candidate list** — `ef`,
+how many candidates the walk may hold at once — is the opposite: it changes
+nothing about the graph and everything about how much of it one query is
+willing to look at. It is the whole recall/latency trade, and it is per query:
+
+```sql
+SET inlaysql_hnsw_ef_search = 400;   -- more recall on the query that matters
+SET inlaysql_hnsw_ef_search = 0;     -- back to the index's own tuning
+```
+
+Embedded, that is `Database::set_vector_ef_search(Some(400))`; the core seam is
+`VectorTuning`, which is a *handle* the host installs rather than a number
+copied into the engine, for the same reason `Cancel` is: the value the server
+reports as `@@inlaysql_hnsw_ef_search` and the value the walk uses have to be
+one load of one field, or a session ends up told it is searching at an `ef` it
+is not searching at.
+
+Three properties, and the reasons they are what they are:
+
+* **Unset changes nothing.** The default is the tuning the index was built with
+  (`HnswParams::DEFAULT`, chosen by `bench --suite sweep`), and that is not a
+  constant: `ef_for(k)` widens the beam with the number of candidates asked for,
+  so the same index searches a `LIMIT 10` at `ef = 80` and a `LIMIT 100` at
+  `ef = 800`.
+* **`EXPLAIN` reports the effective number**, as `(ef=N)` on the vector-search
+  node, because an operating point nobody can see is one nobody can choose —
+  and because the untuned number is per query, `@@inlaysql_hnsw_ef_search` on
+  its own could not tell you what a given query will do.
+* **A beam narrower than the answer is refused.** `ef` must be at least the
+  query's `LIMIT`, which is pgvector's rule too: a walk holding fewer
+  candidates than the answer cannot come back with the answer. The floor is
+  the *row budget* and not the candidate count — the engine over-fetches
+  candidates fourfold so a fused ranking has more than the bare minimum, and
+  an `ef` below that is merely a narrower beam, which is exactly what a caller
+  asking for less latency is asking for. Widening a too-narrow value silently
+  would search at a number the caller did not choose while reporting the one
+  they did; returning a short list would drop rows without saying so. So the
+  query fails and names the smallest `ef` that works.
+
+**`m` and `ef_construction` are not settable per index yet.** They shape the
+stored graph rather than one query, so unlike `ef_search` they cannot be
+changed without a catalog format change to record them and a rebuild to apply
+them. Every index is built at the shipped `m = 16`, `ef_construction = 200`.
+
 ## Scalar B-tree indexes are a different kind of index
 
 Everything above and below this section is about the full-text and vector

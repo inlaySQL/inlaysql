@@ -30,6 +30,7 @@ use crate::catalog::{Catalog, Column, IndexKind, Table, TableConstraints, Unique
 use crate::collation::Collation;
 use crate::error::{Error, Result};
 use crate::fusion::DEFAULT_RRF_K;
+use crate::hnsw::VectorMetric;
 use crate::plan::{
     AggFunc, Aggregate, AlterAction, AlterTablePlan, BinaryOp, CastType, CompareAffinity,
     ConflictAction, ConflictUpdate, CreateIndexPlan, CreateTablePlan, CreateUniqueIndexPlan,
@@ -803,33 +804,55 @@ fn table_constraint(
 /// SQLite's `CREATE TABLE` does not have.
 fn index_columns(columns: &[sqlparser::ast::IndexColumn]) -> Result<Vec<String>> {
     let collated = collated_index_columns(columns)?;
-    if let Some((name, _)) = collated.iter().find(|(_, collation)| collation.is_some()) {
+    if let Some(column) = collated.iter().find(|column| column.collation.is_some()) {
         return Err(Error::Unsupported(alloc::format!(
-            "COLLATE on `{name}` inside a UNIQUE or PRIMARY KEY column list is not \
+            "COLLATE on `{}` inside a UNIQUE or PRIMARY KEY column list is not \
              supported; declare the collation on the column instead, so the constraint and \
-             the column agree about what a duplicate is"
+             the column agree about what a duplicate is",
+            column.name
         )));
     }
-    Ok(collated.into_iter().map(|(name, _)| name).collect())
+    // An operator class picks how an index compares. A `UNIQUE` or
+    // `PRIMARY KEY` constraint is not an index here — it is a statement about
+    // duplicates, decided by the columns' own collations — so there is nothing
+    // for one to apply to, and accepting it would be the silently-dropped
+    // clause this module refuses to have.
+    if let Some(column) = collated
+        .iter()
+        .find(|column| column.operator_class.is_some())
+    {
+        return Err(Error::Unsupported(alloc::format!(
+            "an operator class on `{}` inside a UNIQUE or PRIMARY KEY column list has \
+             nothing to apply to; it selects how an index compares, and a constraint \
+             compares by the column's own collation",
+            column.name
+        )));
+    }
+    Ok(collated.into_iter().map(|column| column.name).collect())
 }
 
-/// The columns of an index or constraint list, each with the `COLLATE` written
-/// beside it if there was one.
+/// One entry of an index or constraint column list.
+struct IndexColumnSpec {
+    /// The column name, as written.
+    name: String,
+    /// The `COLLATE` written beside it, if there was one.
+    collation: Option<Collation>,
+    /// The operator class written after it, if there was one — pgvector's
+    /// `vector_l2_ops` and friends. Resolved (or refused) by whoever knows
+    /// what kind of index is being declared; see [`plan_create_index`].
+    operator_class: Option<String>,
+}
+
+/// The columns of an index or constraint list, each with the `COLLATE` and the
+/// operator class written beside it.
 ///
 /// `CREATE INDEX i ON t (name COLLATE NOCASE)` is real SQLite and is the only
 /// way to key an index under a collation the column did not declare — which is
 /// worth having, because a `BINARY` column can then carry a `NOCASE` index that
 /// `WHERE name = ? COLLATE NOCASE` will actually use.
-fn collated_index_columns(
-    columns: &[sqlparser::ast::IndexColumn],
-) -> Result<Vec<(String, Option<Collation>)>> {
+fn collated_index_columns(columns: &[sqlparser::ast::IndexColumn]) -> Result<Vec<IndexColumnSpec>> {
     let mut names = Vec::with_capacity(columns.len());
     for column in columns {
-        if column.operator_class.is_some() {
-            return Err(Error::Unsupported(
-                "operator classes are not supported".to_string(),
-            ));
-        }
         let (expr, collation) = peel_collation(&column.column.expr)?;
         let Expr::Identifier(ident) = expr else {
             return Err(Error::Unsupported(alloc::format!(
@@ -837,7 +860,14 @@ fn collated_index_columns(
                 column.column.expr
             )));
         };
-        names.push((ident.value.clone(), collation));
+        names.push(IndexColumnSpec {
+            name: ident.value.clone(),
+            collation,
+            operator_class: column
+                .operator_class
+                .as_ref()
+                .map(alloc::string::ToString::to_string),
+        });
     }
     if names.is_empty() {
         return Err(Error::Type(
@@ -1255,7 +1285,8 @@ fn plan_create_index(create: sqlparser::ast::CreateIndex, catalog: &Catalog) -> 
     let mut ordinals = Vec::with_capacity(names.len());
     let mut types = Vec::with_capacity(names.len());
     let mut collations = Vec::with_capacity(names.len());
-    for (column, written) in &names {
+    for spec in &names {
+        let (column, written) = (&spec.name, &spec.collation);
         let (ordinal, resolved) = table.require_column(column)?;
         // The index's collation is the column's unless the statement wrote one
         // over it. A *unique* index may not: the constraint it enforces is
@@ -1290,6 +1321,7 @@ fn plan_create_index(create: sqlparser::ast::CreateIndex, catalog: &Catalog) -> 
         // column's text — has to be asked for explicitly: `USING FULLTEXT`
         // or `USING BM25`.
         if requested == Some(IndexKind::FullText) {
+            index_metric(IndexKind::FullText, create.unique, &names)?;
             return fulltext_plan(name, table_name, ordinals, &names, &types, create.unique);
         }
         // A vector index cannot cover more than one column at all — two
@@ -1305,6 +1337,7 @@ fn plan_create_index(create: sqlparser::ast::CreateIndex, catalog: &Catalog) -> 
                  ANN graph over both",
             )));
         }
+        index_metric(IndexKind::BTree, create.unique, &names)?;
         return btree_plan(
             name,
             table_name,
@@ -1331,13 +1364,16 @@ fn plan_create_index(create: sqlparser::ast::CreateIndex, catalog: &Catalog) -> 
             _ => IndexKind::BTree,
         },
     };
+    // The distance the graph will be built under, which for anything but a
+    // vector index means refusing the clause rather than dropping it.
+    let metric = index_metric(kind, create.unique, &names)?;
     // A retrieval index has no ordered key for a `COLLATE` to apply to, so the
     // clause would have nowhere to go — and a dropped clause is the bug this
     // module is built to refuse. Checked once `kind` is known, because that is
     // what decides whether there is a key at all.
     if kind != IndexKind::BTree
         && !create.unique
-        && names.iter().any(|(_, written)| written.is_some())
+        && names.iter().any(|column| column.collation.is_some())
     {
         return Err(Error::Unsupported(alloc::format!(
             "COLLATE on `{first_name}` needs an ordered index; write USING BTREE, or drop the \
@@ -1378,7 +1414,72 @@ fn plan_create_index(create: sqlparser::ast::CreateIndex, catalog: &Catalog) -> 
         // A retrieval index has no collated key; the list is kept the same
         // length as the column list so the catalog's own check passes.
         collations: alloc::vec![Collation::Binary; 1],
+        metric,
     }))
+}
+
+/// Which distance a `CREATE INDEX` asked its vector index to be built under.
+///
+/// The spelling is pgvector's **operator class**, written after the column:
+///
+/// ```sql
+/// CREATE INDEX items_embedding ON items USING hnsw (embedding vector_l2_ops)
+/// ```
+///
+/// That statement is pgvector's own, verbatim — `USING hnsw` already resolves
+/// to this engine's vector index ([`requested_index_kind`]), the parser already
+/// carries the operator class, and `vector_cosine_ops` / `vector_l2_ops` are
+/// already what a pgvector user writes and what their migration files contain.
+/// This is the project's "compatibility where it is real" test passing rather
+/// than being claimed: nothing here is a lookalike token that means something
+/// else. MariaDB's `DISTANCE=euclidean` and MySQL's `DISTANCE` index option
+/// were the alternatives; both are index *options*, and this dialect's parser
+/// admits only `USING` and `COMMENT` there, so adopting either would have been
+/// a new spelling for a thing that already has one.
+///
+/// It is refused everywhere it would mean nothing: on a B-tree or full-text
+/// index, on a `CREATE UNIQUE INDEX` (which over a `VECTOR` column builds no
+/// graph at all), and for `vector_ip_ops`, whose reason is [`VectorMetric`]'s
+/// own. Any operator class on any column of the list is enough to trigger
+/// those refusals — a vector index has exactly one column, so for the kind
+/// that can honour one there is no ambiguity about which it applies to.
+fn index_metric(
+    kind: IndexKind,
+    unique: bool,
+    columns: &[IndexColumnSpec],
+) -> Result<VectorMetric> {
+    let Some(written) = columns
+        .iter()
+        .find_map(|column| column.operator_class.as_deref())
+    else {
+        // The default, and therefore what every index that exists today is.
+        return Ok(VectorMetric::Cosine);
+    };
+    // `CREATE UNIQUE INDEX` over a `VECTOR` column is a constraint and nothing
+    // else — there is no ordered index that could enforce it, so it becomes a
+    // named `UNIQUE` with a per-write scan and no graph at all. An operator
+    // class on one would therefore choose the distance of an index that does
+    // not exist, which is precisely the silently-dropped clause this module is
+    // built to refuse. Checked before the kind, because `kind` here is
+    // `Vector` — inferred from the column — and would otherwise accept it.
+    if unique {
+        return Err(Error::Unsupported(alloc::format!(
+            "`{written}` selects the distance an ANN graph is built under, and \
+             CREATE UNIQUE INDEX over a VECTOR column builds no graph — it is a constraint \
+             enforced by a scan. Declare the constraint and the index separately"
+        )));
+    }
+    if kind != IndexKind::Vector {
+        return Err(Error::Unsupported(alloc::format!(
+            "`{written}` selects the distance a vector index is built under, and this is a \
+             {} index; drop it, or write USING VECTOR on a VECTOR column",
+            match kind {
+                IndexKind::FullText => "full-text",
+                _ => "B-tree",
+            }
+        )));
+    }
+    VectorMetric::from_ops_name(written)
 }
 
 /// Which structure `USING <type>` asked for.
@@ -1426,7 +1527,7 @@ fn fulltext_plan(
     name: String,
     table_name: String,
     ordinals: Vec<usize>,
-    names: &[(String, Option<Collation>)],
+    names: &[IndexColumnSpec],
     types: &[(String, DataType)],
     unique: bool,
 ) -> Result<Plan> {
@@ -1435,10 +1536,11 @@ fn fulltext_plan(
             "only a B-tree index can be UNIQUE; a full-text index is not a constraint",
         )));
     }
-    if let Some((column, _)) = names.iter().find(|(_, written)| written.is_some()) {
+    if let Some(column) = names.iter().find(|column| column.collation.is_some()) {
         return Err(Error::Unsupported(alloc::format!(
-            "COLLATE on `{column}` needs an ordered index; write USING BTREE, or drop the \
-             clause — a full-text index has no collated key"
+            "COLLATE on `{}` needs an ordered index; write USING BTREE, or drop the \
+             clause — a full-text index has no collated key",
+            column.name
         )));
     }
     for (column, ty) in types {
@@ -1457,6 +1559,9 @@ fn fulltext_plan(
         // A retrieval index has no collated key; the list is kept the same
         // length as the column list so the catalog's own check passes.
         collations: alloc::vec![Collation::Binary; types.len()],
+        // A full-text index has no distance; `index_metric` has already
+        // refused an operator class on one.
+        metric: VectorMetric::Cosine,
     }))
 }
 
@@ -1497,6 +1602,9 @@ fn btree_plan(
         kind: IndexKind::BTree,
         unique,
         collations,
+        // A B-tree index has no distance; `index_metric` has already refused
+        // an operator class on one.
+        metric: VectorMetric::Cosine,
     }))
 }
 

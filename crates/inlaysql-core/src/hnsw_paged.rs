@@ -11,7 +11,8 @@
 //!
 //! Each node is stored as one row in a synthetic table (the index's
 //! `namespace`), keyed by its node index. A node record is its row id, a
-//! tombstone flag, its per-layer adjacency, and its L2-normalised vector. The
+//! tombstone flag, its per-layer adjacency, and its metric-prepared vector
+//! (L2-normalised under the default, cosine). The
 //! [`NodeCache`] holds at most `cache_capacity` decoded nodes; everything else
 //! is fetched on demand through [`Storage::get_row`]. Steady-state search and
 //! incremental maintenance therefore cost `O(cache_capacity + ef)` resident
@@ -95,8 +96,8 @@ use core::cmp::Reverse;
 
 use crate::error::{Error, Result};
 use crate::hnsw::{
-    decode_stored_vector, encode_stored_vector, level_of, level_shift, max_level_for, normalise,
-    stored_distance, Candidate, HnswParams, StoredVector, VectorEncoding, Visited,
+    decode_stored_vector, encode_stored_vector, level_of, level_shift, max_level_for,
+    stored_distance, Candidate, HnswParams, StoredVector, VectorEncoding, VectorMetric, Visited,
 };
 use crate::row::{put_len, Cursor};
 use crate::traits::{RowFilter, RowId, RowScan, Scored, Storage, VectorIndex};
@@ -304,6 +305,11 @@ pub struct PagedHnswIndex<S: Storage> {
     /// type and checked against the header on [`PagedHnswIndex::open`]. See
     /// [`crate::hnsw::VectorEncoding`].
     encoding: VectorEncoding,
+    /// The distance this graph was built under and is searched under, fixed at
+    /// construction from the index's declaration and checked against the
+    /// header on [`PagedHnswIndex::open`]. See [`VectorMetric`], and
+    /// [`PagedHnswIndex::restore`] for what a mismatch does.
+    metric: VectorMetric,
     /// Number of nodes in the graph (live plus tombstoned).
     ///
     /// `Cell`, along with the three below and `stored_version`, because these
@@ -360,6 +366,24 @@ impl<S: Storage> PagedHnswIndex<S> {
         Self::with_params(storage, namespace, dim, HnswParams::DEFAULT)
     }
 
+    /// An empty index over vectors of `dim` under an explicit
+    /// [`VectorMetric`], mirroring [`crate::hnsw::HnswIndex::with_metric`].
+    pub fn with_metric(
+        storage: S,
+        namespace: impl Into<String>,
+        dim: usize,
+        metric: VectorMetric,
+    ) -> Self {
+        Self::with_encoding(
+            storage,
+            namespace,
+            dim,
+            HnswParams::DEFAULT,
+            VectorEncoding::Exact,
+            metric,
+        )
+    }
+
     /// An empty int8-quantised index over vectors of `dim`, mirroring
     /// [`crate::hnsw::HnswIndex::new_quantized`]: a `VECTOR(n, INT8)` column
     /// gets the same ~4x storage/memory win here that it already gets from
@@ -371,6 +395,24 @@ impl<S: Storage> PagedHnswIndex<S> {
             dim,
             HnswParams::DEFAULT,
             VectorEncoding::Q8,
+            VectorMetric::default(),
+        )
+    }
+
+    /// An empty int8-quantised index under an explicit [`VectorMetric`].
+    pub fn quantized_with_metric(
+        storage: S,
+        namespace: impl Into<String>,
+        dim: usize,
+        metric: VectorMetric,
+    ) -> Self {
+        Self::with_encoding(
+            storage,
+            namespace,
+            dim,
+            HnswParams::DEFAULT,
+            VectorEncoding::Q8,
+            metric,
         )
     }
 
@@ -381,7 +423,14 @@ impl<S: Storage> PagedHnswIndex<S> {
         dim: usize,
         params: HnswParams,
     ) -> Self {
-        Self::with_encoding(storage, namespace, dim, params, VectorEncoding::Exact)
+        Self::with_encoding(
+            storage,
+            namespace,
+            dim,
+            params,
+            VectorEncoding::Exact,
+            VectorMetric::default(),
+        )
     }
 
     fn with_encoding(
@@ -390,12 +439,14 @@ impl<S: Storage> PagedHnswIndex<S> {
         dim: usize,
         params: HnswParams,
         encoding: VectorEncoding,
+        metric: VectorMetric,
     ) -> Self {
         Self {
             storage,
             namespace: namespace.into(),
             dim,
             encoding,
+            metric,
             node_count: Cell::new(0),
             entry: Cell::new(None),
             entry_level: Cell::new(0),
@@ -424,6 +475,22 @@ impl<S: Storage> PagedHnswIndex<S> {
         Ok(index)
     }
 
+    /// Open a previously committed index under an explicit [`VectorMetric`].
+    ///
+    /// A namespace holding a graph built under some *other* metric is purged
+    /// and rebuilt, exactly as one holding a foreign encoding is — see
+    /// [`PagedHnswIndex::restore`].
+    pub fn open_with_metric(
+        storage: S,
+        namespace: impl Into<String>,
+        dim: usize,
+        metric: VectorMetric,
+    ) -> Result<Self> {
+        let mut index = Self::with_metric(storage, namespace, dim, metric);
+        index.restore()?;
+        Ok(index)
+    }
+
     /// Open a previously committed int8-quantised index. See
     /// [`PagedHnswIndex::new_quantized`].
     ///
@@ -436,6 +503,19 @@ impl<S: Storage> PagedHnswIndex<S> {
     /// the header format.
     pub fn open_quantized(storage: S, namespace: impl Into<String>, dim: usize) -> Result<Self> {
         let mut index = Self::new_quantized(storage, namespace, dim);
+        index.restore()?;
+        Ok(index)
+    }
+
+    /// Open a previously committed int8-quantised index under an explicit
+    /// [`VectorMetric`]. See [`PagedHnswIndex::open_with_metric`].
+    pub fn open_quantized_with_metric(
+        storage: S,
+        namespace: impl Into<String>,
+        dim: usize,
+        metric: VectorMetric,
+    ) -> Result<Self> {
+        let mut index = Self::quantized_with_metric(storage, namespace, dim, metric);
         index.restore()?;
         Ok(index)
     }
@@ -562,6 +642,11 @@ impl<S: Storage> PagedHnswIndex<S> {
         self.params
     }
 
+    /// The distance this graph is built and searched under.
+    pub fn metric(&self) -> VectorMetric {
+        self.metric
+    }
+
     /// Hand back the backing storage, dropping the in-memory working set.
     ///
     /// The graph is already durable in `storage`, so this is how a caller that
@@ -588,6 +673,13 @@ impl<S: Storage> PagedHnswIndex<S> {
     /// `CATALOG_VERSION_*`-style version number for this header at all, so
     /// this mirrors the one compatibility trick the format already used
     /// (the write-version stamp is read the same optional-trailing-byte way).
+    ///
+    /// The [`VectorMetric`] tag is appended after it by the same trick and for
+    /// the same reason, and — unlike the encoding tag, which is always
+    /// written — only when the metric is not the default. An absent byte means
+    /// cosine, which is what every paged graph written before metrics existed
+    /// is, so a cosine index's header is byte for byte the header it was
+    /// always written as.
     fn restore(&mut self) -> Result<()> {
         let Some(bytes) = self.storage.get_meta(&self.header_key())? else {
             return Ok(());
@@ -644,6 +736,23 @@ impl<S: Storage> PagedHnswIndex<S> {
             // following it. `clear` leaves `stored_version: None`, so the
             // caller's existing "the saved copy is not current" handling
             // still rebuilds it from the rows. See `Engine::load_saved_indexes`.
+            return self.clear();
+        }
+        // Absent on every header written before metrics existed, which were
+        // all cosine.
+        let metric = match cursor.u8() {
+            Ok(tag) => VectorMetric::from_tag(tag)?,
+            Err(_) => VectorMetric::Cosine,
+        };
+        if metric != self.metric {
+            // Nothing about the *bytes* is wrong here — a cosine graph and an
+            // L2 graph over the same rows have the same shape — so nothing
+            // downstream would ever notice. What is wrong is every neighbour
+            // list in it: they answer "what is near what" under the other
+            // distance, and a search would come back with plausible, wrong
+            // rows and no error. Purged for the same reason and by the same
+            // route as a foreign encoding, so the caller's stale-index
+            // handling rebuilds it from the rows.
             return self.clear();
         }
 
@@ -769,6 +878,21 @@ impl<S: Storage> PagedHnswIndex<S> {
             Ok(_) => return Ok(()),
         };
         if encoding != self.encoding {
+            return Ok(());
+        }
+        // A header naming a foreign metric is left alone rather than adopted,
+        // exactly as a foreign encoding is: `restore` is where there is a
+        // `&mut self` to purge with, and adopting a graph whose neighbour
+        // lists answer another distance is the wrong-answers-no-error case
+        // this whole method exists to prevent.
+        let metric = match cursor.u8() {
+            Ok(tag) => match VectorMetric::from_tag(tag) {
+                Ok(metric) => metric,
+                Err(_) => return Ok(()),
+            },
+            Err(_) => VectorMetric::Cosine,
+        };
+        if metric != self.metric {
             return Ok(());
         }
         self.node_count.set(node_count as usize);
@@ -900,6 +1024,11 @@ impl<S: Storage> PagedHnswIndex<S> {
             VectorEncoding::Exact => 0,
             VectorEncoding::Q8 => 1,
         });
+        // Only when it is not the default, so a cosine index writes the header
+        // it has always written — see [`PagedHnswIndex::restore`].
+        if self.metric != VectorMetric::Cosine {
+            out.push(self.metric.tag());
+        }
         self.storage.put_meta(&self.header_key(), &out)?;
         // What this instance now believes the file says, so the next
         // [`PagedHnswIndex::adopt_stored_graph`] does not mistake this
@@ -940,7 +1069,7 @@ impl<S: Storage> PagedHnswIndex<S> {
         for (id, embedding) in &self.pending_inserts {
             live.insert(
                 *id,
-                StoredVector::from_f32(&normalise(embedding), self.encoding),
+                StoredVector::from_f32(&self.metric.prepare(embedding), self.encoding),
             );
         }
 
@@ -1072,7 +1201,12 @@ impl<S: Storage> PagedHnswIndex<S> {
 
         let entry_record = self.fetch_node(entry)?;
         let start = Candidate {
-            distance: stored_distance(&self.distance_calls, query, &entry_record.vector),
+            distance: stored_distance(
+                self.metric,
+                &self.distance_calls,
+                query,
+                &entry_record.vector,
+            ),
             node: entry,
         };
         visited.visit(entry);
@@ -1099,7 +1233,12 @@ impl<S: Storage> PagedHnswIndex<S> {
                 }
                 let neighbor_record = self.fetch_node(neighbor)?;
                 let candidate = Candidate {
-                    distance: stored_distance(&self.distance_calls, query, &neighbor_record.vector),
+                    distance: stored_distance(
+                        self.metric,
+                        &self.distance_calls,
+                        query,
+                        &neighbor_record.vector,
+                    ),
                     node: neighbor,
                 };
                 let enters = match results.peek() {
@@ -1137,8 +1276,12 @@ impl<S: Storage> PagedHnswIndex<S> {
             let mut diverse = true;
             for &kept in &selected {
                 let kept_vector = self.fetch_vector(kept)?;
-                if stored_distance(&self.distance_calls, &candidate_vector, &kept_vector)
-                    <= candidate.distance
+                if stored_distance(
+                    self.metric,
+                    &self.distance_calls,
+                    &candidate_vector,
+                    &kept_vector,
+                ) <= candidate.distance
                 {
                     diverse = false;
                     break;
@@ -1184,7 +1327,12 @@ impl<S: Storage> PagedHnswIndex<S> {
         for &other in &record.neighbors[layer] {
             let other_vector = self.fetch_vector(other)?;
             candidates.push(Candidate {
-                distance: stored_distance(&self.distance_calls, &neighbor_vector, &other_vector),
+                distance: stored_distance(
+                    self.metric,
+                    &self.distance_calls,
+                    &neighbor_vector,
+                    &other_vector,
+                ),
                 node: other,
             });
         }
@@ -1306,7 +1454,7 @@ impl<S: Storage> VectorIndex for PagedHnswIndex<S> {
         let ceiling = max_level_for(self.live.len() + inserts.len(), self.params.m);
         let mut visited = Visited::new(self.node_count.get());
         for (id, embedding) in inserts {
-            let vector = StoredVector::from_f32(&normalise(&embedding), self.encoding);
+            let vector = StoredVector::from_f32(&self.metric.prepare(&embedding), self.encoding);
             let level = level_of(id, shift, ceiling);
             // A replace without an intervening remove retires the old node the
             // same way a remove would.
@@ -1329,6 +1477,22 @@ impl<S: Storage> VectorIndex for PagedHnswIndex<S> {
     }
 
     fn search(&self, query: &[f32], k: usize, filter: Option<&RowFilter>) -> Result<Vec<Scored>> {
+        // The tuning in force, as in the in-memory index: the same `ef_for`
+        // that `EXPLAIN` reports, so the plan and the walk agree.
+        self.search_with_ef(query, k, self.params.ef_for(k), filter)
+    }
+
+    fn ef_for(&self, k: usize) -> Option<usize> {
+        Some(self.params.ef_for(k))
+    }
+
+    fn search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        filter: Option<&RowFilter>,
+    ) -> Result<Vec<Scored>> {
         if query.len() != self.dim {
             return Err(Error::Type(alloc::format!(
                 "query has dimension {} but the index expects {}",
@@ -1347,7 +1511,7 @@ impl<S: Storage> VectorIndex for PagedHnswIndex<S> {
             return Ok(Vec::new());
         }
 
-        let query = StoredVector::Exact(normalise(query));
+        let query = StoredVector::Exact(self.metric.prepare(query));
         let mut visited = Visited::new(self.node_count.get());
         for layer in (1..=self.entry_level.get()).rev() {
             // Unfiltered descent, as in the in-memory index: it only picks
@@ -1357,14 +1521,14 @@ impl<S: Storage> VectorIndex for PagedHnswIndex<S> {
             ep = nearest[0].node;
         }
 
-        let hits = self.search_layer(&query, ep, self.params.ef_for(k), 0, filter, &mut visited)?;
+        let hits = self.search_layer(&query, ep, ef, 0, filter, &mut visited)?;
         let mut scored = Vec::with_capacity(k.min(hits.len()));
         for hit in hits {
             let record = self.fetch_node(hit.node)?;
             if record.deleted {
                 continue;
             }
-            scored.push(Scored::new(record.id, 1.0 - hit.distance));
+            scored.push(Scored::new(record.id, self.metric.score(hit.distance)));
             if scored.len() >= k {
                 break;
             }
@@ -1902,6 +2066,151 @@ mod tests {
             .map(|h| h.id)
             .collect();
         assert_eq!(got, expected, "pre-encoding-tag header failed to restore");
+    }
+
+    /// A cosine graph's header is byte for byte the header it was always
+    /// written as: the metric tag is only appended when it is not the default,
+    /// so every paged index that already exists on disk is untouched.
+    #[test]
+    fn a_cosine_header_is_unchanged_and_an_l2_one_carries_its_tag() {
+        let dim = 6;
+        let mut cosine = PagedHnswIndex::new(MemStorage::new(), "hnsw", dim);
+        let mut l2 = PagedHnswIndex::with_metric(MemStorage::new(), "hnsw", dim, VectorMetric::L2);
+        for (id, vector) in vectors(32, dim).into_iter().enumerate() {
+            cosine.insert(id as u64 + 1, &vector).unwrap();
+            l2.insert(id as u64 + 1, &vector).unwrap();
+        }
+        cosine.commit().unwrap();
+        l2.commit().unwrap();
+
+        let key = cosine.header_key();
+        let cosine_header = cosine.storage.get_meta(&key).unwrap().unwrap();
+        let l2_header = l2.storage.get_meta(&key).unwrap().unwrap();
+        assert_eq!(
+            l2_header.len(),
+            cosine_header.len() + 1,
+            "the metric tag is one trailing byte, present only when it is not cosine"
+        );
+        assert_eq!(*l2_header.last().unwrap(), VectorMetric::L2.tag());
+        // Everything before the tag is identical, which is what says the tag
+        // was appended rather than inserted.
+        assert_eq!(&l2_header[..cosine_header.len()], &cosine_header[..]);
+    }
+
+    /// An L2 paged graph survives a reopen and answers identically — the same
+    /// property the encoding tag has, for the field appended beside it.
+    #[test]
+    fn an_l2_paged_graph_reopens_and_answers_the_same() {
+        let dim = 8;
+        let storage = MemStorage::new();
+        let mut original =
+            PagedHnswIndex::with_metric(storage.clone(), "hnsw", dim, VectorMetric::L2);
+        for (id, vector) in vectors(64, dim).into_iter().enumerate() {
+            original.insert(id as u64 + 1, &vector).unwrap();
+        }
+        original.commit().unwrap();
+
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32).sin()).collect();
+        let expected = original.search(&query, 10, None).unwrap();
+        let storage = original.into_storage();
+
+        let restored =
+            PagedHnswIndex::open_with_metric(storage, "hnsw", dim, VectorMetric::L2).unwrap();
+        assert_eq!(restored.metric(), VectorMetric::L2);
+        assert_eq!(restored.search(&query, 10, None).unwrap(), expected);
+    }
+
+    /// **The failure this design exists to prevent.** A graph built under one
+    /// metric and opened under another decodes perfectly — same node count,
+    /// same adjacency, same vector widths — and every one of its neighbour
+    /// lists is the answer to a different question. Nothing downstream could
+    /// notice, so it is purged here and rebuilt from the rows, exactly as a
+    /// foreign encoding is.
+    #[test]
+    fn opening_a_cosine_graph_as_l2_forces_a_rebuild_rather_than_answering_wrongly() {
+        let dim = 6;
+        let mut original = PagedHnswIndex::new(MemStorage::new(), "hnsw", dim);
+        for (id, vector) in vectors(32, dim).into_iter().enumerate() {
+            original.insert(id as u64 + 1, &vector).unwrap();
+        }
+        original.commit().unwrap();
+        let storage = original.into_storage();
+
+        let mut mismatched =
+            PagedHnswIndex::open_with_metric(storage, "hnsw", dim, VectorMetric::L2)
+                .expect("a mismatched metric must not be a hard error");
+        assert!(
+            mismatched.is_empty(),
+            "a cosine graph must not be answered as an L2 one"
+        );
+        assert_eq!(
+            mismatched.stored_write_version(),
+            None,
+            "a metric mismatch must look exactly like \"nothing saved\", so the caller's \
+             normal staleness check rebuilds it"
+        );
+
+        // And the rebuild answers under L2, against an L2 oracle.
+        let rows = vectors(32, dim);
+        let mut oracle = BruteForceVectorIndex::with_metric(dim, VectorMetric::L2);
+        for (id, vector) in rows.iter().enumerate() {
+            mismatched.insert(id as u64 + 1, vector).unwrap();
+            oracle.insert(id as u64 + 1, vector).unwrap();
+        }
+        mismatched.commit().unwrap();
+        oracle.commit().unwrap();
+        let query: Vec<f32> = (0..dim).map(|i| ((i + 3) as f32).cos()).collect();
+        assert_eq!(
+            mismatched
+                .search(&query, 5, None)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.id)
+                .collect::<Vec<_>>(),
+            oracle
+                .search(&query, 5, None)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The paged L2 walk finds what an exhaustive L2 scan finds — the same
+    /// oracle check the cosine path has, against the metric this graph was
+    /// actually built under.
+    #[test]
+    fn l2_paged_recall_matches_the_brute_force_oracle() {
+        let dim = 12;
+        let count = 400u64;
+        let rows = vectors(count, dim);
+        let mut index =
+            PagedHnswIndex::with_metric(MemStorage::new(), "hnsw", dim, VectorMetric::L2);
+        let mut oracle = BruteForceVectorIndex::with_metric(dim, VectorMetric::L2);
+        for (id, vector) in rows.iter().enumerate() {
+            index.insert(id as u64 + 1, vector).unwrap();
+            oracle.insert(id as u64 + 1, vector).unwrap();
+        }
+        index.commit().unwrap();
+        oracle.commit().unwrap();
+
+        let mut recall = 0.0;
+        for seed in 0..12u64 {
+            let query: Vec<f32> = (0..dim)
+                .map(|i| (((seed * 13 + i as u64) as f32) * 0.6).sin() * 0.5)
+                .collect();
+            let truth: Vec<RowId> = oracle
+                .search(&query, 10, None)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.id)
+                .collect();
+            let found = index.search(&query, 10, None).unwrap();
+            recall += found.iter().filter(|hit| truth.contains(&hit.id)).count() as f64 / 10.0;
+        }
+        recall /= 12.0;
+        std::println!("recall@10 vector_l2_ops paged {count:>6} vectors  {recall:.4}");
+        assert!(recall >= 0.95, "paged L2 recall@10 was {recall:.3}");
     }
 
     /// A graph written exact — which is what every paged index wrote before

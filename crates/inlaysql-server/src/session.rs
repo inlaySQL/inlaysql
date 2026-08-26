@@ -278,6 +278,23 @@ impl Session {
             "max_execution_time" | "max_statement_time" => {
                 return Some(self.control.timeout_ms().to_string())
             }
+            // Read off the live control for the same reason, and it matters
+            // more here than anywhere else on this list: this is the number
+            // the ANN walk is *searching with*, and a client reading it is
+            // deciding how much recall it is buying. `0` is "whatever the
+            // index is tuned for" — the shipped `HnswParams::DEFAULT`, whose
+            // `ef` widens with the query's candidate count and so is not one
+            // number this variable could name. `EXPLAIN` reports the effective
+            // `ef` for a specific query, which is where that number lives.
+            //
+            // Under this server's own name rather than pgvector's
+            // `hnsw.ef_search`: MySQL system variables cannot hold a dot, and
+            // borrowing a bare `ef_search` would put a name MySQL does not
+            // have into MySQL's own namespace. See `Limits::statement_text`
+            // for the same decision.
+            "inlaysql_hnsw_ef_search" => {
+                return Some(self.control.vector_ef_search().unwrap_or(0).to_string())
+            }
             // The three below are the same pairing as the timeouts above:
             // each one is read off the field the connection actually applies,
             // so a client cannot be told a threshold the server is not using.
@@ -365,6 +382,7 @@ impl Session {
             "have_ssl",
             "hostname",
             "init_connect",
+            "inlaysql_hnsw_ef_search",
             "inlaysql_statement_text",
             "interactive_timeout",
             "license",

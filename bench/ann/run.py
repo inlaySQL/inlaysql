@@ -64,10 +64,20 @@ RESULTS = os.path.join(HERE, "results")
 # `ann_benchmarks/datasets.py` downloads from.
 BASE_URL = "http://ann-benchmarks.com"
 
-# The over-fetch sweep. `LIMIT n * over_fetch` is the only query-time dial the
-# SQL surface has — see `module.py`. 1 and 2 collapse onto the same graph walk
-# at k = 10 (`ef = max(64, 2k)`), which is itself worth showing.
-DEFAULT_QUERY_ARGS = [1, 2, 4, 8, 16, 32, 64]
+# The `ef_search` sweep — the candidate list the graph walk holds, set per
+# connection with `SET inlaysql_hnsw_ef_search`. The same values pgvector's own
+# ann-benchmarks config sweeps, so the two engines' curves are sampled at the
+# same operating points.
+#
+# This used to be an over-fetch factor (`LIMIT n * over_fetch`), because
+# `ef_search` lived only in Rust. At k = 10 the first three points of that
+# sweep all ran the identical walk — `ef = max(64, 2k)` ignores an over-fetch
+# below 3.2x — and produced three copies of one recall number.
+#
+# Every value has to be at least `--count`: a beam narrower than the answer
+# cannot hold it, and this engine refuses that rather than returning a short
+# list. `sweep_for` drops the ones that are.
+DEFAULT_QUERY_ARGS = [10, 20, 40, 80, 120, 200, 400, 800]
 
 EPSILON = 1e-3
 
@@ -208,7 +218,7 @@ def main() -> int:
     parser.add_argument(
         "--query-args",
         default=",".join(str(a) for a in DEFAULT_QUERY_ARGS),
-        help="over-fetch factors to sweep",
+        help="ef_search values to sweep (each must be >= --count)",
     )
     parser.add_argument("--quantization", default="exact", choices=["exact", "int8"])
     parser.add_argument(
@@ -274,12 +284,12 @@ def main() -> int:
             f"\nplan:    {algo.get_additional()['inlaysql_plan']}"
         )
         print(
-            f"\n{'over_fetch':>10} {'ef':>6} {'recall@' + str(options.count):>11} "
+            f"\n{'ef_search':>10} {'recall@' + str(options.count):>11} "
             f"{'QPS':>10} {'p50 ms':>9} {'p95 ms':>9} {'fmt us':>8}"
         )
         rows = []
-        for over_fetch in query_args:
-            algo.set_query_arguments(over_fetch)
+        for ef_search in sweep_for(query_args, options.count):
+            algo.set_query_arguments(ef_search)
             attrs, results = run_query_group(
                 algo, train, test, metric, options.count, options.runs
             )
@@ -297,7 +307,7 @@ def main() -> int:
                 result_path(
                     options.dataset,
                     options.count,
-                    [metric, {"quantization": options.quantization}, over_fetch],
+                    [metric, {"quantization": options.quantization}, ef_search],
                 ),
                 attrs,
                 results,
@@ -305,20 +315,40 @@ def main() -> int:
             )
             samples = sorted(elapsed for elapsed, _ in results)
             qps = 1.0 / attrs["best_search_time"]
-            effective_ef = max(64, 2 * options.count * over_fetch)
             print(
-                f"{over_fetch:>10} {effective_ef:>6} {recall:>11.4f} {qps:>10.1f} "
+                f"{ef_search:>10} {recall:>11.4f} {qps:>10.1f} "
                 f"{samples[len(samples) // 2] * 1e3:>9.3f} "
                 f"{samples[int(len(samples) * 0.95)] * 1e3:>9.3f} "
                 f"{attrs['inlaysql_literal_format_us']:>8.1f}"
             )
-            rows.append((over_fetch, recall, qps))
+            rows.append((ef_search, recall, qps))
     finally:
         algo.done()
 
     print(f"\nresults written under {os.path.relpath(RESULTS, ROOT)}/{options.dataset}/"
           f"{options.count}/inlaysql/ in ann-benchmarks' own HDF5 layout")
     return 0
+
+
+def sweep_for(query_args, count):
+    """The sweep points this run can actually ask for, narrowest first.
+
+    A candidate list narrower than the `LIMIT` cannot hold the answer, and the
+    engine refuses that query rather than returning a short list — so a sweep
+    point below `--count` would abort the run instead of producing a fast, bad
+    recall number. Dropped points are named on stderr rather than skipped
+    silently: which operating points an engine cannot be asked for is part of
+    what a benchmark is measuring.
+    """
+    usable = [ef for ef in query_args if ef >= count]
+    dropped = [ef for ef in query_args if ef < count]
+    if dropped:
+        print(
+            f"skipping ef_search {dropped}: below --count {count}, which this engine "
+            f"refuses (a beam narrower than the answer cannot hold it)",
+            file=sys.stderr,
+        )
+    return usable or [count]
 
 
 def _shell(*command: str) -> str:

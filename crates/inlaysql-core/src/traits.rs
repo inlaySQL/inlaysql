@@ -23,6 +23,7 @@ use alloc::vec::Vec;
 
 use crate::btree::{BackupSummary, Device};
 use crate::error::Result;
+use crate::hnsw::VectorMetric;
 use crate::row::RowBuf;
 
 /// Stable identifier of a row inside a table.
@@ -526,6 +527,58 @@ pub trait VectorIndex {
     /// exactly the behaviour and cost of before.
     fn search(&self, query: &[f32], k: usize, filter: Option<&RowFilter>) -> Result<Vec<Scored>>;
 
+    /// [`VectorIndex::search`] with the caller's candidate-list size imposed,
+    /// rather than the one this backend would have chosen for `k` itself.
+    ///
+    /// `ef` is the whole recall/latency trade: it is how many candidates the
+    /// walk may hold at once, so a larger one visits more of the graph and
+    /// finds more of the true neighbours, and a smaller one returns sooner and
+    /// finds fewer.
+    ///
+    /// `ef` may be **smaller than `k`**, and then fewer than `k` neighbours
+    /// come back — which is within this trait's existing contract ("up to
+    /// `k`") and is exactly what a caller asking for less latency is asking
+    /// for. What [`Engine`](crate::Engine) does guarantee is that `ef` is at
+    /// least the number of rows the *query* can return, which is `k` divided
+    /// by the engine's over-fetch; a session that asks for less than that is
+    /// refused rather than silently widened.
+    ///
+    /// **The default refuses.** A backend that has no candidate list to size
+    /// cannot honour this number, and accepting it would mean a session that
+    /// set `ef_search`, read it back, and saw it in `EXPLAIN` was searching
+    /// under a different one — the reported-but-not-enforced failure this
+    /// engine treats as worse than reporting nothing at all. A backend that
+    /// does have a beam overrides this; one that does not says so, loudly, and
+    /// a query that never asked for an `ef` still goes through
+    /// [`VectorIndex::search`] and is unaffected either way.
+    fn search_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        filter: Option<&RowFilter>,
+    ) -> Result<Vec<Scored>> {
+        let _ = (query, k, ef, filter);
+        Err(crate::error::Error::Unsupported(alloc::format!(
+            "this vector index backend has no candidate list to size, so it cannot search \
+             with ef_search = {ef}: it is exhaustive, and already returns the exact answer \
+             an unbounded ef would. Unset the session's ef_search to query it"
+        )))
+    }
+
+    /// The candidate-list size this backend would search `k` neighbours with
+    /// if nothing were imposed, or `None` for a backend that has no candidate
+    /// list at all.
+    ///
+    /// Exists for `EXPLAIN`, which reports the operating point a vector search
+    /// will run at — the number is only choosable if it is also visible, and a
+    /// plan that named an `ef` the search would not use would be describing a
+    /// query nobody ran.
+    fn ef_for(&self, k: usize) -> Option<usize> {
+        let _ = k;
+        None
+    }
+
     /// Resident bytes occupied by vector payloads, when the backend can
     /// report them. Graph/container overhead is excluded.
     fn resident_vector_bytes(&self) -> Option<usize> {
@@ -622,10 +675,23 @@ pub trait IndexFactory {
     /// Build a full-text index for `table.column`.
     fn full_text(&self, table: &str, column: &str) -> Result<Box<dyn FullTextIndex>>;
 
-    /// Build an exact vector index for `table.column`.
-    fn vector(&self, table: &str, column: &str, dim: usize) -> Result<Box<dyn VectorIndex>>;
+    /// Build an exact vector index for `table.column`, under `metric`.
+    ///
+    /// `metric` is not advice. An ANN graph's neighbour lists are the answer to
+    /// "what is near what" under one distance, so a backend that ignored this
+    /// and built a cosine graph for an index declared `vector_l2_ops` would
+    /// answer every query with plausible, wrong rows and report nothing. It is
+    /// a required parameter rather than a defaulted method for exactly that
+    /// reason: an implementor cannot fail to see it.
+    fn vector(
+        &self,
+        table: &str,
+        column: &str,
+        dim: usize,
+        metric: VectorMetric,
+    ) -> Result<Box<dyn VectorIndex>>;
 
-    /// Build an int8 vector index for `table.column`.
+    /// Build an int8 vector index for `table.column`, under `metric`.
     ///
     /// Existing factories remain source-compatible and exact by default.
     /// Backends that store quantised vectors override this method.
@@ -634,8 +700,9 @@ pub trait IndexFactory {
         table: &str,
         column: &str,
         dim: usize,
+        metric: VectorMetric,
     ) -> Result<Box<dyn VectorIndex>> {
-        self.vector(table, column, dim)
+        self.vector(table, column, dim, metric)
     }
 }
 
@@ -827,6 +894,33 @@ impl core::fmt::Debug for Interrupt {
             .field("armed", &self.signal.is_some())
             .finish()
     }
+}
+
+/// The only way the core can be told what operating point a session wants its
+/// vector searches run at.
+///
+/// The same seam as [`Cancel`], and for the same reason: `inlaysql-core` has no
+/// notion of a session, so a number one session chose and another did not can
+/// only arrive from outside. A host that installs nothing leaves every index's
+/// own tuning in force, which is exactly what every query did before this
+/// existed.
+///
+/// # Why it is a handle and not a copied number
+///
+/// The value is read at search time, through whatever the host installed, so
+/// there is one place it lives. The alternative — the host writing its number
+/// into the engine on every change — is two copies of one setting, and two
+/// copies is how a server ends up reporting an `ef_search` it is not searching
+/// with. `inlaysql-server` installs a handle onto the same per-connection state
+/// `@@inlaysql_hnsw_ef_search` is answered from, so the reported number cannot
+/// be a different number from the enforced one; it is the same load.
+pub trait VectorTuning {
+    /// The candidate-list size (`ef`) every vector search must use, or `None`
+    /// to leave each index's own `ef_search` in force.
+    ///
+    /// Called once per vector search — not per row and not per distance
+    /// computation — so it may read shared state, but it must not block.
+    fn ef_search(&self) -> Option<usize>;
 }
 
 /// The only way the core can obtain randomness.

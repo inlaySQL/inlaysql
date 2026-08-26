@@ -59,6 +59,41 @@ impl Q8Vector {
         integer_dot as f32 * scale
     }
 
+    /// Approximate squared Euclidean distance to a full-precision vector.
+    ///
+    /// Reconstructs `code * scale` per component rather than dequantising into
+    /// a `Vec` first, for the same reason [`Q8Vector::dot_f32`] does. Unlike
+    /// the dot products above this one is *not* scale-invariant — squared
+    /// distance is what L2 measures, and the quantisation error rides along
+    /// with it — which is why the int8 recall loss under L2 is measured
+    /// separately from the exact one rather than assumed to be the same.
+    pub(crate) fn l2_f32(&self, other: &[f32]) -> f32 {
+        self.values
+            .iter()
+            .zip(other)
+            .map(|(left, right)| {
+                let delta = *left as f32 * self.scale - *right;
+                delta * delta
+            })
+            .sum()
+    }
+
+    /// Approximate squared Euclidean distance between two quantised vectors.
+    ///
+    /// The integer trick [`Q8Vector::dot_q8`] uses does not apply: the two
+    /// vectors carry different scales, so the difference has to be taken after
+    /// reconstruction, not before.
+    pub(crate) fn l2_q8(&self, other: &Self) -> f32 {
+        self.values
+            .iter()
+            .zip(&other.values)
+            .map(|(left, right)| {
+                let delta = *left as f32 * self.scale - *right as f32 * other.scale;
+                delta * delta
+            })
+            .sum()
+    }
+
     pub(crate) fn payload_bytes(&self) -> usize {
         core::mem::size_of::<f32>() + self.values.len()
     }

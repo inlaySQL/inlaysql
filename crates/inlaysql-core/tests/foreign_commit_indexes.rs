@@ -263,9 +263,10 @@ impl IndexFactory for CountingFactory {
         _table: &str,
         _column: &str,
         dim: usize,
+        metric: inlaysql_core::hnsw::VectorMetric,
     ) -> inlaysql_core::Result<Box<dyn VectorIndex>> {
         Ok(Box::new(CountingVector {
-            inner: BruteForceVectorIndex::new(dim),
+            inner: BruteForceVectorIndex::with_metric(dim, metric),
             work: self.work.clone(),
         }))
     }
