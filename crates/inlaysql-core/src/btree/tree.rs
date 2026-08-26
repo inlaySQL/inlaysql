@@ -1512,6 +1512,29 @@ impl<D: Device> CowBTree<D> {
             after,
             limit,
         };
+        self.walk_raw_row_ids(self.read_root(), &bounds, self.has_pending, &mut out)?;
+        Ok(out)
+    }
+
+    /// Decoded-node parity oracle for [`CowBTree::scan_range_row_ids_from`].
+    #[cfg(test)]
+    fn scan_range_row_ids_decoded_from(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<RowId>> {
+        let mut out = Vec::new();
+        if limit == 0 || end.is_some_and(|end| end <= start) {
+            return Ok(out);
+        }
+        let bounds = WalkBounds {
+            start,
+            end,
+            after,
+            limit,
+        };
         self.walk_row_ids(self.read_root(), &bounds, self.has_pending, &mut out)?;
         Ok(out)
     }
@@ -2368,6 +2391,25 @@ impl<D: Device> CowBTree<D> {
         })
     }
 
+    /// Push every admitted row id of one leaf page into `out`.
+    fn scan_leaf_row_ids_into(
+        &self,
+        bytes: &[u8],
+        bounds: &WalkBounds<'_>,
+        out: &mut Vec<RowId>,
+    ) -> Result<()> {
+        page::scan_leaf_cells(bytes, self.page_size, |key, _value| {
+            if out.len() >= bounds.limit {
+                return Ok(());
+            }
+            if !bounds.admits(key) {
+                return Ok(());
+            }
+            out.push(trailing_row_id(key)?);
+            Ok(())
+        })
+    }
+
     /// Read one page into the reusable scratch buffer and hand it to `f`.
     ///
     /// The buffer is what removes the per-read heap allocation the tree used to
@@ -2599,8 +2641,7 @@ impl<D: Device> CowBTree<D> {
         Ok(())
     }
 
-    /// [`CowBTree::walk`]'s row-id-only sibling, for
-    /// [`CowBTree::scan_range_row_ids_from`].
+    /// Decoded-node row-id walk, retained as the raw-leaf path's test oracle.
     ///
     /// The internal-node branch is [`CowBTree::walk`]'s, unchanged: pruning is
     /// entirely [`WalkBounds::admits`] and [`WalkBounds::starts_below`], so the
@@ -2608,6 +2649,7 @@ impl<D: Device> CowBTree<D> {
     /// ever differ in what they do with one once it is admitted. Only the leaf
     /// branch differs — no key clone, no [`CowBTree::resolve_value_at`], just
     /// the row id out of the entry already in hand.
+    #[cfg(test)]
     fn walk_row_ids(
         &self,
         id: PageId,
@@ -2653,6 +2695,86 @@ impl<D: Device> CowBTree<D> {
                     if below_upper && above_lower {
                         self.walk_row_ids(separator.child, bounds, pending, out)?;
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [`CowBTree::walk`]'s raw-leaf row-id sibling, for
+    /// [`CowBTree::scan_range_row_ids_from`].
+    ///
+    /// Internal nodes follow the decoded walk's pruning and cache rules. Leaf
+    /// pages are parsed in place, and only the trailing row id is retained.
+    fn walk_raw_row_ids(
+        &self,
+        id: PageId,
+        bounds: &WalkBounds<'_>,
+        pending: bool,
+        out: &mut Vec<RowId>,
+    ) -> Result<()> {
+        if id == 0 || out.len() >= bounds.limit {
+            return Ok(());
+        }
+
+        let cached = match self.cached_page(id, pending) {
+            Some(node) => match &*node {
+                Node::Leaf { bytes, .. } => {
+                    self.scan_leaf_row_ids_into(bytes, bounds, out)?;
+                    return Ok(());
+                }
+                Node::Internal { .. } => Some(node),
+            },
+            None => None,
+        };
+
+        let internal = match cached {
+            Some(node) => Some(node),
+            None => {
+                let decoded = self.with_raw_page(id, pending, |page_size, bytes| {
+                    match bytes[page::OFF_KIND] {
+                        page::KIND_LEAF => {
+                            self.scan_leaf_row_ids_into(bytes, bounds, out)?;
+                            Ok(None)
+                        }
+                        page::KIND_INTERNAL => Ok(Some(Rc::new(page::decode(page_size, bytes)?))),
+                        other => Err(Error::Corrupt(alloc::format!("unknown node kind {other}"))),
+                    }
+                })?;
+                if let Some(node) = &decoded {
+                    self.cache_committed(id, pending, node);
+                }
+                decoded
+            }
+        };
+
+        if let Some(node) = internal {
+            let Node::Internal {
+                bytes,
+                leftmost,
+                cells,
+            } = &*node
+            else {
+                return Ok(());
+            };
+            let (leftmost, cells) = (*leftmost, cells);
+            if cells.is_empty() || bounds.starts_below(cells[0].key.resolve(bytes)) {
+                self.walk_raw_row_ids(leftmost, bounds, pending, out)?;
+            }
+            for (i, separator) in cells.iter().enumerate() {
+                if out.len() >= bounds.limit {
+                    return Ok(());
+                }
+                let below_upper = match bounds.end {
+                    Some(end) => separator.key.resolve(bytes) < end,
+                    None => true,
+                };
+                let above_lower = match cells.get(i + 1) {
+                    Some(next) => bounds.starts_below(next.key.resolve(bytes)),
+                    None => true,
+                };
+                if below_upper && above_lower {
+                    self.walk_raw_row_ids(separator.child, bounds, pending, out)?;
                 }
             }
         }
@@ -3959,12 +4081,10 @@ mod tests {
             .is_empty());
     }
 
-    /// `AHL-479`'s fast path against the walk it replaces: over the same
-    /// range, [`CowBTree::scan_range_row_ids_from`] must return exactly the
-    /// row ids [`CowBTree::scan_range_from`] plus the ordinary trailing-eight-
-    /// bytes decode does, in the same order — the discipline `AGENTS.md` asks
-    /// of a new fast path next to the slow one it sits beside, since the two
-    /// now share a pruning rule ([`WalkBounds`]) but not a leaf branch.
+    /// `AHL-479`'s raw-leaf fast path against the decoded walk it replaces:
+    /// over the same range, [`CowBTree::scan_range_row_ids_from`] must return
+    /// exactly the same row ids in the same order. The general entry walk is
+    /// also checked, so both row-id paths stay tied to the stored key shape.
     ///
     /// Keys here are shaped like real index entries — several row ids sharing
     /// one encoded value, then the row id big-endian on the end
@@ -4010,8 +4130,11 @@ mod tests {
 
         let assert_agrees =
             |start: &[u8], end: Option<&[u8]>, after: Option<&[u8]>, limit: usize| {
-                let by_row_id = db
+                let by_raw = db
                     .scan_range_row_ids_from(start, end, after, limit)
+                    .unwrap();
+                let by_decoded = db
+                    .scan_range_row_ids_decoded_from(start, end, after, limit)
                     .unwrap();
                 let by_general_walk: Vec<RowId> = db
                     .scan_range_from(start, end, after, limit)
@@ -4020,9 +4143,14 @@ mod tests {
                     .map(|(key, _)| decode(key))
                     .collect();
                 assert_eq!(
-                    by_row_id, by_general_walk,
-                    "row-id walk disagreed with the general walk over [{start:?}, {end:?}) after \
-                 {after:?} limit {limit}"
+                    by_raw, by_decoded,
+                    "raw row-id walk disagreed with decoded walk over \
+                 [{start:?}, {end:?}) after {after:?} limit {limit}"
+                );
+                assert_eq!(
+                    by_raw, by_general_walk,
+                    "row-id walk disagreed with general walk over [{start:?}, {end:?}) \
+                 after {after:?} limit {limit}"
                 );
             };
 
@@ -4082,6 +4210,88 @@ mod tests {
             .scan_range_row_ids_from(&start, Some(&end), None, 0)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn a_raw_row_id_walk_agrees_through_dirty_rewrites_and_transactions() {
+        let entry = |value: u32, id: u64| {
+            let mut key = b"\x01idx:i\0".to_vec();
+            key.extend_from_slice(&value.to_be_bytes());
+            key.extend_from_slice(&(value as u64 * 3 + id).to_be_bytes());
+            key
+        };
+        let prefix = b"\x01idx:i\0";
+        let upper = prefix_upper_bound(prefix);
+        let scan_decoded = |db: &CowBTree<SimDisk>| {
+            db.scan_range_row_ids_decoded_from(prefix, upper.as_deref(), None, usize::MAX)
+                .unwrap()
+        };
+
+        let mut db = CowBTree::create(disk(), PAGE).unwrap();
+        // Enough committed entries for the rewrites below to include internal
+        // pages as well as the target leaves.
+        for value in 0..180u32 {
+            for id in 0..3u64 {
+                db.put(&entry(value, id), &[]).unwrap();
+            }
+            if value % 30 == 29 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+
+        let baseline = db
+            .scan_range_row_ids_from(prefix, upper.as_deref(), None, usize::MAX)
+            .unwrap();
+        assert_eq!(baseline, scan_decoded(&db));
+
+        // Rewrite an existing leaf and add a distant key in the same open
+        // transaction, forcing copy-on-write leaf and internal pages.
+        db.put(&entry(20, 1), b"updated").unwrap();
+        db.put(&entry(500, 0), &[]).unwrap();
+        assert!(db
+            .dirty
+            .values()
+            .any(|bytes| matches!(page::decode(PAGE, bytes), Ok(Node::Leaf { .. }))));
+        assert!(db
+            .dirty
+            .values()
+            .any(|bytes| matches!(page::decode(PAGE, bytes), Ok(Node::Internal { .. }))));
+
+        let dirty_raw = db
+            .scan_range_row_ids_from(prefix, upper.as_deref(), None, usize::MAX)
+            .unwrap();
+        assert_eq!(dirty_raw, scan_decoded(&db));
+        assert_eq!(dirty_raw.len(), baseline.len() + 1);
+        assert!(dirty_raw.contains(&1500));
+
+        db.rollback();
+        assert!(!db.is_dirty());
+        assert_eq!(
+            db.scan_range_row_ids_from(prefix, upper.as_deref(), None, usize::MAX)
+                .unwrap(),
+            baseline
+        );
+
+        // A fresh dirty rewrite commits and remains visible after reopening.
+        db.put(&entry(200, 0), &[]).unwrap();
+        db.put(&entry(201, 1), &[]).unwrap();
+        let committed_pending = db
+            .scan_range_row_ids_from(prefix, upper.as_deref(), None, usize::MAX)
+            .unwrap();
+        assert_eq!(committed_pending, scan_decoded(&db));
+        assert_eq!(committed_pending.len(), baseline.len() + 2);
+        assert!(committed_pending.ends_with(&[600, 604]));
+
+        db.commit().unwrap();
+        assert!(!db.is_dirty());
+        let reopened = reopen(&db);
+        assert_eq!(
+            reopened
+                .scan_range_row_ids_from(prefix, upper.as_deref(), None, usize::MAX)
+                .unwrap(),
+            committed_pending
+        );
     }
 
     /// The row-id-and-value walk is the table scan's fast path, so it has to
