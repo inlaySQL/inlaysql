@@ -46,6 +46,7 @@ cargo test --workspace          # everything below except the sweeps and the fuz
 | MCP wire protocol | `crates/inlaysql-mcp/tests/client.rs` | every push |
 | Benchmarks vs SQLite and sqlite-vec | `bench/run.sh` | nightly, results published |
 | Benchmarks vs DuckDB and pgvector | `bench/compare.sh` | nightly where Docker exists |
+| Repeated-run report parsing and parity crossings | `bench/test_summarise.py` | every push |
 
 Four workflows, because they answer different questions.
 [`ci.yml`](.github/workflows/ci.yml) answers "is this change correct enough to

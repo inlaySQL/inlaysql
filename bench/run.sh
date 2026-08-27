@@ -55,8 +55,12 @@ if [[ "$BENCH_MAX_LOAD_PER_CPU" != "off" ]]; then
     echo "could not read logical CPU count/load average; set BENCH_MAX_LOAD_PER_CPU=off to override" >&2
     exit 3
   fi
-  if awk -v load="$LOAD_1" -v cpus="$CPU_COUNT" -v max="$BENCH_MAX_LOAD_PER_CPU" \
-    'BEGIN { exit !(load / cpus > max) }'; then
+  # `load` is a built-in function name in gawk.  Using it as an assigned
+  # variable works with some awk implementations but makes the benchmark
+  # guard itself fail before a run on GNU/Linux, which is where CI and the
+  # published benchmark runner execute.
+  if awk -v load_avg="$LOAD_1" -v cpus="$CPU_COUNT" -v max="$BENCH_MAX_LOAD_PER_CPU" \
+    'BEGIN { exit !(load_avg / cpus > max) }'; then
     echo "machine load ${LOAD_1}/${CPU_COUNT} exceeds BENCH_MAX_LOAD_PER_CPU=${BENCH_MAX_LOAD_PER_CPU}; refusing benchmark" >&2
     echo "set BENCH_MAX_LOAD_PER_CPU=off only for a deliberate under-load run" >&2
     exit 3

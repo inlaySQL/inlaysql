@@ -297,7 +297,12 @@ fn inlaysql_joins(
             // matching InlaySQL API rather than retaining a `Vec<Vec<Value>>`
             // that the workload only inspects for its count.
             let rows_returned = db.query_prepared_each(stmt, &[], |_| Ok(()))?;
-            debug_assert_eq!(rows_returned, expected, "row count changed between runs");
+            if rows_returned != expected {
+                return Err(format!(
+                    "{label} returned {rows_returned} rows during a join benchmark; expected {expected}"
+                )
+                .into());
+            }
             samples.push(at.elapsed());
         }
         Ok(Timing {
@@ -388,8 +393,16 @@ fn sqlite_joins(
                     let b: rusqlite::types::Value = row.get(1)?;
                     Ok((a, b))
                 })?
-                .count();
-            debug_assert_eq!(rows_returned, expected, "row count changed between runs");
+                .try_fold(0usize, |count, row| {
+                    row?;
+                    Ok::<_, rusqlite::Error>(count + 1)
+                })?;
+            if rows_returned != expected {
+                return Err(format!(
+                    "{label} returned {rows_returned} rows during a join benchmark; expected {expected}"
+                )
+                .into());
+            }
             samples.push(at.elapsed());
         }
         Ok(Timing {
