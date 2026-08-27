@@ -9,6 +9,10 @@ SUITE=vectors ./bench/run.sh        # just the ANN comparison
 SUITE=concurrency ./bench/run.sh    # just the concurrent-writer comparison
 SUITE=retrieval ./bench/run.sh      # just the retrieval workload
 
+# Focus on the writer counts being compared.
+WRITER_LEVELS=1,32 SUITE=concurrency ./bench/run.sh
+WRITER_LEVELS=1,128 SUITE=concurrency ./bench/run.sh
+
 ./bench/compare.sh                  # vs DuckDB, pgvector, MySQL, PostgreSQL (needs Docker)
 
 REPEATS=5 ./bench/repeat.sh         # run.sh five times, report the median and the spread

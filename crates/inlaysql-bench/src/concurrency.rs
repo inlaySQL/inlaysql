@@ -73,8 +73,8 @@ impl Outcome {
 pub fn run(config: &Config, dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let counts = writer_counts(config.writers);
     println!(
-        "\n=== concurrent writers: {} transactions per writer, one row each, OS threads ===",
-        config.txns
+        "\n=== concurrent writers: {} transactions per writer, one row each, OS threads; levels {counts:?} ===",
+        config.txns,
     );
     println!(
         "(InlaySQL writers flush separate WAL regions in parallel. SQLite's writers\n\
@@ -147,9 +147,27 @@ impl Outcome {
     }
 }
 
-/// The writer counts to sweep: 1 (the baseline) up to the requested maximum,
-/// doubling. Single-writer throughput is what every other row is read against.
+/// The writer counts to sweep: `WRITER_LEVELS` can focus the run on an
+/// explicit comma-separated set (for example `1,32` or `1,128`); otherwise it
+/// uses 1 (the baseline) up to the requested maximum, doubling. Single-writer
+/// throughput is what every other row is read against.
 fn writer_counts(max: usize) -> Vec<usize> {
+    if let Ok(raw) = std::env::var("WRITER_LEVELS") {
+        let mut levels = Vec::new();
+        for value in raw.split(',') {
+            match value.trim().parse::<usize>() {
+                Ok(level) if level > 0 => levels.push(level),
+                _ => eprintln!("ignoring invalid WRITER_LEVELS entry {value:?}"),
+            }
+        }
+        levels.sort_unstable();
+        levels.dedup();
+        if !levels.is_empty() {
+            return levels;
+        }
+        eprintln!("WRITER_LEVELS had no positive entries; using the default sweep");
+    }
+
     let mut counts = Vec::new();
     let mut writers = 1;
     while writers <= max.max(1) {
