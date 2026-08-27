@@ -6946,6 +6946,37 @@ fn evaluate_window_partition(
                 position = end + 1;
             }
         }
+        // Verified against sqlite3 3.54, ties included: both are the same
+        // rank-family loop as `RANK`/`DENSE_RANK` above, just a different
+        // formula per peer group instead of an integer.
+        WindowFunc::PercentRank => {
+            let mut rank = 1i64;
+            let mut position = 0;
+            while position < n {
+                let end = peer_end[position];
+                let value = Value::Real(if n <= 1 {
+                    0.0
+                } else {
+                    (rank - 1) as f64 / (n - 1) as f64
+                });
+                for &row_index in &sequence[position..=end] {
+                    rows[row_index].windows[window_index] = value.clone();
+                }
+                rank += (end - position + 1) as i64;
+                position = end + 1;
+            }
+        }
+        WindowFunc::CumeDist => {
+            let mut position = 0;
+            while position < n {
+                let end = peer_end[position];
+                let value = Value::Real((end + 1) as f64 / n as f64);
+                for &row_index in &sequence[position..=end] {
+                    rows[row_index].windows[window_index] = value.clone();
+                }
+                position = end + 1;
+            }
+        }
         WindowFunc::Ntile => {
             let buckets = match eval::evaluate(&wf.args[0], &[], Computed::NONE, env)? {
                 Value::Integer(n) => n,

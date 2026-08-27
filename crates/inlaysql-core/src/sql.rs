@@ -5393,20 +5393,8 @@ fn resolve_window_function(
         "max" => WindowFunc::Agg(AggFunc::Max),
         "avg" => WindowFunc::Agg(AggFunc::Avg),
         "group_concat" => WindowFunc::Agg(AggFunc::GroupConcat),
-        // SQLite ships both of these as window functions too — confirmed
-        // against sqlite3 3.54 — but neither is implemented; named here
-        // rather than falling into the generic "no such window function"
-        // below so the refusal says what it is, pinned in `unsupported.test`.
-        "percent_rank" => {
-            return Err(Error::Unsupported(
-                "percent_rank() is not supported".to_string(),
-            ))
-        }
-        "cume_dist" => {
-            return Err(Error::Unsupported(
-                "cume_dist() is not supported".to_string(),
-            ));
-        }
+        "percent_rank" => WindowFunc::PercentRank,
+        "cume_dist" => WindowFunc::CumeDist,
         _ => {
             return Err(Error::Unsupported(alloc::format!(
                 "{name}() may not be used as a window function"
@@ -5456,7 +5444,11 @@ fn resolve_window_function(
     let before_windows = binder.windows.len();
 
     let args = match func {
-        WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => {
+        WindowFunc::RowNumber
+        | WindowFunc::Rank
+        | WindowFunc::DenseRank
+        | WindowFunc::PercentRank
+        | WindowFunc::CumeDist => {
             if !raw_args.is_empty() {
                 return Err(arity_error(&name, 0, raw_args.len()));
             }

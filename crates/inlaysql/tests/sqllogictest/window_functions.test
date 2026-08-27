@@ -24,6 +24,20 @@ SELECT id, v, row_number() OVER (ORDER BY v), rank() OVER (ORDER BY v), dense_ra
 4 5 2 2 2
 5 NULL 1 1 1
 
+# `percent_rank`/`cume_dist`, same tie and NULL. `percent_rank` is
+# `(rank() - 1) / (partition size - 1)`; `cume_dist` is the fraction of the
+# partition at or before this row's peer group, so the tied pair both answer
+# `1.0` — they are the whole partition's last peer group.
+
+query IRR nosort
+SELECT id, percent_rank() OVER (ORDER BY v), cume_dist() OVER (ORDER BY v) FROM t ORDER BY id
+----
+1 0.5 0.6
+2 0.75 1.0
+3 0.75 1.0
+4 0.25 0.4
+5 0.0 0.2
+
 # `ORDER BY v NULLS LAST` — the same query with an explicit placement that
 # actually changes the answer (ascending defaults to NULLS FIRST, so the
 # unadorned form above already put the NULL row first).

@@ -2151,6 +2151,18 @@ pub enum WindowFunc {
     /// evenly (confirmed against sqlite3: 5 rows into 2 buckets is 3 then 2,
     /// not 2 then 3). `n` must be a positive integer. Ignores the frame.
     Ntile,
+    /// `percent_rank()` — `(rank() - 1) / (partition size - 1)` as a real,
+    /// `0.0` for a one-row partition rather than a division by zero.
+    /// Confirmed against sqlite3 3.54, ties included: `Self::Rank`'s value is
+    /// the peer group's own rank, so a tied group answers with its shared
+    /// rank exactly as `rank()` does. Ignores the frame.
+    PercentRank,
+    /// `cume_dist()` — the fraction of the partition at or before the
+    /// current row's peer group: `(peer group's last position + 1) /
+    /// partition size`. Confirmed against sqlite3 3.54: with no `ORDER BY`
+    /// the whole partition is one peer group, so every row answers `1.0`.
+    /// Ignores the frame.
+    CumeDist,
     /// `lag(expr[, offset[, default]])` — `expr` evaluated `offset` rows
     /// (default 1) back in the `ORDER BY` sequence, or `default` (default
     /// `NULL`) when that position falls outside the partition. A negative

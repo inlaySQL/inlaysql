@@ -539,14 +539,16 @@ re-evaluated per outer row — and one in an `UPDATE`, `DELETE` or
 
 Window functions too, since AHL-494: `OVER (PARTITION BY ... ORDER BY ...)`
 under SQLite's own grammar — `row_number`, `rank`, `dense_rank`, `ntile`,
-`lag`/`lead`, `first_value`/`last_value`/`nth_value`, the aggregate family
+`lag`/`lead`, `first_value`/`last_value`/`nth_value`, `percent_rank`,
+`cume_dist`, the aggregate family
 (`sum`/`count`/`avg`/`min`/`max`/`group_concat`) `OVER (...)`, `ROWS` frames
 and SQLite's implicit default frame, named windows (`WINDOW w AS (...)`), and
-`FILTER (WHERE ...)` on an aggregate whether or not it is windowed.
-`percent_rank()`, `cume_dist()` and an explicit `RANGE`/`GROUPS` frame are
-refused by name rather than approximated with the `ROWS` frame this engine
-has. They reach the MySQL server unchanged, since MySQL 8 spells every one of
-them the same way — [`docs/server.md`](docs/server.md) has that argument.
+`FILTER (WHERE ...)` on an aggregate whether or not it is windowed. An
+explicit `RANGE`/`GROUPS` frame is refused by name rather than approximated
+with the `ROWS` frame this engine has — a value-based `RANGE` answers a
+different question than a position-based one the moment `ORDER BY` has ties.
+They reach the MySQL server unchanged, since MySQL 8 spells every one of them
+the same way — [`docs/server.md`](docs/server.md) has that argument.
 
 `UNION`/`INTERSECT`/`EXCEPT` and non-recursive `WITH`, since AHL-473. Every
 compound operator shares one precedence and chains left-associatively; the
@@ -560,14 +562,13 @@ pinned as such in `ctes.test`. `WITH RECURSIVE` is refused, named in the
 message.
 
 Not yet, and refused explicitly rather than silently ignored: `WITH
-RECURSIVE`, `percent_rank()`/`cume_dist()` and explicit `RANGE`/`GROUPS`
-window frames (the rest of the window family landed with AHL-494, above),
-`SAVEPOINT`, the partial-write conflict resolutions (`INSERT OR
-ROLLBACK`/`OR FAIL`, `UPDATE OR REPLACE`/`OR IGNORE` — a statement here is
-already atomic, so they cannot mean what they say), `CREATE TABLE ... AS
-SELECT`, `TEMPORARY`, `WITHOUT ROWID`, `STRICT`, the `AUTOINCREMENT` keyword,
-`COUNT(DISTINCT *)`, `GROUP_CONCAT(DISTINCT ...)`, and a collation this engine
-does not have (there is no `CREATE COLLATION`, so a name outside
+RECURSIVE`, an explicit `RANGE`/`GROUPS` window frame (the rest of the window
+family landed with AHL-494, above), `SAVEPOINT`, the partial-write conflict
+resolutions (`INSERT OR ROLLBACK`/`OR FAIL`, `UPDATE OR REPLACE`/`OR IGNORE` —
+a statement here is already atomic, so they cannot mean what they say),
+`CREATE TEMPORARY TABLE`, `WITHOUT ROWID`, `STRICT`, the `AUTOINCREMENT`
+keyword, `COUNT(DISTINCT *)`, `GROUP_CONCAT(DISTINCT ...)`, and a collation
+this engine does not have (there is no `CREATE COLLATION`, so a name outside
 `BINARY`/`NOCASE`/`RTRIM` is refused rather than silently compared byte-wise
 under a name that promises otherwise).
 

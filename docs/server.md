@@ -1424,13 +1424,11 @@ reaches the engine and works — this is SQLite's dialect being a strict
 superset here, the same shape `->`/`->>` are in the JSON section above — but
 it is not something a MySQL-wire client should be expected to send.
 
-`percent_rank()` and `cume_dist()`, which SQLite also ships as window
-functions, are not implemented and are refused with the ordinary `1235`
+An explicit `RANGE`/`GROUPS` frame is refused with the ordinary `1235`
 (`crates/inlaysql-server/tests/wire.rs`'s "still refused" probe uses exactly
-this). An explicit `RANGE`/`GROUPS` frame is refused the same way — see
-`crates/inlaysql/tests/sqllogictest/unsupported.test` and `WindowFrame`'s doc
-in `plan.rs` for why a value-based frame is not silently treated as the
-position-based `ROWS` this engine implements.
+this) — see `crates/inlaysql/tests/sqllogictest/unsupported.test` and
+`WindowFrame`'s doc in `plan.rs` for why a value-based frame is not silently
+treated as the position-based `ROWS` this engine implements.
 
 ### MySQL-only DDL is translated, not invented
 
@@ -2104,13 +2102,14 @@ the comparison-affinity gap that used to be item 2:
    `SQRT`, `CEIL`, `FLOOR`, `TRUNCATE`, `SIGN` — and no padding or hashing
    (`LPAD`, `REPEAT`, `MD5`). **Core's**, if they are wanted; a shim cannot
    invent an arithmetic primitive.
-2. **`percent_rank()`/`cume_dist()` and a value-based `RANGE`/`GROUPS`
-   window frame are refused (1235).** AHL-494 implemented the rest of the
-   window function surface — see
-   [Window functions](#window-functions-ahl-494) above — and both gaps are
-   the engine's, not the shim's, the same way item 1 above is.
+2. **A value-based `RANGE`/`GROUPS` window frame is refused (1235).** AHL-494
+   implemented the rest of the window function surface — see
+   [Window functions](#window-functions-ahl-494) above — and this gap is
+   the engine's, not the shim's, the same way item 1 above is. `percent_rank()`
+   and `cume_dist()`, which used to be refused alongside it, are implemented
+   now — see `crates/inlaysql/tests/sqllogictest/window_functions.test`.
 
-Those two items are the engine's to fix, not the shim's — every shape
+That item is the engine's to fix, not the shim's — every shape
 this shim could plausibly translate has been, now. The shim's own
 already-confirmed gaps in this list were the untranslated
 `ALTER TABLE`/`TRUNCATE`/`RENAME TABLE` shapes, which is what AHL-474 closed;

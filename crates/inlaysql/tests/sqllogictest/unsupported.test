@@ -358,14 +358,8 @@ SELECT id FROM t LIMIT id
 # `ROWS` frames, named windows and `FILTER (WHERE ...)` — see
 # `window_functions.test`. What is still refused, on purpose, is below.
 
-# SQLite ships `percent_rank()`/`cume_dist()` as window functions too, but
-# neither is implemented here.
-
-statement error
-SELECT percent_rank() OVER (ORDER BY id) FROM t
-
-statement error
-SELECT cume_dist() OVER (ORDER BY id) FROM t
+# `percent_rank()`/`cume_dist()` are implemented — see
+# `window_functions.test`.
 
 # `ROWS` frames are implemented; `RANGE`/`GROUPS` frames with an explicit
 # value-based bound are not — a value-based `RANGE` answers a different
