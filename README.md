@@ -586,7 +586,7 @@ cargo run -p inlaysql --bin sqllogictest -- \
   crates/inlaysql/tests/sqllogictest/*.test          # print the pass rate
 ```
 
-Current pass rate over the subset: **1145/1145 (100%)** — covering `CREATE TABLE`,
+Current pass rate over the subset: **1165/1165 (100%)** — covering `CREATE TABLE`,
 `INSERT`, projection, `WHERE`, `DISTINCT`, `ORDER BY` (column, expression,
 alias, multi-key, `NULLS FIRST`/`LAST`), `LIMIT`/`OFFSET` (literal or bound),
 type coercion and affinity, `SELECT`-without-`FROM` scalar expressions,
@@ -605,7 +605,8 @@ SQLite's own rules, declared constraints (`DEFAULT`, `NOT NULL`, `UNIQUE`,
 `REPLACE`, `ON CONFLICT DO NOTHING`/`DO UPDATE`) and `RETURNING`, subqueries
 in every read position (scalar, `IN (SELECT ...)`, `EXISTS`, derived tables,
 correlated and uncorrelated), `UNION`/`INTERSECT`/`EXCEPT`/non-recursive
-`WITH`, and the window functions of AHL-494 (`window_functions.test`). The
+`WITH`, `CREATE TABLE ... AS SELECT`, and the window functions of AHL-494
+including `percent_rank`/`cume_dist` (`window_functions.test`). The
 number is meant to grow (and be reported) as the dialect matures — it does not
 yet include the parts of the corpus that exercise `WITH RECURSIVE`, because
 the dialect does not have it.
