@@ -85,6 +85,16 @@ conflicts:
 These are still diagnostic: the 32-writer row's spread is just over the
 repository's 10% reporting bar, and the 128-writer row is similarly noisy.
 
+Commit `e6e8075` then moved the local concurrency timer past handle opening
+and lock setup, so the timed boundary matches SQLite's. The setup-separated
+32-writer repeat measured 540 commits/s at 32 and 249 at one writer:
+[`bench/results/20260827T080715Z-repeat.txt`](../../bench/results/20260827T080715Z-repeat.txt).
+The matching 128-writer repeat measured 517 commits/s at 128 and 643 at 32:
+[`bench/results/20260827T081143Z-repeat.txt`](../../bench/results/20260827T081143Z-repeat.txt).
+Zero conflicts held, but the spread remains too wide for a headline (up to
+35.1% in the 128-writer sweep). Separating setup did not remove the
+coordination plateau; it only made the next measurement boundary honest.
+
 With `INLAYSQL_COMMIT_STATS=1`, the 32-writer run reported 3,252 normal
 tickets covered by 1,350 normal flushes (about 2.4 tickets per flush). The
 diagnostic is opt-in and printed when the shared coordinator is dropped; it
@@ -97,7 +107,8 @@ barrier releases the already-open workers together; process startup remains in
 the server-to-server harness because that driver is explicitly testing a
 client/server connection's full phase cost. The next W3 run should therefore
 attribute its steady-state result to the coordinator rather than to handle
-setup.
+setup. The setup-separated results above show that it does not by itself close
+the plateau.
 
 ## What the external protocols imply
 
