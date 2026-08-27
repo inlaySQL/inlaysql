@@ -33,22 +33,27 @@ blocks [2 + 4 * WAL_BLOCKS, ...) data     (copy-on-write B-tree pages)
 
 ## Commit protocol (write-ahead)
 
-A commit is one short reservation followed by a single `sync`:
+A normal commit is one short reservation, one ready-ticket publication and a
+single grouped `sync_commit`:
 
 1. Under the process-local commit gate, refresh the committed root and apply
    first-committer-wins. A stale transaction whose row keys are disjoint is
    rebased; an overlapping row change returns `Error::Conflict`. Reserve the
-   next sequence/page range and append position, then leave the gate.
-2. Write the transaction's dirty pages to the data area. They are fresh,
-   never-before-used page ids, so a partial write can never clobber live data.
-   Ids within one transaction are allocated consecutively, so this is normally
-   one device write for the whole commit rather than one per page.
-3. Append a commit record to this handle's WAL region. Besides its new root,
-   next-free-page and copied pages, it names the exact predecessor sequence and
-   root, making the cross-region order explicit.
-4. `sync` the handle outside the gate. This is the commit point: the record and
-   its pages become durable together. Other handles can sync their own regions
-   at the same time.
+   next sequence/page range and append position.
+2. Still under the gate, write the transaction's dirty pages to the data area
+   and append its WAL record. The pages use fresh, never-before-used ids, so a
+   partial write can never clobber live data. The record names the exact
+   predecessor sequence and root, making the cross-region order explicit.
+3. After every data/page and WAL write has returned, publish a normal-commit
+   durability ticket, then release the gate. Publishing at this boundary lets
+   a different handle's flush cover the bytes without treating a transaction
+   that has not written yet as durable.
+4. `sync_commit` runs outside the gate. One handle becomes flush leader and
+   may give other active normal committers a bounded chance to publish their
+   tickets; the final target is loaded immediately before `fsync`. A covered
+   follower returns without another barrier. Checkpoints are the deliberate
+   exception: their state-block sync remains an ordinary in-gate `sync` and
+   never enters the normal-commit cohort.
 
 Step 1's "refresh the committed root" is where the gate's cost lives, and it is
 why the gate is where concurrent-writer throughput was decided. Deriving the
@@ -107,17 +112,18 @@ AHL-406, and it recovered a database to a tree made of two different commits at
 once, with no checksum or decode failing anywhere.
 
 Step 4 is where group commit lives (`FileDevice`'s `CommitCoordinator`, AHL-461).
-A handle reaching `sync` takes a ticket immediately, after its own writes have
-already returned from `pwrite` — a real POSIX guarantee, since `fsync` flushes
+A normal commit publishes its ticket after its `pwrite` calls return and before
+the reservation gate is released — a real POSIX ordering, since `fsync` flushes
 everything already written to a file's inode regardless of which descriptor
 wrote it. One handle at a time becomes flush leader and calls the real
 `fsync`/`F_FULLFSYNC`; a follower whose ticket the leader's flush target
 already covers returns durable without touching the disk, and a follower whose
-write only completed after the leader had already captured that target
-fsyncs for itself instead. A solo commit always becomes its own leader
-immediately, so the uncontended path pays one ticket and one uncontended lock,
-never a wait or a timeout. This changes *which* handle's syscall makes a given
-commit durable; it never changes when a commit is allowed to report success.
+ticket is published after the leader captured that target fsyncs for itself
+instead. The leader's bounded coalescing hint only observes normal committers;
+it never waits on a checkpoint's in-gate sync. With no other normal committer
+active or queued, a solo commit takes the same immediate path as before. This
+changes *which* handle's syscall makes a given commit durable; it never
+changes when a commit is allowed to report success.
 
 The record being self-contained is the crux. A torn write is modelled as
 "only part of the most recent write survives, every other unsynced write is

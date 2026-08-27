@@ -973,7 +973,7 @@ impl<D: Device> CowBTree<D> {
         if !self.has_pending {
             return Ok(CommitOutcome::Committed);
         }
-        self.device.begin_commit()?;
+        self.device.begin_normal_commit()?;
         let region = self.device.wal_region() % crate::wal::region_count(self.format_version);
         // What the gate exists to establish: the committed state to rebase
         // against, and where this region's next record goes. A device that can
@@ -1083,9 +1083,16 @@ impl<D: Device> CowBTree<D> {
             // got, so it hands back the question rather than an answer.
             self.device.set_commit_point(region, None);
         }
+        // A successful commit has issued every data-page and WAL write by this
+        // point. Publish its durability ticket before releasing the gate so a
+        // different commit's flush can cover it; conflicts and failures must
+        // never publish a ticket for bytes that do not describe a commit.
+        if matches!(&prepared, Ok(Some(_))) {
+            self.device.commit_ready();
+        }
         // The generation this commit produced, read atomically with the
-        // increment that produced it — see [`Device::end_commit`].
-        let generation = self.device.end_commit();
+        // increment that produced it — see [`Device::end_normal_commit`].
+        let generation = self.device.end_normal_commit();
 
         let Some(seq) = prepared? else {
             // The conflict path re-reads outside the gate, so it takes the
@@ -1120,7 +1127,7 @@ impl<D: Device> CowBTree<D> {
         // region. Durability is intentionally outside the reservation gate:
         // this is the expensive operation parallel writers are allowed to
         // overlap.
-        self.device.sync()?;
+        self.device.sync_commit()?;
 
         self.next_seq = seq + 1;
         self.root = self.pending_root;

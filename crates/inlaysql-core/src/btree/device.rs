@@ -53,6 +53,25 @@ pub trait Device {
     /// Make all previously written bytes durable.
     fn sync(&mut self) -> Result<()>;
 
+    /// Mark a normal commit's record and data pages ready for a grouped flush.
+    ///
+    /// Called after the commit's writes have returned, but before the short
+    /// reservation gate is released. A native device may publish a durability
+    /// ticket here so another commit's flush can cover it. The default is a
+    /// no-op: devices that do not group normal commits keep the existing
+    /// [`Device::sync_commit`] fallback without changing their semantics.
+    fn commit_ready(&self) {}
+
+    /// Make a normal commit durable after [`Device::end_normal_commit`].
+    ///
+    /// This is separate from [`Device::sync`] because checkpoints perform an
+    /// in-gate sync. A native device that waits for other normal commits here
+    /// must not accidentally wait on a checkpoint holding the reservation
+    /// gate. The default preserves the old behavior exactly.
+    fn sync_commit(&mut self) -> Result<()> {
+        self.sync()
+    }
+
     /// Enter the short commit-reservation critical section.
     ///
     /// Implementations shared by genuinely parallel writers use this to make
@@ -61,6 +80,12 @@ pub trait Device {
     /// can still flush separate log regions concurrently.
     fn begin_commit(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Enter a normal user-commit reservation. Devices that do not distinguish
+    /// it from a checkpoint use the same short reservation by default.
+    fn begin_normal_commit(&self) -> Result<()> {
+        self.begin_commit()
     }
 
     /// Leave the critical section entered by [`Device::begin_commit`], and
@@ -78,6 +103,12 @@ pub trait Device {
     /// [`Device::commit_generation`].
     fn end_commit(&self) -> Option<u64> {
         None
+    }
+
+    /// Leave a normal user-commit reservation. The default shares the ordinary
+    /// commit boundary because the device has no separate grouping protocol.
+    fn end_normal_commit(&self) -> Option<u64> {
+        self.end_commit()
     }
 
     /// A counter that changes whenever a commit by *any* handle on this device
@@ -329,12 +360,28 @@ impl<T: Device> Device for Rc<RefCell<T>> {
         self.borrow_mut().sync()
     }
 
+    fn begin_normal_commit(&self) -> Result<()> {
+        self.borrow().begin_normal_commit()
+    }
+
+    fn commit_ready(&self) {
+        self.borrow().commit_ready();
+    }
+
+    fn sync_commit(&mut self) -> Result<()> {
+        self.borrow_mut().sync_commit()
+    }
+
     fn begin_commit(&self) -> Result<()> {
         self.borrow().begin_commit()
     }
 
     fn end_commit(&self) -> Option<u64> {
         self.borrow().end_commit()
+    }
+
+    fn end_normal_commit(&self) -> Option<u64> {
+        self.borrow().end_normal_commit()
     }
 
     fn commit_generation(&self) -> Option<u64> {

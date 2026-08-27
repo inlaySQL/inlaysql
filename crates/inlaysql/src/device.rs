@@ -32,6 +32,10 @@ pub struct FileDevice {
     file: File,
     coordinator: Option<Arc<CommitCoordinator>>,
     wal_region: usize,
+    /// Ticket published by [`Device::commit_ready`] for this handle's normal
+    /// commit, consumed by [`Device::sync_commit`]. Zero means no ticket is
+    /// waiting; tickets start at one.
+    pending_commit_ticket: AtomicU64,
     /// Kept only to name the file in an error message — [`FileDevice`] itself
     /// never needs to re-open or re-derive a path.
     path: PathBuf,
@@ -64,6 +68,13 @@ struct CommitCoordinator {
     reserved: Mutex<bool>,
     /// Wakes one waiter when the reservation gate becomes available.
     reservation_done: Condvar,
+    /// Normal commits currently waiting to acquire the reservation gate.
+    /// Checkpoint callers do not increment this, so a post-commit leader can
+    /// distinguish a useful cohort from an in-gate checkpoint.
+    normal_waiters: AtomicUsize,
+    /// Normal commits that hold the reservation gate and have not released it
+    /// yet. This is a bounded coalescing hint, never a durability ticket.
+    normal_inflight: AtomicUsize,
     next_region: AtomicUsize,
     /// How many commits have left the reservation gate on this file.
     ///
@@ -73,8 +84,8 @@ struct CommitCoordinator {
     /// lock, so no writer outside this process can exist, and every writer
     /// inside it shares this coordinator for its `(dev, ino)`.
     generation: AtomicU64,
-    /// A ticket counter for group commit: incremented once for every
-    /// [`FileDevice::sync`] call, *after* that call's writes have already
+    /// A ticket counter for group commit: incremented once for every ordinary
+    /// sync or successful normal commit, after the writes it covers have
     /// returned from `pwrite`. See [`CommitCoordinator::make_durable`].
     writes_completed: AtomicU64,
     /// The highest [`CommitCoordinator::writes_completed`] ticket known to be
@@ -101,6 +112,15 @@ struct CommitCoordinator {
     /// re-check [`CommitCoordinator::durable_upto`] — see
     /// [`CommitCoordinator::make_durable`].
     flush_done: Condvar,
+    /// Diagnostic count of completed flushes. Printed only when
+    /// `INLAYSQL_COMMIT_STATS` is set, so the benchmark can explain a
+    /// throughput change without making statistics part of the storage API.
+    flushes: AtomicU64,
+    /// Diagnostic sum of durability tickets covered by completed flushes.
+    tickets_flushed: AtomicU64,
+    /// Diagnostic count/sum for leaders entered through `sync_commit`.
+    normal_flushes: AtomicU64,
+    normal_tickets_flushed: AtomicU64,
     /// Held only for its `Drop`: releases the OS lock when the last
     /// `FileDevice` sharing this coordinator goes away. Never read.
     _lock: File,
@@ -310,8 +330,8 @@ impl CommitCoordinator {
     /// covered.
     ///
     /// `ticket` must be a value this coordinator's own [`Self::writes_completed`]
-    /// has already reached — i.e. taken from the return of a `fetch_add` on it —
-    /// and, critically, taken *after* every `write()` the caller's commit made,
+    /// has already reached — i.e. published by `sync` or `commit_ready` — and,
+    /// critically, taken *after* every `write()` the caller's commit made,
     /// never before. That ordering is the entire contract: a real `pwrite` is a
     /// synchronous syscall, so by the time it returns its bytes are in the
     /// kernel's page cache and visible to *any* subsequent `fsync` on *any* file
@@ -337,6 +357,24 @@ impl CommitCoordinator {
     /// immediately and never reaches [`Condvar::wait`], so a single writer
     /// still fsyncs on its own turn with no batching delay or timeout.
     fn make_durable(&self, ticket: u64, sync: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.make_durable_with_cohort(ticket, false, sync)
+    }
+
+    /// The post-reservation variant used by a normal user commit. It may give
+    /// other normal committers that are already active or queued a few
+    /// scheduler turns to publish their tickets, but never waits on the
+    /// reservation itself. Checkpoints use [`Self::make_durable`] because they
+    /// may be syncing while holding that reservation.
+    fn make_commit_durable(&self, ticket: u64, sync: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.make_durable_with_cohort(ticket, true, sync)
+    }
+
+    fn make_durable_with_cohort(
+        &self,
+        ticket: u64,
+        coalesce_normal_commits: bool,
+        sync: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         loop {
             if self.durable_upto.load(Ordering::SeqCst) >= ticket {
                 return Ok(());
@@ -381,12 +419,59 @@ impl CommitCoordinator {
             // run starts after this load, so it covers every one of them.
             // Our own ticket is always among them, because `writes_completed`
             // already counted it before this function was called.
+            if coalesce_normal_commits {
+                self.coalesce_normal_commits();
+            }
+            let durable_before = self.durable_upto.load(Ordering::SeqCst);
             let target = self.writes_completed.load(Ordering::SeqCst);
             let result = sync();
             if result.is_ok() {
                 self.durable_upto.fetch_max(target, Ordering::SeqCst);
+                let covered = target.saturating_sub(durable_before);
+                self.flushes.fetch_add(1, Ordering::Relaxed);
+                self.tickets_flushed.fetch_add(covered, Ordering::Relaxed);
+                if coalesce_normal_commits {
+                    self.normal_flushes.fetch_add(1, Ordering::Relaxed);
+                    self.normal_tickets_flushed
+                        .fetch_add(covered, Ordering::Relaxed);
+                }
             }
             return result;
+        }
+    }
+
+    /// Give normal commits that are already in the reservation pipeline a
+    /// bounded chance to publish their post-write tickets. No wait is taken on
+    /// the reservation mutex: a checkpoint may own it and may itself be
+    /// waiting for this flush to finish. If no normal commit is active or
+    /// queued, the solo path takes no scheduler turn at all.
+    fn coalesce_normal_commits(&self) {
+        let mut observed = self.writes_completed.load(Ordering::Acquire);
+        for _ in 0..COMMIT_COALESCE_YIELDS {
+            if self.normal_inflight.load(Ordering::Acquire) == 0
+                && self.normal_waiters.load(Ordering::Acquire) == 0
+            {
+                break;
+            }
+            std::thread::yield_now();
+            let next = self.writes_completed.load(Ordering::Acquire);
+            if next != observed {
+                observed = next;
+            }
+        }
+    }
+}
+
+impl Drop for CommitCoordinator {
+    fn drop(&mut self) {
+        if std::env::var_os("INLAYSQL_COMMIT_STATS").is_some() {
+            eprintln!(
+                "commit-stats: flushes={} tickets={} normal_flushes={} normal_tickets={}",
+                self.flushes.load(Ordering::Relaxed),
+                self.tickets_flushed.load(Ordering::Relaxed),
+                self.normal_flushes.load(Ordering::Relaxed),
+                self.normal_tickets_flushed.load(Ordering::Relaxed),
+            );
         }
     }
 }
@@ -427,6 +512,12 @@ type FileId = (u64, u64);
 const LOCK_ATTEMPTS: u32 = 10;
 const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
+/// Maximum scheduler turns in the conditional normal-commit coalescing hint.
+/// It is only entered when another normal commit is active or waiting, and it
+/// is never a correctness dependency — a late ticket simply takes the next
+/// flush round.
+const COMMIT_COALESCE_YIELDS: usize = 8;
+
 type CoordinatorRegistry = Mutex<HashMap<FileId, Weak<CommitCoordinator>>>;
 
 static COORDINATORS: OnceLock<CoordinatorRegistry> = OnceLock::new();
@@ -455,6 +546,7 @@ impl FileDevice {
             file,
             coordinator: Some(coordinator),
             wal_region,
+            pending_commit_ticket: AtomicU64::new(0),
             path: path.to_path_buf(),
         })
     }
@@ -497,6 +589,7 @@ impl FileDevice {
             file,
             coordinator: None,
             wal_region: 0,
+            pending_commit_ticket: AtomicU64::new(0),
             path: path.to_path_buf(),
         })
     }
@@ -576,6 +669,42 @@ impl FileDevice {
                 .note_layout(layout);
         }
     }
+
+    /// Acquire the shared reservation without assigning a commit kind. The
+    /// caller records whether it is a normal commit separately so a flush
+    /// leader can ignore checkpoints when deciding whether a cohort exists.
+    fn begin_reservation(&self, coordinator: &CommitCoordinator) -> Result<()> {
+        let mut reserved = coordinator
+            .reserved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *reserved {
+            reserved = coordinator
+                .reservation_done
+                .wait(reserved)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *reserved = true;
+        Ok(())
+    }
+
+    /// Publish the reservation boundary and optionally remove one normal
+    /// commit from the coalescing hint. The generation increment remains
+    /// atomic with the boundary, as it was before the normal/checkpoint split.
+    fn end_reservation(&self, coordinator: &CommitCoordinator, normal: bool) -> u64 {
+        let generation = coordinator.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut reserved = coordinator
+            .reserved
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *reserved = false;
+        drop(reserved);
+        if normal {
+            coordinator.normal_inflight.fetch_sub(1, Ordering::AcqRel);
+        }
+        coordinator.reservation_done.notify_one();
+        generation
+    }
 }
 
 impl Device for FileDevice {
@@ -611,17 +740,14 @@ impl Device for FileDevice {
     /// Make every write this handle has issued durable — batched with any
     /// other handle committing concurrently on this file via group commit.
     ///
-    /// The ticket is taken from [`CommitCoordinator::writes_completed`] here,
-    /// on this call, which is what makes the batching sound: every caller
-    /// reaches [`Device::sync`] only after its own commit's `write()` calls
-    /// have already returned (see `CowBTree::commit` and `checkpoint`, the
-    /// only callers), so counting the ticket at the top of this function — not
-    /// any earlier — is what lets [`CommitCoordinator::make_durable`] promise
-    /// that any `fsync` starting after this ticket is counted covers this
-    /// handle's bytes, whoever's `fsync` it turns out to be. On macOS this
-    /// still goes through [`File::sync_all`]'s `F_FULLFSYNC` barrier exactly as
-    /// before — group commit only decides *which* handle's call performs it,
-    /// never whether one happens.
+    /// This is the ordinary path for initialization and checkpoints. Its
+    /// ticket is taken here, after the caller's writes have returned, so a
+    /// flush starting afterward covers those bytes. Normal user commits use
+    /// [`Device::commit_ready`] plus [`Device::sync_commit`] instead, which
+    /// lets the native coordinator distinguish them from an in-gate
+    /// checkpoint. On macOS this still goes through [`File::sync_all`]'s
+    /// `F_FULLFSYNC` barrier exactly as before — group commit only decides
+    /// which handle's call performs it, never whether one happens.
     fn sync(&mut self) -> Result<()> {
         let Some(coordinator) = &self.coordinator else {
             return Err(self.read_only_error("sync"));
@@ -631,6 +757,34 @@ impl Device for FileDevice {
         coordinator.make_durable(ticket, || file.sync_all().map_err(io_error))
     }
 
+    /// Make the normal commit whose writes were marked by
+    /// [`Device::commit_ready`] durable. The ticket is already published while
+    /// the reservation gate was held, so a concurrent leader can cover this
+    /// commit before this handle reaches the call. A missing ticket is a
+    /// defensive fallback for a custom caller and keeps the old sync behavior.
+    fn sync_commit(&mut self) -> Result<()> {
+        let Some(coordinator) = &self.coordinator else {
+            return Err(self.read_only_error("sync"));
+        };
+        let ticket = self.pending_commit_ticket.swap(0, Ordering::AcqRel);
+        if ticket == 0 {
+            return self.sync();
+        }
+        let file = &self.file;
+        coordinator.make_commit_durable(ticket, || file.sync_all().map_err(io_error))
+    }
+
+    /// Publish a successful normal commit's durability ticket while its WAL
+    /// and data writes are complete. This runs before the reservation gate is
+    /// released so a leader already flushing can still cover the ticket.
+    fn commit_ready(&self) {
+        let Some(coordinator) = &self.coordinator else {
+            unreachable!("a read-only FileDevice cannot publish a commit ticket");
+        };
+        let ticket = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+        self.pending_commit_ticket.store(ticket, Ordering::Release);
+    }
+
     /// Refuses on a read-only handle (`coordinator` is `None`) rather than
     /// entering the gate, which is what makes [`FileDevice::end_commit`]
     /// genuinely unreachable there — see its doc comment.
@@ -638,18 +792,23 @@ impl Device for FileDevice {
         let Some(coordinator) = &self.coordinator else {
             return Err(self.read_only_error("begin a commit"));
         };
-        let mut reserved = coordinator
-            .reserved
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while *reserved {
-            reserved = coordinator
-                .reservation_done
-                .wait(reserved)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.begin_reservation(coordinator)
+    }
+
+    /// Acquire the reservation for a normal user commit and advertise that a
+    /// normal committer is active. Checkpoints continue to use `begin_commit`
+    /// and therefore do not make a post-commit leader wait on them.
+    fn begin_normal_commit(&self) -> Result<()> {
+        let Some(coordinator) = &self.coordinator else {
+            return Err(self.read_only_error("begin a commit"));
+        };
+        coordinator.normal_waiters.fetch_add(1, Ordering::AcqRel);
+        let result = self.begin_reservation(coordinator);
+        coordinator.normal_waiters.fetch_sub(1, Ordering::AcqRel);
+        if result.is_ok() {
+            coordinator.normal_inflight.fetch_add(1, Ordering::Release);
         }
-        *reserved = true;
-        Ok(())
+        result
     }
 
     /// Count the commit, then release the gate — in that order.
@@ -679,15 +838,20 @@ impl Device for FileDevice {
                  can never reach end_commit"
             );
         };
-        let generation = coordinator.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let mut reserved = coordinator
-            .reserved
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *reserved = false;
-        drop(reserved);
-        coordinator.reservation_done.notify_one();
-        Some(generation)
+        Some(self.end_reservation(coordinator, false))
+    }
+
+    /// Leave a normal user-commit reservation and remove it from the
+    /// coalescing hint. The generation remains the same boundary used by
+    /// readers and recovery.
+    fn end_normal_commit(&self) -> Option<u64> {
+        let Some(coordinator) = &self.coordinator else {
+            unreachable!(
+                "a read-only FileDevice's begin_normal_commit always fails, so a commit \
+                 can never reach end_normal_commit"
+            );
+        };
+        Some(self.end_reservation(coordinator, true))
     }
 
     /// See [`Device::commit_generation`]'s warning. On a read-write handle
@@ -913,6 +1077,8 @@ fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator
     let coordinator = Arc::new(CommitCoordinator {
         reserved: Mutex::new(false),
         reservation_done: Condvar::new(),
+        normal_waiters: AtomicUsize::new(0),
+        normal_inflight: AtomicUsize::new(0),
         next_region: AtomicUsize::new(0),
         generation: AtomicU64::new(0),
         writes_completed: AtomicU64::new(0),
@@ -923,6 +1089,10 @@ fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator
             epoch: 0,
         }),
         flush_done: Condvar::new(),
+        flushes: AtomicU64::new(0),
+        tickets_flushed: AtomicU64::new(0),
+        normal_flushes: AtomicU64::new(0),
+        normal_tickets_flushed: AtomicU64::new(0),
         _lock: lock_file,
         readers: Mutex::new(HashMap::new()),
         next_reader_token: AtomicU64::new(1),
@@ -989,6 +1159,8 @@ mod group_commit_tests {
         CommitCoordinator {
             reserved: Mutex::new(false),
             reservation_done: Condvar::new(),
+            normal_waiters: AtomicUsize::new(0),
+            normal_inflight: AtomicUsize::new(0),
             next_region: AtomicUsize::new(0),
             generation: AtomicU64::new(0),
             writes_completed: AtomicU64::new(0),
@@ -999,6 +1171,10 @@ mod group_commit_tests {
                 epoch: 0,
             }),
             flush_done: Condvar::new(),
+            flushes: AtomicU64::new(0),
+            tickets_flushed: AtomicU64::new(0),
+            normal_flushes: AtomicU64::new(0),
+            normal_tickets_flushed: AtomicU64::new(0),
             _lock: lock_file,
             readers: Mutex::new(HashMap::new()),
             next_reader_token: AtomicU64::new(1),
@@ -1149,6 +1325,53 @@ mod group_commit_tests {
             "a commit after a failed flush must still be able to become leader \
              and fsync for itself"
         );
+    }
+
+    /// Normal commits use the post-gate ticket path, while checkpoints keep
+    /// using the ordinary in-gate sync. This is the boundary that prevents a
+    /// post-commit cohort from ever waiting on a checkpoint that is waiting on
+    /// the cohort's flush.
+    #[test]
+    fn normal_commits_and_checkpoints_use_separate_flush_paths() {
+        use inlaysql_core::btree::{CowBTree, DEFAULT_PAGE_SIZE};
+
+        let path = std::env::temp_dir().join(format!(
+            "inlaysql-normal-commit-paths-{}-{}.inlay",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let device = FileDevice::open(&path).expect("open");
+        let coordinator = Arc::clone(device.coordinator.as_ref().expect("coordinator"));
+        let mut tree = CowBTree::open_or_create(device, DEFAULT_PAGE_SIZE).expect("create");
+        tree.put(b"key", b"value").expect("put");
+        tree.commit().expect("normal commit");
+
+        assert_eq!(
+            coordinator.normal_flushes.load(Ordering::Relaxed),
+            1,
+            "the normal commit must use the post-gate flush path"
+        );
+        assert_eq!(
+            coordinator.normal_inflight.load(Ordering::Acquire),
+            0,
+            "the normal reservation hint must be cleared after commit"
+        );
+
+        tree.checkpoint().expect("checkpoint");
+        assert_eq!(
+            coordinator.normal_flushes.load(Ordering::Relaxed),
+            1,
+            "the checkpoint's in-gate sync must not enter the normal cohort"
+        );
+
+        drop(tree);
+        drop(coordinator);
+        let _ = std::fs::remove_file(&path);
     }
 }
 

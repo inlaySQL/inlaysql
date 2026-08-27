@@ -61,6 +61,27 @@ The first bounded ticket-yield experiment gave the flush leader up to eight
 measured 490 commits/s at 32 writers, below the clean median above. It is
 rejected: an unconditional delay is not a commit pipeline.
 
+The explicit-ready prototype then separated normal commits from checkpoints:
+the successful commit publishes its ticket before releasing the reservation,
+and only a leader with another normal committer active or queued takes up to
+eight scheduler turns. In the same three-repeat shape, the median moved to
+522 commits/s at 32 writers while the one-writer median stayed at 245. The
+spread was still 17.0% on the 32-writer row, so this is a measured prototype
+win, not a publishable headline. A one-run 128-writer probe reached 536
+commits/s with zero conflicts; it is directional only. The repeat output is
+[`bench/results/20260827T041927Z-repeat.txt`](../../bench/results/20260827T041927Z-repeat.txt)
+and the 128-writer output is
+[`bench/results/20260827T043329Z.txt`](../../bench/results/20260827T043329Z.txt).
+Both prototype outputs record base commit `4567457` with `dirty: yes`, because
+the seam was being measured before this commit; they are evidence for the
+decision, not published benchmark rows.
+
+With `INLAYSQL_COMMIT_STATS=1`, the 32-writer run reported 3,252 normal
+tickets covered by 1,350 normal flushes (about 2.4 tickets per flush). The
+diagnostic is opt-in and printed when the shared coordinator is dropped; it
+exists to show that the new path is actually grouping tickets, not merely
+changing the timer's scheduling.
+
 The current benchmark timer also includes each worker's `Database::open` and
 file-lock handoff. That is part of the existing harness boundary, but a
 steady-state follow-up should report it separately before a small difference
@@ -99,8 +120,9 @@ variables](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html).
 
 ## Safe next design
 
-The next implementation should add an explicit *normal-commit-ready* signal,
-not a blind sleep:
+The prototype adds the explicit *normal-commit-ready* signal. The remaining
+implementation work is to harden and tune it without turning a small, noisy
+win into an assumed guarantee:
 
 - Keep the reservation gate responsible for sequence/page allocation, WAL
   placement and `prev_seq`/`prev_root` ordering.
@@ -119,10 +141,9 @@ not a blind sleep:
   A future time-based tail fallback must be measured and named; it must not
   become an implicit durability relaxation.
 
-This likely requires a separate `commit_sync` seam in the `Device` trait so
-checkpoint/initialization syncs cannot accidentally enter the post-commit
-cohort. The default implementation can remain a direct `sync`, keeping
-`inlaysql-core` deterministic and preserving every non-native backend.
+The separate `commit_sync` seam now exists in the `Device` trait, and its
+default implementation remains a direct `sync`, keeping `inlaysql-core`
+deterministic and preserving every non-native backend.
 
 ## Evidence required before landing code
 
@@ -141,3 +162,8 @@ cohort. The default implementation can remain a direct `sync`, keeping
 5. The storage/recovery gate: the normal workspace tests plus the release DST
    sweeps required by `AGENTS.md` for a change that touches WAL or commit
    ordering.
+
+Items 2 and 5 are green for the prototype: the focused concurrent-writer and
+transaction tests pass, and both release DST sweeps pass. Items 3 and 4 still
+need a steady-state benchmark boundary and a quieter 32/128-writer sitting
+before this becomes a closed W3 result.
