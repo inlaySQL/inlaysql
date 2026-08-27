@@ -466,18 +466,23 @@ fn transaction_misuse_is_reported_rather_than_absorbed() {
     run(&mut engine, "ROLLBACK");
 }
 
-/// A savepoint is a nested rollback point, and the storage engine buffers a
-/// transaction as one set of writes. Refusing is the honest answer.
+/// A savepoint is a nested rollback point inside one open transaction. See
+/// `crates/inlaysql/tests/savepoint.rs` for the record-and-replay behaviour
+/// this rests on; this only checks that each statement is accepted rather
+/// than refused, as it used to be.
 #[test]
-fn savepoints_are_refused() {
+fn savepoints_are_accepted() {
     let mut engine = seeded();
-    for sql in [
-        "SAVEPOINT s",
-        "RELEASE SAVEPOINT s",
-        "ROLLBACK TO SAVEPOINT s",
-    ] {
-        assert!(matches!(refuse(&mut engine, sql), Error::Unsupported(_)));
-    }
+    run(&mut engine, "BEGIN");
+    run(&mut engine, "SAVEPOINT s");
+    run(&mut engine, "INSERT INTO t VALUES (3, 'c', 30)");
+    run(&mut engine, "ROLLBACK TO SAVEPOINT s");
+    run(&mut engine, "RELEASE SAVEPOINT s");
+    run(&mut engine, "COMMIT");
+    assert_eq!(
+        rows(&mut engine, "SELECT id FROM t ORDER BY id"),
+        vec![vec!["i:1".to_string()], vec!["i:2".to_string()],]
+    );
 }
 
 /// Updating the row-id alias moves the row, because the column *is* the

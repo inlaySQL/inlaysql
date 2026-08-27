@@ -69,6 +69,12 @@ pub enum Plan {
     Commit,
     /// `ROLLBACK`.
     Rollback,
+    /// `SAVEPOINT name` — starts a transaction first if none is open.
+    Savepoint(String),
+    /// `RELEASE [SAVEPOINT] name`.
+    ReleaseSavepoint(String),
+    /// `ROLLBACK TO [SAVEPOINT] name`.
+    RollbackToSavepoint(String),
 }
 
 impl Plan {
@@ -139,17 +145,23 @@ impl Plan {
             | Plan::Reindex(_)
             | Plan::Begin
             | Plan::Commit
-            | Plan::Rollback => Vec::new(),
+            | Plan::Rollback
+            | Plan::Savepoint(_)
+            | Plan::ReleaseSavepoint(_)
+            | Plan::RollbackToSavepoint(_) => Vec::new(),
         }
     }
 
     /// Whether running this plan can only read.
     ///
     /// Transaction control is read-only by this measure and that is
-    /// deliberate: `BEGIN`, `COMMIT` and `ROLLBACK` write nothing themselves,
-    /// and the statements *inside* a transaction are each judged on their own.
-    /// A read-only handle can therefore take a consistent snapshot across
-    /// several `SELECT`s, which is exactly what a transaction is for.
+    /// deliberate: `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE` and
+    /// `ROLLBACK TO` write nothing themselves — the last replays only writes
+    /// the same handle already made, which a read-only handle never has any
+    /// of — and the statements *inside* a transaction are each judged on
+    /// their own. A read-only handle can therefore take a consistent
+    /// snapshot across several `SELECT`s, which is exactly what a
+    /// transaction is for.
     ///
     /// `EXPLAIN` is read-only *whatever it wraps*, and that is load-bearing
     /// rather than a nicety: it is what stops `EXPLAIN DELETE FROM t` from
@@ -171,6 +183,9 @@ impl Plan {
                 | Plan::Begin
                 | Plan::Commit
                 | Plan::Rollback
+                | Plan::Savepoint(_)
+                | Plan::ReleaseSavepoint(_)
+                | Plan::RollbackToSavepoint(_)
         )
     }
 
@@ -341,8 +356,15 @@ impl Plan {
             // unchanged rather than being free to run.
             Plan::Explain(inner) => return inner.table_access(),
             // These write nothing and name nothing. Transaction control is a
-            // session-level act, not a table-level one.
-            Plan::Begin | Plan::Commit | Plan::Rollback => {}
+            // session-level act, not a table-level one — `ROLLBACK TO
+            // SAVEPOINT` replays writes this same handle already passed its
+            // own check for, not a new act needing one of its own.
+            Plan::Begin
+            | Plan::Commit
+            | Plan::Rollback
+            | Plan::Savepoint(_)
+            | Plan::ReleaseSavepoint(_)
+            | Plan::RollbackToSavepoint(_) => {}
         }
 
         out.extend(reads.into_iter().map(|table| (table, TableAccess::Read)));
@@ -408,7 +430,10 @@ impl Plan {
             | Plan::Analyze(_)
             | Plan::Begin
             | Plan::Commit
-            | Plan::Rollback => Vec::new(),
+            | Plan::Rollback
+            | Plan::Savepoint(_)
+            | Plan::ReleaseSavepoint(_)
+            | Plan::RollbackToSavepoint(_) => Vec::new(),
         }
     }
 }

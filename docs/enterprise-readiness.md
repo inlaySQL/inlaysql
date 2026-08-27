@@ -818,10 +818,11 @@ is one it may `KILL`.
 
 ## Major
 
-- **SQL gaps that hit real ORMs and BI tools** — *reported*. No `SAVEPOINT`
-  (which is how Laravel, Django and Rails implement nested transactions), no
-  views, no triggers, no `WITH RECURSIVE`, no `RANGE`/`GROUPS` window frames,
-  no `CREATE INDEX IF NOT EXISTS`. Foreign keys are recorded and never
+- **SQL gaps that hit real ORMs and BI tools** — *reported*. `SAVEPOINT` is
+  supported (Laravel, Django and Rails all use it to implement nested
+  transactions), but no views, no triggers, no `WITH RECURSIVE`, no
+  `RANGE`/`GROUPS` window frames, no `CREATE INDEX IF NOT EXISTS`. Foreign
+  keys are recorded and never
   enforced, and unlike SQLite there is no `PRAGMA` to switch enforcement on, so
   the "SQLite's own default" framing in `README.md` overstates the parity.
 - **Silently ignored statements** — *reported*. `SET TRANSACTION ISOLATION

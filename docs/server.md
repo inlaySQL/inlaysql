@@ -381,9 +381,11 @@ Four things to know before setting the timeout:
 * **It is per statement, not per transaction.** Ten statements inside one
   `BEGIN` each get the full budget. A statement stopped *inside* an explicit
   transaction follows the same rule any failed statement inside one follows:
-  the transaction is in an indeterminate state and `ROLLBACK` is how to leave
-  it. There are no savepoints here to roll back to (see "What is deliberately
-  left out"), so this is not something the server can hide.
+  the transaction is in an indeterminate state and `ROLLBACK` — or
+  `ROLLBACK TO SAVEPOINT`, to a savepoint set earlier in the same
+  transaction, if there is one — is how to leave it. The timed-out
+  statement's own writes are undone either way, since it never logged a
+  success for the replay a `ROLLBACK TO SAVEPOINT` performs.
 * **It is a ceiling, not a promise of promptness.** The engine asks whether to
   stop once per few thousand rows of work, so a statement overruns its deadline
   by at most that much.
@@ -1148,7 +1150,10 @@ Answered from `Catalog` and session state, never sent to the engine:
   `LIMIT`/`OFFSET`, and `COUNT(*)`. Bound parameters resolve as values inside
   the comparison — they are never spliced into SQL text, so there is no
   injection path through the shim's own parsing.
-- `USE`, `BEGIN`, `START TRANSACTION`, `COMMIT`, `ROLLBACK`, `DO`.
+- `USE`, `BEGIN`, `START TRANSACTION`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`,
+  `RELEASE [SAVEPOINT]`, `ROLLBACK TO [SAVEPOINT]`, `DO` — the last three need
+  no dialect translation, so they pass straight through to the engine's own
+  support for them.
 - `OPTIMIZE [NO_WRITE_TO_BINLOG | LOCAL] TABLE t [, u ...]` — the one shim
   statement whose answer comes from the *engine* rather than from the catalog.
   See [`OPTIMIZE TABLE`](#optimize-table-builds-the-deferred-indexes) below.
@@ -1169,9 +1174,6 @@ it: `SHOW TABLES`, `SHOW TABLE STATUS`, `SHOW COLUMNS`, `DESCRIBE` and each
 
 Things the shim refuses rather than fakes:
 
-- **`SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT`** → `1235`. This
-  is how an ORM spells a nested transaction, and the engine has none. Answering
-  OK would make an inner rollback silently keep its writes.
 - `SHOW TABLES ... WHERE`, `information_schema` joins, `OR` in a shim `WHERE`,
   unknown `information_schema` views, comparisons it cannot evaluate → `1235`,
   naming what was not understood.
@@ -2311,7 +2313,9 @@ the table checked afterwards to prove none of them reached the index, and the
 SQL text path checked to have *not* widened alongside it (AHL-478); a metadata
 filter that must fail rather than
 answer wrongly; transactions including a rollback that really rolls back and
-`autocommit=0`; savepoints being refused; wrong password (under every plugin
+`autocommit=0`; savepoints, including one opening or closing a transaction
+implicitly and a fresh connection seeing the result durably; wrong password
+(under every plugin
 this server completes), wrong user and a forged token; the connection cap;
 four concurrent connections writing disjoint rows; one connection seeing
 another's commits; and a 400 KB value that has to be split across packets and

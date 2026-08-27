@@ -523,7 +523,11 @@ list), the scalar function library (`length`, `upper`, `lower`, `substr`,
 `trim`/`ltrim`/`rtrim`, `replace`, `instr`, `abs`, `round`, `coalesce`,
 `ifnull`, `nullif`, scalar `min`/`max`, `random`, `hex`) and the date/time
 family (`date`, `time`, `datetime`, `strftime`, `unixepoch`,
-`CURRENT_TIMESTAMP`), `BEGIN`/`COMMIT`/`ROLLBACK` as SQL,
+`CURRENT_TIMESTAMP`), `BEGIN`/`COMMIT`/`ROLLBACK` as SQL, `SAVEPOINT`/
+`RELEASE [SAVEPOINT]`/`ROLLBACK TO [SAVEPOINT]` (`savepoint.rs`) — the engine
+has no partial in-place undo, so `ROLLBACK TO SAVEPOINT` is a full
+`ROLLBACK` plus a deterministic replay of the transaction's own log up to
+that point, not a nested transaction,
 `DROP TABLE [IF EXISTS]`, `CREATE TABLE IF NOT EXISTS`, `ALTER TABLE` (`ADD COLUMN`,
 `RENAME TO`, `RENAME COLUMN`, `DROP COLUMN`), `CREATE TABLE` constraints
 (`DEFAULT`, `NOT NULL`, `UNIQUE`, `CHECK`; a foreign key is recorded and left
@@ -563,7 +567,7 @@ message.
 
 Not yet, and refused explicitly rather than silently ignored: `WITH
 RECURSIVE`, an explicit `RANGE`/`GROUPS` window frame (the rest of the window
-family landed with AHL-494, above), `SAVEPOINT`, the partial-write conflict
+family landed with AHL-494, above), the partial-write conflict
 resolutions (`INSERT OR ROLLBACK`/`OR FAIL`, `UPDATE OR REPLACE`/`OR IGNORE` —
 a statement here is already atomic, so they cannot mean what they say),
 `CREATE TEMPORARY TABLE`, `WITHOUT ROWID`, the `AUTOINCREMENT`
@@ -586,7 +590,7 @@ cargo run -p inlaysql --bin sqllogictest -- \
   crates/inlaysql/tests/sqllogictest/*.test          # print the pass rate
 ```
 
-Current pass rate over the subset: **1175/1175 (100%)** — covering `CREATE TABLE`,
+Current pass rate over the subset: **1227/1227 (100%)** — covering `CREATE TABLE`,
 `INSERT`, projection, `WHERE`, `DISTINCT`, `ORDER BY` (column, expression,
 alias, multi-key, `NULLS FIRST`/`LAST`), `LIMIT`/`OFFSET` (literal or bound),
 type coercion and affinity, `SELECT`-without-`FROM` scalar expressions,
@@ -606,7 +610,8 @@ SQLite's own rules, declared constraints (`DEFAULT`, `NOT NULL`, `UNIQUE`,
 in every read position (scalar, `IN (SELECT ...)`, `EXISTS`, derived tables,
 correlated and uncorrelated), `UNION`/`INTERSECT`/`EXCEPT`/non-recursive
 `WITH`, `CREATE TABLE ... AS SELECT`, `CREATE TABLE ... STRICT`
-(`strict.test`), and the window functions of AHL-494 including
+(`strict.test`), `SAVEPOINT`/`RELEASE`/`ROLLBACK TO SAVEPOINT`
+(`savepoint.test`), and the window functions of AHL-494 including
 `percent_rank`/`cume_dist` (`window_functions.test`). The
 number is meant to grow (and be reported) as the dialect matures — it does not
 yet include the parts of the corpus that exercise `WITH RECURSIVE`, because

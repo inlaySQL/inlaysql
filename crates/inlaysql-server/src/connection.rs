@@ -1080,6 +1080,14 @@ impl<S: Read + Write> Connection<S> {
         before: Option<u64>,
         plan: Option<&inlaysql::Statement>,
     ) -> Answer {
+        // `SAVEPOINT` with no open transaction starts one implicitly, and
+        // releasing its last savepoint ends it the same way — both without
+        // going through `Intercepted::Begin`/`Commit`, which is the only
+        // other place this flag is set. Reading it back from the engine
+        // after every statement, rather than trying to predict it here, is
+        // what keeps it honest for those two cases without special-casing
+        // them.
+        self.session.in_transaction = self.db.in_transaction();
         match outcome {
             Outcome::Rows(rows) => Answer::Rows {
                 rows,

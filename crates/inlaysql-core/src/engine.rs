@@ -495,6 +495,28 @@ pub(crate) struct JoinChoice {
     pub cost: Option<JoinDecision>,
 }
 
+/// One entry in [`Engine::transaction_log`]: enough to run a write statement
+/// a second time and reach the exact state it reached the first time.
+///
+/// `now` is the point of this: [`Engine::run_refreshed`] samples the clock
+/// once per statement so every `'now'` inside it agrees, and a replay has to
+/// reproduce that same reading rather than sample a new one — otherwise a
+/// `ROLLBACK TO SAVEPOINT` after an `INSERT ... VALUES (now())` would change
+/// the very row it is supposed to be reconstructing unchanged.
+#[derive(Clone)]
+struct LoggedStatement {
+    statement: Statement,
+    params: Vec<Value>,
+    now: i64,
+}
+
+/// One open `SAVEPOINT`, recording where in [`Engine::transaction_log`] it
+/// was established.
+struct SavepointFrame {
+    name: String,
+    log_position: usize,
+}
+
 /// The database engine.
 ///
 /// It owns the catalog and the live indexes, and drives storage through the
@@ -641,6 +663,26 @@ pub struct Engine {
     /// across statements instead of committing at the end of each, and are made
     /// durable only by [`Engine::commit`].
     in_transaction: bool,
+    /// Whether the open transaction was started by the first `SAVEPOINT`
+    /// rather than an explicit `BEGIN` — decides whether releasing the
+    /// outermost savepoint ends the transaction (SQLite's rule, confirmed
+    /// against a real sqlite3 binary) or merely drops the marker.
+    transaction_is_implicit: bool,
+    /// Every write statement run since the transaction began, in order —
+    /// [`Engine::rollback_to_savepoint`]'s replay log. Cleared whenever the
+    /// transaction ends, by any path.
+    transaction_log: Vec<LoggedStatement>,
+    /// Open savepoints, innermost (most recently established) last.
+    /// `ROLLBACK TO` truncates back to, and keeps, the named frame;
+    /// `RELEASE` drops it and every frame above it — both confirmed against
+    /// a real sqlite3 binary, including the case of two open savepoints
+    /// sharing a name.
+    savepoints: Vec<SavepointFrame>,
+    /// Set only inside [`Engine::rollback_to_savepoint`]'s replay loop: stops
+    /// a replayed statement from re-sampling the clock (it must reproduce the
+    /// exact reading its first run captured, not a new one) or being logged
+    /// a second time.
+    replaying: bool,
     /// How this engine was opened. `implicit_indexes` is the pre-`CREATE INDEX`
     /// behaviour, kept available for the demo and for databases that want
     /// automatic indexing; `paged_vector_indexes` decides whether a vector
@@ -739,6 +781,10 @@ impl Engine {
             cdc_floor,
             parses: Cell::new(0),
             in_transaction: false,
+            transaction_is_implicit: false,
+            transaction_log: Vec::new(),
+            savepoints: Vec::new(),
+            replaying: false,
             options,
         };
         engine.restore_indexes()?;
@@ -931,8 +977,15 @@ impl Engine {
     fn run_refreshed(&mut self, statement: &Statement, params: &[Value]) -> Result<Outcome> {
         statement.validate(&self.catalog, params)?;
         // One clock reading per statement, taken before anything runs, so
-        // every `'now'` inside it agrees.
-        self.statement_now.set(self.clock.now_micros());
+        // every `'now'` inside it agrees. A replayed statement (see
+        // `rollback_to_savepoint`) must reproduce the exact reading its first
+        // run captured instead: sampling a fresh one here would let a
+        // `ROLLBACK TO SAVEPOINT` change a row that used `'now'` or similar,
+        // which is exactly the kind of divergence "replay" is supposed to
+        // rule out.
+        if !self.replaying {
+            self.statement_now.set(self.clock.now_micros());
+        }
         // And one arming of the cancellation signal, in the same place and for
         // the same reason: a deadline has to cover exactly one statement, and a
         // `KILL QUERY` that landed between two of them must not fall on the
@@ -969,7 +1022,29 @@ impl Engine {
             Plan::Begin => self.begin().map(|()| Outcome::Ddl),
             Plan::Commit => self.commit().map(|()| Outcome::Ddl),
             Plan::Rollback => self.rollback().map(|()| Outcome::Ddl),
+            Plan::Savepoint(name) => self.savepoint(name).map(|()| Outcome::Ddl),
+            Plan::ReleaseSavepoint(name) => self.release_savepoint(name).map(|()| Outcome::Ddl),
+            Plan::RollbackToSavepoint(name) => {
+                self.rollback_to_savepoint(name).map(|()| Outcome::Ddl)
+            }
         };
+        // Logged so `rollback_to_savepoint` can replay a prefix of the
+        // transaction later. Only a *successful* write counts: a failed
+        // statement inside a transaction leaves nothing new buffered (see
+        // `discard_failed_statement`'s doc), so there is nothing here for a
+        // later savepoint rollback to reconstruct. Never logged while
+        // replaying, or a rollback would grow the very log it is reading.
+        if self.in_transaction
+            && !self.replaying
+            && !statement.plan().is_read_only()
+            && outcome.is_ok()
+        {
+            self.transaction_log.push(LoggedStatement {
+                statement: statement.clone(),
+                params: params.to_vec(),
+                now: self.statement_now.get(),
+            });
+        }
         if self.must_discard(statement, &outcome) {
             self.discard_failed_statement();
         }
@@ -1099,6 +1174,16 @@ impl Engine {
         self.execute(sql, params)?.into_rows()
     }
 
+    /// Whether a transaction is open right now.
+    ///
+    /// True after [`Engine::begin`] and until the matching [`Engine::commit`]
+    /// or [`Engine::rollback`] — including a transaction [`Engine::savepoint`]
+    /// opened implicitly, since a caller that only issues `SAVEPOINT` has no
+    /// other way to learn one is now open behind it.
+    pub fn in_transaction(&self) -> bool {
+        self.in_transaction
+    }
+
     /// Start an explicit transaction.
     ///
     /// Until [`Engine::commit`], every statement's writes are buffered rather
@@ -1137,6 +1222,9 @@ impl Engine {
         // database that had moved on long before `BEGIN` was called.
         self.refresh_snapshot()?;
         self.in_transaction = true;
+        self.transaction_is_implicit = false;
+        self.transaction_log.clear();
+        self.savepoints.clear();
         Ok(())
     }
 
@@ -1175,6 +1263,9 @@ impl Engine {
         self.bump_write_version()?;
         let result = self.commit_storage();
         self.in_transaction = false;
+        self.transaction_is_implicit = false;
+        self.transaction_log.clear();
+        self.savepoints.clear();
         match result {
             // A conflict has already done both halves: the storage layer threw
             // the transaction away and `commit_storage` reloaded this handle
@@ -1196,10 +1287,16 @@ impl Engine {
     ///
     /// The buffered writes are dropped and the engine reloads itself from the
     /// committed store, so its catalog, counters and indexes agree with what is
-    /// actually on disk.
+    /// actually on disk. Every open savepoint is abandoned too — a plain
+    /// `ROLLBACK` discards them along with everything else, confirmed against
+    /// a real sqlite3 binary; only `ROLLBACK TO name` keeps the transaction
+    /// and that one savepoint alive.
     pub fn rollback(&mut self) -> Result<()> {
         self.require_transaction("rollback")?;
         self.in_transaction = false;
+        self.transaction_is_implicit = false;
+        self.transaction_log.clear();
+        self.savepoints.clear();
         self.storage.rollback()?;
         self.reload()
     }
@@ -1212,6 +1309,111 @@ impl Engine {
                 "{what} with no transaction open"
             )))
         }
+    }
+
+    /// `SAVEPOINT name`. Starts an implicit transaction first when none is
+    /// open — confirmed against sqlite3: `SAVEPOINT s; ...; RELEASE s;` with
+    /// no `BEGIN` persists its writes exactly as `BEGIN; ...; COMMIT;` would.
+    fn savepoint(&mut self, name: &str) -> Result<()> {
+        if !self.in_transaction {
+            self.begin()?;
+            self.transaction_is_implicit = true;
+        }
+        self.savepoints.push(SavepointFrame {
+            name: name.to_string(),
+            log_position: self.transaction_log.len(),
+        });
+        Ok(())
+    }
+
+    /// `RELEASE [SAVEPOINT] name`: keep everything this savepoint (and any
+    /// nested one above it) buffered, and forget the markers. Releasing the
+    /// outermost savepoint of a transaction *this* statement started
+    /// implicitly commits it — confirmed against sqlite3 — but leaves an
+    /// explicit `BEGIN`'s transaction open for its own `COMMIT`/`ROLLBACK`.
+    fn release_savepoint(&mut self, name: &str) -> Result<()> {
+        let position = self
+            .savepoints
+            .iter()
+            .rposition(|frame| frame.name == name)
+            .ok_or_else(|| Error::Transaction(alloc::format!("no such savepoint: {name}")))?;
+        self.savepoints.truncate(position);
+        if self.savepoints.is_empty() && self.transaction_is_implicit {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    /// `ROLLBACK TO [SAVEPOINT] name`: reconstruct the transaction's state as
+    /// it was when `name` was established, keeping the transaction (and that
+    /// savepoint) open. Any savepoint nested *after* `name` no longer exists
+    /// once its own base state is gone — confirmed against sqlite3 — but
+    /// `name` itself may be rolled back to again, repeatedly.
+    ///
+    /// This does not partially undo the storage backend's buffered writes in
+    /// place. It discards all of them (the same full rollback an ordinary
+    /// `ROLLBACK` already does, which is already proven sound for every
+    /// piece of per-transaction state — dirty pages, free-list bookkeeping,
+    /// retrieval-index staging, the row-id counter) and replays the prefix
+    /// of [`Engine::transaction_log`] that led to `name`, through the exact
+    /// same [`Engine::run_refreshed`] every one of those statements already
+    /// ran through once. A second, independent undo mechanism for each of
+    /// those subsystems would be more code with more ways to disagree with
+    /// the first one; replaying the same deterministic inputs against the
+    /// same starting state is the same proof this codebase's DST sweeps
+    /// already rest on.
+    fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
+        let position = self
+            .savepoints
+            .iter()
+            .rposition(|frame| frame.name == name)
+            .ok_or_else(|| Error::Transaction(alloc::format!("no such savepoint: {name}")))?;
+        let target_len = self.savepoints[position].log_position;
+        self.savepoints.truncate(position + 1);
+        self.replay_transaction_up_to(target_len)
+    }
+
+    /// The replay [`Engine::rollback_to_savepoint`] runs.
+    ///
+    /// Every entry here already ran once, against a state replay is
+    /// reconstructing byte for byte, so a failure partway through is not a
+    /// user error to report and continue past — it means something this
+    /// engine assumed was deterministic was not. That is not a case to
+    /// leave the caller in a half-replayed transaction over: the whole
+    /// transaction is aborted, the same way an unrecoverable commit failure
+    /// already is above, and the error says so rather than naming whichever
+    /// replayed statement happened to be the one that surfaced it.
+    fn replay_transaction_up_to(&mut self, target_len: usize) -> Result<()> {
+        let prefix: Vec<LoggedStatement> = self.transaction_log[..target_len].to_vec();
+        self.storage.rollback()?;
+        self.reload()?;
+        self.transaction_log.clear();
+        self.replaying = true;
+        let result = (|| -> Result<()> {
+            for entry in &prefix {
+                self.statement_now.set(entry.now);
+                self.run_refreshed(&entry.statement, &entry.params)?;
+            }
+            Ok(())
+        })();
+        self.replaying = false;
+        if let Err(error) = result {
+            self.in_transaction = false;
+            self.transaction_is_implicit = false;
+            self.savepoints.clear();
+            let _ = self.storage.rollback();
+            let _ = self.reload();
+            return Err(Error::Transaction(alloc::format!(
+                "ROLLBACK TO SAVEPOINT could not reconstruct the transaction and aborted it \
+                 entirely: {error}"
+            )));
+        }
+        // Logging was suppressed during replay (`self.replaying`); restore
+        // the log to exactly what was just replayed, so a later `ROLLBACK
+        // TO` an even earlier savepoint still has it, and the next new
+        // statement extends it rather than starting over.
+        self.transaction_log = prefix;
+        Ok(())
     }
 
     /// Finish a write statement: persist the row-id counter, then either commit

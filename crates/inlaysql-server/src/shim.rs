@@ -383,17 +383,11 @@ pub fn intercept(
         }
         "COMMIT" => Intercepted::Commit,
         "ROLLBACK" => handle_rollback(&sql),
-        // Savepoints are how an ORM implements a nested transaction. The
-        // engine has no nested transactions, and quietly answering OK would
-        // make an inner "rollback" silently keep its writes — the exact class
-        // of bug this shim refuses to create.
-        "SAVEPOINT" => Intercepted::Failed(MysqlError::unsupported(
-            "SAVEPOINT is not supported: InlaySQL has no nested transactions, so a \
-             savepoint could not be rolled back to",
-        )),
-        "RELEASE" => Intercepted::Failed(MysqlError::unsupported(
-            "RELEASE SAVEPOINT is not supported: InlaySQL has no nested transactions",
-        )),
+        // `SAVEPOINT` / `RELEASE [SAVEPOINT]` need no translation out of
+        // MySQL's dialect — the engine's own parser accepts both directly
+        // (see `Engine::savepoint`/`release_savepoint`) — so, like any other
+        // statement with nothing to translate, they fall through to
+        // `handle_engine_statement` below and come back `PassThrough`.
         "DESCRIBE" | "DESC" => handle_describe(&sql, catalog, session),
         // `DO expr` evaluates and discards. Nothing observable, so nothing to do.
         "DO" => Intercepted::Ok,
@@ -850,9 +844,10 @@ fn handle_rollback(sql: &str) -> Intercepted {
     let rest = strip_keyword(sql, "ROLLBACK").unwrap_or("");
     let rest = strip_keyword(rest, "WORK").unwrap_or(rest);
     if starts_with_keyword(rest, "TO") {
-        return Intercepted::Failed(MysqlError::unsupported(
-            "ROLLBACK TO SAVEPOINT is not supported: InlaySQL has no nested transactions",
-        ));
+        // `ROLLBACK TO [SAVEPOINT] name`, as opposed to a plain `ROLLBACK`:
+        // needs no dialect translation, so — like `SAVEPOINT` and `RELEASE`
+        // — it passes straight through to the engine's own support for it.
+        return Intercepted::PassThrough;
     }
     Intercepted::Rollback
 }
@@ -1408,7 +1403,7 @@ fn show_engines() -> Intercepted {
             ),
             Value::Text("YES".to_string().into()),
             Value::Text("NO".to_string().into()),
-            Value::Text("NO".to_string().into()),
+            Value::Text("YES".to_string().into()),
         ]],
     )
 }
@@ -2527,19 +2522,23 @@ mod tests {
         assert!(matches!(run("ROLLBACK"), Intercepted::Rollback));
     }
 
-    /// The one that would silently lose data if it answered OK: an ORM's
-    /// nested transaction must fail loudly, not appear to work.
+    /// An ORM's nested transaction — the engine itself has real
+    /// `SAVEPOINT`/`RELEASE`/`ROLLBACK TO SAVEPOINT` support (see
+    /// `Engine::savepoint`), and none of the three need any dialect
+    /// translation, so the shim's job is to stay out of the way.
     #[test]
-    fn savepoints_are_refused_rather_than_faked() {
+    fn savepoint_statements_pass_straight_through_to_the_engine() {
         for sql in [
             "SAVEPOINT trans1",
             "ROLLBACK TO SAVEPOINT trans1",
+            "ROLLBACK TO trans1",
             "RELEASE SAVEPOINT trans1",
+            "RELEASE trans1",
         ] {
-            match run(sql) {
-                Intercepted::Failed(error) => assert_eq!(error.code, 1235, "{sql}"),
-                other => panic!("{sql} should be refused, got {other:?}"),
-            }
+            assert!(
+                matches!(run(sql), Intercepted::PassThrough),
+                "{sql} should pass through"
+            );
         }
     }
 

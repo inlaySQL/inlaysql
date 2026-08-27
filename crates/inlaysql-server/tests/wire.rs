@@ -1801,6 +1801,50 @@ fn transactions_map_onto_the_engine_and_rollback_really_rolls_back() {
     client.ok_query("ROLLBACK");
 }
 
+/// `SAVEPOINT` with no open transaction starts one implicitly, and releasing
+/// its last savepoint ends it the same way — both without going through
+/// `Intercepted::Begin`/`Commit`. If the wire session's own `in_transaction`
+/// flag is not read back from the engine after a statement like this, a
+/// `COMMIT` right after sees a session that still thinks nothing is open,
+/// answers OK, and never actually commits — the write sits in a transaction
+/// the client believes closed, silently swallowing everything sent after it.
+#[test]
+fn savepoints_map_onto_the_engine_over_the_wire() {
+    let server = TestServer::start("savepoints");
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)");
+
+    client.ok_query("SAVEPOINT s1");
+    client.ok_query("INSERT INTO kv (id, body) VALUES (1, 'kept')");
+    client.ok_query("SAVEPOINT s2");
+    client.ok_query("INSERT INTO kv (id, body) VALUES (2, 'discarded')");
+    client.ok_query("ROLLBACK TO SAVEPOINT s2");
+    client.ok_query("RELEASE SAVEPOINT s1");
+    client.ok_query("COMMIT");
+
+    let rows = client.ok_query("SELECT id FROM kv").rows();
+    assert_eq!(rows.column("id"), vec!["1"]);
+
+    // Releasing every open savepoint of an implicitly-started transaction
+    // commits it outright — the same trap in the other direction, and the one
+    // that would leave this row invisible to a later connection if the
+    // session's flag were still stale.
+    client.ok_query("SAVEPOINT s3");
+    client.ok_query("INSERT INTO kv (id, body) VALUES (3, 'kept too')");
+    client.ok_query("RELEASE SAVEPOINT s3");
+
+    let rows = client.ok_query("SELECT id FROM kv").rows();
+    assert_eq!(rows.column("id"), vec!["1", "3"]);
+
+    let mut other = server.client();
+    let rows = other.ok_query("SELECT id FROM kv").rows();
+    assert_eq!(
+        rows.column("id"),
+        vec!["1", "3"],
+        "a fresh connection must see both commits durably"
+    );
+}
+
 /// **The divergence this whole item exists to close** (AHL-469).
 ///
 /// Before it, a table created the way every ORM creates one — with
@@ -1890,24 +1934,6 @@ fn a_binary_column_keeps_its_case_sensitivity_inside_a_ci_table() {
     assert!(rows.rows.is_empty(), "`a` is utf8mb4_bin: byte-wise");
     let rows = client.ok_query("select b from t where b = 'ADA'").rows();
     assert_eq!(rows.column("b"), vec!["ada"], "`b` inherited the table's");
-}
-
-/// A savepoint is how an ORM spells a nested transaction. The engine has none,
-/// so this must fail loudly rather than appear to work and silently keep the
-/// writes an inner rollback was supposed to discard.
-#[test]
-fn a_savepoint_is_refused_rather_than_silently_accepted() {
-    let server = TestServer::start("savepoints");
-    let mut client = server.client();
-    client.ok_query("CREATE TABLE kv (id INTEGER PRIMARY KEY)");
-    client.ok_query("BEGIN");
-
-    let error = client.query("SAVEPOINT trans1").unwrap_err();
-    assert_eq!(error.code, 1235);
-    let error = client.query("ROLLBACK TO SAVEPOINT trans1").unwrap_err();
-    assert_eq!(error.code, 1235);
-
-    client.ok_query("ROLLBACK");
 }
 
 #[test]
@@ -6975,7 +7001,14 @@ fn show_status_counts_errors_by_class() {
     client
         .query("INSERT INTO t VALUES (1)")
         .expect_err("duplicate key");
-    client.query("SAVEPOINT s").expect_err("unsupported");
+    // See `errors_arrive_as_mysql_error_codes_rather_than_a_dropped_connection`
+    // for why this is an explicit `RANGE` frame rather than a fixed construct:
+    // it needs to name something the dialect does not have yet, and that list
+    // only shrinks. `SAVEPOINT` moved off it once the engine gained real
+    // support.
+    client
+        .query("SELECT sum(id) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t")
+        .expect_err("unsupported");
 
     assert_eq!(
         status(&mut client, "SESSION", "Inlaysql_errors_total"),

@@ -551,6 +551,15 @@ impl Database {
         self.engine.vector_ef_search()
     }
 
+    /// Whether a transaction is open right now.
+    ///
+    /// See [`inlaysql_core::Engine::in_transaction`] — true after
+    /// [`Database::begin`], and also after a bare `SAVEPOINT` with no
+    /// preceding `BEGIN`, which opens one implicitly.
+    pub fn in_transaction(&self) -> bool {
+        self.engine.in_transaction()
+    }
+
     /// Start an explicit transaction.
     ///
     /// See [`inlaysql_core::Engine::begin`]. Statements between this and

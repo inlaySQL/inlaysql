@@ -474,14 +474,9 @@ fn plan_statement(statement: Statement, catalog: &Catalog, binder: &mut Binder) 
         )),
         statement @ (Statement::StartTransaction { .. }
         | Statement::Commit { .. }
-        | Statement::Rollback { .. }) => plan_transaction(&statement),
-        Statement::Savepoint { .. } | Statement::ReleaseSavepoint { .. } => {
-            Err(Error::Unsupported(
-                "SAVEPOINT is not supported; the storage engine buffers a transaction as one \
-                 set of writes and cannot unwind part of it"
-                    .to_string(),
-            ))
-        }
+        | Statement::Rollback { .. }
+        | Statement::Savepoint { .. }
+        | Statement::ReleaseSavepoint { .. }) => plan_transaction(&statement),
         other => Err(Error::Unsupported(alloc::format!(
             "statement not supported in this stage: {other}"
         ))),
@@ -574,6 +569,9 @@ fn plan_explain(
         | Plan::Begin
         | Plan::Commit
         | Plan::Rollback
+        | Plan::Savepoint(_)
+        | Plan::ReleaseSavepoint(_)
+        | Plan::RollbackToSavepoint(_)
         | Plan::Explain(_) => Err(Error::Unsupported(alloc::format!(
             "{alias} describes a query plan; this statement has none"
         ))),
@@ -1488,12 +1486,16 @@ fn added_column(column: &sqlparser::ast::ColumnDef, strict: bool) -> Result<Colu
 
 // ------------------------------------------------------------------ transactions
 
-/// Resolve `BEGIN` / `COMMIT` / `ROLLBACK` onto the engine's transaction API.
+/// Resolve `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `RELEASE` onto the
+/// engine's transaction API.
 ///
-/// `SAVEPOINT` is refused rather than approximated. A savepoint is a *nested*
-/// rollback point, and the storage engine buffers one transaction's writes as
-/// one set with no way to unwind part of it — emulating it by replaying would
-/// be a different guarantee wearing the same name.
+/// A `SAVEPOINT` names a position in the transaction's own log of the writes
+/// it has made so far, not a second copy of the storage engine's buffered
+/// state — see [`crate::engine::Engine::rollback_to_savepoint`] for why that
+/// is enough to make `ROLLBACK TO` sound: it reuses the same full-discard
+/// rollback an ordinary `ROLLBACK` already does, then replays a prefix of
+/// what was buffered, rather than partially undoing dirty pages, free-list
+/// bookkeeping and retrieval-index staging in place.
 fn plan_transaction(statement: &Statement) -> Result<Plan> {
     match statement {
         Statement::StartTransaction {
@@ -1542,15 +1544,13 @@ fn plan_transaction(statement: &Statement) -> Result<Plan> {
                     "ROLLBACK AND CHAIN is not supported".to_string(),
                 ));
             }
-            if savepoint.is_some() {
-                return Err(Error::Unsupported(
-                    "ROLLBACK TO SAVEPOINT is not supported; the storage engine buffers a \
-                     transaction as one set of writes and cannot unwind part of it"
-                        .to_string(),
-                ));
+            match savepoint {
+                Some(name) => Ok(Plan::RollbackToSavepoint(name.value.clone())),
+                None => Ok(Plan::Rollback),
             }
-            Ok(Plan::Rollback)
         }
+        Statement::Savepoint { name } => Ok(Plan::Savepoint(name.value.clone())),
+        Statement::ReleaseSavepoint { name } => Ok(Plan::ReleaseSavepoint(name.value.clone())),
         other => Err(Error::Unsupported(alloc::format!(
             "transaction statement `{other}` is not supported"
         ))),
@@ -7430,32 +7430,31 @@ mod tests {
         assert_eq!(create.table.columns[0].ty, DataType::Numeric);
     }
 
-    /// `SAVEPOINT` is a nested rollback point and the storage engine buffers a
-    /// transaction as one set of writes, so it is refused rather than
-    /// approximated by something carrying the same name and a weaker
-    /// guarantee.
     #[test]
-    fn savepoints_are_refused_and_plain_transactions_are_not() {
+    fn transaction_and_savepoint_statements_plan_onto_the_engine_api() {
         for (sql, expected) in [
             ("BEGIN", Plan::Begin),
             ("BEGIN TRANSACTION", Plan::Begin),
             ("COMMIT", Plan::Commit),
             ("END", Plan::Commit),
             ("ROLLBACK", Plan::Rollback),
+            ("SAVEPOINT s", Plan::Savepoint("s".to_string())),
+            (
+                "RELEASE SAVEPOINT s",
+                Plan::ReleaseSavepoint("s".to_string()),
+            ),
+            ("RELEASE s", Plan::ReleaseSavepoint("s".to_string())),
+            (
+                "ROLLBACK TO SAVEPOINT s",
+                Plan::RollbackToSavepoint("s".to_string()),
+            ),
+            ("ROLLBACK TO s", Plan::RollbackToSavepoint("s".to_string())),
         ] {
             assert_eq!(
                 plan(sql, &[], &Catalog::new()).unwrap(),
                 expected,
                 "`{sql}`"
             );
-        }
-        for sql in [
-            "SAVEPOINT s",
-            "RELEASE SAVEPOINT s",
-            "ROLLBACK TO SAVEPOINT s",
-        ] {
-            let err = plan(sql, &[], &Catalog::new()).unwrap_err();
-            assert!(matches!(err, Error::Unsupported(_)), "`{sql}`: {err}");
         }
     }
 

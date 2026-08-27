@@ -1,0 +1,226 @@
+# SAVEPOINT, RELEASE [SAVEPOINT] and ROLLBACK TO [SAVEPOINT].
+#
+# The engine has no partial in-place undo — a transaction is one buffered set
+# of writes, not a stack of them — so ROLLBACK TO SAVEPOINT is a full
+# ROLLBACK plus a deterministic replay of the transaction's own log up to the
+# savepoint (see `Engine::rollback_to_savepoint`). Every expectation below was
+# checked against the sqlite3 binary first, including the exact "no such
+# savepoint" wording and the two implicit-transaction traps: a bare SAVEPOINT
+# with nothing open starts one, and RELEASEing the last savepoint of *that*
+# transaction (not one an explicit BEGIN opened) ends it.
+
+statement ok
+CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1, 1)
+
+# -------------------------------------------------- implicit begin, nesting
+
+statement ok
+SAVEPOINT s1
+
+statement ok
+INSERT INTO t VALUES (2, 2)
+
+statement ok
+SAVEPOINT s2
+
+statement ok
+INSERT INTO t VALUES (3, 3)
+
+query I nosort
+SELECT count(*) FROM t
+----
+3
+
+# Undoes row 3 only — s1's own insert survives.
+statement ok
+ROLLBACK TO s2
+
+query I nosort
+SELECT count(*) FROM t
+----
+2
+
+# RELEASE keeps what is there; it does not undo anything.
+statement ok
+RELEASE s1
+
+query I nosort
+SELECT count(*) FROM t
+----
+2
+
+# s1 was the transaction's own first savepoint, opened when nothing was
+# open yet — so releasing it (and s2, nested inside it) already committed
+# the implicit transaction outright. This COMMIT has nothing left to act on.
+statement error
+COMMIT
+
+query I nosort
+SELECT count(*) FROM t
+----
+2
+
+# ------------------------------------------------ a bare ROLLBACK abandons everything
+
+statement ok
+SAVEPOINT s3
+
+statement ok
+INSERT INTO t VALUES (4, 4)
+
+statement ok
+ROLLBACK
+
+query I nosort
+SELECT count(*) FROM t
+----
+2
+
+# --------------------------------------------- explicit BEGIN owns the transaction
+
+# RELEASEing every savepoint here must *not* end the transaction — an
+# explicit BEGIN opened it, not SAVEPOINT, so only COMMIT/ROLLBACK can.
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT s
+
+statement ok
+INSERT INTO t VALUES (5, 5)
+
+statement ok
+RELEASE s
+
+statement ok
+INSERT INTO t VALUES (6, 6)
+
+query I nosort
+SELECT count(*) FROM t
+----
+4
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT count(*) FROM t
+----
+4
+
+# -------------------------------------------------------------- duplicate names
+
+# Two open savepoints may share a name; both TO and RELEASE resolve the
+# innermost one first. ROLLBACK TO does not close the savepoint it targets —
+# only RELEASE does — so a repeated ROLLBACK TO the same name is idempotent
+# until something releases the inner one and uncovers the outer.
+statement ok
+BEGIN
+
+statement ok
+SAVEPOINT dup
+
+statement ok
+INSERT INTO t VALUES (7, 7)
+
+statement ok
+SAVEPOINT dup
+
+statement ok
+INSERT INTO t VALUES (8, 8)
+
+statement ok
+ROLLBACK TO dup
+
+query I nosort
+SELECT count(*) FROM t
+----
+5
+
+statement ok
+ROLLBACK TO dup
+
+query I nosort
+SELECT count(*) FROM t
+----
+5
+
+statement ok
+RELEASE dup
+
+query I nosort
+SELECT count(*) FROM t
+----
+5
+
+statement ok
+ROLLBACK TO dup
+
+query I nosort
+SELECT count(*) FROM t
+----
+4
+
+statement ok
+ROLLBACK
+
+# -------------------------------------------------------------- unknown names
+
+statement ok
+SAVEPOINT known
+
+statement error
+ROLLBACK TO unknown
+
+statement error
+RELEASE unknown
+
+# The failed statements above touched nothing.
+query I nosort
+SELECT count(*) FROM t
+----
+4
+
+statement ok
+ROLLBACK
+
+query I nosort
+SELECT count(*) FROM t
+----
+4
+
+# --------------------------------------------------------------- both spellings
+
+statement ok
+SAVEPOINT sp
+
+statement ok
+INSERT INTO t VALUES (9, 9)
+
+statement ok
+RELEASE SAVEPOINT sp
+
+query I nosort
+SELECT count(*) FROM t
+----
+5
+
+statement ok
+SAVEPOINT sp2
+
+statement ok
+INSERT INTO t VALUES (10, 10)
+
+statement ok
+ROLLBACK TO SAVEPOINT sp2
+
+query I nosort
+SELECT count(*) FROM t
+----
+5
+
+statement ok
+ROLLBACK

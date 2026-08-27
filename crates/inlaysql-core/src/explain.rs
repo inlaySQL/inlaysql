@@ -737,6 +737,9 @@ fn statement_kind(plan: &Plan) -> &'static str {
         Plan::Begin => "BEGIN",
         Plan::Commit => "COMMIT",
         Plan::Rollback => "ROLLBACK",
+        Plan::Savepoint(_) => "SAVEPOINT",
+        Plan::ReleaseSavepoint(_) => "RELEASE",
+        Plan::RollbackToSavepoint(_) => "ROLLBACK TO SAVEPOINT",
         Plan::Explain(_) => "EXPLAIN",
         Plan::Select(_)
         | Plan::Scalar(_)

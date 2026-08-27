@@ -40,14 +40,7 @@ UPDATE OR IGNORE t SET a = 5
 statement error
 INSERT INTO t VALUES (2, 2, 'two') ON CONFLICT (b) DO NOTHING
 
-# A savepoint is a nested rollback point, and the storage engine buffers a
-# transaction as one set of writes with no way to unwind part of it.
-
-statement error
-SAVEPOINT s1
-
-statement error
-RELEASE SAVEPOINT s1
+# `SAVEPOINT`/`RELEASE`/`ROLLBACK TO` are implemented — see `savepoint.test`.
 
 # Nothing above fired, so the row is untouched.
 
