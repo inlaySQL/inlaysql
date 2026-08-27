@@ -23,6 +23,18 @@ cargo run --release -p inlaysql-bench -- --suite sweep --docs 20000
 bench/ann/.venv/bin/python bench/ann/run.py --dataset glove-25-angular
 ```
 
+`bench/run.sh` refuses to write a result when the one-minute load average is
+above `0.25` per logical CPU, because a busy host has moved the concurrency
+rows by more than the code changes being measured. For a deliberate
+under-load experiment only, override it explicitly:
+
+```sh
+BENCH_MAX_LOAD_PER_CPU=off SUITE=concurrency ./bench/run.sh
+```
+
+The raw result records the observed load and the threshold/override, so a
+later reader can tell whether a run passed the quiet-machine gate.
+
 Writes a timestamped file to `bench/results/` (git-ignored) containing the
 toolchain, host and commit alongside the numbers, so a result is always
 traceable to what produced it.
