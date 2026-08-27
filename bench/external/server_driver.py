@@ -38,6 +38,13 @@ every one of them.
 every commit is synced before the statement returns, the same commit path
 the host and containerised OLTP rows already measure; see bench/README.md.
 
+**Driver isolation.** Each connection's workload is executed in a spawned
+process rather than a Python thread. That keeps `mysql.connector`'s GIL out
+of the connection-count comparison while leaving the server-side model
+visible: `inlaysql-server` still owns one OS thread and one `Database` handle
+per connection. Process creation and connection setup remain inside the
+phase timer, so isolation does not hide startup cost.
+
 **What is not, and cannot be, made comparable even here** — read
 "Server-to-server" in bench/README.md before trusting a ratio between these
 two engines:
@@ -67,8 +74,8 @@ two engines:
 
 from __future__ import annotations
 
+import multiprocessing
 import os
-import threading
 import time
 
 import mysql.connector
@@ -188,9 +195,7 @@ def chunks(items: list, n: int) -> list[list]:
 def run_writes(
     target: dict,
     rows_chunk: list[tuple[int, str]],
-    out: dict,
-    index: int,
-) -> None:
+) -> tuple[list[float], int]:
     connection = connect(target)
     connection.autocommit = True
     cursor = connection.cursor(prepared=True)
@@ -217,10 +222,10 @@ def run_writes(
                 raise
     cursor.close()
     connection.close()
-    out[index] = (timer, retried)
+    return timer.samples, retried
 
 
-def run_reads(target: dict, keys_chunk: list[int], out: dict, index: int) -> None:
+def run_reads(target: dict, keys_chunk: list[int]) -> list[float]:
     connection = connect(target)
     connection.autocommit = True
     cursor = connection.cursor(prepared=True)
@@ -236,45 +241,46 @@ def run_reads(target: dict, keys_chunk: list[int], out: dict, index: int) -> Non
         timer.time(run)
     cursor.close()
     connection.close()
-    out[index] = timer
+    return timer.samples
 
 
 def measure_concurrency(target: dict, workload: common.OltpWorkload, concurrency: int) -> dict:
     setup_schema(target)
 
-    write_out: dict[int, tuple[common.Timer, int]] = {}
-    threads = [
-        threading.Thread(target=run_writes, args=(target, chunk, write_out, i))
-        for i, chunk in enumerate(chunks(workload.rows, concurrency))
-    ]
+    # Use independent processes rather than threads. `mysql.connector` keeps
+    # enough Python-side work in its prepared-cursor path that threaded
+    # concurrency can be GIL-bound; process isolation is the property this
+    # comparison needs to measure. `spawn` is explicit so the benchmark does
+    # not inherit a connector, socket, or partially initialised module state
+    # on Unix, and it is also the portable start method for the Linux image.
+    context = multiprocessing.get_context("spawn")
+    row_chunks = chunks(workload.rows, concurrency)
+    key_chunks = chunks(workload.lookup_keys, concurrency)
     started = time.perf_counter()
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    with context.Pool(processes=concurrency) as pool:
+        write_results = pool.starmap(
+            run_writes,
+            [(target, chunk) for chunk in row_chunks],
+        )
     write_elapsed = time.perf_counter() - started
     write_ops_s = len(workload.rows) / write_elapsed
     write_timer = common.Timer()
     write_retries = 0
-    for timer, retried in write_out.values():
-        write_timer.samples.extend(timer.samples)
+    for samples, retried in write_results:
+        write_timer.samples.extend(samples)
         write_retries += retried
 
-    read_out: dict[int, common.Timer] = {}
-    threads = [
-        threading.Thread(target=run_reads, args=(target, chunk, read_out, i))
-        for i, chunk in enumerate(chunks(workload.lookup_keys, concurrency))
-    ]
     started = time.perf_counter()
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    with context.Pool(processes=concurrency) as pool:
+        read_results = pool.starmap(
+            run_reads,
+            [(target, chunk) for chunk in key_chunks],
+        )
     read_elapsed = time.perf_counter() - started
     read_ops_s = len(workload.lookup_keys) / read_elapsed
     read_timer = common.Timer()
-    for timer in read_out.values():
-        read_timer.samples.extend(timer.samples)
+    for samples in read_results:
+        read_timer.samples.extend(samples)
 
     return dict(
         concurrency=concurrency,
@@ -293,11 +299,12 @@ def measure(target: dict, workload: common.OltpWorkload) -> None:
         "client/server over the compose network, mysql.connector on both sides of this "
         "table — the same client library and code path drives MySQL and InlaySQL here, so "
         "this is the one OLTP row where every engine pays an identical socket round trip; "
-        "each connection is its own OS thread with its own prepared statement, autocommit, "
-        "one durable commit per row; concurrency levels are disjoint contiguous id/key "
-        "ranges per connection, not a shared queue. See bench/README.md's Server-to-server "
-        "section for the concurrency-model, credential and TLS asymmetries that remain even "
-        "so, and for why PostgreSQL has no row in this table."
+        "each connection is a spawned process in this driver, with its own prepared "
+        "statement and autocommit session, one durable commit per row; concurrency levels "
+        "are disjoint contiguous id/key ranges per connection, not a shared queue. See "
+        "bench/README.md's Server-to-server section for the concurrency-model, credential "
+        "and TLS asymmetries that remain even so, and for why PostgreSQL has no row in "
+        "this table."
     )
     common.write_server_oltp_result(
         common.CORPUS,

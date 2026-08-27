@@ -826,28 +826,24 @@ reads by primary key, and single-row durable writes (`INSERT`, autocommit,
 one commit per row) — the same two operations the OLTP section above already
 measures, over the same exported workload (`oltp-rows.csv`,
 `oltp-lookup-keys.csv`), run at **a couple of connection counts** instead of
-one. Each concurrency level opens that many OS threads, one `mysql.connector`
-connection and one prepared statement per thread; writers get disjoint,
-contiguous id ranges (thread *i* writes a contiguous slice of the row list,
-never a shared queue) and readers get disjoint, contiguous slices of the
-lookup-key sequence, so raising the connection count changes how many
-connections are open, not which rows or keys any one of them touches.
-Throughput is total operations over the wall-clock span of the whole
-concurrent phase, matching how `write_oltp_result`'s ops/s is computed above.
-Default levels are **1 and 8**; override with `SERVER_CONCURRENCY_LEVELS`
-(comma-separated).
+one. Each concurrency level opens that many **spawned OS processes**, one
+`mysql.connector` connection and one prepared statement per process; writers
+get disjoint, contiguous id ranges (process *i* writes a contiguous slice of
+the row list, never a shared queue) and readers get disjoint, contiguous
+slices of the lookup-key sequence, so raising the connection count changes
+how many connections are open, not which rows or keys any one of them touches.
+Process isolation removes `mysql.connector`'s Python-thread GIL from the
+concurrency measurement. Process creation, connection setup and teardown are
+inside each phase's wall-clock span, matching the earlier threaded driver's
+boundary rather than hiding startup overhead. Throughput is total operations
+over the wall-clock span of the whole concurrent phase, matching how
+`write_oltp_result`'s ops/s is computed above. Default levels are **1 and 8**;
+override with `SERVER_CONCURRENCY_LEVELS` (comma-separated).
 
-**Known confound: `mysql.connector`'s threaded concurrency is GIL-bound, and
-this driver uses threads.** A published read comparing 1 against 8
-connections (AHL-495) was read as evidence of server-side per-connection
-cache duplication; a later investigation could not reproduce the drop on a
-quiet machine and instead independently reproduced, twice, that this same
-client library's threaded concurrency regresses on its own — 8 threads
-measurably slower than 1 connection, where 8 *processes* of the identical
-client scale up several times over. See `BENCHMARK.md`'s "Server-to-server"
-section for the correction. This driver has not been changed to use
-processes yet; a number from it at more than one connection should be read
-with that confound in mind until it is.
+The earlier threaded measurement (AHL-495) is retired as a baseline: it could
+not distinguish server scheduling from the client library's own GIL-bound
+threading. Results produced by the current driver are process-based and
+should not be compared numerically with that retired row.
 
 **The workload size here is deliberately smaller than the OLTP section's own
 `ROWS`/`LOOKUPS`, and is its own separate knob** (`SERVER_ROWS`/
