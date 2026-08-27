@@ -116,8 +116,9 @@ CREATE TABLE c13(a INTEGER) WITHOUT ROWID
 statement error
 CREATE TABLE c14(a INTEGER) STRICT
 
-statement error
-CREATE TABLE c15 AS SELECT 1
+# `CREATE TABLE ... AS SELECT` is implemented — see
+# `create_table_as_select.test` for what it does, and
+# `inlaysql-core::sql::tests` for its column-naming and -typing rules.
 
 # `AUTOINCREMENT` is accepted on an INTEGER PRIMARY KEY — the row-id counter is
 # monotonic, so the guarantee already holds — and refused everywhere SQLite

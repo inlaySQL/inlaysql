@@ -119,8 +119,19 @@ impl Plan {
             // now. Listing them here would make a prepared `REINDEX` go stale
             // for a column rename it does not care about.
             Plan::Analyze(analyze) => analyze.tables.iter().map(String::as_str).collect(),
-            Plan::CreateTable(_)
-            | Plan::DropTable(_)
+            // Empty for an ordinary `CREATE TABLE`, per this method's own doc
+            // comment — its table does not exist yet. `... AS SELECT` is the
+            // exception: the plan holds ordinals into whatever its query
+            // reads, exactly as `INSERT ... SELECT` does above.
+            Plan::CreateTable(create) => match &create.as_select {
+                Some(query) => {
+                    let mut tables = Vec::new();
+                    query.tables_read(&mut tables);
+                    tables
+                }
+                None => Vec::new(),
+            },
+            Plan::DropTable(_)
             | Plan::AlterTable(_)
             | Plan::Scalar(_)
             | Plan::CreateUniqueIndex(_)
@@ -195,8 +206,15 @@ impl Plan {
         match self {
             // The table does not exist yet, so there is nothing to read; the
             // name is still the one a per-table grant would be written for.
+            // `... AS SELECT` is the exception, and a load-bearing one: a
+            // caller with `CREATE` but not `SELECT` on the source table must
+            // not be able to copy it out through a new one, so its reads are
+            // recorded exactly as an `INSERT ... SELECT`'s are below.
             Plan::CreateTable(create) => {
-                out.push((create.table.name.as_str(), TableAccess::Create))
+                out.push((create.table.name.as_str(), TableAccess::Create));
+                if let Some(query) = &create.as_select {
+                    query.tables_read(&mut reads);
+                }
             }
             Plan::DropTable(drop) => out.push((drop.name.as_str(), TableAccess::Drop)),
             Plan::AlterTable(alter) => out.push((alter.table.as_str(), TableAccess::Alter)),
@@ -497,6 +515,10 @@ pub struct CreateTablePlan {
     /// `IF NOT EXISTS`: an existing table of this name is not an error, and
     /// the statement does nothing.
     pub if_not_exists: bool,
+    /// `CREATE TABLE ... AS SELECT`: the query that populates the new table,
+    /// once it is created. `None` for an ordinary `CREATE TABLE`, whose table
+    /// starts empty.
+    pub as_select: Option<Box<SubqueryBody>>,
 }
 
 /// A planned `DROP TABLE`.

@@ -1,0 +1,63 @@
+# CREATE TABLE ... AS SELECT.
+#
+# Replayed through the sqlite3 binary. A bare column keeps its source's
+# declared type, an alias does not lose it, an expression never had one to
+# carry — and no constraint, default or PRIMARY KEY survives from the
+# source. See `inlaysql-core::sql::tests` for the planning-level rules this
+# exercises end to end.
+
+statement ok
+CREATE TABLE src(id INTEGER PRIMARY KEY, name TEXT NOT NULL, price REAL)
+
+statement ok
+INSERT INTO src VALUES (1, 'a', 1.5), (2, 'b', 2.5)
+
+statement ok
+CREATE TABLE t1 AS SELECT * FROM src
+
+query ITR nosort
+SELECT id, name, price FROM t1 ORDER BY id
+----
+1 a 1.5
+2 b 2.5
+
+# `id` kept its INTEGER type from `src`, so a non-integer value is refused.
+statement error
+INSERT INTO t1 (id, name) VALUES ('x', 'y')
+
+# None of `src`'s constraints did: a duplicate `id` and a NULL `name` are
+# both accepted.
+statement ok
+INSERT INTO t1 (id, name) VALUES (1, NULL)
+
+query I nosort
+SELECT count(*) FROM t1 WHERE id = 1
+----
+2
+
+# An alias does not stop a bare column's type carrying over. `doubled` is an
+# expression, so it has no declared type at all in SQLite; this catalog's
+# nearest affinity to that is NUMERIC, which is why the exact real `3.0`
+# `price * 2` computes comes back as the integer `3` — the same narrowing
+# `affinity.test`'s own NUMERIC section shows for an ordinary column.
+statement ok
+CREATE TABLE t2 AS SELECT id, name AS nm, price * 2 AS doubled FROM src WHERE id = 1
+
+query ITI nosort
+SELECT id, nm, doubled FROM t2
+----
+1 a 3
+
+# An existing table is left exactly as it was.
+statement ok
+CREATE TABLE IF NOT EXISTS t2 AS SELECT 1
+
+query I nosort
+SELECT count(*) FROM t2
+----
+1
+
+# Two columns projected under the same name are refused rather than
+# silently renumbered the way sqlite3 does.
+statement error
+CREATE TABLE t3 AS SELECT id, id FROM src

@@ -4879,6 +4879,35 @@ fn a_write_that_reads_needs_the_read_privilege_too() {
     root.quit();
 }
 
+/// The vulnerability `CREATE TABLE ... AS SELECT` would have been if its
+/// plan did not record what its query reads: an account holding `CREATE`
+/// could copy a table it has no `SELECT` on into one of its own.
+#[test]
+fn create_table_as_select_still_needs_select_on_what_it_reads() {
+    let (server, mut root) = accounts_fixture("acl-ctas");
+    root.ok_query("CREATE USER 'maker' IDENTIFIED BY 'm-pass'");
+    root.ok_query("GRANT CREATE ON stolen TO 'maker'");
+    root.ok_query("GRANT CREATE, SELECT ON copy_of_posts TO 'maker'");
+    root.ok_query("GRANT SELECT ON posts TO 'maker'");
+
+    let mut maker = server.client_as("maker", "m-pass");
+
+    // `CREATE` alone is not enough to read `vault` through a new table.
+    let error = maker
+        .query("CREATE TABLE stolen AS SELECT secret FROM vault")
+        .expect_err("no SELECT on vault");
+    assert_eq!(error.code, 1142, "should be ER_TABLEACCESS_DENIED");
+    assert!(error.message.contains("vault"), "{}", error.message);
+    assert!(error.message.contains("SELECT"), "{}", error.message);
+
+    // With `SELECT` on the source, the same shape is a working copy.
+    maker.ok_query("CREATE TABLE copy_of_posts AS SELECT * FROM posts");
+    assert_eq!(maker.count_rows("SELECT id, body FROM copy_of_posts"), 1);
+
+    maker.quit();
+    root.quit();
+}
+
 /// Accounts and grants are in the database file, so they outlive the process
 /// that created them — and the password is not in there in any readable form.
 #[test]

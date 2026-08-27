@@ -946,7 +946,7 @@ impl Engine {
             self.ensure_transaction_fits()?;
         }
         let outcome = match statement.plan() {
-            Plan::CreateTable(create) => self.create_table(create),
+            Plan::CreateTable(create) => self.create_table(create, params),
             Plan::DropTable(drop) => self.drop_table(drop),
             Plan::AlterTable(alter) => self.alter_table(alter),
             Plan::CreateIndex(create) => self.create_index(create),
@@ -1785,13 +1785,52 @@ impl Engine {
         self.storage.put_meta(CATALOG_KEY, &self.catalog.encode())
     }
 
-    fn create_table(&mut self, plan: &CreateTablePlan) -> Result<Outcome> {
-        let table = &plan.table;
+    fn create_table(&mut self, plan: &CreateTablePlan, params: &[Value]) -> Result<Outcome> {
         // `IF NOT EXISTS` asks whether the *name* is taken, not whether the
         // table matches: SQLite does not compare the two definitions either.
-        if plan.if_not_exists && self.catalog.table(&table.name).is_some() {
+        // `... AS SELECT` leaves with the same answer: a caller finding its
+        // table already there does not have its `SELECT` run either, which
+        // matches a real sqlite3 binary — an existing `t2` is left untouched
+        // by `CREATE TABLE IF NOT EXISTS t2 AS SELECT ...`, byte for byte.
+        if plan.if_not_exists && self.catalog.table(&plan.table.name).is_some() {
             return Ok(Outcome::Ddl);
         }
+        self.create_table_uncommitted(plan)?;
+        match &plan.as_select {
+            None => {
+                self.end_write()?;
+                Ok(Outcome::Ddl)
+            }
+            // The table is created and empty at this point, so populating it
+            // is exactly an `INSERT INTO <the new table> SELECT ...` — built
+            // here rather than at plan time because it targets column
+            // ordinals that only exist once `create_table_uncommitted` has
+            // registered them. One `end_write` covers both: a process that
+            // dies between them must not leave a table with no rows behind,
+            // any more than a crash mid-`INSERT` may.
+            Some(query) => {
+                let insert = InsertPlan {
+                    table: plan.table.name.clone(),
+                    source: InsertSource::Select {
+                        query: query.clone(),
+                        targets: (0..plan.table.columns.len()).collect(),
+                    },
+                    on_conflict: OnConflict::abort(),
+                    returning: None,
+                };
+                let (written, _returned) = self.insert_uncommitted(&insert, params)?;
+                self.end_write()?;
+                Ok(Outcome::Written(written))
+            }
+        }
+    }
+
+    /// The declaration half of `CREATE TABLE`: registers the table and its
+    /// indexes, but takes no commit. Shared by an ordinary `CREATE TABLE`,
+    /// which commits immediately after, and `... AS SELECT`, which still has
+    /// rows to insert into the same transaction first.
+    fn create_table_uncommitted(&mut self, plan: &CreateTablePlan) -> Result<()> {
+        let table = &plan.table;
         if table
             .columns
             .iter()
@@ -1839,8 +1878,7 @@ impl Engine {
         self.declare_unique_indexes(&table.name)?;
         self.open_indexes_for(table)?;
         self.persist_catalog()?;
-        self.end_write()?;
-        Ok(Outcome::Ddl)
+        Ok(())
     }
 
     /// `DROP TABLE`: remove the declaration, its indexes and every row.
@@ -3379,6 +3417,27 @@ impl Engine {
     // --------------------------------------------------------------- INSERT
 
     fn insert(&mut self, insert: &InsertPlan, params: &[Value]) -> Result<Outcome> {
+        let (written, returned) = self.insert_uncommitted(insert, params)?;
+        self.end_write()?;
+        match &insert.returning {
+            Some(items) => Ok(Outcome::Rows(ResultSet {
+                columns: items.iter().map(|item| item.label().to_string()).collect(),
+                rows: returned,
+            })),
+            None => Ok(Outcome::Written(written)),
+        }
+    }
+
+    /// Everything `INSERT` does short of committing: proposes, checks
+    /// constraints, resolves conflicts and writes every row. Split out so
+    /// `CREATE TABLE ... AS SELECT` can populate its new table inside the
+    /// same commit that creates it, rather than in a second one a crash
+    /// between the two could turn into a table with no rows.
+    fn insert_uncommitted(
+        &mut self,
+        insert: &InsertPlan,
+        params: &[Value],
+    ) -> Result<(usize, Vec<Vec<Value>>)> {
         let table = self.catalog.require_table(&insert.table)?.clone();
         let rules = self.rules_for(&table)?;
         let alias = table.rowid_alias();
@@ -3504,14 +3563,7 @@ impl Engine {
             }
         }
 
-        self.end_write()?;
-        match &insert.returning {
-            Some(items) => Ok(Outcome::Rows(ResultSet {
-                columns: items.iter().map(|item| item.label().to_string()).collect(),
-                rows: returned,
-            })),
-            None => Ok(Outcome::Written(written)),
-        }
+        Ok((written, returned))
     }
 
     /// Build every row an `INSERT` proposes, from its `VALUES` or its `SELECT`,

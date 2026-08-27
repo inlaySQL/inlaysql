@@ -411,7 +411,7 @@ fn plan_reindex(target: Option<String>, catalog: &Catalog) -> Result<crate::plan
 fn plan_statement(statement: Statement, catalog: &Catalog, binder: &mut Binder) -> Result<Plan> {
     match statement {
         Statement::Analyze(analyze) => plan_analyze(analyze, catalog),
-        Statement::CreateTable(create) => plan_create_table(create),
+        Statement::CreateTable(create) => plan_create_table(create, catalog, binder),
         Statement::CreateIndex(create) => plan_create_index(create, catalog),
         Statement::AlterTable(alter) => plan_alter_table(alter, catalog),
         Statement::Drop {
@@ -832,10 +832,19 @@ fn plan_analyze(analyze: sqlparser::ast::Analyze, catalog: &Catalog) -> Result<P
 
 // ---------------------------------------------------------------- CREATE TABLE
 
-fn plan_create_table(create: sqlparser::ast::CreateTable) -> Result<Plan> {
+fn plan_create_table(
+    create: sqlparser::ast::CreateTable,
+    catalog: &Catalog,
+    binder: &mut Binder,
+) -> Result<Plan> {
     use sqlparser::ast::ColumnOption as Opt;
 
     reject_unsupported_create_table(&create)?;
+
+    if let Some(query) = create.query.as_deref() {
+        return plan_create_table_as_select(&create, query, catalog, binder);
+    }
+
     // Stored expressions name no table, so they resolve against nothing.
     let empty = Catalog::new();
     let name = object_name(&create.name)?;
@@ -993,6 +1002,91 @@ fn plan_create_table(create: sqlparser::ast::CreateTable) -> Result<Plan> {
         table,
         constraints,
         if_not_exists: create.if_not_exists,
+        as_select: None,
+    }))
+}
+
+/// `CREATE TABLE ... AS SELECT`.
+///
+/// Verified against a real sqlite3 binary. The new table's columns take
+/// their *name* from the select list — an explicit alias, else a bare
+/// column's own name, else the expression's rendered source text, the same
+/// rule [`resolve_returning`] already applies — via [`SubqueryBody::labels`],
+/// which already replicates SQLite's one surprising case: a compound
+/// query's names come from its left arm alone. Their *type* is the source
+/// column's declared type, but only where the item is a bare reference to a
+/// stored column; every other column — an expression, a compound query's
+/// arm, a `SELECT` with no `FROM` — gets no declared type in SQLite at all.
+/// No constraint, default, `COLLATE` or primary key survives from a source
+/// column either, and neither does SQLite's: `CREATE TABLE t AS SELECT id
+/// FROM src` does not make `t.id` a rowid alias however `src` declared it.
+///
+/// This engine's catalog has no representation for SQLite's genuinely
+/// type-less column — every stored column already had one of the affinities
+/// in [`DataType`] before this feature existed, and adding one now would be
+/// a catalog format change out of proportion to composing two statements
+/// that already work. `DataType::Numeric` is used instead: unlike
+/// `DataType::Blob`, which `sql::coerce` accepts only actual blob bytes for
+/// and would reject the integer or text an ordinary expression evaluates
+/// to, `Numeric` passes an integer, blob or vector through unchanged and
+/// only reshapes a real (to an integer, when exact) or a numeric-looking
+/// text — the narrow, disclosed difference from SQLite's true no-op.
+///
+/// A compound query's own column-unification affinity rule — SQLite can
+/// still type a compound's column from an arm that is itself an expression
+/// — is not replicated. Treating every compound column as having no source
+/// column is strictly safe, only sometimes narrower than SQLite's answer,
+/// never wrong.
+fn plan_create_table_as_select(
+    create: &sqlparser::ast::CreateTable,
+    query: &Query,
+    catalog: &Catalog,
+    binder: &mut Binder,
+) -> Result<Plan> {
+    // Neither is reachable through SQLite's own grammar — a column or
+    // constraint list and `AS SELECT` do not parse together — but a more
+    // permissive dialect in `sqlparser` might one day hand both back, and
+    // silently ignoring either would be exactly the dropped-clause bug this
+    // file exists to refuse.
+    if !create.columns.is_empty() || !create.constraints.is_empty() {
+        return Err(Error::Unsupported(
+            "CREATE TABLE ... AS SELECT does not take an explicit column or constraint list"
+                .to_string(),
+        ));
+    }
+
+    let name = object_name(&create.name)?;
+    let body = plan_query_body(query, catalog, binder, None)?;
+    let labels: Vec<String> = body.labels().into_iter().map(str::to_string).collect();
+    let types: Vec<Option<DataType>> = match &body {
+        SubqueryBody::Select(plan) => plan.output_columns().into_iter().map(|c| c.ty).collect(),
+        SubqueryBody::Scalar(_) | SubqueryBody::SetOp(_) => alloc::vec![None; labels.len()],
+    };
+
+    let mut columns: Vec<Column> = Vec::with_capacity(labels.len());
+    for (label, ty) in labels.into_iter().zip(types) {
+        if columns
+            .iter()
+            .any(|existing| existing.name.eq_ignore_ascii_case(&label))
+        {
+            return Err(Error::Unsupported(alloc::format!(
+                "CREATE TABLE ... AS SELECT does not support two columns both named `{label}`; \
+                 alias one of them"
+            )));
+        }
+        columns.push(Column::new(&label, ty.unwrap_or(DataType::Numeric)));
+    }
+    if columns.is_empty() {
+        return Err(Error::Catalog(alloc::format!(
+            "table `{name}` must declare at least one column"
+        )));
+    }
+
+    Ok(Plan::CreateTable(CreateTablePlan {
+        table: Table { name, columns },
+        constraints: TableConstraints::default(),
+        if_not_exists: create.if_not_exists,
+        as_select: Some(Box::new(body)),
     }))
 }
 
@@ -1461,9 +1555,6 @@ fn reject_unsupported_create_table(create: &sqlparser::ast::CreateTable) -> Resu
     }
     if create.temporary {
         return not_yet("CREATE TEMPORARY TABLE");
-    }
-    if create.query.is_some() {
-        return not_yet("CREATE TABLE ... AS SELECT");
     }
     if create.without_rowid {
         return not_yet("WITHOUT ROWID");
@@ -7157,7 +7248,6 @@ mod tests {
             "CREATE TEMPORARY TABLE t (a INTEGER)",
             "CREATE TABLE t (a INTEGER) WITHOUT ROWID",
             "CREATE TABLE t (a INTEGER) STRICT",
-            "CREATE TABLE t AS SELECT 1",
         ] {
             let err = plan(sql, &[], &Catalog::new()).unwrap_err();
             assert!(
@@ -7165,6 +7255,79 @@ mod tests {
                 "`{sql}` gave {err} instead of a refusal"
             );
         }
+    }
+
+    /// Verified against a real sqlite3 binary: `CREATE TABLE t AS SELECT id,
+    /// body AS renamed FROM docs` keeps `id`'s and `body`'s declared types —
+    /// an alias does not lose it — and neither an expression nor a literal
+    /// gets one at all.
+    #[test]
+    fn create_table_as_select_keeps_a_bare_columns_type_but_not_an_expressions() {
+        let plan = plan(
+            "CREATE TABLE t AS SELECT id, body AS renamed, id + 1 AS incremented, \
+             'lit' AS lit FROM docs",
+            &[],
+            &catalog(),
+        )
+        .unwrap();
+        let Plan::CreateTable(create) = plan else {
+            panic!("expected CREATE TABLE")
+        };
+        assert!(create.as_select.is_some());
+        let columns = &create.table.columns;
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[0].ty, DataType::Integer);
+        assert_eq!(columns[1].name, "renamed");
+        assert_eq!(
+            columns[1].ty,
+            DataType::Text,
+            "an alias does not stop a bare column's type from carrying over"
+        );
+        assert_eq!(columns[2].name, "incremented");
+        assert_eq!(
+            columns[2].ty,
+            DataType::Numeric,
+            "an expression has no declared type in SQLite; Numeric is the closest \
+             affinity this catalog has to that without a format change"
+        );
+        assert_eq!(columns[3].name, "lit");
+        assert_eq!(columns[3].ty, DataType::Numeric);
+        for column in columns {
+            assert!(
+                !column.primary_key,
+                "CTAS carries over no column's PRIMARY KEY"
+            );
+            assert!(!column.not_null, "CTAS carries over no column's NOT NULL");
+            assert!(
+                column.default.is_none(),
+                "CTAS carries over no column's DEFAULT"
+            );
+        }
+    }
+
+    #[test]
+    fn create_table_as_select_refuses_two_columns_with_the_same_name() {
+        let err = plan("CREATE TABLE t AS SELECT id, id FROM docs", &[], &catalog()).unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "got {err}");
+    }
+
+    /// Real sqlite3 can type a compound's column from an arm that is itself
+    /// an expression (`SELECT a+1 FROM t UNION SELECT a FROM t` keeps `a`'s
+    /// `INTEGER`) — an affinity-unification rule this catalog does not
+    /// replicate. Every compound column is `Numeric` instead: always safe,
+    /// only sometimes narrower than SQLite's answer.
+    #[test]
+    fn create_table_as_select_of_a_compound_query_is_untyped() {
+        let plan = plan(
+            "CREATE TABLE t AS SELECT id FROM docs UNION SELECT id FROM docs",
+            &[],
+            &catalog(),
+        )
+        .unwrap();
+        let Plan::CreateTable(create) = plan else {
+            panic!("expected CREATE TABLE")
+        };
+        assert_eq!(create.table.columns[0].ty, DataType::Numeric);
     }
 
     /// `SAVEPOINT` is a nested rollback point and the storage engine buffers a
