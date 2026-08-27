@@ -385,9 +385,13 @@ uniqueness constraint at insert time. The same index also answers the inner
 side of a join: `FROM posts JOIN users ON posts.user_id = users.id` probes
 `users` by one tree descent per outer row instead of materialising and
 scanning it, when the `ON` is a top-level equality on the inner table's
-`INTEGER PRIMARY KEY` or an indexed column (AHL-464). Index selection stops
-there — there is no cost model, so a join or a predicate the rule does not
-cover still runs nested-loop over a full scan; see
+`INTEGER PRIMARY KEY` or an indexed column (AHL-464). A full-scan equi-join on same-storage-class keys builds a hash table over the
+inner side rather than comparing every pair, and `ANALYZE` now lets the
+planner cost a choice between that hash build and an index probe when it
+holds a complete, current statistics snapshot for the join
+(`docs/research/cost-planner.md`) — missing, corrupt or stale stats fall back
+to the same shape rule. Join **order** is still the order the query is
+written in; there is no reordering yet. See
 [What this is not](#what-this-is-not).
 
 ### Which distance a vector index uses
@@ -931,11 +935,16 @@ below is a surprise to the project, it is the honest state of it:
    SQLite's own `VACUUM` uses, so it never touches the copy-on-write tree's
    crash-recovery path at all. See `docs/recovery.md` for what is and is not
    done at the storage layer underneath it.
-5. **A cost-based join planner.** Joins run nested-loop in the order they are
-   written; index selection is the narrow rule in
-   [Scalar indexes and joins that use them](#scalar-indexes-and-joins-that-use-them).
-   This is what the join losses in [Performance](#performance) are waiting
-   on.
+5. ~~**A cost-based join planner.**~~ — **partially done.** `ANALYZE` records
+   table row counts and leading B-tree index cardinalities; given a complete,
+   current snapshot the planner costs a choice between the existing
+   hash-join and index-probe operators per join, still in written order
+   (`docs/research/cost-planner.md`). Missing, corrupt or stale stats fall
+   back to the old rule in
+   [Scalar indexes and joins that use them](#scalar-indexes-and-joins-that-use-them),
+   and join reordering is not implemented — that is what the join losses in
+   [Performance](#performance) whose fix needs a different physical order are
+   still waiting on.
 6. **A server-to-server benchmark with a corrected driver, on a quiet
    machine.** The first server-to-server table exists (AHL-495, in
    [Performance](#performance)), but item 2 above found its own driver
@@ -1017,14 +1026,18 @@ useful one.
   `INTEGER`/`REAL`/`TEXT` (`USING BTREE` on the last) is a real ordered
   B-tree, may be declared `UNIQUE`, and may span more than one column — see
   [Scalar indexes and joins that use them](#scalar-indexes-and-joins-that-use-them).
-- **No cost-based join planner.** Joins run nested-loop in the order they are
-  written, and are never reordered or hashed. Index selection is the narrow
-  rule that already pays: a retrieval expression is answered by its index, a
-  top-level equality on `INTEGER PRIMARY KEY` or a scalar-indexed column by a
-  tree descent or range probe — including as the inner side of a join
-  (AHL-464) — everything else by a full scan. [Performance](#performance)
-  publishes what that rule still loses to SQLite on an unindexed range or a
-  join it declines.
+- **Join order is still written order; only the operator choice is now
+  costed.** `ANALYZE` records row counts and leading-index cardinalities, and
+  a complete, current snapshot lets the planner choose between the existing
+  hash-join and index-probe operators for each join
+  (`docs/research/cost-planner.md`); missing or stale stats fall back to the
+  narrow rule that already existed: a retrieval expression is answered by its
+  index, a top-level equality on `INTEGER PRIMARY KEY` or a scalar-indexed
+  column by a tree descent or range probe — including as the inner side of a
+  join (AHL-464) — a full-scan equi-join by a hash build, and everything else
+  by a full scan. There is no join reordering yet. [Performance](#performance)
+  publishes what a join whose *order*, not its operator, is wrong still loses
+  to SQLite.
 - **Recall on uniformly random vectors is poor, and cannot be fixed by
   tuning.** On text-derived embeddings recall@10 stays flat across a 20x
   range of corpus sizes tested (0.998 at 5,000 rows, 1.000 at 20,000, 0.998
