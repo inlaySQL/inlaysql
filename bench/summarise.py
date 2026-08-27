@@ -36,7 +36,7 @@ SECONDS = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1.0}
 
 # Provenance, which is meant to differ between runs: dropped, because
 # repeat.sh writes its own header for the combined report.
-DROP = re.compile(r"^\s*(?:date|commit|dirty|rustc|host|docker|written to)\b")
+DROP = re.compile(r"^\s*(?:date|commit|dirty|rustc|host|docker|load|written to)\b")
 
 # Banners and parenthesised notes. Kept in the output because they are what
 # makes the report readable, but never measured: the digits in them are the
