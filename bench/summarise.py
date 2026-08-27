@@ -38,10 +38,13 @@ SECONDS = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1.0}
 # repeat.sh writes its own header for the combined report.
 DROP = re.compile(r"^\s*(?:date|commit|dirty|rustc|host|docker|load|written to)\b")
 
-# Banners and parenthesised notes. Kept in the output because they are what
-# makes the report readable, but never measured: the digits in them are the
-# parameters the run was given, not results it produced.
-PROSE = re.compile(r"^\s*===|^\s*\(")
+# Banners, parenthesised notes and derived comparison sentences. Kept in the
+# output because they are what makes the report readable, but never measured.
+# In particular, the comparison can legitimately cross parity between noisy
+# runs ("faster" in one and "slower" in another); its ratio is derived from
+# the engine rows above, so treating that wording as benchmark structure both
+# double-counts the metric and makes an otherwise valid summary fail.
+PROSE = re.compile(r"^\s*===|^\s*\(|^InlaySQL is ")
 
 
 @dataclass

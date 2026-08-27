@@ -98,6 +98,7 @@ check_job='
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
+    python3 bench/test_summarise.py
     cargo run --example hybrid_search -p inlaysql
     cargo run -p inlaysql --bin sqllogictest -- crates/inlaysql/tests/sqllogictest/*.test
     cargo test -p inlaysql --test backends -- --nocapture

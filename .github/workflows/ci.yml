@@ -61,6 +61,12 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # Benchmark scripts are publication instruments rather than Rust
+      # targets. Keep their parser regression tests in the merge gate so a
+      # harness failure cannot silently turn into a headline number.
+      - name: Benchmark instrument tests
+        run: python3 bench/test_summarise.py
+
       - name: Demo still runs
         run: cargo run --example hybrid_search -p inlaysql
 
