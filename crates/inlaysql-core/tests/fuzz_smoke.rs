@@ -28,6 +28,7 @@ fn catalog() -> Catalog {
                 Column::new("body", DataType::Text),
                 Column::new("embedding", DataType::Vector(4)),
             ],
+            strict: false,
         })
         .unwrap();
     catalog

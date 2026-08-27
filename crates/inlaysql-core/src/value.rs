@@ -40,6 +40,12 @@ pub enum DataType {
     /// quantisation. Values cross the public API as `f32`; only the durable
     /// row and ANN index representations are quantised.
     QuantizedVector(usize),
+    /// SQLite's `STRICT`-table `ANY` type: no affinity and no coercion at
+    /// all, the column holds whatever storage class the value it was given
+    /// already has. Only reachable inside a `STRICT` table — see
+    /// [`crate::catalog::Table::strict`] — because it is the one type name
+    /// SQLite's ordinary tables do not recognise as anything but `NUMERIC`.
+    Any,
 }
 
 impl DataType {
@@ -67,6 +73,7 @@ impl fmt::Display for DataType {
             DataType::Numeric => f.write_str("NUMERIC"),
             DataType::Vector(dim) => write!(f, "VECTOR({dim})"),
             DataType::QuantizedVector(dim) => write!(f, "VECTOR({dim}, INT8)"),
+            DataType::Any => f.write_str("ANY"),
         }
     }
 }

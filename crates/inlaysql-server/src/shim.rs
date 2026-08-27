@@ -1534,6 +1534,9 @@ fn mysql_type_name(ty: DataType) -> String {
         DataType::Numeric => "numeric".to_string(),
         DataType::Vector(dim) => format!("vector({dim})"),
         DataType::QuantizedVector(dim) => format!("vector({dim},int8)"),
+        // `STRICT`'s no-affinity column: no MySQL type means this either, so
+        // it is reported under its own SQLite name rather than disguised.
+        DataType::Any => "any".to_string(),
     }
 }
 
@@ -1747,12 +1750,14 @@ mod tests {
                     Column::new("score", DataType::Real),
                     Column::new("embedding", DataType::Vector(4)),
                 ],
+                strict: false,
             })
             .unwrap();
         catalog
             .create_table(Table {
                 name: "user_roles".to_string(),
                 columns: vec![Column::new("role", DataType::Text)],
+                strict: false,
             })
             .unwrap();
         catalog
@@ -1918,6 +1923,7 @@ mod tests {
                     Column::new("folded", DataType::Text)
                         .with_collation(inlaysql::Collation::NoCase),
                 ],
+                strict: false,
             })
             .unwrap();
         let rows = match intercept(

@@ -2965,7 +2965,7 @@ pub(crate) fn numeric_affinity(value: Value) -> Value {
 /// The bounds are strict on purpose, and they are SQLite's: `i64::MAX` and
 /// `i64::MIN` are not exactly representable as doubles, so a double that
 /// converts to either of them did not come from one.
-fn integer_affinity(real: f64) -> Value {
+pub(crate) fn integer_affinity(real: f64) -> Value {
     if real.is_finite() {
         let integer = real as i64;
         if integer as f64 == real && integer > i64::MIN && integer < i64::MAX {

@@ -1953,6 +1953,7 @@ impl Engine {
                     Some(expr) => sql::coerce(
                         eval::evaluate(expr, &[], Computed::NONE, &env)?,
                         &after.columns[ordinal],
+                        after.strict,
                     )?,
                     None => Value::Null,
                 };
@@ -3588,7 +3589,7 @@ impl Engine {
                 Some(expr) => eval::evaluate(expr, &[], Computed::NONE, env)?,
                 None => Value::Null,
             };
-            sql::coerce(value, &table.columns[ordinal])
+            sql::coerce(value, &table.columns[ordinal], table.strict)
         };
 
         match &insert.source {
@@ -3619,7 +3620,9 @@ impl Engine {
                             .position(|target| *target == ordinal)
                             .map(|index| values[index].clone());
                         row.push(match supplied {
-                            Some(value) => sql::coerce(value, &table.columns[ordinal])?,
+                            Some(value) => {
+                                sql::coerce(value, &table.columns[ordinal], table.strict)?
+                            }
                             None => fill(ordinal, None)?,
                         });
                     }
@@ -3790,6 +3793,7 @@ impl Engine {
             next[*ordinal] = sql::coerce(
                 eval::evaluate(expr, &pair, Computed::NONE, env)?,
                 &table.columns[*ordinal],
+                table.strict,
             )?;
         }
         self.apply_constraints(table, rules, &mut next, &OnConflict::abort(), env)?;
@@ -3917,6 +3921,7 @@ impl Engine {
                     let value = sql::coerce(
                         eval::evaluate(expr, &[], Computed::NONE, env)?,
                         &table.columns[ordinal],
+                        table.strict,
                     )?;
                     if value != Value::Null {
                         row[ordinal] = value;
@@ -4396,6 +4401,7 @@ impl Engine {
                 let value = sql::coerce(
                     eval::evaluate(expr, &row, Computed::NONE, &env)?,
                     &table.columns[*index],
+                    table.strict,
                 )?;
                 next[*index] = value;
             }

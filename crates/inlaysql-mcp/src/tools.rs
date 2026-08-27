@@ -213,6 +213,7 @@ fn type_name(ty: &DataType) -> String {
         DataType::Numeric => "NUMERIC".to_string(),
         DataType::Vector(dim) => format!("VECTOR({dim})"),
         DataType::QuantizedVector(dim) => format!("VECTOR({dim}, INT8)"),
+        DataType::Any => "ANY".to_string(),
     }
 }
 

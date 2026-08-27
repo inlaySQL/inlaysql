@@ -855,7 +855,12 @@ fn plan_create_table(
     let mut primary_key: Option<Vec<String>> = None;
 
     for column in &create.columns {
-        let mut resolved = Column::new(&column.name.value, resolve_data_type(&column.data_type)?);
+        let ty = if create.strict {
+            resolve_strict_data_type(&column.data_type, &column.name.value)?
+        } else {
+            resolve_data_type(&column.data_type)?
+        };
+        let mut resolved = Column::new(&column.name.value, ty);
         let mut declares_primary_key = false;
         let mut autoincrement = false;
 
@@ -986,7 +991,11 @@ fn plan_create_table(
         }
     }
 
-    let table = Table { name, columns };
+    let table = Table {
+        name,
+        columns,
+        strict: create.strict,
+    };
     for group in &constraints.unique {
         for column in &group.columns {
             table.require_column(column)?;
@@ -1048,9 +1057,10 @@ fn plan_create_table_as_select(
     // permissive dialect in `sqlparser` might one day hand both back, and
     // silently ignoring either would be exactly the dropped-clause bug this
     // file exists to refuse.
-    if !create.columns.is_empty() || !create.constraints.is_empty() {
+    if !create.columns.is_empty() || !create.constraints.is_empty() || create.strict {
         return Err(Error::Unsupported(
-            "CREATE TABLE ... AS SELECT does not take an explicit column or constraint list"
+            "CREATE TABLE ... AS SELECT does not take an explicit column or constraint list, \
+             or STRICT"
                 .to_string(),
         ));
     }
@@ -1083,7 +1093,11 @@ fn plan_create_table_as_select(
     }
 
     Ok(Plan::CreateTable(CreateTablePlan {
-        table: Table { name, columns },
+        table: Table {
+            name,
+            columns,
+            strict: false,
+        },
         constraints: TableConstraints::default(),
         if_not_exists: create.if_not_exists,
         as_select: Some(Box::new(body)),
@@ -1356,7 +1370,10 @@ fn plan_alter_table(alter: sqlparser::ast::AlterTable, catalog: &Catalog) -> Res
                         .to_string(),
                 ));
             }
-            AlterAction::AddColumn(added_column(column_def)?)
+            AlterAction::AddColumn(added_column(
+                column_def,
+                catalog.require_table(&name)?.strict,
+            )?)
         }
         Op::RenameTable { table_name } => {
             let target = match table_name {
@@ -1424,11 +1441,16 @@ fn plan_alter_table(alter: sqlparser::ast::AlterTable, catalog: &Catalog) -> Res
 /// would need every existing row to be checked or rewritten against a
 /// constraint they were never written under: no `PRIMARY KEY`, no `UNIQUE`,
 /// and `NOT NULL` only with a non-`NULL` default.
-fn added_column(column: &sqlparser::ast::ColumnDef) -> Result<Column> {
+fn added_column(column: &sqlparser::ast::ColumnDef, strict: bool) -> Result<Column> {
     use sqlparser::ast::ColumnOption as Opt;
 
     let empty = Catalog::new();
-    let mut resolved = Column::new(&column.name.value, resolve_data_type(&column.data_type)?);
+    let ty = if strict {
+        resolve_strict_data_type(&column.data_type, &column.name.value)?
+    } else {
+        resolve_data_type(&column.data_type)?
+    };
+    let mut resolved = Column::new(&column.name.value, ty);
     for option in &column.options {
         match &option.option {
             Opt::Null => {}
@@ -1558,9 +1580,6 @@ fn reject_unsupported_create_table(create: &sqlparser::ast::CreateTable) -> Resu
     }
     if create.without_rowid {
         return not_yet("WITHOUT ROWID");
-    }
-    if create.strict {
-        return not_yet("STRICT");
     }
     if create.like.is_some() {
         return not_yet("CREATE TABLE ... LIKE");
@@ -2032,6 +2051,50 @@ fn resolve_data_type(ty: &sqlparser::ast::DataType) -> Result<DataType> {
     })
 }
 
+/// Resolve a column's declared type inside a `STRICT` table.
+///
+/// Checked directly against a real sqlite3 binary: only `INT`/`INTEGER`,
+/// `REAL`, `TEXT`, `BLOB` and `ANY` are allowed — case insensitively, with no
+/// length or precision argument — and every other name, including ones an
+/// ordinary table would resolve to `NUMERIC` (`DECIMAL`, `DATETIME`,
+/// `BOOLEAN`, `JSON`, or any name carrying a length like `VARCHAR(10)`), is
+/// refused rather than silently answering with a real column's affinity.
+/// `VECTOR(n)` is not SQLite's to refuse or allow, and stays exactly as
+/// strict as it already is outside `STRICT` — a dimension and a value type
+/// it already checks on every write — so it is accepted here unchanged.
+fn resolve_strict_data_type(ty: &sqlparser::ast::DataType, column_name: &str) -> Result<DataType> {
+    use sqlparser::ast::DataType as Ast;
+
+    if let Ast::Custom(name, modifiers) = ty {
+        let name = object_name(name)?;
+        if name.eq_ignore_ascii_case("vector") {
+            return resolve_vector_type(modifiers);
+        }
+        if name.eq_ignore_ascii_case("any") && modifiers.is_empty() {
+            return Ok(DataType::Any);
+        }
+    }
+    Ok(match ty {
+        Ast::Int(None) | Ast::Integer(None) => DataType::Integer,
+        Ast::Real => DataType::Real,
+        Ast::Text => DataType::Text,
+        Ast::Blob(None) => DataType::Blob,
+        Ast::Unspecified => {
+            return Err(Error::Unsupported(alloc::format!(
+                "STRICT table column `{column_name}` has no declared type; STRICT requires \
+                 one of INT/INTEGER, REAL, TEXT, BLOB, ANY or VECTOR(n)"
+            )))
+        }
+        _ => {
+            return Err(Error::Unsupported(alloc::format!(
+                "STRICT table column `{column_name}` has type `{ty}`, which is not one of \
+                 INT/INTEGER, REAL, TEXT, BLOB, ANY or VECTOR(n) — STRICT allows only those, \
+                 with no length or precision argument"
+            )))
+        }
+    })
+}
+
 fn resolve_vector_type(modifiers: &[String]) -> Result<DataType> {
     let (dim, quantized) = match modifiers {
         [dim] => (dim, false),
@@ -2123,7 +2186,9 @@ fn plan_insert(
                         // bound; the executor coerces every cell, so the check
                         // happens either way.
                         full_row[target] = Some(match bind_value(expr, binder)? {
-                            PlanExpr::Literal(value) => PlanExpr::Literal(coerce(value, column)?),
+                            PlanExpr::Literal(value) => {
+                                PlanExpr::Literal(coerce(value, column, table.strict)?)
+                            }
                             other => {
                                 if let Some(dim) = column.ty.vector_dim() {
                                     binder.pin_vector_param(&other, dim);
@@ -2331,6 +2396,7 @@ fn excluded_scope(table: &Table) -> Scope<'static> {
     let excluded = Table {
         name: "excluded".to_string(),
         columns: table.columns.clone(),
+        strict: false,
     };
     Scope {
         sources: alloc::vec![FromItem::table(table.clone()), FromItem::table(excluded)],
@@ -2455,7 +2521,13 @@ fn reject_unsupported_insert_clauses(insert: &sqlparser::ast::Insert) -> Result<
 
 /// Fit a value to its column, widening integers to reals and checking vector
 /// dimensions. Anything else that does not match is a type error.
-pub(crate) fn coerce(value: Value, column: &Column) -> Result<Value> {
+///
+/// `strict` is the enclosing table's [`Table::strict`](crate::catalog::Table)
+/// flag. A `STRICT` table's `INTEGER` and `TEXT` columns check and convert a
+/// value more narrowly — and, for `TEXT`, more *broadly* — than an ordinary
+/// affinity does; every arm below that reads `strict` cites the sqlite3
+/// behaviour it was checked against.
+pub(crate) fn coerce(value: Value, column: &Column, strict: bool) -> Result<Value> {
     let mismatch = |value: &Value| {
         Err(Error::Type(alloc::format!(
             "column `{}` is {} but the value is {}",
@@ -2468,9 +2540,29 @@ pub(crate) fn coerce(value: Value, column: &Column) -> Result<Value> {
     match (&column.ty, &value) {
         (_, Value::Null) => Ok(Value::Null),
         (DataType::Integer, Value::Integer(_)) => Ok(value),
+        // `STRICT INT` accepts a `REAL` only when it round-trips exactly —
+        // confirmed against sqlite3: `INSERT ... VALUES (2.0)` into a
+        // `STRICT INT` column stores the integer `2`, and `(2.5)` is refused
+        // ("cannot store REAL value in INT column"). No non-strict column
+        // of this engine's has ever taken this conversion, and that stays
+        // unchanged: the arm requires `strict`.
+        (DataType::Integer, Value::Real(r)) if strict => match crate::eval::integer_affinity(*r) {
+            Value::Integer(i) => Ok(Value::Integer(i)),
+            _ => mismatch(&value),
+        },
         (DataType::Real, Value::Real(_)) => Ok(value),
         (DataType::Real, Value::Integer(i)) => Ok(Value::Real(*i as f64)),
         (DataType::Text, Value::Text(_)) => Ok(value),
+        // `STRICT TEXT` accepts a number by rendering it exactly as
+        // `CAST(x AS TEXT)` would — confirmed against sqlite3: a `STRICT
+        // TEXT` column storing the integer `5` reads back as the text `5`.
+        // A `BLOB` is still refused ("cannot store BLOB value in TEXT
+        // column"), which is why this is two arms naming `Integer`/`Real`
+        // rather than a blanket non-`Text` one.
+        (DataType::Text, Value::Integer(i)) if strict => Ok(Value::Text(i.to_string().into())),
+        (DataType::Text, Value::Real(r)) if strict => {
+            Ok(Value::Text(crate::eval::real_to_text(*r).into()))
+        }
         (DataType::Blob, Value::Blob(_)) => Ok(value),
         // `NUMERIC` is the affinity every unrecognised type name resolves to,
         // and unlike the four above it is not a storage class: SQLite converts
@@ -2478,6 +2570,13 @@ pub(crate) fn coerce(value: Value, column: &Column) -> Result<Value> {
         // thing that cannot land here, because it is not a SQLite value at all.
         (DataType::Numeric, Value::Vector(_)) => mismatch(&value),
         (DataType::Numeric, _) => Ok(crate::eval::numeric_affinity(value)),
+        // `ANY` is `STRICT`'s "no affinity at all" column, only ever reached
+        // inside one — confirmed against sqlite3: every storage class round
+        // -trips through it unconverted. A `VECTOR` still cannot, for the
+        // same reason `NUMERIC` refuses one two arms up: it is not a SQLite
+        // value at all.
+        (DataType::Any, Value::Vector(_)) => mismatch(&value),
+        (DataType::Any, _) => Ok(value),
         (DataType::Vector(dim) | DataType::QuantizedVector(dim), Value::Vector(v)) => {
             if v.len() == *dim {
                 Ok(value)
@@ -4339,6 +4438,7 @@ fn derived_table(alias: Option<&str>, body: &SubqueryBody) -> Result<Table> {
                 )
             })
             .collect(),
+        strict: false,
     })
 }
 
@@ -4761,7 +4861,12 @@ fn func_collation(args: &[PlanExpr], scope: &Scope<'_>, binder: &Binder<'_>) -> 
 /// converts to" here, so this is the one place the two enums meet.
 /// `VECTOR`/`VECTOR(.., INT8)` answer `None`: neither is one of SQLite's five
 /// storage affinities, and a comparison against one already fails in
-/// `eval::compare_cells` before affinity would matter.
+/// `eval::compare_cells` before affinity would matter. `ANY` answers `None`
+/// too, and for the same reason as the others rather than a new one: it is
+/// SQLite's spelling of "no affinity", confirmed against a real sqlite3
+/// binary — `WHERE a = '5'` against a `STRICT` `ANY` column holding the
+/// integer `5` matches nothing, exactly the storage-class-order comparison
+/// an affinity-free column gets everywhere else.
 fn column_affinity(ty: DataType) -> Option<CastType> {
     match ty {
         DataType::Integer => Some(CastType::Integer),
@@ -4769,7 +4874,7 @@ fn column_affinity(ty: DataType) -> Option<CastType> {
         DataType::Text => Some(CastType::Text),
         DataType::Blob => Some(CastType::Blob),
         DataType::Numeric => Some(CastType::Numeric),
-        DataType::Vector(_) | DataType::QuantizedVector(_) => None,
+        DataType::Vector(_) | DataType::QuantizedVector(_) | DataType::Any => None,
     }
 }
 
@@ -6863,6 +6968,7 @@ mod tests {
                     Column::new("body", DataType::Text),
                     Column::new("embedding", DataType::Vector(3)),
                 ],
+                strict: false,
             })
             .unwrap();
         catalog
@@ -6877,6 +6983,7 @@ mod tests {
                     Column::new("id", DataType::Integer),
                     Column::new("name", DataType::Text),
                 ],
+                strict: false,
             })
             .unwrap();
         catalog
@@ -6888,6 +6995,7 @@ mod tests {
             .create_table(Table {
                 name: "t".to_string(),
                 columns: vec![Column::new("a", DataType::Integer)],
+                strict: false,
             })
             .unwrap();
         catalog
@@ -7053,6 +7161,7 @@ mod tests {
                     Column::new("body", DataType::Text),
                     Column::new("embedding", DataType::Vector(3)),
                 ],
+                strict: false,
             })
             .unwrap();
         let Plan::Insert(insert) = plan(
@@ -7239,7 +7348,6 @@ mod tests {
             "CREATE TABLE t (a TEXT COLLATE utf8mb4_unicode_ci)",
             "CREATE TEMPORARY TABLE t (a INTEGER)",
             "CREATE TABLE t (a INTEGER) WITHOUT ROWID",
-            "CREATE TABLE t (a INTEGER) STRICT",
         ] {
             let err = plan(sql, &[], &Catalog::new()).unwrap_err();
             assert!(
@@ -7764,6 +7872,7 @@ mod tests {
                     Column::new("body", DataType::Text),
                     Column::new("embedding", DataType::Vector(3)),
                 ],
+                strict: false,
             })
             .unwrap();
         moved
@@ -7773,6 +7882,7 @@ mod tests {
                     Column::new("name", DataType::Text),
                     Column::new("id", DataType::Integer),
                 ],
+                strict: false,
             })
             .unwrap();
         assert!(matches!(
@@ -7887,6 +7997,7 @@ mod tests {
                     Column::new("bin", DataType::Text),
                     Column::new("rt", DataType::Text).with_collation(Collation::RTrim),
                 ],
+                strict: false,
             })
             .unwrap();
         catalog
@@ -8345,6 +8456,7 @@ mod tests {
                     Column::new("a", DataType::Vector(4)),
                     Column::new("b", DataType::Vector(4)),
                 ],
+                strict: false,
             })
             .unwrap();
         let error = plan("CREATE INDEX i ON vecs (a, b) USING VECTOR", &[], &catalog).unwrap_err();

@@ -81,6 +81,7 @@ const CATALOG_VERSION_CONSTRAINTS: u32 = 4;
 const CATALOG_VERSION_BTREE: u32 = 5;
 const CATALOG_VERSION_COLLATION: u32 = 6;
 const CATALOG_VERSION_METRIC: u32 = 7;
+const CATALOG_VERSION_STRICT: u32 = 8;
 
 const TYPE_INTEGER: u8 = 1;
 const TYPE_REAL: u8 = 2;
@@ -89,6 +90,7 @@ const TYPE_BLOB: u8 = 4;
 const TYPE_VECTOR: u8 = 5;
 const TYPE_VECTOR_Q8: u8 = 6;
 const TYPE_NUMERIC: u8 = 7;
+const TYPE_ANY: u8 = 8;
 
 const INDEX_FULL_TEXT: u8 = 1;
 const INDEX_VECTOR: u8 = 2;
@@ -256,9 +258,31 @@ pub struct Table {
     pub name: String,
     /// Columns in declaration order; the ordinal is the row's field index.
     pub columns: Vec<Column>,
+    /// Whether this table was declared `STRICT`.
+    ///
+    /// A strict column's declared type must be one of `INT`/`INTEGER`,
+    /// `REAL`, `TEXT`, `BLOB` or `ANY` — nothing else, and no length or
+    /// precision modifier — and `sql::coerce` checks and converts a value
+    /// against it more narrowly than an ordinary affinity does: an `INTEGER`
+    /// column accepts a `REAL` only when it converts losslessly, a `TEXT`
+    /// column accepts a number by rendering it exactly as `CAST(x AS TEXT)`
+    /// would, and every other combination that an ordinary affinity would
+    /// coerce or accept is instead a type error.
+    pub strict: bool,
 }
 
 impl Table {
+    /// A non-`STRICT` table — every table this engine built before this
+    /// field existed, and every synthetic one (a virtual `information_schema`
+    /// view, a test fixture) that is not real user schema.
+    pub fn new(name: String, columns: Vec<Column>) -> Self {
+        Self {
+            name,
+            columns,
+            strict: false,
+        }
+    }
+
     /// The ordinal of the column that aliases the row id, if the table has one.
     ///
     /// This is the single fact the planner needs to turn `WHERE id = 42` into a
@@ -1017,6 +1041,17 @@ impl Catalog {
     /// a table actually declares a constraint or uses an affinity older
     /// versions cannot name.
     fn required_version(&self) -> u32 {
+        // A `STRICT` table, or an `ANY` column (only reachable inside one),
+        // forces version 8 for the same reason every other tag-introducing
+        // version does: an older build would decode a tag it never learned,
+        // or read `strict` past a byte that is not there.
+        if self
+            .tables
+            .values()
+            .any(|table| table.strict || table.columns.iter().any(|c| c.ty == DataType::Any))
+        {
+            return CATALOG_VERSION_STRICT;
+        }
         // A non-cosine vector index forces version 7 for the reason the module
         // docs give: an older build would read the declaration, miss the
         // metric, and rebuild the graph as cosine over vectors L2 declared
@@ -1090,6 +1125,9 @@ impl Catalog {
         put_len(&mut out, self.tables.len());
         for (key, table) in &self.tables {
             put_string(&mut out, &table.name);
+            if version >= CATALOG_VERSION_STRICT {
+                out.push(u8::from(table.strict));
+            }
             put_len(&mut out, table.columns.len());
             for column in &table.columns {
                 put_string(&mut out, &column.name);
@@ -1112,6 +1150,7 @@ impl Catalog {
                         out.push(TYPE_VECTOR_Q8 | flags);
                         put_len(&mut out, dim);
                     }
+                    DataType::Any => out.push(TYPE_ANY | flags),
                 }
                 if version >= CATALOG_VERSION_CONSTRAINTS {
                     out.push(u8::from(column.not_null));
@@ -1224,10 +1263,11 @@ impl Catalog {
                 | CATALOG_VERSION_BTREE
                 | CATALOG_VERSION_COLLATION
                 | CATALOG_VERSION_METRIC
+                | CATALOG_VERSION_STRICT
         ) {
             return Err(Error::FormatVersion(alloc::format!(
                 "catalog format version {version} is not supported (this build supports \
-                 {CATALOG_VERSION_EXACT} through {CATALOG_VERSION_METRIC}); pre-1.0 the \
+                 {CATALOG_VERSION_EXACT} through {CATALOG_VERSION_STRICT}); pre-1.0 the \
                  policy is to recreate the database, not to migrate it"
             )));
         }
@@ -1337,6 +1377,7 @@ fn decode_tables(cursor: &mut Cursor<'_>, version: u32) -> Result<Catalog> {
     let mut catalog = Catalog::new();
     for _ in 0..table_count {
         let name = cursor.string()?;
+        let strict = version >= CATALOG_VERSION_STRICT && cursor.u8()? != 0;
         let column_count = cursor.count(5)?;
         let mut columns = Vec::with_capacity(column_count);
         for _ in 0..column_count {
@@ -1353,6 +1394,7 @@ fn decode_tables(cursor: &mut Cursor<'_>, version: u32) -> Result<Catalog> {
                 TYPE_VECTOR_Q8 if version >= CATALOG_VERSION_QUANTIZED => {
                     DataType::QuantizedVector(cursor.u32()? as usize)
                 }
+                TYPE_ANY if version >= CATALOG_VERSION_STRICT => DataType::Any,
                 other => {
                     return Err(Error::Corrupt(alloc::format!(
                         "unknown catalog type tag {other}"
@@ -1383,7 +1425,14 @@ fn decode_tables(cursor: &mut Cursor<'_>, version: u32) -> Result<Catalog> {
         } else {
             TableConstraints::default()
         };
-        catalog.create_table_with(Table { name, columns }, constraints)?;
+        catalog.create_table_with(
+            Table {
+                name,
+                columns,
+                strict,
+            },
+            constraints,
+        )?;
     }
     Ok(catalog)
 }
@@ -1512,6 +1561,7 @@ mod tests {
                     Column::new("body", DataType::Text),
                     Column::new("embedding", DataType::Vector(384)),
                 ],
+                strict: false,
             })
             .unwrap();
         catalog
@@ -1527,6 +1577,7 @@ mod tests {
             .create_table(Table {
                 name: "MiXeD".to_string(),
                 columns: vec![Column::new("a", DataType::Integer)],
+                strict: false,
             })
             .unwrap();
 
@@ -1558,6 +1609,7 @@ mod tests {
             .create_table(Table {
                 name: "plain".to_string(),
                 columns: vec![Column::new("a", DataType::Integer)],
+                strict: false,
             })
             .unwrap();
         assert_eq!(catalog.table("plain").unwrap().rowid_alias(), None);
@@ -1584,6 +1636,7 @@ mod tests {
             .create_table(Table {
                 name: "DOCS".to_string(),
                 columns: vec![],
+                strict: false,
             })
             .unwrap_err();
         assert!(matches!(err, Error::Catalog(_)));
@@ -1614,8 +1667,10 @@ mod tests {
                         out.push(TYPE_VECTOR | flags);
                         put_len(&mut out, dim);
                     }
-                    DataType::Numeric | DataType::QuantizedVector(_) => {
-                        panic!("version-1 fixtures cannot contain NUMERIC or quantized vectors")
+                    DataType::Numeric | DataType::QuantizedVector(_) | DataType::Any => {
+                        panic!(
+                            "version-1 fixtures cannot contain NUMERIC, ANY or quantized vectors"
+                        )
                     }
                 }
             }
@@ -1684,6 +1739,7 @@ mod tests {
                     Column::new("title", DataType::Text),
                     Column::new("body", DataType::Text),
                 ],
+                strict: false,
             })
             .unwrap();
         catalog
@@ -1751,6 +1807,7 @@ mod tests {
                     Column::new("a", DataType::Vector(4)),
                     Column::new("b", DataType::Vector(4)),
                 ],
+                strict: false,
             })
             .unwrap();
         let err = catalog
@@ -1839,6 +1896,7 @@ mod tests {
             .create_table(Table {
                 name: "nums".to_string(),
                 columns: vec![Column::new("n", DataType::Integer)],
+                strict: false,
             })
             .unwrap();
         let decoded = Catalog::decode(&encode_v1(&plain)).unwrap();
@@ -1849,7 +1907,7 @@ mod tests {
     fn a_future_catalog_version_is_refused() {
         let mut bytes = sample().encode();
         // Magic is b"ISQL"; the version follows at offset 4.
-        bytes[4..8].copy_from_slice(&(CATALOG_VERSION_METRIC + 1).to_le_bytes());
+        bytes[4..8].copy_from_slice(&(CATALOG_VERSION_STRICT + 1).to_le_bytes());
         let err = Catalog::decode(&bytes).unwrap_err();
         assert!(matches!(err, Error::FormatVersion(_)), "got {err}");
     }
@@ -1877,6 +1935,7 @@ mod tests {
                         Column::new("age", DataType::Integer).with_default("18"),
                         Column::new("price", DataType::Numeric),
                     ],
+                    strict: false,
                 },
                 TableConstraints {
                     unique: vec![UniqueConstraint::new(vec!["email".to_string()])],
@@ -1918,6 +1977,7 @@ mod tests {
             .create_table(Table {
                 name: "t".to_string(),
                 columns: vec![Column::new("n", DataType::Numeric)],
+                strict: false,
             })
             .unwrap();
         let bytes = catalog.encode();
@@ -1926,6 +1986,58 @@ mod tests {
             CATALOG_VERSION_CONSTRAINTS
         );
         assert_eq!(Catalog::decode(&bytes).unwrap(), catalog);
+    }
+
+    /// A `STRICT` table forces version 8, because no earlier version has a
+    /// byte for the flag at all.
+    #[test]
+    fn a_strict_table_forces_version_eight() {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(Table {
+                name: "t".to_string(),
+                columns: vec![Column::new("a", DataType::Integer)],
+                strict: true,
+            })
+            .unwrap();
+        let bytes = catalog.encode();
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            CATALOG_VERSION_STRICT
+        );
+        assert_eq!(Catalog::decode(&bytes).unwrap(), catalog);
+    }
+
+    /// An `ANY` column alone — inside a non-strict table, which cannot
+    /// happen through SQL but is not this layer's job to refuse — also
+    /// forces version 8, for the same reason as the flag: no earlier
+    /// version has a tag for it.
+    #[test]
+    fn an_any_column_alone_forces_version_eight() {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(Table {
+                name: "t".to_string(),
+                columns: vec![Column::new("a", DataType::Any)],
+                strict: false,
+            })
+            .unwrap();
+        let bytes = catalog.encode();
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            CATALOG_VERSION_STRICT
+        );
+        assert_eq!(Catalog::decode(&bytes).unwrap(), catalog);
+    }
+
+    /// A plain table with no `STRICT` flag and no `ANY` column still writes
+    /// the lowest version that fits it — `STRICT`'s byte must not leak into
+    /// a database that never asked for it.
+    #[test]
+    fn a_table_with_neither_strict_nor_any_does_not_force_version_eight() {
+        let catalog = sample();
+        let bytes = catalog.encode();
+        assert!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()) < CATALOG_VERSION_STRICT);
     }
 
     #[test]
@@ -1984,6 +2096,7 @@ mod tests {
                         Column::new("a", DataType::Integer),
                         Column::new("b", DataType::Integer),
                     ],
+                    strict: false,
                 },
                 TableConstraints {
                     unique: vec![UniqueConstraint::new(vec!["a".to_string()])],
@@ -2019,6 +2132,7 @@ mod tests {
                     Column::new("code", DataType::Text).with_collation(Collation::RTrim),
                     Column::new("plain", DataType::Text),
                 ],
+                strict: false,
             })
             .unwrap();
         catalog
@@ -2183,6 +2297,7 @@ mod tests {
             .create_table(Table {
                 name: "docs".to_string(),
                 columns: vec![Column::new("embedding", DataType::QuantizedVector(384))],
+                strict: false,
             })
             .unwrap();
         let bytes = catalog.encode();

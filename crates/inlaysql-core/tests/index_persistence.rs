@@ -557,6 +557,7 @@ fn a_database_written_before_create_index_is_grandfathered() {
                 Column::new("body", DataType::Text),
                 Column::new("embedding", DataType::Vector(3)),
             ],
+            strict: false,
         })
         .unwrap();
     let v2 = catalog.encode();

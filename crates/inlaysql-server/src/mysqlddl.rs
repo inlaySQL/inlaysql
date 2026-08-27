@@ -2029,6 +2029,7 @@ mod tests {
                     Column::new("email", DataType::Text),
                     Column::new("name", DataType::Text).with_collation(Collation::NoCase),
                 ],
+                strict: false,
             })
             .unwrap();
         for index in indexes {

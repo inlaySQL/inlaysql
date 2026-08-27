@@ -333,7 +333,10 @@ pub fn streamed_column_def(name: String, declared: Option<DataType>) -> Option<C
             | DataType::Vector(_)
             | DataType::QuantizedVector(_)),
         ) => Some(column_def_from_type(name, Some(ty))),
-        Some(DataType::Numeric) | None => None,
+        // `ANY` (`STRICT`'s no-affinity column) holds whatever the value
+        // turns out to be, exactly as `NUMERIC` does, for the same reason:
+        // nothing but the values themselves can say what type a row has.
+        Some(DataType::Numeric) | Some(DataType::Any) | None => None,
     }
 }
 
@@ -365,11 +368,13 @@ pub fn column_def_from_type(name: String, ty: Option<DataType>) -> ColumnDef {
             length: u32::MAX,
         },
         // `NUMERIC` holds whatever the value turns out to be (D7's affinity
-        // rules), a vector renders as the JSON text `format_vector` builds,
+        // rules), `ANY` the same for the same reason `STRICT` gives it none
+        // at all, a vector renders as the JSON text `format_vector` builds,
         // and `None` covers everything the plan does not statically know
         // the type of. Text represents every one of them.
         Some(DataType::Text)
         | Some(DataType::Numeric)
+        | Some(DataType::Any)
         | Some(DataType::Vector(_))
         | Some(DataType::QuantizedVector(_))
         | None => ColumnDef::text(name),

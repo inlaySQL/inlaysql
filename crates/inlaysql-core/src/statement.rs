@@ -206,6 +206,7 @@ mod tests {
             .create_table(Table {
                 name: "docs".to_string(),
                 columns,
+                strict: false,
             })
             .unwrap();
         catalog
@@ -284,6 +285,7 @@ mod tests {
             .create_table(Table {
                 name: "other".to_string(),
                 columns: vec![Column::new("a", DataType::Integer)],
+                strict: false,
             })
             .unwrap();
         assert!(statement.check_schema(&catalog).is_ok());
@@ -337,6 +339,7 @@ mod tests {
                     Column::new("doc_id", DataType::Integer),
                     Column::new("label", DataType::Real),
                 ],
+                strict: false,
             })
             .unwrap();
         let statement = crate::sql::prepare(

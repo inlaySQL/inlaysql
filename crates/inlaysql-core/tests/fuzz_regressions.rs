@@ -69,6 +69,7 @@ fn the_bound_does_not_reject_legitimate_data() {
                 Column::new("body", DataType::Text),
                 Column::new("embedding", DataType::Vector(384)),
             ],
+            strict: false,
         })
         .unwrap();
     assert_eq!(Catalog::decode(&catalog.encode()).unwrap(), catalog);

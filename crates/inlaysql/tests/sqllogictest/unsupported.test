@@ -113,8 +113,7 @@ CREATE TEMPORARY TABLE c12(a INTEGER)
 statement error
 CREATE TABLE c13(a INTEGER) WITHOUT ROWID
 
-statement error
-CREATE TABLE c14(a INTEGER) STRICT
+# `STRICT` is implemented — see `strict.test`.
 
 # `CREATE TABLE ... AS SELECT` is implemented — see
 # `create_table_as_select.test` for what it does, and

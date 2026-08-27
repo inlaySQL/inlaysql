@@ -837,6 +837,10 @@ fn data_type_name(ty: DataType) -> String {
         // docs/server.md, "Divergences".
         DataType::Numeric => "numeric".to_string(),
         DataType::Vector(_) | DataType::QuantizedVector(_) => "vector".to_string(),
+        // MySQL has nothing that means "no affinity at all"; `any` names it
+        // rather than claiming one of MySQL's own storage classes, the same
+        // choice `vector` above makes for a column MySQL has no type for.
+        DataType::Any => "any".to_string(),
     }
 }
 
@@ -1361,12 +1365,14 @@ mod tests {
                     Column::primary_key("id", DataType::Integer),
                     Column::new("email", DataType::Text),
                 ],
+                strict: false,
             })
             .unwrap();
         catalog
             .create_table(Table {
                 name: "posts".to_string(),
                 columns: vec![Column::new("title", DataType::Text)],
+                strict: false,
             })
             .unwrap();
         catalog

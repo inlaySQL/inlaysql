@@ -192,6 +192,7 @@ fn alloc_type_name(ty: &inlaysql_core::DataType) -> String {
         inlaysql_core::DataType::Numeric => "NUMERIC".to_string(),
         inlaysql_core::DataType::Vector(dim) => format!("VECTOR({dim})"),
         inlaysql_core::DataType::QuantizedVector(dim) => format!("VECTOR({dim}, INT8)"),
+        inlaysql_core::DataType::Any => "ANY".to_string(),
     }
 }
 

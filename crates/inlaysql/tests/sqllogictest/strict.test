@@ -1,0 +1,41 @@
+# CREATE TABLE ... STRICT.
+#
+# Replayed through the sqlite3 binary. Only INT/INTEGER, REAL, TEXT, BLOB and
+# ANY are allowed, with no length or precision modifier; INT still checks a
+# REAL for a lossless conversion, and TEXT still accepts a number by
+# stringifying it, exactly as an ordinary sqlite3 STRICT table does.
+
+statement ok
+CREATE TABLE t(a INT, b TEXT, c REAL, d BLOB, e ANY) STRICT
+
+statement ok
+INSERT INTO t VALUES (2.0, 5, 1, x'0102', 'x')
+
+query ITRTT nosort
+SELECT a, b, c, hex(d), e FROM t
+----
+2 5 1.0 0102 x
+
+statement error
+INSERT INTO t (a) VALUES (2.5)
+
+statement error
+INSERT INTO t (a) VALUES ('x')
+
+statement error
+INSERT INTO t (d) VALUES (1)
+
+statement error
+CREATE TABLE bad(x NUMERIC) STRICT
+
+statement error
+CREATE TABLE bad(x) STRICT
+
+statement error
+CREATE TABLE bad(x VARCHAR(10)) STRICT
+
+statement ok
+ALTER TABLE t ADD COLUMN f INT
+
+statement error
+ALTER TABLE t ADD COLUMN g
