@@ -98,6 +98,17 @@ Zero conflicts held, but the spread remains too wide for a headline (up to
 35.1% in the 128-writer sweep). Separating setup did not remove the
 coordination plateau; it only made the next measurement boundary honest.
 
+The focused-level selector in `7d1f766` then compared only `1,32`, removing
+the intermediate writer levels from each repetition. Its clean three-repeat
+median was 246 commits/s at one writer and 507 at 32 writers, with a 16.4%
+spread on the 32-writer row:
+[`bench/results/20260827T082514Z-repeat.txt`](../../bench/results/20260827T082514Z-repeat.txt).
+That is effectively the earlier 508-commits/s baseline, so the apparent gains
+from the broad sweeps are not a stable W3 improvement. The current cohort
+prototype is therefore a **no-go for publication**; its explicit ticket seam
+may still inform a future pipeline, but the next production optimization
+should not assume it moved the barrier floor.
+
 With `INLAYSQL_COMMIT_STATS=1`, the 32-writer run reported 3,252 normal
 tickets covered by 1,350 normal flushes (about 2.4 tickets per flush). The
 diagnostic is opt-in and printed when the shared coordinator is dropped; it
