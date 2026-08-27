@@ -39,11 +39,12 @@ use crate::fusion::{reciprocal_rank_fusion, sort_by_score_desc};
 use crate::hnsw::VectorMetric;
 use crate::hnsw_paged::PagedHnswIndex;
 use crate::plan::{
-    Aggregate, AlterAction, AlterTablePlan, ConflictAction, ConflictUpdate, CreateTablePlan,
-    DeletePlan, DropTablePlan, FrameBound, FromItem, InsertPlan, InsertSource, JoinKind,
-    OnConflict, Order, OrderKey, Plan, ReindexPlan, ScalarPlan, ScoreExpr, SelectItem, SelectPlan,
-    SetOp, SetOperationPlan, SubqueryBody, UpdatePlan, WindowFn, WindowFunc,
+    Aggregate, AlterAction, AlterTablePlan, AnalyzePlan, ConflictAction, ConflictUpdate,
+    CreateTablePlan, DeletePlan, DropTablePlan, FrameBound, FromItem, InsertPlan, InsertSource,
+    JoinKind, OnConflict, Order, OrderKey, Plan, ReindexPlan, ScalarPlan, ScoreExpr, SelectItem,
+    SelectPlan, SetOp, SetOperationPlan, SubqueryBody, UpdatePlan, WindowFn, WindowFunc,
 };
+use crate::planner::{self, JoinDecision, JoinPath, PlannerStats, STATS_META_KEY};
 use crate::row::{
     decode_row, decode_row_masked, decode_value_at, encode_typed_row, ColumnMask, RowBuf,
 };
@@ -69,6 +70,9 @@ const NEXT_ROW_ID_KEY: &str = "next_row_id";
 /// engine can tell at a glance whether a saved index still describes the rows
 /// on disk. See [`Engine::persist_indexes`].
 const WRITE_VERSION_KEY: &str = "write_version";
+
+/// Metadata key holding the catalog revision used to invalidate planner stats.
+const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// How many row mutations may accumulate before the engine rewrites the
 /// persisted indexes.
@@ -467,6 +471,30 @@ impl CachedHashJoin {
     }
 }
 
+/// One join access path chosen by the executor and `EXPLAIN` together.
+pub(crate) enum JoinStrategy {
+    /// Build the inner table's hash table and probe it with `outer_key`.
+    Hash { outer_key: usize, inner_key: usize },
+    /// Probe the inner primary key or scalar B-tree index per outer row.
+    Probe {
+        key: usize,
+        ty: DataType,
+        collation: Collation,
+        kind: ProbeKind,
+    },
+    /// Materialise the inner table and replay it for each outer row.
+    Materialise,
+}
+
+/// A join strategy, plus the optional cost comparison that selected it.
+pub(crate) struct JoinChoice {
+    /// The path the executor should use.
+    pub strategy: JoinStrategy,
+    /// Present only when fresh, complete statistics selected between existing
+    /// paths; `None` means the legacy shape rule made the choice.
+    pub cost: Option<JoinDecision>,
+}
+
 /// The database engine.
 ///
 /// It owns the catalog and the live indexes, and drives storage through the
@@ -566,6 +594,15 @@ pub struct Engine {
     last_insert_row_id: Option<RowId>,
     /// Number of committed row mutations. Stamped onto persisted indexes.
     write_version: u64,
+    /// Number of committed catalog changes. DDL does not change
+    /// `write_version`, so planner stats need this separate currency.
+    schema_version: u64,
+    /// Optional cardinality snapshot used by the staged cost planner.
+    ///
+    /// It is derived from committed rows and is discarded whenever the data
+    /// or catalog moves. A stale or incomplete snapshot therefore cannot
+    /// affect a plan; the rule-based chooser remains the fallback.
+    planner_stats: PlannerStats,
     /// The `write_version` the persisted indexes were saved at.
     persisted_version: u64,
     /// The `write_version` the *live* retrieval indexes are known to describe
@@ -668,6 +705,9 @@ impl Engine {
         let write_version =
             read_counter(&storage, WRITE_VERSION_KEY, "write version")?.unwrap_or_default();
         let cdc_floor = read_counter(&storage, CDC_FLOOR_KEY, "change floor")?.unwrap_or_default();
+        let schema_version =
+            read_counter(&storage, SCHEMA_VERSION_KEY, "schema version")?.unwrap_or_default();
+        let planner_stats = load_planner_stats(&storage, write_version, schema_version, &catalog)?;
 
         // Seeded from the clock, which is itself injected: in the simulation
         // that is a logical counter, so the stream is reproducible.
@@ -691,6 +731,8 @@ impl Engine {
             next_row_id,
             last_insert_row_id: None,
             write_version,
+            schema_version,
+            planner_stats,
             persisted_version: write_version,
             indexed_version: write_version,
             pending_changes: Vec::new(),
@@ -923,6 +965,7 @@ impl Engine {
                 Ok(Outcome::Rows(crate::explain::explain(self, inner, params)?))
             }
             Plan::Reindex(reindex) => self.run_reindex(reindex),
+            Plan::Analyze(analyze) => self.run_analyze(analyze),
             Plan::Begin => self.begin().map(|()| Outcome::Ddl),
             Plan::Commit => self.commit().map(|()| Outcome::Ddl),
             Plan::Rollback => self.rollback().map(|()| Outcome::Ddl),
@@ -1232,6 +1275,9 @@ impl Engine {
                         .unwrap_or_default();
                 self.cdc_floor =
                     read_counter(&self.storage, CDC_FLOOR_KEY, "change floor")?.unwrap_or_default();
+                self.schema_version =
+                    read_counter(&self.storage, SCHEMA_VERSION_KEY, "schema version")?
+                        .unwrap_or_default();
                 if self.write_version == predicted {
                     // Nobody got between this handle and the root it committed
                     // onto, so its indexes describe every committed row: the
@@ -1347,6 +1393,7 @@ impl Engine {
         // [`Engine::indexed_version`](Self::indexed_version).
         let previous_version = self.indexed_version;
         let previous_catalog = core::mem::replace(&mut self.catalog, catalog);
+        let catalog_changed = self.catalog != previous_catalog;
         // Unconditional, and before the early return below: the constraints
         // cache is keyed off a catalog this handle no longer holds, whether or
         // not the new one turns out to be equal.
@@ -1358,6 +1405,18 @@ impl Engine {
             read_counter(&self.storage, WRITE_VERSION_KEY, "write version")?.unwrap_or_default();
         self.cdc_floor =
             read_counter(&self.storage, CDC_FLOOR_KEY, "change floor")?.unwrap_or_default();
+        self.schema_version =
+            read_counter(&self.storage, SCHEMA_VERSION_KEY, "schema version")?.unwrap_or_default();
+        self.planner_stats = if catalog_changed {
+            PlannerStats::empty(self.write_version)
+        } else {
+            load_planner_stats(
+                &self.storage,
+                self.write_version,
+                self.schema_version,
+                &self.catalog,
+            )?
+        };
 
         if self.write_version == previous_version && self.catalog == previous_catalog {
             // Whatever the other handle committed, it was not a row and not a
@@ -1691,6 +1750,14 @@ impl Engine {
             read_counter(&self.storage, WRITE_VERSION_KEY, "write version")?.unwrap_or_default();
         self.cdc_floor =
             read_counter(&self.storage, CDC_FLOOR_KEY, "change floor")?.unwrap_or_default();
+        self.schema_version =
+            read_counter(&self.storage, SCHEMA_VERSION_KEY, "schema version")?.unwrap_or_default();
+        self.planner_stats = load_planner_stats(
+            &self.storage,
+            self.write_version,
+            self.schema_version,
+            &self.catalog,
+        )?;
         self.persisted_version = self.write_version;
         self.text_indexes.clear();
         self.vector_indexes.clear();
@@ -1703,6 +1770,20 @@ impl Engine {
     }
 
     // ------------------------------------------------------------------ DDL
+
+    /// Persist the catalog and advance its independent revision counter.
+    ///
+    /// DDL can leave `write_version` unchanged when it touches no rows, but it
+    /// still invalidates planner statistics. The separate counter makes that
+    /// invalidation survive a close and reopen, including a drop/recreate with
+    /// an identical catalog encoding.
+    fn persist_catalog(&mut self) -> Result<()> {
+        self.schema_version = self.schema_version.saturating_add(1);
+        self.planner_stats = PlannerStats::empty(self.write_version);
+        self.storage
+            .put_meta(SCHEMA_VERSION_KEY, &self.schema_version.to_le_bytes())?;
+        self.storage.put_meta(CATALOG_KEY, &self.catalog.encode())
+    }
 
     fn create_table(&mut self, plan: &CreateTablePlan) -> Result<Outcome> {
         let table = &plan.table;
@@ -1757,8 +1838,7 @@ impl Engine {
         // so there is nothing to build — only the declaration to record.
         self.declare_unique_indexes(&table.name)?;
         self.open_indexes_for(table)?;
-        let encoded = self.catalog.encode();
-        self.storage.put_meta(CATALOG_KEY, &encoded)?;
+        self.persist_catalog()?;
         self.end_write()?;
         Ok(Outcome::Ddl)
     }
@@ -1790,7 +1870,7 @@ impl Engine {
             self.storage.delete_row(&table.name, id)?;
             self.note_change(&table.name, id, ChangeKind::Delete);
         }
-        self.storage.put_meta(CATALOG_KEY, &self.catalog.encode())?;
+        self.persist_catalog()?;
         self.end_write()?;
         Ok(Outcome::Ddl)
     }
@@ -1887,7 +1967,7 @@ impl Engine {
         self.vector_indexes.clear();
         self.dirty_tables.clear();
         self.restore_indexes()?;
-        self.storage.put_meta(CATALOG_KEY, &self.catalog.encode())?;
+        self.persist_catalog()?;
         self.end_write()?;
         Ok(Outcome::Ddl)
     }
@@ -2046,6 +2126,10 @@ impl Engine {
     /// Throw away every resolved constraint, because the catalog moved.
     fn invalidate_rules(&mut self) {
         self.rules.clear();
+        // Statistics include table and index identities. A catalog change
+        // therefore invalidates them even when no row mutation advances the
+        // write version; the next explicit ANALYZE can refresh the snapshot.
+        self.planner_stats = PlannerStats::empty(self.write_version);
         // A hash build's mask and column ordinals were resolved against this
         // same catalog. Even when DDL changed no row and therefore did not
         // advance `write_version`, a build from the old shape is not valid for
@@ -2281,7 +2365,7 @@ impl Engine {
             }
         }
 
-        self.storage.put_meta(CATALOG_KEY, &self.catalog.encode())?;
+        self.persist_catalog()?;
         self.end_write()?;
         Ok(Outcome::Ddl)
     }
@@ -2440,7 +2524,7 @@ impl Engine {
                 columns: create.columns.clone(),
             },
         )?;
-        self.storage.put_meta(CATALOG_KEY, &self.catalog.encode())?;
+        self.persist_catalog()?;
         self.end_write()?;
         Ok(Outcome::Ddl)
     }
@@ -2465,7 +2549,7 @@ impl Engine {
                 // A unique constraint over a column no B-tree index can cover
                 // — a `VECTOR` — has no index half at all.
                 let _ = error;
-                self.storage.put_meta(CATALOG_KEY, &self.catalog.encode())?;
+                self.persist_catalog()?;
                 self.end_write()?;
                 return Ok(Outcome::Ddl);
             }
@@ -2485,7 +2569,7 @@ impl Engine {
             // may no longer exist.
             IndexKind::BTree => {
                 self.purge_index_entries(&index)?;
-                self.storage.put_meta(CATALOG_KEY, &self.catalog.encode())?;
+                self.persist_catalog()?;
                 self.end_write()?;
                 return Ok(Outcome::Ddl);
             }
@@ -2498,7 +2582,7 @@ impl Engine {
         self.storage
             .put_meta(&index_meta_key_for(&index.table, &index.columns), &[])?;
 
-        self.storage.put_meta(CATALOG_KEY, &self.catalog.encode())?;
+        self.persist_catalog()?;
         self.end_write()?;
         Ok(Outcome::Ddl)
     }
@@ -3199,6 +3283,37 @@ impl Engine {
             .filter(|index| keys.contains(&retrieval_key(&index.table, &index.columns)))
             .map(|index| index.name.clone())
             .collect()
+    }
+
+    /// Run a planned `ANALYZE`, replacing the selected tables' derived stats.
+    fn run_analyze(&mut self, plan: &AnalyzePlan) -> Result<Outcome> {
+        if self.in_transaction {
+            return Err(Error::Transaction(
+                "ANALYZE cannot run inside a transaction; analyze committed rows after \
+                 committing or rolling back"
+                    .to_string(),
+            ));
+        }
+        let mut stats = if self.planner_stats.is_current(self.write_version) {
+            self.planner_stats.clone()
+        } else {
+            PlannerStats::empty(self.write_version)
+        };
+        for name in &plan.tables {
+            let table = self.catalog.require_table(name)?.clone();
+            let indexes = self.catalog.indexes_for(&table.name);
+            let table_stats =
+                planner::collect_table(&self.storage, &table, &indexes, &self.interrupt)?;
+            stats
+                .tables
+                .insert(table.name.to_ascii_lowercase(), table_stats);
+        }
+        stats.data_version = self.write_version;
+        stats.stamp_catalog(&self.catalog, self.schema_version);
+        self.storage.put_meta(STATS_META_KEY, &stats.encode())?;
+        self.end_write()?;
+        self.planner_stats = stats;
+        Ok(Outcome::Ddl)
     }
 
     /// Run the deferred index build now, rather than leaving it to whichever
@@ -4423,6 +4538,7 @@ impl Engine {
             stop_after,
             full_scan,
         } = scan_shape(plan, env, cap)?;
+        let outer_rows = self.estimated_outer_rows(plan, fetch, env.params());
 
         // Which columns any of this can observe. Everything else is walked past
         // rather than turned into a `String` or a `Vec` on the heap.
@@ -4461,6 +4577,7 @@ impl Engine {
                     &mask,
                     &driving_mask,
                     full_scan,
+                    outer_rows,
                     offset,
                     limit,
                     sink,
@@ -4550,6 +4667,7 @@ impl Engine {
                         join.on.as_ref(),
                         &mask,
                         full_scan,
+                        if index == 0 { outer_rows } else { None },
                     )?,
                 };
                 offset_of += width;
@@ -4669,6 +4787,7 @@ impl Engine {
         mask: &ColumnMask,
         driving_mask: &ColumnMask,
         full_scan: bool,
+        outer_rows: Option<u64>,
         offset: usize,
         limit: Option<usize>,
         sink: &mut dyn FnMut(&[Value]) -> Result<()>,
@@ -4698,6 +4817,7 @@ impl Engine {
             join.on.as_ref(),
             mask,
             full_scan,
+            outer_rows,
         )?;
         let hash_key_is_full_on = side.is_hash() && is_single_equality(join.on.as_ref());
         let mut skipped = 0usize;
@@ -4891,14 +5011,160 @@ impl Engine {
         ))
     }
 
-    /// Where one join's inner rows come from: a hash table on a full scan, an
-    /// index probe when the `ON` justifies one, the whole table otherwise.
+    /// Estimate how many rows the first join's driving side will produce.
+    ///
+    /// The estimate is deliberately an upper bound for a `LIMIT` and does not
+    /// pretend to know filter selectivity. A derived source has no persisted
+    /// table stats, and an incomplete/stale snapshot returns `None`, which
+    /// keeps the existing shape rule in force.
+    pub(crate) fn estimated_outer_rows(
+        &self,
+        plan: &SelectPlan,
+        fetch: Option<usize>,
+        params: &[Value],
+    ) -> Option<u64> {
+        let driving = plan.from.first()?;
+        if driving.derived.is_some() || !self.planner_stats.is_current(self.write_version) {
+            return None;
+        }
+        let table = self.planner_stats.table(&driving.table.name)?;
+        let rows = if pinned_rowid(&driving.table, plan.filter.as_ref(), params).is_some() {
+            1
+        } else {
+            table.row_count
+        };
+        Some(fetch.map_or(rows, |fetch| rows.min(fetch as u64)))
+    }
+
+    /// Choose one join path for the executor and `EXPLAIN` to share.
+    ///
+    /// Fresh stats are used only for the first stored-table join, where the
+    /// driving cardinality is observable. Later joins and unknown shapes use
+    /// the existing deterministic rule. A costed choice may select a hash
+    /// build for a limited query, or an index probe for a full scan; both are
+    /// already implemented operators and retain the same residual `ON`
+    /// evaluation.
+    pub(crate) fn join_strategy(
+        &self,
+        from: &[FromItem],
+        inner_index: usize,
+        offset_of: usize,
+        on: Option<&crate::plan::Expr>,
+        full_scan: bool,
+        outer_rows: Option<u64>,
+    ) -> JoinChoice {
+        let hash_key = hash_join_key(from, inner_index, offset_of, on);
+        let inner = &from[inner_index].table;
+        let probe = self.join_probe(inner, offset_of, on);
+        let decision = self.costed_join_decision(
+            from,
+            inner_index,
+            outer_rows,
+            hash_key.is_some(),
+            probe.as_ref(),
+        );
+
+        if let Some(decision) = decision {
+            match decision.path {
+                JoinPath::Hash => {
+                    if let Some(key) = hash_key.as_ref() {
+                        return JoinChoice {
+                            strategy: JoinStrategy::Hash {
+                                outer_key: key.0.outer,
+                                inner_key: key.0.inner,
+                            },
+                            cost: Some(decision),
+                        };
+                    }
+                }
+                JoinPath::Probe => {
+                    if let Some((key, ty, collation, kind)) = probe {
+                        return JoinChoice {
+                            strategy: JoinStrategy::Probe {
+                                key,
+                                ty,
+                                collation,
+                                kind,
+                            },
+                            cost: Some(decision),
+                        };
+                    }
+                }
+            }
+        }
+
+        if full_scan {
+            if let Some(key) = hash_key {
+                return JoinChoice {
+                    strategy: JoinStrategy::Hash {
+                        outer_key: key.0.outer,
+                        inner_key: key.0.inner,
+                    },
+                    cost: None,
+                };
+            }
+        }
+        match probe {
+            Some((key, ty, collation, kind)) => JoinChoice {
+                strategy: JoinStrategy::Probe {
+                    key,
+                    ty,
+                    collation,
+                    kind,
+                },
+                cost: None,
+            },
+            None => JoinChoice {
+                strategy: JoinStrategy::Materialise,
+                cost: None,
+            },
+        }
+    }
+
+    /// Cost a first join when every required cardinality is known.
+    fn costed_join_decision(
+        &self,
+        from: &[FromItem],
+        inner_index: usize,
+        outer_rows: Option<u64>,
+        hash_available: bool,
+        probe: Option<&(usize, DataType, Collation, ProbeKind)>,
+    ) -> Option<JoinDecision> {
+        if inner_index != 1
+            || !self.planner_stats.is_current(self.write_version)
+            || from.first()?.derived.is_some()
+        {
+            return None;
+        }
+        let outer_rows = outer_rows?;
+        // Presence of the outer stats is part of the completeness check even
+        // though the caller already supplied the LIMIT-aware row estimate.
+        self.planner_stats.table(&from[0].table.name)?;
+        let inner_stats = self.planner_stats.table(&from[inner_index].table.name)?;
+        let group_size = match probe {
+            None => None,
+            Some((_, _, _, ProbeKind::RowId)) => Some(1),
+            Some((_, _, _, ProbeKind::Index(name))) => {
+                inner_stats.index(name).map(|stats| stats.group_size())
+            }
+        };
+        planner::choose_join(
+            outer_rows,
+            inner_stats.row_count,
+            group_size,
+            hash_available,
+        )
+    }
+
+    /// Where one join's inner rows come from: a costed choice when fresh stats
+    /// cover the first join, then the existing shape rule otherwise.
     ///
     /// `offset_of` is where the inner table's columns begin in the joined row,
     /// which is what translates the plan's ordinals — held against the
     /// concatenation of every table in `FROM` order — onto this table. `from`
     /// and `inner_index` name the tables before and at the join, so a hash-join
     /// key can be checked for a matching declared class on both sides.
+    #[allow(clippy::too_many_arguments)]
     fn join_inner(
         &self,
         from: &[FromItem],
@@ -4907,20 +5173,26 @@ impl Engine {
         on: Option<&crate::plan::Expr>,
         mask: &ColumnMask,
         full_scan: bool,
+        outer_rows: Option<u64>,
     ) -> Result<JoinInner<'_>> {
         let inner = &from[inner_index].table;
         let inner_mask = mask.slice(offset_of, inner.columns.len());
-
-        if full_scan {
-            if let Some((key, _ty)) = hash_join_key(from, inner_index, offset_of, on) {
+        let choice = self.join_strategy(from, inner_index, offset_of, on, full_scan, outer_rows);
+        match choice.strategy {
+            JoinStrategy::Hash {
+                outer_key,
+                inner_key,
+            } => {
                 let table =
-                    self.hash_join_table(&inner.name, inner_mask, key.inner, inner.columns.len())?;
-                return Ok(JoinInner::Hash(HashJoin::from_table(table, key.outer)));
+                    self.hash_join_table(&inner.name, inner_mask, inner_key, inner.columns.len())?;
+                Ok(JoinInner::Hash(HashJoin::from_table(table, outer_key)))
             }
-        }
-
-        match self.join_probe(inner, offset_of, on) {
-            Some((key, ty, collation, kind)) => Ok(JoinInner::probe(IndexProbe::new(
+            JoinStrategy::Probe {
+                key,
+                ty,
+                collation,
+                kind,
+            } => Ok(JoinInner::probe(IndexProbe::new(
                 &self.storage,
                 &inner.name,
                 inner_mask,
@@ -4931,7 +5203,7 @@ impl Engine {
                 kind,
                 &self.interrupt,
             ))),
-            None => self.materialise_inner(inner, &inner_mask),
+            JoinStrategy::Materialise => self.materialise_inner(inner, &inner_mask),
         }
     }
 
@@ -6254,6 +6526,33 @@ fn read_counter(storage: &dyn Storage, key: &str, what: &str) -> Result<Option<u
             Ok(Some(u64::from_le_bytes(bytes)))
         }
         None => Ok(None),
+    }
+}
+
+/// Load the optional planner statistics cache.
+///
+/// The blob is derived state, so corruption or a version mismatch disables it
+/// rather than preventing the database from opening. An actual storage read
+/// failure still propagates: that is an I/O failure, not stale statistics.
+fn load_planner_stats(
+    storage: &dyn Storage,
+    write_version: u64,
+    schema_version: u64,
+    catalog: &Catalog,
+) -> Result<PlannerStats> {
+    let Some(bytes) = storage.get_meta(STATS_META_KEY)? else {
+        return Ok(PlannerStats::empty(write_version));
+    };
+    let catalog = catalog.encode();
+    match PlannerStats::decode(&bytes) {
+        Ok(stats)
+            if stats.is_current(write_version)
+                && stats.schema_version == schema_version
+                && stats.catalog == catalog =>
+        {
+            Ok(stats)
+        }
+        Ok(_) | Err(_) => Ok(PlannerStats::empty(write_version)),
     }
 }
 

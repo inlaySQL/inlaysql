@@ -45,6 +45,7 @@ pub mod index;
 pub mod json;
 pub mod mem;
 pub mod plan;
+mod planner;
 mod quantize;
 pub mod row;
 pub mod shared;

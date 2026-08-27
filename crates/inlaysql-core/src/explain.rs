@@ -10,14 +10,12 @@
 //!
 //! # What it deliberately does not report
 //!
-//! **No row counts, no costs, no selectivity.** There is no statistics system
-//! here — no `ANALYZE`, no histograms, no cardinality anywhere in the
-//! catalog — so every number of that kind would be invented. A fabricated
-//! estimate is worse than none: it reads exactly like a measured one, and the
-//! first thing anyone does with `rows` is compare it against reality. Every
-//! access-path rule in [`crate::engine`] is a *rule* rather than a cost model
-//! (`docs/architecture.md`, D6), so there is nothing to report a cost from
-//! even in principle.
+//! **No fabricated cardinalities.** `ANALYZE` can now persist exact
+//! row-count/leading-key statistics for a committed snapshot, and the first
+//! costed join prototype reports its integer work-unit comparison in the join
+//! detail. A missing, corrupt, stale or incomplete snapshot still reports no
+//! cost and follows the rule-based path. There are no histograms or sampled
+//! selectivities yet, so this output never pretends to be a measured runtime.
 //!
 //! # The output shape, and why this one
 //!
@@ -51,7 +49,7 @@
 //! # Where the answers come from
 //!
 //! Every choice reported here is read back from the executor's own chooser —
-//! `Engine::choose_index`, `Engine::join_probe`, `hash_join_key`,
+//! `Engine::choose_index`, `Engine::join_strategy`, `hash_join_key`,
 //! `pinned_rowid`, `scan_shape` — never re-derived from the same inputs by
 //! a second implementation of the same rule. A second implementation would
 //! drift, and the way it would drift is the one that matters: an `EXPLAIN`
@@ -75,7 +73,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::catalog::Table;
-use crate::engine::{hash_join_key, pinned_rowid, scan_shape, Engine, ResultSet};
+use crate::engine::{pinned_rowid, scan_shape, Engine, JoinStrategy, ResultSet};
 use crate::error::Result;
 use crate::eval::Env;
 use crate::exec::ProbeKind;
@@ -251,6 +249,9 @@ impl<'e> Explainer<'e> {
     fn select(&mut self, plan: &SelectPlan, parent: i64, cap: Option<usize>) -> Result<()> {
         let shape = scan_shape(plan, &self.env, cap)?;
         let driving = &plan.from[0];
+        let outer_rows = self
+            .engine
+            .estimated_outer_rows(plan, shape.fetch, self.env.params());
 
         // How many candidates a retrieval leaf will be asked for, derived the
         // one way the executor derives it (`Engine::candidate_limit`) rather
@@ -308,7 +309,13 @@ impl<'e> Explainer<'e> {
                     inner.table.name
                 )
             } else {
-                self.join_side(plan, index, offset_of, shape.full_scan)
+                self.join_side(
+                    plan,
+                    index,
+                    offset_of,
+                    shape.full_scan,
+                    if index == 0 { outer_rows } else { None },
+                )
             };
             let detail = match join.kind {
                 JoinKind::Left => alloc::format!("LEFT {side}"),
@@ -508,38 +515,58 @@ impl<'e> Explainer<'e> {
         Ok(())
     }
 
-    /// Which of the three inner-side strategies one join gets. This mirrors
-    /// [`Engine::join_inner`] arm for arm, and asks the same two functions in
-    /// the same order — a hash key first, but only under a full scan, then an
-    /// index probe, then the materialising fallback.
+    /// Which of the three inner-side strategies one join gets. This asks the
+    /// same chooser as [`Engine::join_inner`], including its optional costed
+    /// decision, so the report cannot drift from execution.
     fn join_side(
         &self,
         plan: &SelectPlan,
         join_index: usize,
         offset_of: usize,
         full_scan: bool,
+        outer_rows: Option<u64>,
     ) -> String {
         let inner_index = join_index + 1;
         let inner = &plan.from[inner_index].table;
         let on = plan.joins[join_index].on.as_ref();
+        let choice = self.engine.join_strategy(
+            &plan.from,
+            inner_index,
+            offset_of,
+            on,
+            full_scan,
+            outer_rows,
+        );
+        let cost = match choice.cost {
+            Some(decision) => match decision.alternative_cost {
+                Some(alternative) => {
+                    alloc::format!(" (COSTED: {} vs {} work units)", decision.cost, alternative)
+                }
+                None => alloc::format!(" (COSTED: {} work units)", decision.cost),
+            },
+            None => String::new(),
+        };
 
-        if full_scan {
-            if let Some((key, _)) = hash_join_key(&plan.from, inner_index, offset_of, on) {
-                return alloc::format!(
-                    "HASH JOIN {} (BUILD ON {}.{})",
-                    inner.name,
-                    inner.name,
-                    inner.columns[key.inner].name
-                );
-            }
-        }
-
-        match self.engine.join_probe(inner, offset_of, on) {
-            Some((_, _, _, ProbeKind::RowId)) => alloc::format!(
-                "INDEX NESTED LOOP JOIN {} USING INTEGER PRIMARY KEY (rowid=?)",
-                inner.name
+        match choice.strategy {
+            JoinStrategy::Hash { inner_key, .. } => alloc::format!(
+                "HASH JOIN {} (BUILD ON {}.{}){}",
+                inner.name,
+                inner.name,
+                inner.columns[inner_key].name,
+                cost
             ),
-            Some((_, _, _, ProbeKind::Index(name))) => {
+            JoinStrategy::Probe {
+                kind: ProbeKind::RowId,
+                ..
+            } => alloc::format!(
+                "INDEX NESTED LOOP JOIN {} USING INTEGER PRIMARY KEY (rowid=?){}",
+                inner.name,
+                cost
+            ),
+            JoinStrategy::Probe {
+                kind: ProbeKind::Index(name),
+                ..
+            } => {
                 // The probe reads the run of entries whose *leading* column
                 // equals the key; nothing past it is contiguous, so that one
                 // column is the whole of what the index answers here.
@@ -552,11 +579,12 @@ impl<'e> Explainer<'e> {
                     .and_then(|index| index.columns.first().cloned())
                     .unwrap_or_else(|| "?".to_string());
                 alloc::format!(
-                    "INDEX NESTED LOOP JOIN {} USING INDEX {name} ({leading}=?)",
-                    inner.name
+                    "INDEX NESTED LOOP JOIN {} USING INDEX {name} ({leading}=?){}",
+                    inner.name,
+                    cost
                 )
             }
-            None => alloc::format!(
+            JoinStrategy::Materialise => alloc::format!(
                 "NESTED LOOP JOIN {} (MATERIALISED: no index or hash key applies)",
                 inner.name
             ),
@@ -705,6 +733,7 @@ fn statement_kind(plan: &Plan) -> &'static str {
         Plan::CreateIndex(_) | Plan::CreateUniqueIndex(_) => "CREATE INDEX",
         Plan::DropIndex(_) => "DROP INDEX",
         Plan::Reindex(_) => "REINDEX",
+        Plan::Analyze(_) => "ANALYZE",
         Plan::Begin => "BEGIN",
         Plan::Commit => "COMMIT",
         Plan::Rollback => "ROLLBACK",

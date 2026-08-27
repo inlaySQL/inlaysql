@@ -29,8 +29,8 @@ extension bolted on the side.
 >   real power cuts and real filesystems. SQLite has those; this does not.
 > - **Known gaps are listed, not hidden.** See
 >   [What this is not](#what-this-is-not). Some of them will bite you: recall
->   on uniformly random vectors is poor, and there is no cost-based join
->   planner.
+>   on uniformly random vectors is poor, and the cost-based planner is still a
+>   staged access-path prototype with no join reordering.
 >
 > Use it for experiments, prototypes, and anything you can rebuild from source
 > data. `inlaysql backup <database> <destination>` now takes a consistent copy
@@ -63,6 +63,8 @@ indexes (BM25 and HNSW ANN) are now in-house.
 How the pieces fit together: [Using it](#using-it) for the API,
 [The SQL surface](#the-sql-surface) for the dialect, and
 [Layout](#layout) for how the crates and the `no_std` boundary are arranged.
+For the current engineering sequence and cloud continuation handoff, see
+[`docs/PLAN.md`](docs/PLAN.md).
 
 ## The demo
 

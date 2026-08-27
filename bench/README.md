@@ -210,12 +210,15 @@ SUITE=joins ROWS=20000 QUERIES=100 LIMIT=20 ./bench/run.sh
   users.id`. The inner table's join key is `posts.user_id`, a scalar B-tree
   index. This is the exact shape `PERF.md` names.
 
-Without `LIMIT`, both are full scans and use the hash join; a repeated prepared
-execution may reuse its immutable inner build while the committed row version
-is unchanged. With `LIMIT`, the planner keeps the index-probe path so it can
-stop before paying a full build. Both engines consume and discard one projected
-row at a time (`query_prepared_each` and `query_map`, respectively); neither
-retains an answer-sized result container merely to count it.
+The setup runs `ANALYZE` on both engines before preparing the statements. With
+fresh stats, full scans use the costed hash path for this row-at-a-time engine;
+with `LIMIT`, the planner can keep the index-probe path so it can stop before
+paying a full build. The cost constants are calibrated to InlaySQL's measured
+probe/descent cost, not copied from SQLite's physical implementation. A
+repeated prepared execution may reuse its immutable inner build while the
+committed row version is unchanged. Both engines consume and discard one
+projected row at a time (`query_prepared_each` and `query_map`, respectively);
+neither retains an answer-sized result container merely to count it.
 
 Each direction runs with and without a `LIMIT` (`--limit`, default 10),
 because the probe is a stage of the streaming pipeline and a `LIMIT` on an

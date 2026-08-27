@@ -32,12 +32,12 @@ use crate::error::{Error, Result};
 use crate::fusion::DEFAULT_RRF_K;
 use crate::hnsw::VectorMetric;
 use crate::plan::{
-    AggFunc, Aggregate, AlterAction, AlterTablePlan, BinaryOp, CastType, CompareAffinity,
-    ConflictAction, ConflictUpdate, CreateIndexPlan, CreateTablePlan, CreateUniqueIndexPlan,
-    DeletePlan, DropIndexPlan, DropTablePlan, Expr as PlanExpr, FrameBound, FromItem, InsertPlan,
-    InsertSource, Join, JoinKind, OnConflict, Order, OrderKey, Plan, ScalarFunc, ScalarItem,
-    ScalarPlan, ScoreExpr, SelectItem, SelectPlan, SetOp, SetOperationPlan, Subquery, SubqueryBody,
-    SubqueryOp, UnaryOp, UpdatePlan, WindowFn, WindowFrame, WindowFunc,
+    AggFunc, Aggregate, AlterAction, AlterTablePlan, AnalyzePlan, BinaryOp, CastType,
+    CompareAffinity, ConflictAction, ConflictUpdate, CreateIndexPlan, CreateTablePlan,
+    CreateUniqueIndexPlan, DeletePlan, DropIndexPlan, DropTablePlan, Expr as PlanExpr, FrameBound,
+    FromItem, InsertPlan, InsertSource, Join, JoinKind, OnConflict, Order, OrderKey, Plan,
+    ScalarFunc, ScalarItem, ScalarPlan, ScoreExpr, SelectItem, SelectPlan, SetOp, SetOperationPlan,
+    Subquery, SubqueryBody, SubqueryOp, UnaryOp, UpdatePlan, WindowFn, WindowFrame, WindowFunc,
 };
 use crate::statement::Statement as Prepared;
 use crate::value::{DataType, Value};
@@ -410,6 +410,7 @@ fn plan_reindex(target: Option<String>, catalog: &Catalog) -> Result<crate::plan
 /// would be a second front end.
 fn plan_statement(statement: Statement, catalog: &Catalog, binder: &mut Binder) -> Result<Plan> {
     match statement {
+        Statement::Analyze(analyze) => plan_analyze(analyze, catalog),
         Statement::CreateTable(create) => plan_create_table(create),
         Statement::CreateIndex(create) => plan_create_index(create, catalog),
         Statement::AlterTable(alter) => plan_alter_table(alter, catalog),
@@ -569,6 +570,7 @@ fn plan_explain(
         | Plan::CreateUniqueIndex(_)
         | Plan::DropIndex(_)
         | Plan::Reindex(_)
+        | Plan::Analyze(_)
         | Plan::Begin
         | Plan::Commit
         | Plan::Rollback
@@ -789,6 +791,43 @@ impl<'c> Binder<'c> {
             }
         }
     }
+}
+
+// ------------------------------------------------------------------- ANALYZE
+
+/// Resolve SQLite's `ANALYZE` maintenance statement.
+///
+/// The first statistics prototype performs a deterministic full scan of one
+/// or all tables. Other dialects expose sampling, partitions, column lists and
+/// metadata-only variants through the same keyword; accepting those fields and
+/// silently doing a full scan would answer a different request, so each is
+/// refused here.
+fn plan_analyze(analyze: sqlparser::ast::Analyze, catalog: &Catalog) -> Result<Plan> {
+    if analyze.partitions.is_some()
+        || analyze.for_columns
+        || !analyze.columns.is_empty()
+        || analyze.cache_metadata
+        || analyze.noscan
+        || analyze.compute_statistics
+    {
+        return Err(Error::Unsupported(
+            "ANALYZE options are not supported; use ANALYZE [TABLE] <table> or bare ANALYZE"
+                .to_string(),
+        ));
+    }
+
+    let tables = match analyze.table_name {
+        Some(name) => {
+            let name = object_name(&name)?;
+            catalog.require_table(&name)?;
+            alloc::vec![name.to_ascii_lowercase()]
+        }
+        None => catalog
+            .tables()
+            .map(|table| table.name.to_ascii_lowercase())
+            .collect(),
+    };
+    Ok(Plan::Analyze(AnalyzePlan { tables }))
 }
 
 // ---------------------------------------------------------------- CREATE TABLE

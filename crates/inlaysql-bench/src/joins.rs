@@ -4,9 +4,9 @@
 //! # What is being compared
 //!
 //! The AHL-464 shape: `posts.user_id = users.id`, in both directions the join
-//! rule (`Engine::join_inner`, `crates/inlaysql-core/src/engine.rs`) actually
-//! takes — a full scan hashes the inner table, while a `LIMIT` keeps the index
-//! nested-loop probe:
+//! planner (`Engine::join_inner`, `crates/inlaysql-core/src/engine.rs`) takes.
+//! Both sides run `ANALYZE` during setup, so the R4 prototype can cost the
+//! existing hash and index nested-loop operators from the same statistics:
 //!
 //! * **PK inner** — `FROM posts JOIN users ON posts.user_id = users.id`. The
 //!   inner table is `users`, and the join key is `users.id`, its `INTEGER
@@ -22,9 +22,9 @@
 //! is a stage of the streaming pipeline (AHL-462) and a `LIMIT` on an
 //! unindexed-order plan stops the outer scan as soon as it has enough rows —
 //! `PERF.md` gives the counted case (`LIMIT 2` over a probed join fetches two
-//! inner rows, not the whole inner table). Without a `LIMIT` the same query
-//! builds a hash table over the inner side instead of probing it once per
-//! outer row. Whether either shows up as a
+//! inner rows, not the whole inner table). Without a `LIMIT`, the cost model
+//! may choose a hash or a probe from the measured cardinalities. Whether
+//! either shows up as a
 //! wall-clock win over SQLite, which has no equivalent streaming guarantee and
 //! no hash join, is exactly what this row is for finding out rather than
 //! asserting.
@@ -44,6 +44,9 @@
 //!   loop and re-run — neither query takes a bound parameter, so this is
 //!   purely "parse and plan once, execute repeatedly," the same principle
 //!   `points` and `indexed` apply where there is a parameter to bind.
+//! * **Explicit `ANALYZE` on both sides before prepare.** The maintenance scan
+//!   is setup, not timing; it makes the R4 cardinality input a deliberate
+//!   precondition on both engines.
 //! * **Every user has exactly the same number of posts** (`POSTS_PER_USER`),
 //!   assigned by round-robin rather than randomly, so the two directions
 //!   answer the same total row count and neither engine gets a luckier key
@@ -264,6 +267,10 @@ fn inlaysql_joins(
         "CREATE INDEX posts_user_id ON posts (user_id) USING BTREE",
         &[],
     )?;
+    // Refresh the same derived cardinalities SQLite gets from ANALYZE before
+    // preparing the timed statements. The maintenance scan is setup, not the
+    // join measurement.
+    db.execute("ANALYZE", &[])?;
 
     let pk_inner = db
         .prepare("SELECT posts.id, users.name FROM posts JOIN users ON posts.user_id = users.id")?;
@@ -349,6 +356,9 @@ fn sqlite_joins(
     }
     conn.execute("COMMIT", [])?;
     conn.execute("CREATE INDEX posts_user_id ON posts (user_id)", [])?;
+    // Give SQLite the same explicit statistics refresh as InlaySQL; otherwise
+    // this comparison would measure two different planner inputs.
+    conn.execute("ANALYZE", [])?;
 
     let total_posts = users * POSTS_PER_USER;
     let label = durability.label();

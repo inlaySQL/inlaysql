@@ -84,17 +84,20 @@ only projected columns. Keep the row codec's tag-walk format (early-exit decode 
 cheap); a column-offset directory is a format bump to consider **only if** profiling
 still shows decode dominating after streaming lands.
 
-### D6 — Planner stays rule-based, gets real rules (cost model later)
+### D6 — Planner stays rule-based, gets real rules (cost model is staged)
 Before a cost model, add the rules that pay: equality/range predicate → B-tree index
 probe (G4's new indexes), an index nested-loop join when the `ON` is an equality on the
 inner table's PK or an indexed column, and a hash join of the inner table for a
 full-scan equi-join on same-storage-class keys, LIMIT/projection pushdown, and
 `COUNT(*)` fast path. The join split is by shape, not size: a `LIMIT` or a
 point-pinning `WHERE` keeps the probe (few outer rows → few descents), while a full
-scan prefers the hash table (one O(inner) build amortised over every outer row). A
-genuine cost-based planner (statistics, join reordering, choosing hash vs probe by
-cardinality) is later work, after ANALYZE-style stats exist. Do not build the cost
-model before the access paths.
+scan prefers the hash table (one O(inner) build amortised over every outer row).
+The first staged cost layer now exists after `ANALYZE`: with a complete,
+current statistics snapshot it may choose between the existing hash and probe
+operators by cardinality, still in written join order. Missing or stale stats
+fall back to these shape rules. Join reordering remains later work, after
+output-order and stale-stat proofs exist. Do not build a broader cost model
+before the access paths.
 
 ### D7 — Types follow SQLite affinity, not strict names
 Replace the strict `resolve_data_type` whitelist with SQLite's affinity rules
@@ -106,4 +109,3 @@ Dates/times store as TEXT/INTEGER exactly as SQLite does; JSON stores as TEXT wi
 functions over it.
 
 ---
-

@@ -61,6 +61,8 @@ pub enum Plan {
     Explain(Box<Plan>),
     /// `REINDEX [name]` — do the deferred retrieval-index build now.
     Reindex(ReindexPlan),
+    /// `ANALYZE` — refresh the optional planner statistics for resolved tables.
+    Analyze(AnalyzePlan),
     /// `BEGIN` / `BEGIN TRANSACTION`.
     Begin,
     /// `COMMIT` / `END`.
@@ -116,6 +118,7 @@ impl Plan {
             // them: it rebuilds a retrieval index from whatever the rows say
             // now. Listing them here would make a prepared `REINDEX` go stale
             // for a column rename it does not care about.
+            Plan::Analyze(analyze) => analyze.tables.iter().map(String::as_str).collect(),
             Plan::CreateTable(_)
             | Plan::DropTable(_)
             | Plan::AlterTable(_)
@@ -217,6 +220,15 @@ impl Plan {
             // read here as "touches nothing", which is a grant nobody wrote.
             Plan::Reindex(reindex) => {
                 for table in &reindex.tables {
+                    out.push((table.as_str(), TableAccess::Alter));
+                    out.push((table.as_str(), TableAccess::Read));
+                }
+            }
+            // `ANALYZE` reads every row and replaces derived planner metadata.
+            // Its table list is resolved at prepare time for the same
+            // authorisation reason as `REINDEX`'s list.
+            Plan::Analyze(analyze) => {
+                for table in &analyze.tables {
                     out.push((table.as_str(), TableAccess::Alter));
                     out.push((table.as_str(), TableAccess::Read));
                 }
@@ -375,6 +387,7 @@ impl Plan {
             // What was built is reported through `Engine::reindex`'s return
             // value, which is where a caller that wants the detail asks.
             | Plan::Reindex(_)
+            | Plan::Analyze(_)
             | Plan::Begin
             | Plan::Commit
             | Plan::Rollback => Vec::new(),
@@ -605,6 +618,20 @@ pub struct ReindexPlan {
     /// the accept-and-do-something-else shape `AGENTS.md` calls out: the
     /// statement would report success having done more than it was asked.
     pub index: Option<String>,
+}
+
+/// A planned `ANALYZE`.
+///
+/// The table list is resolved at plan time, including for bare `ANALYZE`.
+/// Keeping the names in the plan gives an authorisation layer an exact list of
+/// tables whose rows will be read and whose derived statistics will be
+/// replaced. `Engine::execute` reparses each call, while a prepared statement
+/// should be prepared again after a schema change for the same reason as a
+/// prepared `REINDEX`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnalyzePlan {
+    /// The tables to scan, lowercased and in catalog order.
+    pub tables: Vec<String>,
 }
 
 /// A planned `UPDATE`.
