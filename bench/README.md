@@ -499,10 +499,12 @@ so it runs real OS threads rather than simulating contention in a turn-taking
 loop.
 
 Several writers, one file, one row per transaction. Each thread opens its own
-file handle and gets one of four WAL regions. A short process-local gate orders
-conflict decisions, sequence/page reservations and append positions; record
-writes and the expensive `fsync` happen outside that gate. Writers beyond four
-share a region safely because append placement remains reserved.
+file handle and gets one of four WAL regions before the timed phase begins. A
+short process-local gate orders conflict decisions, sequence/page reservations,
+dirty-page/WAL writes and append positions; a normal commit publishes its
+ready ticket before leaving the gate, and only the expensive `fsync` remains
+outside it. Writers beyond four share a region safely because append placement
+remains reserved.
 
 The keys are disjoint. A stale transaction compares its touched rows against
 the newer root and rebases when none changed; two writers touching the same row

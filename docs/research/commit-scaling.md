@@ -76,16 +76,28 @@ Both prototype outputs record base commit `4567457` with `dirty: yes`, because
 the seam was being measured before this commit; they are evidence for the
 decision, not published benchmark rows.
 
+The first clean committed follow-up at `f89abf6` measured 568 commits/s at 32
+writers in a three-repeat run, with 241 at one writer and zero conflicts:
+[`bench/results/20260827T051323Z-repeat.txt`](../../bench/results/20260827T051323Z-repeat.txt).
+A three-repeat 128-writer run measured 565 commits/s at 128 writers and zero
+conflicts:
+[`bench/results/20260827T052022Z-repeat.txt`](../../bench/results/20260827T052022Z-repeat.txt).
+These are still diagnostic: the 32-writer row's spread is just over the
+repository's 10% reporting bar, and the 128-writer row is similarly noisy.
+
 With `INLAYSQL_COMMIT_STATS=1`, the 32-writer run reported 3,252 normal
 tickets covered by 1,350 normal flushes (about 2.4 tickets per flush). The
 diagnostic is opt-in and printed when the shared coordinator is dropped; it
 exists to show that the new path is actually grouping tickets, not merely
 changing the timer's scheduling.
 
-The current benchmark timer also includes each worker's `Database::open` and
-file-lock handoff. That is part of the existing harness boundary, but a
-steady-state follow-up should report it separately before a small difference
-is attributed to the coordinator.
+The local concurrency harness now opens and locks every worker before starting
+the timed phase, matching the SQLite baseline's boundary. A synchronization
+barrier releases the already-open workers together; process startup remains in
+the server-to-server harness because that driver is explicitly testing a
+client/server connection's full phase cost. The next W3 run should therefore
+attribute its steady-state result to the coordinator rather than to handle
+setup.
 
 ## What the external protocols imply
 

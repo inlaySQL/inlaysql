@@ -175,16 +175,22 @@ fn inlaysql_writers(
     creator.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, n INTEGER)", &[])?;
     drop(creator);
 
-    let barrier = Arc::new(Barrier::new(writers));
-    let started = Instant::now();
-    let results: Vec<Result<(usize, usize), Error>> = std::thread::scope(|scope| {
+    // Open and lock every handle before starting the clock. SQLite's baseline
+    // creates all of its connections before its timed loop; including
+    // InlaySQL's per-thread open/lock handoff here would make this a setup
+    // comparison rather than a steady-state commit comparison.
+    let ready = Arc::new(Barrier::new(writers + 1));
+    let start = Arc::new(Barrier::new(writers + 1));
+    let (results, elapsed) = std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for index in 0..writers {
             let path = path.to_path_buf();
-            let barrier = barrier.clone();
+            let ready = ready.clone();
+            let start = start.clone();
             handles.push(scope.spawn(move || {
                 let mut db = Database::open(path)?;
-                barrier.wait();
+                ready.wait();
+                start.wait();
                 let mut committed = 0;
                 let mut conflicts = 0;
                 for round in 0..txns {
@@ -206,16 +212,19 @@ fn inlaysql_writers(
                 Ok((committed, conflicts))
             }));
         }
-        handles
+        ready.wait();
+        let started = Instant::now();
+        start.wait();
+        let results: Vec<Result<(usize, usize), Error>> = handles
             .into_iter()
             .map(|handle| {
                 handle.join().unwrap_or_else(|panic| {
                     std::panic::resume_unwind(panic);
                 })
             })
-            .collect()
+            .collect();
+        (results, started.elapsed())
     });
-    let elapsed = started.elapsed();
     let mut committed = 0;
     let mut conflicts = 0;
     for result in results {
