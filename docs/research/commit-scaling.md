@@ -22,12 +22,15 @@ flush coordinator:
 2. While holding it, the writer rebases against the latest commit, reserves
    its sequence/page range, encodes the self-contained WAL record, writes its
    dirty data pages and appends the record.
-3. `end_commit` publishes the new generation and releases the reservation.
-4. The writer then enters `FileDevice::sync`. It takes a durability ticket
-   only after its `pwrite` calls have returned.
-5. One ticket holder becomes the flush leader. It loads the highest ticket
-   visible before its `fsync`, and followers whose tickets are covered wait
-   for that flush and return without another barrier.
+3. After every data/page and WAL write has returned, `commit_ready` publishes
+   the normal commit's durability ticket. `end_normal_commit` then publishes
+   the new generation and releases the reservation.
+4. The writer enters `FileDevice::sync_commit`. A ticket already covered by a
+   concurrent flush returns without another barrier; otherwise one ticket
+   holder becomes the flush leader.
+5. The leader may give active or queued normal committers a bounded chance to
+   publish their tickets, then loads the highest ticket immediately before its
+   `fsync`. Checkpoints use ordinary `sync` and never enter this cohort.
 
 The ordering is the important part. A leader may not acknowledge a ticket
 that was issued after the leader's `fsync` began, and a follower may not be
