@@ -19,6 +19,7 @@ fuzz_target!(|data: &str| {
             Column::new("body", DataType::Text),
             Column::new("embedding", DataType::Vector(4)),
         ],
+        strict: false,
     });
     // Errors are the expected outcome; only a panic is a finding.
     let _ = inlaysql_core::sql::plan(data, &[], &catalog);
