@@ -82,6 +82,7 @@ const CATALOG_VERSION_BTREE: u32 = 5;
 const CATALOG_VERSION_COLLATION: u32 = 6;
 const CATALOG_VERSION_METRIC: u32 = 7;
 const CATALOG_VERSION_STRICT: u32 = 8;
+const CATALOG_VERSION_WITHOUT_ROWID: u32 = 9;
 
 const TYPE_INTEGER: u8 = 1;
 const TYPE_REAL: u8 = 2;
@@ -269,17 +270,41 @@ pub struct Table {
     /// would, and every other combination that an ordinary affinity would
     /// coerce or accept is instead a type error.
     pub strict: bool,
+    /// Whether this table was declared `WITHOUT ROWID`.
+    ///
+    /// There is no hidden row id at all — [`Table::rowid_alias`] is always
+    /// `None` here even for a single `INTEGER PRIMARY KEY` column, unlike an
+    /// ordinary table, confirmed against sqlite3 — so the row is stored
+    /// under its own [`Table::primary_key`] columns' encoded bytes instead
+    /// (`storage::primary_key_bytes`, reusing the same collation-aware
+    /// value encoding a scalar index's entry key uses). `AUTOINCREMENT`
+    /// combined with this is refused at plan time, the same as sqlite3
+    /// refuses it: there is nothing for it to increment.
+    pub without_rowid: bool,
+    /// The primary key's columns, by name, in the order the `PRIMARY KEY`
+    /// clause declared them — the order that decides how the composite
+    /// storage key sorts, so declaration order and not table-column order.
+    ///
+    /// Empty exactly when `!without_rowid`; an ordinary table's primary key
+    /// (a single `INTEGER PRIMARY KEY` column, or a composite one) is
+    /// represented the existing ways instead — [`Column::primary_key`], or
+    /// an ordinary [`UniqueConstraint`] backed by a secondary index — neither
+    /// of which is disturbed by this field existing.
+    pub primary_key: Vec<String>,
 }
 
 impl Table {
-    /// A non-`STRICT` table — every table this engine built before this
-    /// field existed, and every synthetic one (a virtual `information_schema`
-    /// view, a test fixture) that is not real user schema.
+    /// A non-`STRICT`, rowid table — every table this engine built before
+    /// `STRICT`/`WITHOUT ROWID` existed, and every synthetic one (a virtual
+    /// `information_schema` view, a test fixture) that is not real user
+    /// schema.
     pub fn new(name: String, columns: Vec<Column>) -> Self {
         Self {
             name,
             columns,
             strict: false,
+            without_rowid: false,
+            primary_key: Vec::new(),
         }
     }
 
@@ -1041,6 +1066,13 @@ impl Catalog {
     /// a table actually declares a constraint or uses an affinity older
     /// versions cannot name.
     fn required_version(&self) -> u32 {
+        // A `WITHOUT ROWID` table forces version 9 for the same reason every
+        // other tag-introducing version does: an older build would decode
+        // it as an ordinary rowid table and offer a row id that does not
+        // exist.
+        if self.tables.values().any(|table| table.without_rowid) {
+            return CATALOG_VERSION_WITHOUT_ROWID;
+        }
         // A `STRICT` table, or an `ANY` column (only reachable inside one),
         // forces version 8 for the same reason every other tag-introducing
         // version does: an older build would decode a tag it never learned,
@@ -1127,6 +1159,13 @@ impl Catalog {
             put_string(&mut out, &table.name);
             if version >= CATALOG_VERSION_STRICT {
                 out.push(u8::from(table.strict));
+            }
+            if version >= CATALOG_VERSION_WITHOUT_ROWID {
+                out.push(u8::from(table.without_rowid));
+                put_len(&mut out, table.primary_key.len());
+                for column in &table.primary_key {
+                    put_string(&mut out, column);
+                }
             }
             put_len(&mut out, table.columns.len());
             for column in &table.columns {
@@ -1264,10 +1303,11 @@ impl Catalog {
                 | CATALOG_VERSION_COLLATION
                 | CATALOG_VERSION_METRIC
                 | CATALOG_VERSION_STRICT
+                | CATALOG_VERSION_WITHOUT_ROWID
         ) {
             return Err(Error::FormatVersion(alloc::format!(
                 "catalog format version {version} is not supported (this build supports \
-                 {CATALOG_VERSION_EXACT} through {CATALOG_VERSION_STRICT}); pre-1.0 the \
+                 {CATALOG_VERSION_EXACT} through {CATALOG_VERSION_WITHOUT_ROWID}); pre-1.0 the \
                  policy is to recreate the database, not to migrate it"
             )));
         }
@@ -1378,6 +1418,17 @@ fn decode_tables(cursor: &mut Cursor<'_>, version: u32) -> Result<Catalog> {
     for _ in 0..table_count {
         let name = cursor.string()?;
         let strict = version >= CATALOG_VERSION_STRICT && cursor.u8()? != 0;
+        let (without_rowid, primary_key) = if version >= CATALOG_VERSION_WITHOUT_ROWID {
+            let without_rowid = cursor.u8()? != 0;
+            let count = cursor.count(4)?;
+            let mut primary_key = Vec::with_capacity(count);
+            for _ in 0..count {
+                primary_key.push(cursor.string()?);
+            }
+            (without_rowid, primary_key)
+        } else {
+            (false, Vec::new())
+        };
         let column_count = cursor.count(5)?;
         let mut columns = Vec::with_capacity(column_count);
         for _ in 0..column_count {
@@ -1430,6 +1481,8 @@ fn decode_tables(cursor: &mut Cursor<'_>, version: u32) -> Result<Catalog> {
                 name,
                 columns,
                 strict,
+                without_rowid,
+                primary_key,
             },
             constraints,
         )?;
@@ -1555,6 +1608,8 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns: vec![
                     Column::primary_key("id", DataType::Integer),
@@ -1575,6 +1630,8 @@ mod tests {
         let mut catalog = sample();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "MiXeD".to_string(),
                 columns: vec![Column::new("a", DataType::Integer)],
                 strict: false,
@@ -1607,6 +1664,8 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "plain".to_string(),
                 columns: vec![Column::new("a", DataType::Integer)],
                 strict: false,
@@ -1634,6 +1693,8 @@ mod tests {
         let mut catalog = sample();
         let err = catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "DOCS".to_string(),
                 columns: vec![],
                 strict: false,
@@ -1733,6 +1794,8 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns: vec![
                     Column::primary_key("id", DataType::Integer),
@@ -1802,6 +1865,8 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns: vec![
                     Column::new("a", DataType::Vector(4)),
@@ -1894,6 +1959,8 @@ mod tests {
         let mut plain = Catalog::new();
         plain
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "nums".to_string(),
                 columns: vec![Column::new("n", DataType::Integer)],
                 strict: false,
@@ -1907,7 +1974,7 @@ mod tests {
     fn a_future_catalog_version_is_refused() {
         let mut bytes = sample().encode();
         // Magic is b"ISQL"; the version follows at offset 4.
-        bytes[4..8].copy_from_slice(&(CATALOG_VERSION_STRICT + 1).to_le_bytes());
+        bytes[4..8].copy_from_slice(&(CATALOG_VERSION_WITHOUT_ROWID + 1).to_le_bytes());
         let err = Catalog::decode(&bytes).unwrap_err();
         assert!(matches!(err, Error::FormatVersion(_)), "got {err}");
     }
@@ -1928,6 +1995,8 @@ mod tests {
         catalog
             .create_table_with(
                 Table {
+                    without_rowid: false,
+                    primary_key: Vec::new(),
                     name: "users".to_string(),
                     columns: vec![
                         Column::primary_key("id", DataType::Integer),
@@ -1975,6 +2044,8 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "t".to_string(),
                 columns: vec![Column::new("n", DataType::Numeric)],
                 strict: false,
@@ -1995,6 +2066,8 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "t".to_string(),
                 columns: vec![Column::new("a", DataType::Integer)],
                 strict: true,
@@ -2017,6 +2090,8 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "t".to_string(),
                 columns: vec![Column::new("a", DataType::Any)],
                 strict: false,
@@ -2038,6 +2113,31 @@ mod tests {
         let catalog = sample();
         let bytes = catalog.encode();
         assert!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()) < CATALOG_VERSION_STRICT);
+    }
+
+    /// A `WITHOUT ROWID` table forces version 9, because no earlier version
+    /// has a byte for the flag — or for the primary key's own column list,
+    /// which only means something once there is no row id to fall back to.
+    #[test]
+    fn a_without_rowid_table_forces_version_nine() {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(Table {
+                without_rowid: true,
+                primary_key: alloc::vec!["a".to_string()],
+                name: "t".to_string(),
+                columns: vec![Column::new("a", DataType::Integer).not_null()],
+                strict: false,
+            })
+            .unwrap();
+        let bytes = catalog.encode();
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            CATALOG_VERSION_WITHOUT_ROWID
+        );
+        let decoded = Catalog::decode(&bytes).unwrap();
+        assert_eq!(decoded, catalog);
+        assert_eq!(decoded.table("t").unwrap().primary_key, ["a"]);
     }
 
     #[test]
@@ -2091,6 +2191,8 @@ mod tests {
         catalog
             .create_table_with(
                 Table {
+                    without_rowid: false,
+                    primary_key: Vec::new(),
                     name: "t".to_string(),
                     columns: vec![
                         Column::new("a", DataType::Integer),
@@ -2125,6 +2227,8 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "people".to_string(),
                 columns: vec![
                     Column::primary_key("id", DataType::Integer),
@@ -2295,6 +2399,8 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns: vec![Column::new("embedding", DataType::QuantizedVector(384))],
                 strict: false,

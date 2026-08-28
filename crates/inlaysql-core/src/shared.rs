@@ -103,6 +103,27 @@ impl Storage for SharedStorage {
         self.inner.borrow().scan_batch(table, after, limit)
     }
 
+    fn put_row_keyed(&mut self, table: &str, key: &[u8], bytes: &[u8]) -> Result<()> {
+        self.inner.borrow_mut().put_row_keyed(table, key, bytes)
+    }
+
+    fn get_row_keyed(&self, table: &str, key: &[u8]) -> Result<Option<RowBuf>> {
+        self.inner.borrow().get_row_keyed(table, key)
+    }
+
+    fn delete_row_keyed(&mut self, table: &str, key: &[u8]) -> Result<()> {
+        self.inner.borrow_mut().delete_row_keyed(table, key)
+    }
+
+    fn scan_batch_keyed(
+        &self,
+        table: &str,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, RowBuf)>> {
+        self.inner.borrow().scan_batch_keyed(table, after, limit)
+    }
+
     fn put_meta(&mut self, key: &str, bytes: &[u8]) -> Result<()> {
         self.inner.borrow_mut().put_meta(key, bytes)
     }

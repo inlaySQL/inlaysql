@@ -582,15 +582,34 @@ limit of the algorithm, not only a SQLite restriction being matched: a step
 only ever sees that step's new rows, never the whole table an aggregate would
 need.
 
+`CREATE TABLE ... WITHOUT ROWID` (`without_rowid.test`): the row is stored
+under its own primary key's encoded bytes — the same collation-aware
+ordered-byte encoding a scalar secondary index already used for its keys,
+reused here as the *primary* storage key — rather than under a hidden,
+engine-assigned row id, so the table's natural scan order is primary-key
+order and there is no `rowid` pseudo-column to select. A lone
+`INTEGER PRIMARY KEY` does not become a row id alias here the way it does on
+an ordinary table: a `NULL` in it is a `NOT NULL` violation, not an
+auto-assigned key, since there is no row id counter to assign from — for the
+same reason `AUTOINCREMENT` is refused outright on one of these tables, not
+merely ineffective. Two gaps are disclosed rather than silently dropped: a
+secondary index (`CREATE INDEX`, or a `UNIQUE` constraint on anything but the
+primary key itself) is refused, because an index entry points back to a row
+by row id and this table has none; and joining one of these tables against
+anything else in the same query is refused at plan time, because every join
+strategy this engine has reads its inner side through a row-id-based
+mechanism. `INSERT OR IGNORE`/`OR REPLACE`, `UPDATE`, `DELETE`, `DROP TABLE`,
+`RETURNING` and aggregates all work, keyed by the primary key instead of a
+row id throughout.
+
 Not yet, and refused explicitly rather than silently ignored: `DISTINCT`
 inside a window function's argument list, the partial-write conflict
 resolutions (`INSERT OR ROLLBACK`/`OR FAIL`, `UPDATE OR REPLACE`/`OR IGNORE` —
 a statement here is already atomic, so they cannot mean what they say),
-`CREATE TEMPORARY TABLE`, `WITHOUT ROWID`, the `AUTOINCREMENT`
-keyword, `COUNT(DISTINCT *)`, `GROUP_CONCAT(DISTINCT ...)`, and a collation
-this engine does not have (there is no `CREATE COLLATION`, so a name outside
-`BINARY`/`NOCASE`/`RTRIM` is refused rather than silently compared byte-wise
-under a name that promises otherwise).
+`CREATE TEMPORARY TABLE`, `COUNT(DISTINCT *)`, `GROUP_CONCAT(DISTINCT ...)`,
+and a collation this engine does not have (there is no `CREATE COLLATION`, so
+a name outside `BINARY`/`NOCASE`/`RTRIM` is refused rather than silently
+compared byte-wise under a name that promises otherwise).
 
 ## SQL Logic Test
 
@@ -606,7 +625,7 @@ cargo run -p inlaysql --bin sqllogictest -- \
   crates/inlaysql/tests/sqllogictest/*.test          # print the pass rate
 ```
 
-Current pass rate over the subset: **1250/1250 (100%)** — covering `CREATE TABLE`,
+Current pass rate over the subset: **1273/1273 (100%)** — covering `CREATE TABLE`,
 `INSERT`, projection, `WHERE`, `DISTINCT`, `ORDER BY` (column, expression,
 alias, multi-key, `NULLS FIRST`/`LAST`), `LIMIT`/`OFFSET` (literal or bound),
 type coercion and affinity, `SELECT`-without-`FROM` scalar expressions,
@@ -627,9 +646,10 @@ in every read position (scalar, `IN (SELECT ...)`, `EXISTS`, derived tables,
 correlated and uncorrelated), `UNION`/`INTERSECT`/`EXCEPT`/`WITH` (recursive
 and not — `ctes.test`, `recursive_cte.test`), `CREATE TABLE ... AS SELECT`,
 `CREATE TABLE ... STRICT` (`strict.test`), `SAVEPOINT`/`RELEASE`/
-`ROLLBACK TO SAVEPOINT` (`savepoint.test`), and the window functions of
-AHL-494 including `percent_rank`/`cume_dist` and explicit `RANGE`/`GROUPS`
-frames (`window_functions.test`). The
+`ROLLBACK TO SAVEPOINT` (`savepoint.test`), the window functions of AHL-494
+including `percent_rank`/`cume_dist` and explicit `RANGE`/`GROUPS` frames
+(`window_functions.test`), and `CREATE TABLE ... WITHOUT ROWID`
+(`without_rowid.test`). The
 number is meant to grow (and be reported) as the dialect matures — it does not
 yet include the parts of the *SQLite project's own* sqllogictest corpus that
 exercise `WITH RECURSIVE`, which this subset has not pulled in and adapted,

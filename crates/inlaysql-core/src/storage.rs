@@ -12,9 +12,11 @@ use alloc::vec::Vec;
 use crate::btree::{
     BackupSummary, CommitOutcome, CowBTree, Device, DEFAULT_PAGE_CACHE_BYTES, DEFAULT_PAGE_SIZE,
 };
+use crate::collation::{self, Collation};
 use crate::error::{Error, Result};
 use crate::row::RowBuf;
 use crate::traits::{RowId, Storage};
+use crate::value::Value;
 
 /// Separates the table name from the row id in a row key. A NUL byte cannot
 /// appear in a SQL identifier, so the prefix is unambiguous.
@@ -46,6 +48,27 @@ pub fn row_key(table: &str, id: RowId) -> Vec<u8> {
     // makes `scan` return rows sorted without a separate sort.
     key.extend_from_slice(&id.to_be_bytes());
     key
+}
+
+/// The bytes a `WITHOUT ROWID` table's row is stored under, given its
+/// primary key's values in declaration order.
+///
+/// Collation-aware the same way a scalar index's entry key is
+/// ([`crate::index::encode_value`]): two primary keys that compare equal
+/// under a `NOCASE` column land on the same storage slot, which is what
+/// makes a duplicate one a constraint violation (`Error::Constraint` from
+/// the ordinary "already occupied" check every `put_row_keyed` caller
+/// already makes) rather than two rows silently sharing a value.
+///
+/// This is the row-id-shaped *suffix* only — table-name-prefixed by the
+/// caller, the same division [`row_key`] draws between a table's prefix and
+/// one row's own key.
+pub fn primary_key_bytes(values: &[&Value], collations: &[Collation]) -> Result<Vec<u8>> {
+    let mut key = Vec::new();
+    for (position, value) in values.iter().enumerate() {
+        crate::index::encode_value(&mut key, value, collation::at(collations, position))?;
+    }
+    Ok(key)
 }
 
 /// Stack scratch space a row key is assembled in, so a point lookup reaches
@@ -228,6 +251,49 @@ impl<D: Device> Storage for TreeStorage<D> {
         // gives the index probe).
         self.tree
             .scan_prefix_row_values_raw_from(&table_prefix(table), resume, limit)
+    }
+
+    fn put_row_keyed(&mut self, table: &str, key: &[u8], bytes: &[u8]) -> Result<()> {
+        let mut full = table_prefix(table);
+        full.extend_from_slice(key);
+        self.tree.put(&full, bytes)
+    }
+
+    fn get_row_keyed(&self, table: &str, key: &[u8]) -> Result<Option<RowBuf>> {
+        let mut full = table_prefix(table);
+        full.extend_from_slice(key);
+        self.tree.get(&full)
+    }
+
+    fn delete_row_keyed(&mut self, table: &str, key: &[u8]) -> Result<()> {
+        let mut full = table_prefix(table);
+        full.extend_from_slice(key);
+        self.tree.delete(&full)
+    }
+
+    /// Reuses [`CowBTree::scan_prefix_from`] — the same one-traversal
+    /// primitive a scalar index's range probe and the batched streaming row
+    /// scan both already go through — rather than a bespoke walk, so this
+    /// is proven code answering a new question, not new code to prove.
+    fn scan_batch_keyed(
+        &self,
+        table: &str,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, RowBuf)>> {
+        let prefix = table_prefix(table);
+        let full_after = after.map(|suffix| {
+            let mut key = prefix.clone();
+            key.extend_from_slice(suffix);
+            key
+        });
+        let rows = self
+            .tree
+            .scan_prefix_from(&prefix, full_after.as_deref(), limit)?;
+        Ok(rows
+            .into_iter()
+            .map(|(key, value)| (key[prefix.len()..].to_vec(), value))
+            .collect())
     }
 
     fn put_meta(&mut self, key: &str, bytes: &[u8]) -> Result<()> {

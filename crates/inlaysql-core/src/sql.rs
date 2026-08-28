@@ -962,6 +962,14 @@ fn plan_create_table(
                 column.name.value
             )));
         }
+        // Confirmed against sqlite3: `AUTOINCREMENT` on a `WITHOUT ROWID`
+        // table is refused outright, not merely ineffective — there is no
+        // row id counter on such a table for it to advance.
+        if autoincrement && create.without_rowid {
+            return Err(Error::Unsupported(
+                "AUTOINCREMENT is not allowed on a WITHOUT ROWID table".to_string(),
+            ));
+        }
 
         if declares_primary_key {
             if primary_key.is_some() {
@@ -990,6 +998,60 @@ fn plan_create_table(
         )));
     }
 
+    // A `WITHOUT ROWID` table's `PRIMARY KEY` is not a unique index over the
+    // row: it *is* the row's storage location. Confirmed against sqlite3:
+    // `PRIMARY KEY missing on table t` refuses one with none at all — unlike
+    // an ordinary table, where every column defaults to a hidden row id —
+    // and even a lone `INTEGER PRIMARY KEY` does *not* become a row id
+    // alias here, unlike on an ordinary table (`Table::without_rowid`'s doc
+    // has the measurement); its columns are also implicitly `NOT NULL`, the
+    // same rule an ordinary table's row id itself is never absent for.
+    if create.without_rowid {
+        let key = primary_key.ok_or_else(|| {
+            Error::Catalog(alloc::format!("PRIMARY KEY missing on table `{name}`"))
+        })?;
+        // Same disclosed gap `plan_create_index` refuses by name: a `UNIQUE`
+        // constraint gets a secondary index backing it, and a secondary
+        // index needs a row id to point back with — the primary key's own
+        // columns do not need one (they *are* the storage key), but any
+        // other `UNIQUE` here would.
+        if let Some(group) = constraints.unique.first() {
+            return Err(Error::Unsupported(alloc::format!(
+                "UNIQUE on a WITHOUT ROWID table's column `{}` is not supported yet, for the \
+                 same reason CREATE INDEX on one is not: it would need a secondary index \
+                 pointing back to the row by row id, and this table has none",
+                group.columns.join(", ")
+            )));
+        }
+        for column_name in &key {
+            let (ordinal, _) = require_column(&name, &columns, column_name)?;
+            columns[ordinal].not_null = true;
+        }
+        let table = Table {
+            name,
+            columns,
+            strict: create.strict,
+            without_rowid: true,
+            primary_key: key,
+        };
+        for group in &constraints.unique {
+            for column in &group.columns {
+                table.require_column(column)?;
+            }
+        }
+        for key in &constraints.foreign_keys {
+            for column in &key.columns {
+                table.require_column(column)?;
+            }
+        }
+        return Ok(Plan::CreateTable(CreateTablePlan {
+            table,
+            constraints,
+            if_not_exists: create.if_not_exists,
+            as_select: None,
+        }));
+    }
+
     // SQLite's rule, and it is worth stating because it decides the storage
     // layout: a *single* `INTEGER PRIMARY KEY` column is not an index at all,
     // it is an alias for the row id. Every other primary key — composite, or
@@ -1010,6 +1072,8 @@ fn plan_create_table(
     }
 
     let table = Table {
+        without_rowid: false,
+        primary_key: Vec::new(),
         name,
         columns,
         strict: create.strict,
@@ -1118,6 +1182,8 @@ fn plan_create_table_as_select(
 
     Ok(Plan::CreateTable(CreateTablePlan {
         table: Table {
+            without_rowid: false,
+            primary_key: Vec::new(),
             name,
             columns,
             strict: false,
@@ -1604,9 +1670,6 @@ fn reject_unsupported_create_table(create: &sqlparser::ast::CreateTable) -> Resu
     if create.temporary {
         return not_yet("CREATE TEMPORARY TABLE");
     }
-    if create.without_rowid {
-        return not_yet("WITHOUT ROWID");
-    }
     if create.like.is_some() {
         return not_yet("CREATE TABLE ... LIKE");
     }
@@ -1667,6 +1730,18 @@ fn plan_create_index(create: sqlparser::ast::CreateIndex, catalog: &Catalog) -> 
     let name = object_name(&name)?;
     let table_name = object_name(&create.table_name)?;
     let table = catalog.require_table(&table_name)?;
+    // Disclosed, narrower than sqlite3 rather than silent or fake: a
+    // secondary index's entries point back to a row by row id, and a
+    // `WITHOUT ROWID` table does not have one — it would need to point back
+    // by primary key instead, a real feature this engine does not have yet.
+    // Refusing by name is the honest answer until it does, not this or the
+    // planner silently building an index that could never resolve a probe.
+    if table.without_rowid {
+        return Err(Error::Unsupported(alloc::format!(
+            "CREATE INDEX on WITHOUT ROWID table `{table_name}` is not supported yet: a \
+             secondary index's entries point back to a row by row id, and this table has none"
+        )));
+    }
 
     let names = collated_index_columns(&create.columns)?;
     let mut ordinals = Vec::with_capacity(names.len());
@@ -2420,6 +2495,8 @@ fn resolve_conflict_target(
 /// proposed row under the name `excluded`.
 fn excluded_scope(table: &Table) -> Scope<'static> {
     let excluded = Table {
+        without_rowid: false,
+        primary_key: Vec::new(),
         name: "excluded".to_string(),
         columns: table.columns.clone(),
         strict: false,
@@ -4458,6 +4535,25 @@ fn resolve_from<'p>(
         }
     }
 
+    // A `WITHOUT ROWID` table joined against anything else is refused here
+    // rather than silently answered wrong: every join strategy below this
+    // planner (hash build, index probe, materialise) reads its inner side
+    // through the ordinary row-id path, which this table's rows are not
+    // reachable through at all — see `Engine::without_rowid_stream`'s doc.
+    // A lone `WITHOUT ROWID` table as the *only* source is unaffected; that
+    // is the one shape `run_select_to` actually handles.
+    if sources.len() > 1 {
+        if let Some(item) = sources
+            .iter()
+            .find(|item| item.derived.is_none() && item.table.without_rowid)
+        {
+            return Err(Error::Unsupported(alloc::format!(
+                "joining WITHOUT ROWID table `{}` with anything else is not supported yet",
+                item.table.name
+            )));
+        }
+    }
+
     let scope = Scope {
         sources,
         aliases,
@@ -4648,6 +4744,8 @@ fn derived_table(alias: Option<&str>, body: &SubqueryBody) -> Result<Table> {
         ));
     }
     Ok(Table {
+        without_rowid: false,
+        primary_key: Vec::new(),
         name: alias.unwrap_or(UNNAMED_DERIVED).to_string(),
         columns: labels
             .into_iter()
@@ -7199,6 +7297,8 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns: vec![
                     Column::new("id", DataType::Integer),
@@ -7215,6 +7315,8 @@ mod tests {
         let mut catalog = catalog();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "authors".to_string(),
                 columns: vec![
                     Column::new("id", DataType::Integer),
@@ -7230,6 +7332,8 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "t".to_string(),
                 columns: vec![Column::new("a", DataType::Integer)],
                 strict: false,
@@ -7392,6 +7496,8 @@ mod tests {
         let mut keyed = Catalog::new();
         keyed
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns: vec![
                     Column::primary_key("id", DataType::Integer),
@@ -7584,7 +7690,6 @@ mod tests {
             // (AHL-469); a collation this engine does not have still is not.
             "CREATE TABLE t (a TEXT COLLATE utf8mb4_unicode_ci)",
             "CREATE TEMPORARY TABLE t (a INTEGER)",
-            "CREATE TABLE t (a INTEGER) WITHOUT ROWID",
         ] {
             let err = plan(sql, &[], &Catalog::new()).unwrap_err();
             assert!(
@@ -8102,6 +8207,8 @@ mod tests {
         let mut moved = Catalog::new();
         moved
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns: vec![
                     Column::new("id", DataType::Integer),
@@ -8113,6 +8220,8 @@ mod tests {
             .unwrap();
         moved
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "authors".to_string(),
                 columns: vec![
                     Column::new("name", DataType::Text),
@@ -8226,6 +8335,8 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "t".to_string(),
                 columns: vec![
                     Column::new("id", DataType::Integer),
@@ -8687,6 +8798,8 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "vecs".to_string(),
                 columns: vec![
                     Column::new("a", DataType::Vector(4)),

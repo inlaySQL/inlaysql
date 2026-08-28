@@ -27,6 +27,15 @@ pub struct MemStorage {
     pending_rows: BTreeMap<String, BTreeMap<RowId, Option<Vec<u8>>>>,
     /// Buffered metadata writes.
     pending_meta: BTreeMap<String, Vec<u8>>,
+    /// A `WITHOUT ROWID` table's rows, keyed by primary key bytes rather
+    /// than row id — a second map rather than folding into `tables` because
+    /// nothing here needs the two to share a key space the way the on-disk
+    /// backend's one tree does; keeping them apart is what let every
+    /// existing row-id path above stay untouched by this addition.
+    tables_keyed: BTreeMap<String, BTreeMap<Vec<u8>, Vec<u8>>>,
+    /// [`MemStorage::tables_keyed`]'s buffered writes, the same shape
+    /// [`MemStorage::pending_rows`] is to `tables`.
+    pending_rows_keyed: BTreeMap<String, BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
     /// Scalar secondary index entries. A `BTreeMap` keyed by the raw entry key
     /// is the same ordered key space the tree gives, which is all an index
     /// needs from a backend.
@@ -137,6 +146,90 @@ impl Storage for MemStorage {
         Ok(out)
     }
 
+    fn put_row_keyed(&mut self, table: &str, key: &[u8], bytes: &[u8]) -> Result<()> {
+        self.pending_rows_keyed
+            .entry(table.to_ascii_lowercase())
+            .or_default()
+            .insert(key.to_vec(), Some(bytes.to_vec()));
+        Ok(())
+    }
+
+    fn get_row_keyed(&self, table: &str, key: &[u8]) -> Result<Option<RowBuf>> {
+        let table = table.to_ascii_lowercase();
+        if let Some(pending) = self
+            .pending_rows_keyed
+            .get(&table)
+            .and_then(|rows| rows.get(key))
+        {
+            return Ok(pending.clone().map(RowBuf::Owned));
+        }
+        Ok(self
+            .tables_keyed
+            .get(&table)
+            .and_then(|rows| rows.get(key))
+            .cloned()
+            .map(RowBuf::Owned))
+    }
+
+    fn delete_row_keyed(&mut self, table: &str, key: &[u8]) -> Result<()> {
+        self.pending_rows_keyed
+            .entry(table.to_ascii_lowercase())
+            .or_default()
+            .insert(key.to_vec(), None);
+        Ok(())
+    }
+
+    /// The same committed-plus-overlay merge [`MemStorage::scan_batch`]
+    /// does, keyed by primary key bytes instead of row id.
+    fn scan_batch_keyed(
+        &self,
+        table: &str,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, RowBuf)>> {
+        let table = table.to_ascii_lowercase();
+        let start = match after {
+            Some(key) => Bound::Excluded(key.to_vec()),
+            None => Bound::Unbounded,
+        };
+        let empty_rows = BTreeMap::new();
+        let empty_pending = BTreeMap::new();
+        let mut committed = self
+            .tables_keyed
+            .get(&table)
+            .unwrap_or(&empty_rows)
+            .range((start.clone(), Bound::Unbounded))
+            .peekable();
+        let mut pending = self
+            .pending_rows_keyed
+            .get(&table)
+            .unwrap_or(&empty_pending)
+            .range((start, Bound::Unbounded))
+            .peekable();
+
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let next = match (committed.peek(), pending.peek()) {
+                (None, None) => break,
+                (Some((key, _)), None) => (*key).clone(),
+                (None, Some((key, _))) => (*key).clone(),
+                (Some((left, _)), Some((right, _))) => (*left).min(*right).clone(),
+            };
+            let overlay = pending.next_if(|(key, _)| **key == next).map(|(_, v)| v);
+            let stored = committed.next_if(|(key, _)| **key == next).map(|(_, v)| v);
+            match overlay {
+                Some(Some(bytes)) => out.push((next, RowBuf::Owned(bytes.clone()))),
+                Some(None) => {}
+                None => {
+                    if let Some(bytes) = stored {
+                        out.push((next, RowBuf::Owned(bytes.clone())));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn put_meta(&mut self, key: &str, bytes: &[u8]) -> Result<()> {
         self.pending_meta.insert(key.to_string(), bytes.to_vec());
         Ok(())
@@ -210,6 +303,19 @@ impl Storage for MemStorage {
                 }
             }
         }
+        for (table, rows) in core::mem::take(&mut self.pending_rows_keyed) {
+            let committed = self.tables_keyed.entry(table).or_default();
+            for (key, value) in rows {
+                match value {
+                    Some(bytes) => {
+                        committed.insert(key, bytes);
+                    }
+                    None => {
+                        committed.remove(&key);
+                    }
+                }
+            }
+        }
         for (key, value) in core::mem::take(&mut self.pending_meta) {
             self.meta.insert(key, value);
         }
@@ -218,6 +324,7 @@ impl Storage for MemStorage {
 
     fn rollback(&mut self) -> Result<()> {
         self.pending_rows.clear();
+        self.pending_rows_keyed.clear();
         self.pending_meta.clear();
         self.pending_index.clear();
         Ok(())

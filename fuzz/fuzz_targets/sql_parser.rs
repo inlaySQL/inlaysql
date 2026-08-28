@@ -13,6 +13,8 @@ use inlaysql_core::{mem, Catalog, Column, DataType, Table};
 fuzz_target!(|data: &str| {
     let mut catalog = Catalog::new();
     let _ = catalog.create_table(Table {
+        without_rowid: false,
+        primary_key: Vec::new(),
         name: "t".to_string(),
         columns: vec![
             Column::primary_key("id", DataType::Integer),

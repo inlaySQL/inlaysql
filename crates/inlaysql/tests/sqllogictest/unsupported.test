@@ -103,8 +103,7 @@ CREATE INDEX c7_ft ON c7(a COLLATE NOCASE)
 statement error
 CREATE TEMPORARY TABLE c12(a INTEGER)
 
-statement error
-CREATE TABLE c13(a INTEGER) WITHOUT ROWID
+# `WITHOUT ROWID` is implemented — see `without_rowid.test`.
 
 # `STRICT` is implemented — see `strict.test`.
 

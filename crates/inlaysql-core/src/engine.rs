@@ -2107,9 +2107,18 @@ impl Engine {
             // the rows they point at are about to stop existing.
             self.purge_index_entries(index)?;
         }
-        for (id, _) in self.scan_all(&table.name)? {
-            self.storage.delete_row(&table.name, id)?;
-            self.note_change(&table.name, id, ChangeKind::Delete);
+        if table.without_rowid {
+            // No `note_change` here, for the same disclosed reason
+            // `Engine::delete_without_rowid` has none: there is no `RowId`
+            // to report one under.
+            for (key, _) in crate::traits::scan_all_keyed(&self.storage, &table.name)? {
+                self.storage.delete_row_keyed(&table.name, &key)?;
+            }
+        } else {
+            for (id, _) in self.scan_all(&table.name)? {
+                self.storage.delete_row(&table.name, id)?;
+                self.note_change(&table.name, id, ChangeKind::Delete);
+            }
         }
         self.persist_catalog()?;
         self.end_write()?;
@@ -2126,6 +2135,23 @@ impl Engine {
     /// silent misread the format versions exist to prevent.
     fn alter_table(&mut self, plan: &AlterTablePlan) -> Result<Outcome> {
         let before = self.catalog.require_table(&plan.table)?.clone();
+        // `RENAME COLUMN` is a pure catalog change — nothing about a stored
+        // row changes, only what its ordinal is called — so it needs
+        // nothing here. The other three all rewrite every row keyed by
+        // `RowId`, which this table's rows are not; a disclosed gap rather
+        // than a silent one, the same as everywhere else in this feature.
+        if before.without_rowid && !matches!(plan.action, AlterAction::RenameColumn { .. }) {
+            return Err(Error::Unsupported(alloc::format!(
+                "{} on WITHOUT ROWID table `{}` is not supported yet",
+                match &plan.action {
+                    AlterAction::AddColumn(_) => "ADD COLUMN",
+                    AlterAction::RenameTable(_) => "RENAME TO",
+                    AlterAction::DropColumn(_) => "DROP COLUMN",
+                    AlterAction::RenameColumn { .. } => unreachable!("excluded above"),
+                },
+                before.name
+            )));
+        }
         // Every declared index of this table is about to have its key, its
         // column name or its rows change underneath it. Blanking the saved
         // copies now means the rebuild below reads the rows rather than a blob
@@ -3643,6 +3669,9 @@ impl Engine {
         params: &[Value],
     ) -> Result<(usize, Vec<Vec<Value>>)> {
         let table = self.catalog.require_table(&insert.table)?.clone();
+        if table.without_rowid {
+            return self.insert_uncommitted_without_rowid(insert, &table, params);
+        }
         let rules = self.rules_for(&table)?;
         let alias = table.rowid_alias();
         let env = self.env(params);
@@ -3767,6 +3796,112 @@ impl Engine {
             }
         }
 
+        Ok((written, returned))
+    }
+
+    /// `INSERT` into a `WITHOUT ROWID` table.
+    ///
+    /// The primary key's own encoded bytes are the storage key
+    /// (`storage::primary_key_bytes`), so there is no row id counter to
+    /// consult here and no secondary index to maintain — `sql.rs` already
+    /// refuses both a non-key `UNIQUE` constraint and `CREATE INDEX` on one
+    /// of these tables, for exactly this reason. That also makes conflict
+    /// resolution simpler than [`Engine::insert_uncommitted`]'s general
+    /// path: the primary key is the *only* constraint that can collide, so
+    /// there is no second target an `ON CONFLICT (columns)` clause could be
+    /// naming instead, and no `Conflict` list to search.
+    ///
+    /// Two gaps, both disclosed rather than silent: `ON CONFLICT DO UPDATE`
+    /// is refused outright (the general path's upsert machinery is
+    /// `RowId`-keyed throughout, not yet worth duplicating for this), and
+    /// a written row does not reach the CDC change log
+    /// ([`Engine::note_change`] is `RowId`-keyed too) or retrieval-index
+    /// maintenance (moot — this table cannot have one).
+    fn insert_uncommitted_without_rowid(
+        &mut self,
+        insert: &InsertPlan,
+        table: &Table,
+        params: &[Value],
+    ) -> Result<(usize, Vec<Vec<Value>>)> {
+        let rules = self.rules_for(table)?;
+        let env = self.env(params);
+        let pk_ordinals: Vec<usize> = table
+            .primary_key
+            .iter()
+            .map(|column| table.require_column(column).map(|(ordinal, _)| ordinal))
+            .collect::<Result<_>>()?;
+        let pk_collations: Vec<Collation> = pk_ordinals
+            .iter()
+            .map(|&ordinal| table.columns[ordinal].collation)
+            .collect();
+
+        let proposed = self.proposed_rows(insert, table, &rules, params, &env)?;
+        let mut written = 0usize;
+        let mut returned: Vec<Vec<Value>> = Vec::new();
+        for mut row in proposed {
+            self.interrupt.check()?;
+            if !self.apply_constraints(table, &rules, &mut row, &insert.on_conflict, &env)? {
+                continue;
+            }
+            let key_values: Vec<&Value> =
+                pk_ordinals.iter().map(|&ordinal| &row[ordinal]).collect();
+            let key = crate::storage::primary_key_bytes(&key_values, &pk_collations)?;
+            if self.storage.get_row_keyed(&table.name, &key)?.is_some() {
+                // A target that does not name the primary key cannot be what
+                // answers this conflict — there is nothing else here for it
+                // to name — so it falls through to the same plain refusal an
+                // unanswered conflict gets on the general path.
+                let answered = match &insert.on_conflict.target {
+                    None => true,
+                    Some(target) => same_columns(&pk_ordinals, target),
+                };
+                if !answered {
+                    return Err(conflict_error(
+                        table,
+                        &Conflict {
+                            id: 0,
+                            values: Vec::new(),
+                            columns: pk_ordinals,
+                        },
+                    ));
+                }
+                match &insert.on_conflict.action {
+                    ConflictAction::Abort => {
+                        return Err(conflict_error(
+                            table,
+                            &Conflict {
+                                id: 0,
+                                values: Vec::new(),
+                                columns: pk_ordinals,
+                            },
+                        ))
+                    }
+                    ConflictAction::Ignore => continue,
+                    ConflictAction::Replace => {
+                        self.storage.delete_row_keyed(&table.name, &key)?;
+                    }
+                    ConflictAction::Update(_) => {
+                        return Err(Error::Unsupported(
+                            "ON CONFLICT DO UPDATE on a WITHOUT ROWID table is not supported yet"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            self.storage
+                .put_row_keyed(&table.name, &key, &encode_table_row(table, &row))?;
+            written += 1;
+            if let Some(items) = &insert.returning {
+                let exec = ExecRow {
+                    id: 0,
+                    score: None,
+                    values: row,
+                    aggregates: Vec::new(),
+                    windows: Vec::new(),
+                };
+                returned.push(project_row(items, &exec, &env)?);
+            }
+        }
         Ok((written, returned))
     }
 
@@ -4585,6 +4720,9 @@ impl Engine {
 
     fn update(&mut self, plan: &UpdatePlan, params: &[Value]) -> Result<Outcome> {
         let table = self.catalog.require_table(&plan.table)?.clone();
+        if table.without_rowid {
+            return self.update_without_rowid(plan, &table, params);
+        }
         let rules = self.rules_for(&table)?;
         let env = self.env(params);
         let mut count = 0;
@@ -4629,8 +4767,102 @@ impl Engine {
         }
     }
 
+    /// `UPDATE` on a `WITHOUT ROWID` table.
+    ///
+    /// The primary key is the storage key, so an assignment that changes
+    /// one of its columns moves the row — delete the old key, write the
+    /// new one — the same rule `Engine::write_changed_row` already applies
+    /// when an ordinary table's `INTEGER PRIMARY KEY` is the target of its
+    /// own `UPDATE`, generalised from one column to however many the key
+    /// has. `RowId`-keyed machinery (`ensure_unique`, `write_changed_row`,
+    /// retrieval-index and CDC upkeep) is not reused for the same reasons
+    /// [`Engine::insert_uncommitted_without_rowid`] does not reuse it.
+    fn update_without_rowid(
+        &mut self,
+        plan: &UpdatePlan,
+        table: &Table,
+        params: &[Value],
+    ) -> Result<Outcome> {
+        let rules = self.rules_for(table)?;
+        let env = self.env(params);
+        let pk_ordinals: Vec<usize> = table
+            .primary_key
+            .iter()
+            .map(|column| table.require_column(column).map(|(ordinal, _)| ordinal))
+            .collect::<Result<_>>()?;
+        let pk_collations: Vec<Collation> = pk_ordinals
+            .iter()
+            .map(|&ordinal| table.columns[ordinal].collation)
+            .collect();
+        // Read up front, exactly as `candidate_rows` does for the ordinary
+        // path: the statement sees the table as it was when it started, not
+        // as this loop is changing it.
+        let candidates = crate::traits::scan_all_keyed(&self.storage, &table.name)?;
+
+        let mut count = 0;
+        let mut returned: Vec<Vec<Value>> = Vec::new();
+        for (old_key, bytes) in candidates {
+            self.interrupt.check()?;
+            let row = decode_row(&bytes)?;
+            if !self.matches(&plan.filter, &row, &env)? {
+                continue;
+            }
+            let mut next = row.clone();
+            next.resize(table.columns.len(), Value::Null);
+            for (index, expr) in &plan.assignments {
+                let value = sql::coerce(
+                    eval::evaluate(expr, &row, Computed::NONE, &env)?,
+                    &table.columns[*index],
+                    table.strict,
+                )?;
+                next[*index] = value;
+            }
+            self.apply_constraints(table, &rules, &mut next, &OnConflict::abort(), &env)?;
+            let key_values: Vec<&Value> =
+                pk_ordinals.iter().map(|&ordinal| &next[ordinal]).collect();
+            let new_key = crate::storage::primary_key_bytes(&key_values, &pk_collations)?;
+            if new_key != old_key {
+                if self.storage.get_row_keyed(&table.name, &new_key)?.is_some() {
+                    return Err(conflict_error(
+                        table,
+                        &Conflict {
+                            id: 0,
+                            values: Vec::new(),
+                            columns: pk_ordinals,
+                        },
+                    ));
+                }
+                self.storage.delete_row_keyed(&table.name, &old_key)?;
+            }
+            self.storage
+                .put_row_keyed(&table.name, &new_key, &encode_table_row(table, &next))?;
+            count += 1;
+            if let Some(items) = &plan.returning {
+                let exec = ExecRow {
+                    id: 0,
+                    score: None,
+                    values: next,
+                    aggregates: Vec::new(),
+                    windows: Vec::new(),
+                };
+                returned.push(project_row(items, &exec, &env)?);
+            }
+        }
+        self.end_write()?;
+        match &plan.returning {
+            Some(items) => Ok(Outcome::Rows(ResultSet {
+                columns: items.iter().map(|item| item.label().to_string()).collect(),
+                rows: returned,
+            })),
+            None => Ok(Outcome::Written(count)),
+        }
+    }
+
     fn delete(&mut self, plan: &DeletePlan, params: &[Value]) -> Result<Outcome> {
         let table = self.catalog.require_table(&plan.table)?.clone();
+        if table.without_rowid {
+            return self.delete_without_rowid(plan, &table, params);
+        }
         let env = self.env(params);
         let mut count = 0;
         let mut returned: Vec<Vec<Value>> = Vec::new();
@@ -4657,6 +4889,50 @@ impl Engine {
             self.storage.delete_row(&table.name, id)?;
             self.deindex_row_retrieval(&table, id, &row)?;
             self.note_change(&table.name, id, ChangeKind::Delete);
+            count += 1;
+        }
+        self.end_write()?;
+        match &plan.returning {
+            Some(items) => Ok(Outcome::Rows(ResultSet {
+                columns: items.iter().map(|item| item.label().to_string()).collect(),
+                rows: returned,
+            })),
+            None => Ok(Outcome::Written(count)),
+        }
+    }
+
+    /// `DELETE` on a `WITHOUT ROWID` table: the primary key bytes decoded
+    /// straight back out of the matched row are the storage key, so there
+    /// is nothing else to look up. Not yet reaching retrieval-index or CDC
+    /// upkeep, for the same disclosed reasons
+    /// [`Engine::insert_uncommitted_without_rowid`] does not.
+    fn delete_without_rowid(
+        &mut self,
+        plan: &DeletePlan,
+        table: &Table,
+        params: &[Value],
+    ) -> Result<Outcome> {
+        let env = self.env(params);
+        let candidates = crate::traits::scan_all_keyed(&self.storage, &table.name)?;
+        let mut count = 0;
+        let mut returned: Vec<Vec<Value>> = Vec::new();
+        for (key, bytes) in candidates {
+            self.interrupt.check()?;
+            let row = decode_row(&bytes)?;
+            if !self.matches(&plan.filter, &row, &env)? {
+                continue;
+            }
+            if let Some(items) = &plan.returning {
+                let exec = ExecRow {
+                    id: 0,
+                    score: None,
+                    values: row.clone(),
+                    aggregates: Vec::new(),
+                    windows: Vec::new(),
+                };
+                returned.push(project_row(items, &exec, &env)?);
+            }
+            self.storage.delete_row_keyed(&table.name, &key)?;
             count += 1;
         }
         self.end_write()?;
@@ -4907,6 +5183,16 @@ impl Engine {
                         .into_iter()
                         .map(Ok),
                 ),
+                // `WITHOUT ROWID`: `sql.rs`'s `resolve_from` already refused
+                // any join for one of these, so `plan.joins.is_empty()`
+                // holds and this is the whole query's only source.
+                (None, None, _) if driving.table.without_rowid => {
+                    let base = self.without_rowid_stream(&driving.table.name)?;
+                    match &plan.filter {
+                        Some(filter) => Box::new(Filter::new(base, filter, env)),
+                        None => base,
+                    }
+                }
                 (None, None, _) => {
                     let source = self.candidate_bytes(&driving.table, &plan.filter, params)?;
                     match &plan.filter {
@@ -5401,6 +5687,32 @@ impl Engine {
         let rows = self.run_body(body, env, cap)?;
         Ok(Box::new(
             rows.into_iter()
+                .zip(1u64..)
+                .map(|(values, id)| Ok(ExecRow::scanned(id, values))),
+        ))
+    }
+
+    /// A `WITHOUT ROWID` table's rows, as a stream the outer pipeline can
+    /// consume — the same materialise-then-stream treatment
+    /// [`Engine::derived_stream`] gives a derived table, since this table's
+    /// rows are not reachable through [`Engine::candidate_bytes`]'s row-id
+    /// path at all. Every column is decoded, not only the ones the
+    /// statement can observe (`ColumnMask` does not reach this path yet) —
+    /// real, just not as tight as the ordinary scan.
+    ///
+    /// The row ids are positions, one-based, exactly as a derived table's
+    /// are: there is no `SELECT rowid` on a `WITHOUT ROWID` table to
+    /// answer, so nothing downstream needs them to mean anything beyond
+    /// breaking ties.
+    fn without_rowid_stream<'a>(&self, table: &str) -> Result<RowStream<'a>> {
+        let rows = crate::traits::scan_all_keyed(&self.storage, table)?;
+        let mut decoded = Vec::with_capacity(rows.len());
+        for (_, bytes) in rows {
+            decoded.push(decode_row(&bytes)?);
+        }
+        Ok(Box::new(
+            decoded
+                .into_iter()
                 .zip(1u64..)
                 .map(|(values, id)| Ok(ExecRow::scanned(id, values))),
         ))

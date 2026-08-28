@@ -204,6 +204,8 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns,
                 strict: false,
@@ -283,6 +285,8 @@ mod tests {
         let mut catalog = docs();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "other".to_string(),
                 columns: vec![Column::new("a", DataType::Integer)],
                 strict: false,
@@ -334,6 +338,8 @@ mod tests {
         let mut catalog = docs();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "tags".to_string(),
                 columns: vec![
                     Column::new("doc_id", DataType::Integer),

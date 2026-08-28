@@ -22,6 +22,8 @@ fn catalog() -> Catalog {
     let mut catalog = Catalog::new();
     catalog
         .create_table(Table {
+            without_rowid: false,
+            primary_key: Vec::new(),
             name: "t".to_string(),
             columns: vec![
                 Column::primary_key("id", DataType::Integer),

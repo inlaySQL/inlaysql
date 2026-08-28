@@ -1,0 +1,102 @@
+# CREATE TABLE ... WITHOUT ROWID.
+#
+# No hidden row id at all: the row is stored under its own primary key's
+# encoded bytes, index-organized. Every expectation here was checked
+# against a real sqlite3 3.54 binary first. Two disclosed gaps, not silent
+# ones — see `without_rowid.rs` and `Table::without_rowid`'s doc: a
+# secondary index on one of these tables, and joining one against anything
+# else in the same query.
+
+statement ok
+CREATE TABLE t(a INTEGER, b TEXT, c REAL, PRIMARY KEY (a, b)) WITHOUT ROWID
+
+statement ok
+INSERT INTO t VALUES (2, 'y', 2.5), (1, 'x', 1.5)
+
+# An index-organized table's natural scan order is primary-key order, not
+# insertion order.
+
+query ITR nosort
+SELECT a, b, c FROM t
+----
+1 x 1.5
+2 y 2.5
+
+statement error
+SELECT rowid FROM t
+
+statement error
+CREATE TABLE t2(a INTEGER, b TEXT) WITHOUT ROWID
+
+statement error
+CREATE TABLE t3(a INTEGER PRIMARY KEY AUTOINCREMENT) WITHOUT ROWID
+
+statement error
+INSERT INTO t VALUES (1, 'x', 9.9)
+
+# A lone INTEGER PRIMARY KEY does not become a row id alias here — a NULL
+# is a NOT NULL violation, not an auto-assigned key.
+
+statement ok
+CREATE TABLE u(a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID
+
+statement error
+INSERT INTO u (b) VALUES ('z')
+
+statement ok
+INSERT INTO u VALUES (1, 'first')
+
+statement ok
+INSERT OR IGNORE INTO u VALUES (1, 'second')
+
+query T nosort
+SELECT b FROM u WHERE a = 1
+----
+first
+
+statement ok
+INSERT OR REPLACE INTO u VALUES (1, 'third')
+
+query T nosort
+SELECT b FROM u WHERE a = 1
+----
+third
+
+# Updating a primary-key column moves the row.
+
+statement ok
+UPDATE t SET a = 9 WHERE a = 1
+
+query I nosort
+SELECT a FROM t ORDER BY a
+----
+2
+9
+
+statement ok
+DELETE FROM t WHERE a = 9
+
+query I nosort
+SELECT a FROM t
+----
+2
+
+statement ok
+DROP TABLE t
+
+statement error
+CREATE INDEX idx ON u (b)
+
+statement error
+CREATE TABLE v(a INTEGER PRIMARY KEY, b TEXT UNIQUE) WITHOUT ROWID
+
+statement ok
+CREATE TABLE w(a INTEGER PRIMARY KEY) WITHOUT ROWID
+
+statement error
+SELECT * FROM u JOIN w ON u.a = w.a
+
+query II nosort
+INSERT INTO w VALUES (1) RETURNING a, a * 2
+----
+1 2

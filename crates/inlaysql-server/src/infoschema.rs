@@ -1360,6 +1360,8 @@ mod tests {
         let mut catalog = Catalog::new();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "users".to_string(),
                 columns: vec![
                     Column::primary_key("id", DataType::Integer),
@@ -1370,6 +1372,8 @@ mod tests {
             .unwrap();
         catalog
             .create_table(Table {
+                without_rowid: false,
+                primary_key: Vec::new(),
                 name: "posts".to_string(),
                 columns: vec![Column::new("title", DataType::Text)],
                 strict: false,

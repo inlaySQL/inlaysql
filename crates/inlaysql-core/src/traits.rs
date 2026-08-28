@@ -121,6 +121,56 @@ pub trait Storage {
         limit: usize,
     ) -> Result<Vec<(RowId, RowBuf)>>;
 
+    /// Write (or overwrite) a `WITHOUT ROWID` table's row, addressed by its
+    /// primary key's encoded bytes rather than a [`RowId`] — there is no
+    /// row id on such a table at all.
+    ///
+    /// `key` is built the same collation-aware way a scalar index's entry
+    /// key is (`crate::storage::primary_key_bytes`), which is what makes it
+    /// a legal key in the same tree namespace `key`'s table already owns:
+    /// implementing this is exactly [`Storage::put_row`] with the row id's
+    /// eight fixed bytes replaced by an arbitrary-length one, not a second
+    /// storage scheme.
+    ///
+    /// **The default refuses**, the same reasoning [`Storage::put_index_entry`]
+    /// gives: a backend that has not implemented this cannot hold a
+    /// `WITHOUT ROWID` table, and the engine fails the `CREATE TABLE` (and
+    /// every write to one already created) rather than accept rows nothing
+    /// can read back.
+    fn put_row_keyed(&mut self, table: &str, key: &[u8], bytes: &[u8]) -> Result<()> {
+        let _ = (table, key, bytes);
+        Err(unsupported_without_rowid())
+    }
+
+    /// Read a single `WITHOUT ROWID` row by its primary key's encoded bytes.
+    /// See [`Storage::put_row_keyed`].
+    fn get_row_keyed(&self, table: &str, key: &[u8]) -> Result<Option<RowBuf>> {
+        let _ = (table, key);
+        Err(unsupported_without_rowid())
+    }
+
+    /// Delete a `WITHOUT ROWID` row by its primary key's encoded bytes.
+    /// Deleting a missing one is not an error, matching [`Storage::delete_row`].
+    fn delete_row_keyed(&mut self, table: &str, key: &[u8]) -> Result<()> {
+        let _ = (table, key);
+        Err(unsupported_without_rowid())
+    }
+
+    /// The next run of a `WITHOUT ROWID` table's rows, ordered by primary
+    /// key bytes ascending — [`Storage::scan_batch`]'s three obligations
+    /// (resume-after, short-batch-means-done, one snapshot across batches)
+    /// apply here identically, with the primary key's bytes standing in for
+    /// the row id as both the sort order and the resume token.
+    fn scan_batch_keyed(
+        &self,
+        table: &str,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, RowBuf)>> {
+        let _ = (table, after, limit);
+        Err(unsupported_without_rowid())
+    }
+
     /// Write an engine metadata entry (the catalog lives here).
     fn put_meta(&mut self, key: &str, bytes: &[u8]) -> Result<()>;
 
@@ -416,6 +466,31 @@ pub fn scan_all_watched(
     RowScan::watched(storage, table, interrupt).collect()
 }
 
+/// [`scan_all`] for a `WITHOUT ROWID` table, keyed by primary key bytes
+/// rather than row id.
+///
+/// A plain loop over [`Storage::scan_batch_keyed`] rather than a second
+/// [`RowScan`]: that struct's self-doubling batch size and cancellable
+/// variant exist for the streaming *read* path, which this table does not
+/// have yet either (`Engine::without_rowid_stream` materialises fully, the
+/// same choice `Engine::derived_stream` makes for a derived table) — so
+/// there is nothing here for a streaming iterator to buy back.
+pub fn scan_all_keyed(storage: &dyn Storage, table: &str) -> Result<Vec<(Vec<u8>, RowBuf)>> {
+    let mut out = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let batch = storage.scan_batch_keyed(table, after.as_deref(), MAX_SCAN_BATCH)?;
+        let short = batch.len() < MAX_SCAN_BATCH;
+        if let Some((key, _)) = batch.last() {
+            after = Some(key.clone());
+        }
+        out.extend(batch);
+        if short {
+            return Ok(out);
+        }
+    }
+}
+
 /// A BM25-ranked full-text index over one text column.
 pub trait FullTextIndex {
     /// Index (or re-index) a document.
@@ -658,6 +733,13 @@ fn unsupported_index() -> crate::error::Error {
     crate::error::Error::Unsupported(alloc::string::String::from(
         "this storage backend cannot hold scalar secondary index entries, so an index on it \
          would describe rows nothing keeps up to date",
+    ))
+}
+
+fn unsupported_without_rowid() -> crate::error::Error {
+    crate::error::Error::Unsupported(alloc::string::String::from(
+        "this storage backend cannot hold a WITHOUT ROWID table's rows, which are addressed by \
+         primary key rather than by row id",
     ))
 }
 
