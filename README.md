@@ -624,14 +624,23 @@ buffered the way an ordinary `CREATE TABLE`'s is, so `ROLLBACK` could not
 undo it — row-level writes to one that already exists are unaffected by that
 last restriction and are fully transactional.
 
-Not yet, and refused explicitly rather than silently ignored: `DISTINCT`
-inside a window function's argument list, the partial-write conflict
-resolutions (`INSERT OR ROLLBACK`/`OR FAIL`, `UPDATE OR REPLACE`/`OR IGNORE` —
-a statement here is already atomic, so they cannot mean what they say),
-`COUNT(DISTINCT *)`, `GROUP_CONCAT(DISTINCT ...)`, and a collation this
-engine does not have (there is no `CREATE COLLATION`, so a name outside
-`BINARY`/`NOCASE`/`RTRIM` is refused rather than silently compared byte-wise
-under a name that promises otherwise).
+Refused explicitly rather than silently ignored, and confirmed against
+sqlite3 to be refused there too rather than a gap on a to-do list:
+`DISTINCT` inside a window function's argument list (`SUM(DISTINCT x) OVER
+(...)`, sqlite3: "DISTINCT is not supported for window functions", the exact
+message this engine gives), `COUNT(DISTINCT *)` (not valid sqlite3 syntax at
+all — a parse error there, a plan-time refusal here, same statement
+refused), `GROUP_CONCAT(DISTINCT x, sep)` with an explicit separator
+(sqlite3: "DISTINCT aggregates must have exactly one argument", since a
+separator is not part of what is being deduplicated — the single-argument
+form, `GROUP_CONCAT(DISTINCT x)`, works), `CREATE COLLATION` (not a SQL
+statement sqlite3 has either — a collation is registered through its C API,
+which a `CREATE TABLE`/`SELECT` surface has no equivalent of, so a name
+outside `BINARY`/`NOCASE`/`RTRIM` is refused rather than silently compared
+byte-wise under a name that promises otherwise, the same as sqlite3 refuses
+an unregistered collation name), and the partial-write conflict resolutions
+(`INSERT OR ROLLBACK`/`OR FAIL`, `UPDATE OR REPLACE`/`OR IGNORE` — a
+statement here is already atomic, so they cannot mean what they say).
 
 ## SQL Logic Test
 
