@@ -26,11 +26,13 @@
 #     wired onto a derived table's own alias list, unlike what the plan
 #     first assumed: that syntax does not exist in SQLite at all).
 #
-# What is deliberately absent: `WITH RECURSIVE` (refused, named in the
-# message), `WITH` before `UPDATE`/`DELETE`/`INSERT` (SQLite has it; this
-# engine does not reach it yet), and the forward/self-reference and
-# real-table-shadowing-during-its-own-definition cases above — all pinned in
-# `unsupported.test` rather than here.
+# What is deliberately absent: `WITH` before `UPDATE`/`DELETE`/`INSERT`
+# (SQLite has it; this engine does not reach it yet), and the forward/self-
+# reference and real-table-shadowing-during-its-own-definition cases above —
+# pinned in `unsupported.test` rather than here. `WITH RECURSIVE` is
+# implemented; see `recursive_cte.test`, not this file, since its execution
+# model (semi-naive iteration, not plan-once/clone) is different enough to
+# be worth its own file.
 
 statement ok
 CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)

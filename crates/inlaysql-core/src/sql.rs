@@ -36,8 +36,9 @@ use crate::plan::{
     CompareAffinity, ConflictAction, ConflictUpdate, CreateIndexPlan, CreateTablePlan,
     CreateUniqueIndexPlan, DeletePlan, DropIndexPlan, DropTablePlan, Expr as PlanExpr, FrameBound,
     FromItem, InsertPlan, InsertSource, Join, JoinKind, OnConflict, Order, OrderKey, Plan,
-    ScalarFunc, ScalarItem, ScalarPlan, ScoreExpr, SelectItem, SelectPlan, SetOp, SetOperationPlan,
-    Subquery, SubqueryBody, SubqueryOp, UnaryOp, UpdatePlan, WindowFn, WindowFrame, WindowFunc,
+    RecursivePlan, ScalarFunc, ScalarItem, ScalarPlan, ScoreExpr, SelectItem, SelectPlan, SetOp,
+    SetOperationPlan, Subquery, SubqueryBody, SubqueryOp, UnaryOp, UpdatePlan, WindowFn,
+    WindowFrame, WindowFunc,
 };
 use crate::statement::Statement as Prepared;
 use crate::value::{DataType, Value};
@@ -696,6 +697,23 @@ struct Binder<'c> {
     /// rather than guessed from the bytes, where a text embedding whose length
     /// happened to be `4 * dim` would decode as garbage floats.
     vector_params: Vec<Option<usize>>,
+    /// The name and synthetic table of the `WITH RECURSIVE` CTE whose
+    /// recursive term is being resolved right now, if any — what a bare
+    /// `FROM name`/`JOIN name` inside it resolves to instead of erroring on
+    /// [`Binder::resolve_cte`]'s ordinary "not yet defined" check. See
+    /// `try_plan_recursive_cte`.
+    ///
+    /// Not a stack: saved and restored around each recursive term the same
+    /// way [`Binder::aggregates`] is, so a recursive CTE nested inside
+    /// another's recursive term resolves its *own* name here rather than the
+    /// outer one's.
+    recursive_self: Option<(String, Table)>,
+    /// Whether [`Binder::recursive_self`] has been resolved to yet, while it
+    /// is set. A second occurrence — a repeated `FROM`/`JOIN`, or one nested
+    /// in a subquery — is refused: SQLite allows exactly one, and the
+    /// semi-naive loop this plans for has no meaning for a second reference
+    /// with its own, different frontier at the same step.
+    recursive_self_used: bool,
 }
 
 impl<'c> Binder<'c> {
@@ -713,6 +731,8 @@ impl<'c> Binder<'c> {
             ctes: Vec::new(),
             cte_reserved: Vec::new(),
             vector_params: Vec::new(),
+            recursive_self: None,
+            recursive_self_used: false,
         }
     }
 
@@ -1068,7 +1088,13 @@ fn plan_create_table_as_select(
     let labels: Vec<String> = body.labels().into_iter().map(str::to_string).collect();
     let types: Vec<Option<DataType>> = match &body {
         SubqueryBody::Select(plan) => plan.output_columns().into_iter().map(|c| c.ty).collect(),
-        SubqueryBody::Scalar(_) | SubqueryBody::SetOp(_) => alloc::vec![None; labels.len()],
+        SubqueryBody::Scalar(_) | SubqueryBody::SetOp(_) | SubqueryBody::Recursive(_) => {
+            alloc::vec![None; labels.len()]
+        }
+        SubqueryBody::RecursiveSelf(_) => unreachable!(
+            "a recursive CTE's self-reference only ever appears inside a FromItem, never as a \
+             top-level query body"
+        ),
     };
 
     let mut columns: Vec<Column> = Vec::with_capacity(labels.len());
@@ -2600,6 +2626,13 @@ fn plan_select(query: Query, catalog: &Catalog, binder: &mut Binder) -> Result<P
         SubqueryBody::Select(plan) => Plan::Select(plan),
         SubqueryBody::Scalar(plan) => Plan::Scalar(plan),
         SubqueryBody::SetOp(plan) => Plan::SetOperation(plan),
+        // A `WITH RECURSIVE cte AS (...) SELECT ... FROM cte` statement's
+        // top-level body is the trailing `SELECT`, an ordinary `Select` —
+        // `Recursive` only ever exists nested inside that `Select`'s `FROM`,
+        // as one `FromItem`'s `derived` body. See `try_plan_recursive_cte`.
+        SubqueryBody::Recursive(_) | SubqueryBody::RecursiveSelf(_) => unreachable!(
+            "a WITH clause's own trailing query is never itself a recursive CTE's body"
+        ),
     })
 }
 
@@ -2659,11 +2692,6 @@ fn plan_query_body(
     // below returns, rather than at each of that dispatch's several exits.
     let with_pushed = match with {
         Some(with) => {
-            if with.recursive {
-                return Err(Error::Unsupported(
-                    "WITH RECURSIVE is not supported".to_string(),
-                ));
-            }
             plan_ctes(with, catalog, binder)?;
             true
         }
@@ -2966,7 +2994,7 @@ fn plan_ctes(with: &With, catalog: &Catalog, binder: &mut Binder) -> Result<()> 
     binder.cte_reserved.push(reserved);
 
     for cte in &with.cte_tables {
-        if let Err(error) = plan_one_cte(cte, catalog, binder) {
+        if let Err(error) = plan_one_cte(cte, catalog, binder, with.recursive) {
             binder.ctes.pop();
             binder.cte_reserved.pop();
             return Err(error);
@@ -2977,7 +3005,20 @@ fn plan_ctes(with: &With, catalog: &Catalog, binder: &mut Binder) -> Result<()> 
 
 /// Plan one `name AS (query)` entry of a `WITH` clause and push it onto the
 /// frame [`plan_ctes`] just opened.
-fn plan_one_cte(cte: &Cte, catalog: &Catalog, binder: &mut Binder) -> Result<()> {
+///
+/// `with_recursive` is the enclosing clause's own `RECURSIVE` keyword, not a
+/// property of this one entry — confirmed against sqlite3, a `WITH
+/// RECURSIVE` list may freely mix members that self-reference with ones that
+/// do not (`WITH RECURSIVE t(a) AS (SELECT 1), cnt(x) AS (SELECT 1 UNION ALL
+/// SELECT x+1 FROM cnt WHERE x<3) SELECT * FROM t, cnt` runs there), so this
+/// only *attempts* the recursive shape when the keyword is present and falls
+/// back to the ordinary path when a given entry turns out not to use it.
+fn plan_one_cte(
+    cte: &Cte,
+    catalog: &Catalog,
+    binder: &mut Binder,
+    with_recursive: bool,
+) -> Result<()> {
     if cte.materialized.is_some() {
         return Err(Error::Unsupported(
             "AS MATERIALIZED / AS NOT MATERIALIZED is not in SQLite's dialect".to_string(),
@@ -2992,7 +3033,15 @@ fn plan_one_cte(cte: &Cte, catalog: &Catalog, binder: &mut Binder) -> Result<()>
     // leak into a sibling's, or into the statement that uses it.
     let outer_aggregates = core::mem::take(&mut binder.aggregates);
     let outer_windows = core::mem::take(&mut binder.windows);
-    let planned = plan_query_body(&cte.query, catalog, binder, None);
+    let planned = if with_recursive {
+        match try_plan_recursive_cte(&name, cte, catalog, binder) {
+            Ok(Some(body)) => Ok(body),
+            Ok(None) => plan_query_body(&cte.query, catalog, binder, None),
+            Err(error) => Err(error),
+        }
+    } else {
+        plan_query_body(&cte.query, catalog, binder, None)
+    };
     binder.aggregates = outer_aggregates;
     binder.windows = outer_windows;
     let body = planned?;
@@ -3006,6 +3055,136 @@ fn plan_one_cte(cte: &Cte, catalog: &Catalog, binder: &mut Binder) -> Result<()>
         .expect("plan_ctes pushed a frame before calling this")
         .push(CteEntry { name, table, body });
     Ok(())
+}
+
+/// Attempt to plan `cte` as `WITH RECURSIVE name AS (seed UNION [ALL]
+/// recursive)`. `Ok(None)` means `cte`'s body never actually references
+/// `name` at all — a member of a `WITH RECURSIVE` list that simply is not
+/// recursive itself, which sqlite3 allows — so the caller plans it the
+/// ordinary way instead.
+///
+/// The shape accepted, confirmed against sqlite3 3.54:
+///
+/// * The body must be a compound (`a UNION [ALL] b`, or `a UNION b UNION
+///   ALL c`, ...); a bare `SELECT` can never be legally recursive — there is
+///   nothing to seed from — so this always answers `Ok(None)` for one, and
+///   a self-reference inside it (illegal either way) surfaces the ordinary
+///   ["not yet defined"](Binder::resolve_cte) refusal once the caller
+///   re-plans it.
+/// * `name` may not appear anywhere in every arm but the last — sqlite3
+///   refuses that as a "circular reference", and so, indirectly, does this:
+///   every arm but the last plans with `name` still unresolvable, through
+///   the same [`fold_compound_arms`] [`plan_compound`] itself uses, so a
+///   reference anywhere in it hits [`Binder::resolve_cte`]'s ordinary
+///   refusal.
+/// * `name` must appear in the *last* arm, exactly once, in its `FROM` (see
+///   `push_source`'s [`Binder::recursive_self`] check) — a second
+///   occurrence, repeated or nested in a subquery, is refused. Neither an
+///   aggregate nor a window function may appear there either — not a
+///   sqlite3 rule this happens to match, but a real correctness limit of
+///   [`crate::Engine::run_recursive`]'s semi-naive evaluation: a step only
+///   ever sees the previous step's new rows, never the whole table an
+///   aggregate would need to fold over.
+/// * The operator immediately to the left of the last arm — the one
+///   [`RecursivePlan::all`] records — must be `UNION` or `UNION ALL`;
+///   sqlite3 refuses `INTERSECT`/`EXCEPT` there too (the same "circular
+///   reference" message, since neither has a meaning for "keep going until
+///   a step adds nothing new").
+/// * The last arm is always a plain `SELECT`, never a further compound:
+///   guaranteed for free by [`flatten_compound`], which only ever pushes a
+///   `Select` onto its operand list — a parenthesised or further-nested arm
+///   is refused there already, for every compound, not only a recursive
+///   one, matching sqlite3's own "recursive-select must be a simple SELECT".
+fn try_plan_recursive_cte(
+    name: &str,
+    cte: &Cte,
+    catalog: &Catalog,
+    binder: &mut Binder,
+) -> Result<Option<SubqueryBody>> {
+    let mut operands: Vec<&Select> = Vec::new();
+    let mut ops: Vec<SetOp> = Vec::new();
+    if flatten_compound(&cte.query.body, &mut operands, &mut ops).is_err() || operands.len() < 2 {
+        return Ok(None);
+    }
+    let last = *operands.last().expect("checked len >= 2 above");
+    let seed_operands = &operands[..operands.len() - 1];
+    let (last_op, seed_ops) = ops
+        .split_last()
+        .expect("len(ops) == len(operands) - 1 >= 1");
+
+    let seed = fold_compound_arms(seed_operands, seed_ops, catalog, binder, None)?;
+    let mut seed_table = derived_table(None, &seed)?;
+    // The recursive term names the CTE's own declared columns (`cnt(x)`,
+    // not whatever the seed's own unaliased projection happened to be
+    // called) — the same rewrite `plan_one_cte` applies to the *outer*
+    // reference's table, applied here too since the self-reference needs
+    // it while resolving the recursive term, before that outer rewrite runs.
+    apply_column_aliases(&mut seed_table, &cte.alias.columns)?;
+
+    // Saved and restored rather than cleared, so a recursive CTE nested
+    // inside this one's recursive term resolves its own name here rather
+    // than this one's — see `Binder::recursive_self`'s doc.
+    let outer_recursive_self = binder.recursive_self.take();
+    let outer_recursive_self_used = binder.recursive_self_used;
+    binder.recursive_self = Some((name.to_string(), seed_table));
+    binder.recursive_self_used = false;
+    let recursive = plan_compound_arm(last, catalog, binder, None);
+    let used = binder.recursive_self_used;
+    binder.recursive_self = outer_recursive_self;
+    binder.recursive_self_used = outer_recursive_self_used;
+    let recursive = recursive?;
+
+    if !used {
+        return Ok(None);
+    }
+
+    let all = match last_op {
+        SetOp::UnionAll => true,
+        SetOp::Union => false,
+        other => {
+            return Err(Error::Unsupported(alloc::format!(
+                "the recursive term of `{name}` must be combined with UNION or UNION ALL, not \
+                 {other}"
+            )));
+        }
+    };
+
+    if let SubqueryBody::Select(plan) = &recursive {
+        if !plan.aggregates.is_empty() || !plan.group_by.is_empty() {
+            return Err(Error::Unsupported(alloc::format!(
+                "the recursive term of `{name}` may not use an aggregate function; a step only \
+                 ever sees the previous step's new rows, never the whole table an aggregate \
+                 would need"
+            )));
+        }
+        if !plan.windows.is_empty() {
+            return Err(Error::Unsupported(alloc::format!(
+                "the recursive term of `{name}` may not use a window function, for the same \
+                 reason it may not use an aggregate"
+            )));
+        }
+    }
+
+    let left_width = seed.width();
+    let right_width = recursive.width();
+    if left_width != right_width {
+        return Err(Error::Type(alloc::format!(
+            "the recursive term of `{name}` does not have the same number of result columns as \
+             its seed ({right_width} vs {left_width})"
+        )));
+    }
+    let collations = (0..left_width)
+        .map(|position| {
+            body_output_collation(&seed, position).map_or(Collation::Binary, |(c, _)| c)
+        })
+        .collect();
+
+    Ok(Some(SubqueryBody::Recursive(Box::new(RecursivePlan {
+        seed: Box::new(seed),
+        recursive: Box::new(recursive),
+        all,
+        collations,
+    }))))
 }
 
 /// Rename a synthetic table's columns positionally — `WITH t(a, b) AS
@@ -3046,6 +3225,61 @@ fn apply_column_aliases(table: &mut Table, columns: &[TableAliasColumnDef]) -> R
 }
 
 // ------------------------------------------------------------ set operations
+
+/// Fold a flat sequence of compound arms left-associatively into one
+/// `SubqueryBody`, in [`flatten_compound`]'s output order — the part of
+/// [`plan_compound`] shared with `try_plan_recursive_cte`, which folds only
+/// the non-recursive prefix of a `WITH RECURSIVE` definition this same way
+/// before planning its one recursive arm separately.
+///
+/// `operands` must be non-empty; `ops` one shorter, one operator between
+/// each consecutive pair.
+fn fold_compound_arms(
+    operands: &[&Select],
+    ops: &[SetOp],
+    catalog: &Catalog,
+    binder: &mut Binder,
+    parent: Option<&Scope<'_>>,
+) -> Result<SubqueryBody> {
+    let mut arms = operands.iter();
+    let mut acc = plan_compound_arm(
+        arms.next()
+            .expect("fold_compound_arms is never called with an empty `operands`"),
+        catalog,
+        binder,
+        parent,
+    )?;
+
+    for (op, arm) in ops.iter().zip(arms) {
+        let right = plan_compound_arm(arm, catalog, binder, parent)?;
+
+        let left_width = acc.width();
+        let right_width = right.width();
+        if left_width != right_width {
+            return Err(Error::Type(alloc::format!(
+                "SELECTs to the left and right of {op} do not have the same number of result \
+                 columns ({left_width} vs {right_width})"
+            )));
+        }
+        let collations = (0..left_width)
+            .map(|position| {
+                body_output_collation(&acc, position)
+                    .map_or(Collation::Binary, |(collation, _)| collation)
+            })
+            .collect();
+
+        acc = SubqueryBody::SetOp(Box::new(SetOperationPlan {
+            op: *op,
+            left: Box::new(acc),
+            right: Box::new(right),
+            collations,
+            order: Vec::new(),
+            limit: None,
+            offset: None,
+        }));
+    }
+    Ok(acc)
+}
 
 /// Plan a chain of `UNION [ALL]` / `INTERSECT` / `EXCEPT`.
 ///
@@ -3106,44 +3340,7 @@ fn plan_compound(
     let mut operands: Vec<&Select> = Vec::new();
     let mut ops: Vec<SetOp> = Vec::new();
     flatten_compound(body, &mut operands, &mut ops)?;
-
-    let mut arms = operands.into_iter();
-    let mut acc = plan_compound_arm(
-        arms.next()
-            .expect("a SetOperation node always has at least one leaf on each side"),
-        catalog,
-        binder,
-        parent,
-    )?;
-
-    for (op, arm) in ops.into_iter().zip(arms) {
-        let right = plan_compound_arm(arm, catalog, binder, parent)?;
-
-        let left_width = acc.width();
-        let right_width = right.width();
-        if left_width != right_width {
-            return Err(Error::Type(alloc::format!(
-                "SELECTs to the left and right of {op} do not have the same number of result \
-                 columns ({left_width} vs {right_width})"
-            )));
-        }
-        let collations = (0..left_width)
-            .map(|position| {
-                body_output_collation(&acc, position)
-                    .map_or(Collation::Binary, |(collation, _)| collation)
-            })
-            .collect();
-
-        acc = SubqueryBody::SetOp(Box::new(SetOperationPlan {
-            op,
-            left: Box::new(acc),
-            right: Box::new(right),
-            collations,
-            order: Vec::new(),
-            limit: None,
-            offset: None,
-        }));
-    }
+    let acc = fold_compound_arms(&operands, &ops, catalog, binder, parent)?;
 
     // `ORDER BY`/`LIMIT` bind to the whole compound; resolve them against a
     // synthetic single-source scope built the same way `FROM (SELECT ...)`
@@ -4326,6 +4523,30 @@ fn push_source(
                 )));
             }
             let table_name = object_name(name)?;
+            // While a `WITH RECURSIVE` CTE's recursive term is being
+            // resolved, its own name is not an ordinary (not yet fully
+            // planned) CTE reference — it is the one bare name in the whole
+            // statement that means "the previous step's frontier". Checked
+            // ahead of `resolve_cte`, which would otherwise refuse it as a
+            // self-reference the same way it refuses any other.
+            if let Some((self_name, self_table)) = binder.recursive_self.clone() {
+                if table_name.eq_ignore_ascii_case(&self_name) {
+                    if binder.recursive_self_used {
+                        return Err(Error::Unsupported(alloc::format!(
+                            "`{table_name}` may be referenced only once in the FROM clause of a \
+                             recursive common table expression's recursive term; SQLite refuses \
+                             a second occurrence too, whether repeated or nested in a subquery"
+                        )));
+                    }
+                    binder.recursive_self_used = true;
+                    sources.push(FromItem {
+                        table: self_table.clone(),
+                        derived: Some(Box::new(SubqueryBody::RecursiveSelf(self_table))),
+                    });
+                    aliases.push(alias.as_ref().map(|alias| alias.name.value.clone()));
+                    return Ok(());
+                }
+            }
             // A CTE name shadows a real table of the same name for the rest
             // of the statement it was declared in — checked first, and
             // ahead of the catalog, which is what makes `WITH t AS (...)
@@ -4796,6 +5017,11 @@ fn body_output_collation(body: &SubqueryBody, position: usize) -> Option<(Collat
         // the comparison at all, however many operators deep. See
         // `plan_compound`'s doc for what was checked.
         SubqueryBody::SetOp(plan) => body_output_collation(&plan.left, position),
+        // Same rule: always the seed's, never the recursive arm's.
+        SubqueryBody::Recursive(plan) => body_output_collation(&plan.seed, position),
+        SubqueryBody::RecursiveSelf(table) => {
+            table.columns.get(position).map(|c| (c.collation, false))
+        }
     }
 }
 
@@ -4965,6 +5191,11 @@ fn body_output_affinity(body: &SubqueryBody, position: usize) -> Option<CastType
         // Same rule `body_output_collation` uses: a compound's per-column
         // affinity is the left arm's alone.
         SubqueryBody::SetOp(plan) => body_output_affinity(&plan.left, position),
+        SubqueryBody::Recursive(plan) => body_output_affinity(&plan.seed, position),
+        SubqueryBody::RecursiveSelf(table) => table
+            .columns
+            .get(position)
+            .and_then(|c| column_affinity(c.ty)),
     }
 }
 

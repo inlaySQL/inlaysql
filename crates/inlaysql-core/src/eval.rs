@@ -68,6 +68,18 @@ pub struct Env<'a> {
     /// Uncorrelated subquery results, by [`Subquery::id`], shared with every
     /// nested environment so that one statement evaluates each of them once.
     memo: SubqueryMemo,
+    /// The current step's newly produced rows, while evaluating a recursive
+    /// CTE's recursive term — what a [`crate::plan::SubqueryBody::RecursiveSelf`]
+    /// reference resolves to. `None` everywhere else, including while
+    /// evaluating the CTE's own seed.
+    ///
+    /// Set fresh by [`crate::Engine::run_recursive`] before each step, not
+    /// carried in from the enclosing environment the way [`Env::outer`] is —
+    /// a recursive CTE referenced *inside* another recursive CTE's recursive
+    /// term is a different self-reference with its own frontier, and each
+    /// [`Engine::run_body`] call for a [`crate::plan::SubqueryBody::Recursive`]
+    /// establishes its own.
+    recursive_frontier: Option<&'a [Vec<Value>]>,
 }
 
 /// The generator an [`Env`] draws from, shared with whoever injected it.
@@ -114,6 +126,7 @@ impl<'a> Env<'a> {
             outer: &[],
             runner: None,
             memo: Rc::new(RefCell::new(BTreeMap::new())),
+            recursive_frontier: None,
         }
     }
 
@@ -128,8 +141,40 @@ impl<'a> Env<'a> {
         self
     }
 
+    /// The environment one step of a recursive CTE's recursive term runs in:
+    /// the same environment with `frontier` as what a
+    /// [`crate::plan::SubqueryBody::RecursiveSelf`] reference inside it
+    /// resolves to. See [`Env::recursive_frontier`].
+    pub fn with_recursive_frontier<'b>(&'b self, frontier: &'b [Vec<Value>]) -> Env<'b>
+    where
+        'a: 'b,
+    {
+        Env {
+            params: self.params,
+            now_micros: self.now_micros,
+            rng: Rc::clone(&self.rng),
+            outer: self.outer,
+            runner: self.runner,
+            memo: Rc::clone(&self.memo),
+            recursive_frontier: Some(frontier),
+        }
+    }
+
+    /// The current step's newly produced rows, set by
+    /// [`Env::with_recursive_frontier`]; `None` outside a recursive CTE's
+    /// recursive term.
+    pub fn recursive_frontier(&self) -> Option<&[Vec<Value>]> {
+        self.recursive_frontier
+    }
+
     /// The environment a subquery runs in: the same parameters, clock,
     /// generator, runner and memo, with `outer` as its captured row.
+    ///
+    /// `recursive_frontier` carries down too — a subquery nested inside a
+    /// recursive term's `FROM` still needs to see the same step's rows a
+    /// direct reference there would (see [`Env::with_recursive_frontier`]'s
+    /// doc for why a *fresh* recursive CTE resolved from inside gets its own
+    /// instead of inheriting this one).
     pub fn nested<'b>(&'b self, outer: &'b [Value]) -> Env<'b>
     where
         'a: 'b,
@@ -141,6 +186,7 @@ impl<'a> Env<'a> {
             outer,
             runner: self.runner,
             memo: Rc::clone(&self.memo),
+            recursive_frontier: self.recursive_frontier,
         }
     }
 

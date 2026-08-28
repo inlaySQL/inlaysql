@@ -818,10 +818,11 @@ is one it may `KILL`.
 
 ## Major
 
-- **SQL gaps that hit real ORMs and BI tools** — *reported*. `SAVEPOINT` is
-  supported (Laravel, Django and Rails all use it to implement nested
-  transactions), but no views, no triggers, no `WITH RECURSIVE`, no
-  `RANGE`/`GROUPS` window frames, no `CREATE INDEX IF NOT EXISTS`. Foreign
+- **SQL gaps that hit real ORMs and BI tools** — *reported*. `SAVEPOINT` and
+  `WITH RECURSIVE` are supported (Laravel, Django and Rails all use `SAVEPOINT`
+  to implement nested transactions; a BI tool's hierarchy/ancestor query is
+  the usual reason to reach for `WITH RECURSIVE`), but no views, no triggers,
+  no `RANGE`/`GROUPS` window frames, no `CREATE INDEX IF NOT EXISTS`. Foreign
   keys are recorded and never
   enforced, and unlike SQLite there is no `PRAGMA` to switch enforcement on, so
   the "SQLite's own default" framing in `README.md` overstates the parity.

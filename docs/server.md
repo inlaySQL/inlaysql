@@ -2078,11 +2078,14 @@ in an `UPDATE`, `DELETE` or `INSERT ... VALUES` is still refused at prepare
 time (`UPDATE`/`DELETE`/`INSERT ... VALUES` build their expression
 environment and then take the engine mutably to write, so that environment
 cannot hold the shared borrow reading a subquery needs), and so is
-`WITH RECURSIVE`, a forward- or self-referencing non-recursive CTE, a
+a forward- or self-referencing non-recursive CTE, a
 parenthesised compound arm, `INTERSECT ALL`/`EXCEPT ALL`, a bare `VALUES`
 query, an arbitrary expression or a qualified column in a compound's
 `ORDER BY`, and `WITH` in front of `UPDATE`/`DELETE`/`INSERT` rather than
-`SELECT` (`unsupported.test` pins each). None of that is what a stock
+`SELECT` (`unsupported.test` pins each). `WITH RECURSIVE` is implemented
+(`recursive_cte.test`), by semi-naive iteration rather than the plan-once
+approach an ordinary CTE gets — see `README.md`'s SQL-completeness section
+for what that means and what it restricts the recursive term to. None of that is what a stock
 migration or ordinary Eloquent CRUD reaches — `CREATE TABLE` with
 decorations, the post-creation index and constraint DDL, a model save with a
 qualified `updated_at`, `upsert()`'s own `ON DUPLICATE KEY UPDATE`, a
@@ -2195,12 +2198,13 @@ non-recursive `WITH` — Phase 1c items 2 and 3, and the previous version of
 this list's item 1. No shim change was needed: this is a straight core
 addition (`crates/inlaysql-core/src/sql.rs`, `set_operations.test`,
 `ctes.test`), so a compound query or a CTE that already ran on a real MySQL
-connection reaches the engine unchanged and now runs there too. `WITH
-RECURSIVE`, a forward- or self-referencing non-recursive CTE, a
-parenthesised compound arm, `INTERSECT ALL`/`EXCEPT ALL` and `WITH` in front
-of a write statement are still refused — see the narrower ground listed
-above, under [What does not work yet](#what-does-not-work-yet), for exactly
-what stayed behind. AHL-477, landed the same day, is worth naming here too
+connection reaches the engine unchanged and now runs there too. A forward- or
+self-referencing non-recursive CTE, a parenthesised compound arm,
+`INTERSECT ALL`/`EXCEPT ALL` and `WITH` in front of a write statement are
+still refused — see the narrower ground listed above, under
+[What does not work yet](#what-does-not-work-yet), for exactly what stayed
+behind. `WITH RECURSIVE` also reaches the engine unchanged now, since it too
+is a straight core addition with no shim change. AHL-477, landed the same day, is worth naming here too
 even though it fixed a bug rather than closing a gap: three cross-storage-
 class comparators (`ORDER BY`/`GROUP BY`, `MIN`/`MAX`, and `WHERE`'s own
 `comparison`) each answered a `TEXT`-vs-`INTEGER`-shaped pair its own wrong

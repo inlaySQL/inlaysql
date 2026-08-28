@@ -1,0 +1,178 @@
+# WITH RECURSIVE.
+#
+# Every expectation here was checked against a real sqlite3 3.54 binary
+# first. Run by semi-naive iteration (`Engine::run_recursive`), not the
+# plan-once/clone approach `ctes.test`'s non-recursive CTEs get — see
+# `README.md`'s SQL-completeness section for what that means and what it
+# restricts the recursive term to (exactly one self-reference, in its own
+# `FROM`, never in a subquery, and never under an aggregate or window
+# function).
+
+statement ok
+CREATE TABLE t(id INTEGER PRIMARY KEY)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+# ---------------------------------------------------------------- a counter
+
+query I nosort
+WITH RECURSIVE cnt(x) AS (
+  SELECT 1
+  UNION ALL
+  SELECT x + 1 FROM cnt WHERE x < 5
+) SELECT x FROM cnt
+----
+1
+2
+3
+4
+5
+
+# `LIMIT` ends the recursion early even with no `WHERE` guard on the
+# recursive term at all — the single most common shape this feature is used
+# for, and the one that would otherwise run forever.
+
+query I nosort
+WITH RECURSIVE cnt(x) AS (
+  SELECT 1
+  UNION ALL
+  SELECT x + 1 FROM cnt
+) SELECT x FROM cnt LIMIT 5
+----
+1
+2
+3
+4
+5
+
+# A `WHERE` on the *outer* query filters the fully materialised result
+# rather than shortening the recursion — the recursive term's own guard is
+# what bounds the work here.
+
+query I nosort
+WITH RECURSIVE cnt(x) AS (
+  SELECT 1
+  UNION ALL
+  SELECT x + 1 FROM cnt WHERE x < 5
+) SELECT x FROM cnt WHERE x > 2
+----
+3
+4
+5
+
+# -------------------------------------------------------- UNION vs UNION ALL
+
+# Under `UNION`, a row that repeats one already produced is dropped from the
+# *next* step's frontier too, not only from the final output — without that,
+# a cycling recursive term never converges.
+
+query I nosort
+WITH RECURSIVE cnt(x) AS (
+  SELECT 1
+  UNION
+  SELECT (x + 1) % 3 FROM cnt WHERE x < 10
+) SELECT x FROM cnt
+----
+1
+2
+0
+
+# ------------------------------------------------------- graph reachability
+
+statement ok
+CREATE TABLE edges(src INTEGER, dst INTEGER)
+
+statement ok
+INSERT INTO edges VALUES (1, 2), (2, 3), (3, 4), (4, 2)
+
+# No `WHERE` guard at all — a graph with a cycle back to node 2 has no
+# natural upper bound on `n`, so only `UNION`'s dedup terminates this.
+
+query I nosort
+WITH RECURSIVE reach(n) AS (
+  SELECT 1
+  UNION
+  SELECT e.dst FROM edges e JOIN reach r ON e.src = r.n
+) SELECT n FROM reach ORDER BY n
+----
+1
+2
+3
+4
+
+# ------------------------------------------------- mixed recursive/ordinary
+
+# A `WITH RECURSIVE` list may mix a member that never references itself with
+# one that does.
+
+query II nosort
+WITH RECURSIVE u(a) AS (SELECT 1), cnt(x) AS (
+  SELECT 1
+  UNION ALL
+  SELECT x + 1 FROM cnt WHERE x < 3
+) SELECT a, x FROM u, cnt ORDER BY x
+----
+1 1
+1 2
+1 3
+
+# ------------------------------------------------------------------ refused
+
+# The recursive term may reference the CTE only once — confirmed against
+# sqlite3 ("multiple references to recursive table").
+
+statement error
+WITH RECURSIVE cnt(x) AS (
+  SELECT 1
+  UNION ALL
+  SELECT a.x + b.x FROM cnt a, cnt b WHERE a.x < 3
+) SELECT x FROM cnt
+
+# The seed may not reference the CTE it is seeding — confirmed against
+# sqlite3 ("circular reference").
+
+statement error
+WITH RECURSIVE cnt(x) AS (
+  SELECT x FROM cnt
+  UNION ALL
+  SELECT x + 1 FROM cnt WHERE x < 5
+) SELECT x FROM cnt
+
+# `INTERSECT`/`EXCEPT` cannot combine a seed with a recursive term — neither
+# has a meaning for "keep going until a step adds nothing new". Confirmed
+# against sqlite3 ("circular reference").
+
+statement error
+WITH RECURSIVE cnt(x) AS (
+  SELECT 1
+  INTERSECT
+  SELECT x + 1 FROM cnt WHERE x < 5
+) SELECT x FROM cnt
+
+# Not a sqlite3-matching rule but a real limit of semi-naive iteration: a
+# step only ever sees that step's new rows, never the whole table an
+# aggregate would need.
+
+statement error
+WITH RECURSIVE cnt(x) AS (
+  SELECT 1
+  UNION ALL
+  SELECT count(*) FROM cnt WHERE x < 5
+) SELECT x FROM cnt
+
+# A bare SELECT with no compound at all can never be legally recursive —
+# there is nothing to seed from. Confirmed against sqlite3 ("circular
+# reference").
+
+statement error
+WITH RECURSIVE cnt(x) AS (SELECT x + 1 FROM cnt) SELECT x FROM cnt
+
+# The recursive term's column count must match the seed's.
+
+statement error
+WITH RECURSIVE cnt(x) AS (
+  SELECT 1
+  UNION ALL
+  SELECT x, x + 1 FROM cnt WHERE x < 5
+) SELECT x FROM cnt

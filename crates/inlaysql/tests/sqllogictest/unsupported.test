@@ -136,10 +136,7 @@ CREATE TABLE ok1(a INTEGER PRIMARY KEY, b INTEGER NULL)
 # the sqlite3 binary. What is left below is the CTE and compound-query ground
 # that is still refused.
 #
-# `WITH RECURSIVE` stays refused, named in the message.
-
-statement error
-WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM x WHERE n < 3) SELECT n FROM x
+# `WITH RECURSIVE` is implemented — see `recursive_cte.test`.
 
 # SQLite resolves a non-recursive `WITH` list's names as one namespace: a CTE
 # may reference one defined *later* in the same list, as long as it is not

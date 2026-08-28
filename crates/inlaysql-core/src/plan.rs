@@ -987,6 +987,52 @@ pub enum SubqueryBody {
     /// precedence, unlike the SQL-standard rule sqlparser's generic grammar
     /// otherwise applies).
     SetOp(Box<SetOperationPlan>),
+    /// `WITH RECURSIVE name AS (seed UNION [ALL] recursive)`.
+    ///
+    /// Executed by semi-naive iteration rather than by the ordinary compound
+    /// pipeline: `seed` runs once, then `recursive` runs repeatedly, each
+    /// time seeing only the *previous step's newly produced rows* through a
+    /// [`SubqueryBody::RecursiveSelf`] reference inside it — not the whole
+    /// table accumulated so far — until a step adds nothing new. See
+    /// `sql.rs::try_plan_recursive_cte` for the shape this is built from and
+    /// `Engine::run_recursive` for the loop.
+    Recursive(Box<RecursivePlan>),
+    /// The recursive term's own reference to the common table expression it
+    /// belongs to — resolved at plan time to this rather than to a stored
+    /// table or a cloned body, because what it means is "whatever
+    /// [`Engine::run_recursive`] is holding as the current step's frontier",
+    /// which does not exist until execution.
+    ///
+    /// Never appears anywhere but inside a [`RecursivePlan::recursive`]
+    /// body's `FROM`/`JOIN` list, and at most once there — `sql.rs`'s planner
+    /// refuses a second occurrence, matching sqlite3's "recursive table
+    /// referenced more than once" refusal.
+    RecursiveSelf(Table),
+}
+
+/// `WITH RECURSIVE name AS (seed UNION [ALL] recursive)`, planned.
+///
+/// See [`SubqueryBody::Recursive`] for how this executes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecursivePlan {
+    /// The non-recursive part: one arm, or (for `a UNION b UNION ALL
+    /// recursive`) a further compound of arms, none of which may reference
+    /// the CTE — confirmed against sqlite3, which refuses a self-reference
+    /// anywhere in this part as a "circular reference".
+    pub seed: Box<SubqueryBody>,
+    /// The one arm allowed to reference the CTE, via
+    /// [`SubqueryBody::RecursiveSelf`] somewhere in its `FROM`.
+    pub recursive: Box<SubqueryBody>,
+    /// Whether the operator joining `seed` to `recursive` was `UNION ALL`
+    /// (`true`: every row of every step survives) or `UNION` (`false`: a row
+    /// equal to one already produced — by the seed or by any earlier step —
+    /// is dropped, and does not become part of the next step's frontier
+    /// either, which is what lets a cyclic recursive term terminate).
+    pub all: bool,
+    /// Per-column collation `UNION`'s deduplication compares under, aligned
+    /// with the output — always the seed's, the same rule an ordinary
+    /// compound's [`SetOperationPlan::collations`] follows.
+    pub collations: Vec<Collation>,
 }
 
 impl SubqueryBody {
@@ -1003,6 +1049,9 @@ impl SubqueryBody {
             // right arm's at plan time, so either would do, but the left is
             // the one whose *labels* the compound also reports.
             SubqueryBody::SetOp(plan) => plan.left.width(),
+            // Same rule: checked equal to the recursive arm's at plan time.
+            SubqueryBody::Recursive(plan) => plan.seed.width(),
+            SubqueryBody::RecursiveSelf(table) => table.columns.len(),
         }
     }
 
@@ -1017,6 +1066,10 @@ impl SubqueryBody {
             SubqueryBody::Select(plan) => plan.items.iter().map(SelectItem::label).collect(),
             SubqueryBody::Scalar(plan) => plan.items.iter().map(|i| i.label.as_str()).collect(),
             SubqueryBody::SetOp(plan) => plan.left.labels(),
+            SubqueryBody::Recursive(plan) => plan.seed.labels(),
+            SubqueryBody::RecursiveSelf(table) => {
+                table.columns.iter().map(|c| c.name.as_str()).collect()
+            }
         }
     }
 
@@ -1030,6 +1083,13 @@ impl SubqueryBody {
                 }
             }
             SubqueryBody::SetOp(plan) => plan.tables_read(out),
+            SubqueryBody::Recursive(plan) => {
+                plan.seed.tables_read(out);
+                plan.recursive.tables_read(out);
+            }
+            // The CTE itself, not a stored table — what it reads is recorded
+            // through `RecursivePlan::seed`/`recursive` instead.
+            SubqueryBody::RecursiveSelf(_) => {}
         }
     }
 }

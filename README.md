@@ -562,11 +562,22 @@ dedup keeps the last-occurring row of a colliding group where
 `INTERSECT`/`EXCEPT` keep the first, deduplicated. A `WITH` reference becomes
 a derived table planned once, but a CTE referenced twice may *run* once per
 reference rather than being shared — this engine's own choice, not a bug, and
-pinned as such in `ctes.test`. `WITH RECURSIVE` is refused, named in the
-message.
+pinned as such in `ctes.test`. `WITH RECURSIVE` (`recursive_cte.test`) runs by
+semi-naive iteration rather than the plan-once/clone approach an ordinary CTE
+gets: the seed runs once, then the recursive term runs repeatedly, each step
+seeing only the previous step's *new* rows rather than the whole table so
+far, until a step adds nothing new — the same algorithm SQLite's own VDBE
+uses, verified against it including the trap a naive version falls into (a
+row that repeats one already produced has to stop propagating too, under
+`UNION`, or a cyclic recursive term never converges). The recursive term may
+reference the CTE exactly once, in its own `FROM`, never in a subquery, and
+never with an aggregate or window function over it — the last two are a real
+limit of the algorithm, not only a SQLite restriction being matched: a step
+only ever sees that step's new rows, never the whole table an aggregate would
+need.
 
-Not yet, and refused explicitly rather than silently ignored: `WITH
-RECURSIVE`, an explicit `RANGE`/`GROUPS` window frame (the rest of the window
+Not yet, and refused explicitly rather than silently ignored: an explicit
+`RANGE`/`GROUPS` window frame (the rest of the window
 family landed with AHL-494, above), the partial-write conflict
 resolutions (`INSERT OR ROLLBACK`/`OR FAIL`, `UPDATE OR REPLACE`/`OR IGNORE` —
 a statement here is already atomic, so they cannot mean what they say),
@@ -590,7 +601,7 @@ cargo run -p inlaysql --bin sqllogictest -- \
   crates/inlaysql/tests/sqllogictest/*.test          # print the pass rate
 ```
 
-Current pass rate over the subset: **1227/1227 (100%)** — covering `CREATE TABLE`,
+Current pass rate over the subset: **1242/1242 (100%)** — covering `CREATE TABLE`,
 `INSERT`, projection, `WHERE`, `DISTINCT`, `ORDER BY` (column, expression,
 alias, multi-key, `NULLS FIRST`/`LAST`), `LIMIT`/`OFFSET` (literal or bound),
 type coercion and affinity, `SELECT`-without-`FROM` scalar expressions,
@@ -608,14 +619,16 @@ SQLite's own rules, declared constraints (`DEFAULT`, `NOT NULL`, `UNIQUE`,
 `BEGIN`/`COMMIT`/`ROLLBACK`, every conflict clause (`INSERT OR IGNORE`/
 `REPLACE`, `ON CONFLICT DO NOTHING`/`DO UPDATE`) and `RETURNING`, subqueries
 in every read position (scalar, `IN (SELECT ...)`, `EXISTS`, derived tables,
-correlated and uncorrelated), `UNION`/`INTERSECT`/`EXCEPT`/non-recursive
-`WITH`, `CREATE TABLE ... AS SELECT`, `CREATE TABLE ... STRICT`
-(`strict.test`), `SAVEPOINT`/`RELEASE`/`ROLLBACK TO SAVEPOINT`
-(`savepoint.test`), and the window functions of AHL-494 including
-`percent_rank`/`cume_dist` (`window_functions.test`). The
+correlated and uncorrelated), `UNION`/`INTERSECT`/`EXCEPT`/`WITH` (recursive
+and not — `ctes.test`, `recursive_cte.test`), `CREATE TABLE ... AS SELECT`,
+`CREATE TABLE ... STRICT` (`strict.test`), `SAVEPOINT`/`RELEASE`/
+`ROLLBACK TO SAVEPOINT` (`savepoint.test`), and the window functions of
+AHL-494 including `percent_rank`/`cume_dist` (`window_functions.test`). The
 number is meant to grow (and be reported) as the dialect matures — it does not
-yet include the parts of the corpus that exercise `WITH RECURSIVE`, because
-the dialect does not have it.
+yet include the parts of the *SQLite project's own* sqllogictest corpus that
+exercise `WITH RECURSIVE`, which this subset has not pulled in and adapted,
+even though the dialect now has the feature (verified against sqlite3
+directly instead, in `recursive_cte.test`).
 
 One file in that subset asserts **refusals** rather than results, because the
 alternative was worse than a missing feature: `INSERT ... ON CONFLICT`,
@@ -1008,9 +1021,9 @@ below is a surprise to the project, it is the honest state of it:
     asset) is the same category of work, longer.
 
 Full Postgres parity is deliberately not on this list — see the last point in
-[What this is not](#what-this-is-not). Neither is `WITH RECURSIVE`: nothing in
-the Laravel corpus that motivated Phase 1 needs it yet. Window functions were
-in this paragraph until AHL-494 implemented them.
+[What this is not](#what-this-is-not). Window functions and `WITH RECURSIVE`
+were in this paragraph until AHL-494 and semi-naive iteration implemented
+them, respectively.
 
 ## What this is not
 

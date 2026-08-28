@@ -78,8 +78,8 @@ use crate::error::Result;
 use crate::eval::Env;
 use crate::exec::ProbeKind;
 use crate::plan::{
-    ColumnInfo, DeletePlan, Expr, InsertPlan, InsertSource, JoinKind, Plan, ScoreExpr, SelectItem,
-    SelectPlan, SetOperationPlan, SubqueryBody, SubqueryOp, UpdatePlan,
+    ColumnInfo, DeletePlan, Expr, InsertPlan, InsertSource, JoinKind, Plan, RecursivePlan,
+    ScoreExpr, SelectItem, SelectPlan, SetOperationPlan, SubqueryBody, SubqueryOp, UpdatePlan,
 };
 use crate::value::{DataType, Value};
 
@@ -225,7 +225,28 @@ impl<'e> Explainer<'e> {
                 Ok(())
             }
             SubqueryBody::SetOp(plan) => self.compound(plan, parent, cap),
+            SubqueryBody::Recursive(plan) => self.recursive(plan, parent),
+            SubqueryBody::RecursiveSelf(_) => {
+                self.push(parent, "SCAN RECURSIVE STEP".to_string());
+                Ok(())
+            }
         }
+    }
+
+    /// `cap` is not threaded to either arm: [`Engine::run_recursive`] applies
+    /// it to the accumulated total between steps, not to one call of
+    /// [`Engine::run_body`], so there is no single access path here a budget
+    /// would change.
+    fn recursive(&mut self, plan: &RecursivePlan, parent: i64) -> Result<()> {
+        let id = self.push(
+            parent,
+            alloc::format!(
+                "RECURSIVE {} STEP",
+                if plan.all { "UNION ALL" } else { "UNION" }
+            ),
+        );
+        self.body(&plan.seed, id, None)?;
+        self.body(&plan.recursive, id, None)
     }
 
     /// Both arms of a compound run to completion before a single output row

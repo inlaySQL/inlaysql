@@ -41,8 +41,9 @@ use crate::hnsw_paged::PagedHnswIndex;
 use crate::plan::{
     Aggregate, AlterAction, AlterTablePlan, AnalyzePlan, ConflictAction, ConflictUpdate,
     CreateTablePlan, DeletePlan, DropTablePlan, FrameBound, FromItem, InsertPlan, InsertSource,
-    JoinKind, OnConflict, Order, OrderKey, Plan, ReindexPlan, ScalarPlan, ScoreExpr, SelectItem,
-    SelectPlan, SetOp, SetOperationPlan, SubqueryBody, UpdatePlan, WindowFn, WindowFunc,
+    JoinKind, OnConflict, Order, OrderKey, Plan, RecursivePlan, ReindexPlan, ScalarPlan, ScoreExpr,
+    SelectItem, SelectPlan, SetOp, SetOperationPlan, SubqueryBody, UpdatePlan, WindowFn,
+    WindowFunc,
 };
 use crate::planner::{self, JoinDecision, JoinPath, PlannerStats, STATS_META_KEY};
 use crate::row::{
@@ -4697,6 +4698,11 @@ impl Engine {
             SubqueryBody::Select(plan) => self.select(plan, params),
             SubqueryBody::Scalar(plan) => self.select_scalar(plan, params),
             SubqueryBody::SetOp(plan) => self.select_set_op(plan, params),
+            SubqueryBody::Recursive(plan) => self.select_recursive(plan, params),
+            SubqueryBody::RecursiveSelf(_) => unreachable!(
+                "a recursive CTE's self-reference only ever appears inside a FromItem, never as \
+                 a top-level query body"
+            ),
         }
     }
 
@@ -4736,6 +4742,20 @@ impl Engine {
         self.refresh_indexes()?;
         let env = self.read_env(params);
         self.run_set_operation(plan, &env, None)
+    }
+
+    /// Evaluate a `WITH RECURSIVE` CTE run as a top-level query, e.g.
+    /// `INSERT INTO t SELECT * FROM (WITH RECURSIVE cnt(x) AS (...) SELECT x
+    /// FROM cnt)`. The ordinary `FROM`-reference path is
+    /// [`Engine::run_recursive`] by way of [`Engine::run_body`]; this exists
+    /// only because [`Engine::select_body`] has to answer every
+    /// [`SubqueryBody`] shape.
+    fn select_recursive(&mut self, plan: &RecursivePlan, params: &[Value]) -> Result<ResultSet> {
+        self.refresh_indexes()?;
+        let env = self.read_env(params);
+        let columns = plan.seed.labels().into_iter().map(str::to_string).collect();
+        let rows = self.run_recursive(plan, &env, None)?;
+        Ok(ResultSet { columns, rows })
     }
 
     /// Run a planned `SELECT` through the streaming pipeline.
@@ -4852,9 +4872,19 @@ impl Engine {
                 // cost is real and is not hidden: `FROM (SELECT ...)` builds
                 // the whole inner result, and a `LIMIT` on the outer query does
                 // not shorten it. Pushing the outer limit inward is a planner
-                // rewrite, not something this loop can do.
+                // rewrite, not something this loop can do — except for a
+                // recursive CTE with no filter on top of it, where the
+                // alternative is running an unguarded recursion to
+                // completion; see `Engine::derived_stream`'s doc.
                 (Some(body), _, filter) => {
-                    let base = self.derived_stream(body, env)?;
+                    let recursive_cap = if filter.is_none()
+                        && matches!(body.as_ref(), SubqueryBody::Recursive(_))
+                    {
+                        stop_after
+                    } else {
+                        None
+                    };
+                    let base = self.derived_stream(body, env, recursive_cap)?;
                     match filter {
                         Some(filter) => Box::new(Filter::new(base, filter, env)),
                         None => base,
@@ -4896,7 +4926,7 @@ impl Engine {
             // `WHERE` that references other tables cannot be pushed into the
             // fetch; it is applied to the joined rows below instead.
             let mut stream: RowStream<'_> = match (&driving.derived, &plan.score) {
-                (Some(body), _) => self.derived_stream(body, env)?,
+                (Some(body), _) => self.derived_stream(body, env, None)?,
                 (None, Some(score)) => Box::new(
                     self.retrieve_rows(&driving.table, score, fetch, &driving_mask, env)?
                         .into_iter()
@@ -5206,7 +5236,95 @@ impl Engine {
             SubqueryBody::Select(plan) => Ok(self.run_select(plan, env, cap)?.rows),
             SubqueryBody::Scalar(plan) => Ok(self.run_scalar(plan, env)?.rows),
             SubqueryBody::SetOp(plan) => Ok(self.run_set_operation(plan, env, cap)?.rows),
+            SubqueryBody::Recursive(plan) => self.run_recursive(plan, env, cap),
+            SubqueryBody::RecursiveSelf(_) => Ok(env
+                .recursive_frontier()
+                .expect(
+                    "a RecursiveSelf reference only ever resolves inside \
+                     Engine::run_recursive's loop, which always sets one first",
+                )
+                .to_vec()),
         }
+    }
+
+    /// Run a recursive CTE by semi-naive iteration: `seed` once, then
+    /// `recursive` repeatedly, each time through [`Env::with_recursive_frontier`]
+    /// seeing only the *previous step's newly produced rows* as
+    /// [`SubqueryBody::RecursiveSelf`] — not the whole table accumulated so
+    /// far — until a step adds nothing new.
+    ///
+    /// Verified against sqlite3 3.54, including the trap a naive
+    /// implementation falls into: under `UNION` (not `UNION ALL`), a row
+    /// that repeats one already produced is dropped from the *next* step's
+    /// frontier too, not only from the final output. Without that, a
+    /// recursive term whose output cycles (`(x + 1) % 3`, say) never
+    /// converges — sqlite3 confirms the cycling case terminates, which is
+    /// only possible if a repeated row stops propagating.
+    ///
+    /// `cap` ends the loop once at least that many rows exist in total,
+    /// *before* filtering the last step against what came before — see
+    /// `sql.rs`'s `run_select_to` call site, the only one that ever passes
+    /// one: a bare `FROM recursive_cte LIMIT n` with nothing else on the
+    /// outer query, where "the recursive evaluation produced n rows" and
+    /// "the query answered n rows" are the same fact, so ending the loop
+    /// there is exactly what a `LIMIT`-aware caller means and matches
+    /// sqlite3's own short-circuit for this shape (confirmed: an unguarded
+    /// `WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt)
+    /// SELECT x FROM cnt LIMIT 5` returns at once there rather than running
+    /// forever). Every other shape — a `WHERE`, a `JOIN`, an `ORDER BY` on
+    /// the outer query — passes `None` and gets the whole table, the same
+    /// policy an ordinary derived table already has (see
+    /// [`Engine::derived_stream`]'s doc): unbounded, but not un-killable,
+    /// since [`Interrupt::check`] is asked every step.
+    fn run_recursive(
+        &self,
+        plan: &RecursivePlan,
+        env: &Env<'_>,
+        cap: Option<usize>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let mut all_rows = self.run_body(&plan.seed, env, None)?;
+        if !plan.all {
+            let keep = duplicate_keep_mask(&all_rows, &plan.collations, Keep::First);
+            let mut kept = Vec::with_capacity(all_rows.len());
+            for (row, keep) in all_rows.into_iter().zip(keep) {
+                if keep {
+                    kept.push(row);
+                }
+            }
+            all_rows = kept;
+        }
+        let mut frontier = all_rows.clone();
+
+        while !frontier.is_empty() {
+            self.interrupt.check_now()?;
+            if cap.is_some_and(|cap| all_rows.len() >= cap) {
+                break;
+            }
+            let step_env = env.with_recursive_frontier(&frontier);
+            let mut next = self.run_body(&plan.recursive, &step_env, None)?;
+            if !plan.all {
+                next.retain(|row| {
+                    !all_rows.iter().any(|seen| {
+                        compare_projections(seen, row, &plan.collations)
+                            == core::cmp::Ordering::Equal
+                    })
+                });
+                let keep = duplicate_keep_mask(&next, &plan.collations, Keep::First);
+                let mut kept = Vec::with_capacity(next.len());
+                for (row, keep) in next.into_iter().zip(keep) {
+                    if keep {
+                        kept.push(row);
+                    }
+                }
+                next = kept;
+            }
+            all_rows.extend(next.iter().cloned());
+            frontier = next;
+        }
+        if let Some(cap) = cap {
+            all_rows.truncate(cap);
+        }
+        Ok(all_rows)
     }
 
     /// Run a `UNION`/`INTERSECT`/`EXCEPT` chain: both arms run through the
@@ -5262,8 +5380,25 @@ impl Engine {
     /// id, and this is only ever used to break `ORDER BY` ties — where "the
     /// order the inner query produced them in" is the honest tie-break and the
     /// one that matches reading the subquery's own output top to bottom.
-    fn derived_stream<'a>(&self, body: &SubqueryBody, env: &Env<'_>) -> Result<RowStream<'a>> {
-        let rows = self.run_body(body, env, None)?;
+    ///
+    /// `cap` is `None` for almost every caller: an ordinary derived table
+    /// materialises in full before the outer pipeline starts, and a `LIMIT`
+    /// on the outer query does not shorten it — that cost is real and is not
+    /// hidden, since pushing the outer limit inward in general is a planner
+    /// rewrite, not something this loop can do. The one caller that passes
+    /// `Some` is `run_select_to`'s driving-side dispatch, and only for a
+    /// [`SubqueryBody::Recursive`] body in the one shape where "the recursive
+    /// evaluation produced `n` rows" and "the query answered `n` rows" are
+    /// the same fact — see [`Engine::run_recursive`]'s doc for why that one
+    /// case needs it to avoid running an unguarded recursion to completion
+    /// under a `LIMIT` that was supposed to end it early.
+    fn derived_stream<'a>(
+        &self,
+        body: &SubqueryBody,
+        env: &Env<'_>,
+        cap: Option<usize>,
+    ) -> Result<RowStream<'a>> {
+        let rows = self.run_body(body, env, cap)?;
         Ok(Box::new(
             rows.into_iter()
                 .zip(1u64..)
