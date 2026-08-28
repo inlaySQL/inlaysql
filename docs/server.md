@@ -1426,11 +1426,12 @@ reaches the engine and works — this is SQLite's dialect being a strict
 superset here, the same shape `->`/`->>` are in the JSON section above — but
 it is not something a MySQL-wire client should be expected to send.
 
-An explicit `RANGE`/`GROUPS` frame is refused with the ordinary `1235`
-(`crates/inlaysql-server/tests/wire.rs`'s "still refused" probe uses exactly
-this) — see `crates/inlaysql/tests/sqllogictest/unsupported.test` and
-`WindowFrame`'s doc in `plan.rs` for why a value-based frame is not silently
-treated as the position-based `ROWS` this engine implements.
+An explicit `RANGE`/`GROUPS` frame is implemented too, reaching the engine
+unchanged the same way `ROWS` does — see `WindowFrame`'s doc in `plan.rs`
+for why a value-based `RANGE` and a peer-group-counted `GROUPS` needed their
+own evaluation rather than being approximated with the position-based
+`ROWS` this engine already had, and `window_functions.test` for what was
+checked against sqlite3.
 
 ### MySQL-only DDL is translated, not invented
 
@@ -2092,8 +2093,12 @@ qualified `updated_at`, `upsert()`'s own `ON DUPLICATE KEY UPDATE`, a
 paginated `SELECT` with `COUNT(*)`, `whereIn`, an eager-load `JOIN`, a
 `whereHas` subquery, a `withCount` subquery and `WHERE DATE(...)` all run
 end-to-end without touching any of it. What is left, now that AHL-473 has
-closed the `UNION`/CTE gap that used to be item 1 here and AHL-486 has closed
-the comparison-affinity gap that used to be item 2:
+closed the `UNION`/CTE gap that used to be item 1 here, AHL-486 has closed
+the comparison-affinity gap that used to be item 2, and `percent_rank()`/
+`cume_dist()`/an explicit `RANGE`/`GROUPS` window frame — the item after
+that — are all implemented too, along with the rest of the window function
+surface (see [Window functions](#window-functions-ahl-494) above and
+`crates/inlaysql/tests/sqllogictest/window_functions.test`):
 
 1. **The unmapped MySQL-named scalar functions are refused (1235).** `NOW()`,
    `CONCAT()`, `RAND()`, `CHAR_LENGTH()`, `LOCATE()`, `LEFT()`, `IF()`,
@@ -2107,12 +2112,6 @@ the comparison-affinity gap that used to be item 2:
    `SQRT`, `CEIL`, `FLOOR`, `TRUNCATE`, `SIGN` — and no padding or hashing
    (`LPAD`, `REPEAT`, `MD5`). **Core's**, if they are wanted; a shim cannot
    invent an arithmetic primitive.
-2. **A value-based `RANGE`/`GROUPS` window frame is refused (1235).** AHL-494
-   implemented the rest of the window function surface — see
-   [Window functions](#window-functions-ahl-494) above — and this gap is
-   the engine's, not the shim's, the same way item 1 above is. `percent_rank()`
-   and `cume_dist()`, which used to be refused alongside it, are implemented
-   now — see `crates/inlaysql/tests/sqllogictest/window_functions.test`.
 
 That item is the engine's to fix, not the shim's — every shape
 this shim could plausibly translate has been, now. The shim's own

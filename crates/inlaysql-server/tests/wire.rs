@@ -1545,16 +1545,15 @@ fn errors_arrive_as_mysql_error_codes_rather_than_a_dropped_connection() {
     // from `UNION` when AHL-473 implemented set operations and CTEs, from
     // `ROW_NUMBER() OVER ()` when AHL-494 implemented window functions
     // (ranking, `lag`/`lead`, the aggregate family, `ROWS` frames, named
-    // windows and `FILTER`), and from `percent_rank()`/`cume_dist()` once
-    // those landed too. If an explicit `RANGE` frame lands and this starts
-    // failing, that is the same good news: point it at whatever is still
-    // refused rather than deleting the assertion. What is being tested is
-    // the mapping of `Error::Unsupported` onto 1235, not this particular
-    // statement.
+    // windows and `FILTER`), from `percent_rank()`/`cume_dist()`, and from
+    // an explicit `RANGE`/`GROUPS` frame once those landed too. If
+    // `DISTINCT` inside a window function's argument list lands and this
+    // starts failing, that is the same good news: point it at whatever is
+    // still refused rather than deleting the assertion. What is being
+    // tested is the mapping of `Error::Unsupported` onto 1235, not this
+    // particular statement.
     let error = client
-        .query(
-            "SELECT sum(id) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM kv",
-        )
+        .query("SELECT sum(DISTINCT id) OVER (ORDER BY id) FROM kv")
         .unwrap_err();
     assert_eq!(error.code, 1235, "ER_NOT_SUPPORTED_YET");
 
@@ -7002,12 +7001,13 @@ fn show_status_counts_errors_by_class() {
         .query("INSERT INTO t VALUES (1)")
         .expect_err("duplicate key");
     // See `errors_arrive_as_mysql_error_codes_rather_than_a_dropped_connection`
-    // for why this is an explicit `RANGE` frame rather than a fixed construct:
-    // it needs to name something the dialect does not have yet, and that list
-    // only shrinks. `SAVEPOINT` moved off it once the engine gained real
+    // for why this is `DISTINCT` inside a window function rather than a
+    // fixed construct: it needs to name something the dialect does not have
+    // yet, and that list only shrinks. `SAVEPOINT` and an explicit
+    // `RANGE`/`GROUPS` frame both moved off it once the engine gained real
     // support.
     client
-        .query("SELECT sum(id) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t")
+        .query("SELECT sum(DISTINCT id) OVER (ORDER BY id) FROM t")
         .expect_err("unsupported");
 
     assert_eq!(

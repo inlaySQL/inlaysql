@@ -350,16 +350,8 @@ SELECT id FROM t LIMIT id
 # `percent_rank()`/`cume_dist()` are implemented — see
 # `window_functions.test`.
 
-# `ROWS` frames are implemented; `RANGE`/`GROUPS` frames with an explicit
-# value-based bound are not — a value-based `RANGE` answers a different
-# question than a position-based `ROWS` the moment `ORDER BY` has ties, so
-# this is not silently treated as `ROWS`.
-
-statement error
-SELECT SUM(a) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t
-
-statement error
-SELECT SUM(a) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t
+# `ROWS`, `RANGE` and `GROUPS` frames are all implemented — see
+# `window_functions.test`.
 
 # `DISTINCT` inside a window function's argument list — refused by sqlite3
 # itself ("DISTINCT is not supported for window functions"), and here.

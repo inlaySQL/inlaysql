@@ -35,9 +35,9 @@ use crate::plan::{
     AggFunc, Aggregate, AlterAction, AlterTablePlan, AnalyzePlan, BinaryOp, CastType,
     CompareAffinity, ConflictAction, ConflictUpdate, CreateIndexPlan, CreateTablePlan,
     CreateUniqueIndexPlan, DeletePlan, DropIndexPlan, DropTablePlan, Expr as PlanExpr, FrameBound,
-    FromItem, InsertPlan, InsertSource, Join, JoinKind, OnConflict, Order, OrderKey, Plan,
-    RecursivePlan, ScalarFunc, ScalarItem, ScalarPlan, ScoreExpr, SelectItem, SelectPlan, SetOp,
-    SetOperationPlan, Subquery, SubqueryBody, SubqueryOp, UnaryOp, UpdatePlan, WindowFn,
+    FrameUnit, FromItem, InsertPlan, InsertSource, Join, JoinKind, OnConflict, Order, OrderKey,
+    Plan, RecursivePlan, ScalarFunc, ScalarItem, ScalarPlan, ScoreExpr, SelectItem, SelectPlan,
+    SetOp, SetOperationPlan, Subquery, SubqueryBody, SubqueryOp, UnaryOp, UpdatePlan, WindowFn,
     WindowFrame, WindowFunc,
 };
 use crate::statement::Statement as Prepared;
@@ -5499,7 +5499,7 @@ fn resolve_window_spec(
         }
     }
     let frame = match &spec.window_frame {
-        Some(raw) => Some(resolve_window_frame(raw, scope, binder)?),
+        Some(raw) => Some(resolve_window_frame(raw, &order_by, scope, binder)?),
         None => base.as_ref().and_then(|base| base.frame.clone()),
     };
 
@@ -5593,26 +5593,15 @@ fn resolve_window_order_by(
 /// always-empty frame, confirmed against sqlite3).
 fn resolve_window_frame(
     frame: &sqlparser::ast::WindowFrame,
+    order_by: &[Order],
     scope: &Scope,
     binder: &mut Binder,
 ) -> Result<WindowFrame> {
-    match frame.units {
-        sqlparser::ast::WindowFrameUnits::Rows => {}
-        sqlparser::ast::WindowFrameUnits::Range => {
-            return Err(Error::Unsupported(
-                "RANGE frame is not supported; only ROWS frames (and SQLite's implicit default \
-                 frame) are implemented"
-                    .to_string(),
-            ));
-        }
-        sqlparser::ast::WindowFrameUnits::Groups => {
-            return Err(Error::Unsupported(
-                "GROUPS frame is not supported; only ROWS frames (and SQLite's implicit default \
-                 frame) are implemented"
-                    .to_string(),
-            ));
-        }
-    }
+    let unit = match frame.units {
+        sqlparser::ast::WindowFrameUnits::Rows => FrameUnit::Rows,
+        sqlparser::ast::WindowFrameUnits::Range => FrameUnit::Range,
+        sqlparser::ast::WindowFrameUnits::Groups => FrameUnit::Groups,
+    };
     let start = resolve_frame_bound(&frame.start_bound, scope, binder)?;
     // `end_bound = None` is the shorthand form (`ROWS 1 PRECEDING`), which
     // sqlparser's own doc says "must behave the same as `CURRENT ROW`" —
@@ -5640,11 +5629,28 @@ fn resolve_window_frame(
             "a window frame's start must not come after its end".to_string(),
         ));
     }
-    Ok(WindowFrame {
-        rows: true,
-        start,
-        end,
-    })
+    // Confirmed against sqlite3: a `RANGE` bound that compares *values*
+    // (`<expr> PRECEDING`/`FOLLOWING`, as opposed to `CURRENT ROW` or
+    // `UNBOUNDED`, which stay peer-group-based regardless) needs exactly one
+    // `ORDER BY` term to compare against — zero terms means no value to
+    // offset from, and more than one means no single value the offset could
+    // mean. `GROUPS` and `CURRENT ROW`/`UNBOUNDED` `RANGE` bounds have no
+    // such restriction: a peer group is well-defined by any number of
+    // `ORDER BY` terms, the same rule the implicit default frame already
+    // relies on.
+    let has_value_offset =
+        |bound: &FrameBound| matches!(bound, FrameBound::Preceding(_) | FrameBound::Following(_));
+    if unit == FrameUnit::Range
+        && (has_value_offset(&start) || has_value_offset(&end))
+        && order_by.len() != 1
+    {
+        return Err(Error::Unsupported(alloc::format!(
+            "a RANGE frame with a PRECEDING/FOLLOWING offset needs exactly one ORDER BY term to \
+             compare it against, this window has {}",
+            order_by.len()
+        )));
+    }
+    Ok(WindowFrame { unit, start, end })
 }
 
 /// One `PRECEDING`/`FOLLOWING`/`CURRENT ROW` bound. An offset expression is

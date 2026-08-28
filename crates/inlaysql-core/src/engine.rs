@@ -40,10 +40,10 @@ use crate::hnsw::VectorMetric;
 use crate::hnsw_paged::PagedHnswIndex;
 use crate::plan::{
     Aggregate, AlterAction, AlterTablePlan, AnalyzePlan, ConflictAction, ConflictUpdate,
-    CreateTablePlan, DeletePlan, DropTablePlan, FrameBound, FromItem, InsertPlan, InsertSource,
-    JoinKind, OnConflict, Order, OrderKey, Plan, RecursivePlan, ReindexPlan, ScalarPlan, ScoreExpr,
-    SelectItem, SelectPlan, SetOp, SetOperationPlan, SubqueryBody, UpdatePlan, WindowFn,
-    WindowFunc,
+    CreateTablePlan, DeletePlan, DropTablePlan, FrameBound, FrameUnit, FromItem, InsertPlan,
+    InsertSource, JoinKind, OnConflict, Order, OrderKey, Plan, RecursivePlan, ReindexPlan,
+    ScalarPlan, ScoreExpr, SelectItem, SelectPlan, SetOp, SetOperationPlan, SubqueryBody,
+    UpdatePlan, WindowFn, WindowFunc,
 };
 use crate::planner::{self, JoinDecision, JoinPath, PlannerStats, STATS_META_KEY};
 use crate::row::{
@@ -7232,22 +7232,41 @@ fn evaluate_window_partition(
     }
     let n = sequence.len();
 
-    // Peer-group boundaries (index-into-`sequence`, inclusive), needed by
-    // `RANK`/`DENSE_RANK` and by the default frame's peer-group-aware end
-    // bound (`WindowFrame`'s doc). Only computed when there is an `ORDER BY`
-    // to tie on; with none, every row is the whole partition's own peer
-    // (`rank`/`dense_rank` never actually reach that case without an
-    // `ORDER BY` producing a total order, but the default frame does, and
-    // `WindowFrame::whole_partition` is exactly "every row's peer group is
-    // the whole partition").
-    let peer_end: Vec<usize> = if wf.order_by.is_empty() {
-        alloc::vec![n.saturating_sub(1); n]
+    // Peer-group boundaries and index (index-into-`sequence`), needed by
+    // `RANK`/`DENSE_RANK`, the default frame's peer-group-aware `CURRENT
+    // ROW` bound, and an explicit `RANGE`/`GROUPS` frame's own peer-group
+    // bounds (`WindowFrame`'s doc). Only computed when there is an `ORDER
+    // BY` to tie on; with none, every row is the whole partition's own
+    // single peer group (`rank`/`dense_rank` never actually reach that case
+    // without an `ORDER BY` producing a total order, but a frame's default
+    // or an explicit `RANGE`/`GROUPS` does, and `WindowFrame::whole_partition`
+    // is exactly "every row's peer group is the whole partition").
+    let (peer_start, peer_end, group_of, group_start, group_end) = if wf.order_by.is_empty() {
+        (
+            alloc::vec![0usize; n],
+            alloc::vec![n.saturating_sub(1); n],
+            alloc::vec![0usize; n],
+            if n == 0 {
+                Vec::new()
+            } else {
+                alloc::vec![0usize]
+            },
+            if n == 0 {
+                Vec::new()
+            } else {
+                alloc::vec![n - 1]
+            },
+        )
     } else {
         let mut keys: Vec<Vec<SortKey>> = Vec::with_capacity(n);
         for &index in &sequence {
             keys.push(window_sort_keys(&wf.order_by, &rows[index], env)?);
         }
+        let mut starts = alloc::vec![0usize; n];
         let mut ends = alloc::vec![0usize; n];
+        let mut group_of = alloc::vec![0usize; n];
+        let mut group_start = Vec::new();
+        let mut group_end = Vec::new();
         let mut i = 0;
         while i < n {
             let mut j = i + 1;
@@ -7256,12 +7275,17 @@ fn evaluate_window_partition(
             {
                 j += 1;
             }
-            for slot in ends.iter_mut().take(j).skip(i) {
-                *slot = j - 1;
+            let group_index = group_start.len();
+            group_start.push(i);
+            group_end.push(j - 1);
+            for slot in i..j {
+                starts[slot] = i;
+                ends[slot] = j - 1;
+                group_of[slot] = group_index;
             }
             i = j;
         }
-        ends
+        (starts, ends, group_of, group_start, group_end)
     };
 
     match wf.func {
@@ -7396,15 +7420,55 @@ fn evaluate_window_partition(
         | WindowFunc::Agg(_) => {
             let start_bound = resolve_frame_bound_once(&wf.frame.start, env, "starting")?;
             let end_bound = resolve_frame_bound_once(&wf.frame.end, env, "ending")?;
+            let needs_numeric = wf.frame.unit == FrameUnit::Range
+                && (matches!(
+                    wf.frame.start,
+                    FrameBound::Preceding(_) | FrameBound::Following(_)
+                ) || matches!(
+                    wf.frame.end,
+                    FrameBound::Preceding(_) | FrameBound::Following(_)
+                ));
+            let numeric = if needs_numeric {
+                // `sql.rs`'s `resolve_window_frame` refuses a value-offset
+                // `RANGE` bound unless the window has exactly one `ORDER BY`
+                // term, so indexing it here is safe.
+                let term = core::slice::from_ref(&wf.order_by[0]);
+                let mut values = Vec::with_capacity(n);
+                for &index in &sequence {
+                    let key = match &window_sort_keys(term, &rows[index], env)?[0] {
+                        SortKey::Value(Value::Integer(x)) => Some(*x as f64),
+                        SortKey::Value(Value::Real(x)) => Some(*x),
+                        _ => None,
+                    };
+                    // "Comparison space": negated for `DESC` so the array is
+                    // monotonically non-decreasing in sequence order either
+                    // way — see `numeric_range_bound`'s doc.
+                    values.push(if term[0].desc { key.map(|v| -v) } else { key });
+                }
+                let lo = values.iter().position(Option::is_some).unwrap_or(n);
+                let hi = values
+                    .iter()
+                    .rposition(Option::is_some)
+                    .map_or(0, |p| p + 1);
+                Some((values, lo, hi))
+            } else {
+                None
+            };
+            let ctx = FrameContext {
+                unit: wf.frame.unit,
+                peer_start: &peer_start,
+                peer_end: &peer_end,
+                group_of: &group_of,
+                group_start: &group_start,
+                group_end: &group_end,
+                numeric: numeric.as_ref().map(|(keys, lo, hi)| NumericFrameKeys {
+                    keys,
+                    lo: *lo,
+                    hi: *hi,
+                }),
+            };
             for position in 0..n {
-                let frame = frame_range(
-                    &start_bound,
-                    &end_bound,
-                    wf.frame.rows,
-                    position,
-                    peer_end[position],
-                    n,
-                );
+                let frame = frame_range(&ctx, &start_bound, &end_bound, position, n);
                 let row_index = sequence[position];
                 let value = match (wf.func, frame) {
                     (_, None) => Value::Null,
@@ -7558,30 +7622,155 @@ fn frame_offset(expr: &crate::plan::Expr, env: &Env<'_>, edge: &str) -> Result<i
     Ok(offset)
 }
 
+/// A `RANGE` frame's value-offset bounds for one window: the single
+/// `ORDER BY` term's key per sequence position, in "comparison space" (see
+/// [`numeric_range_bound`]'s doc), and `[lo, hi)` — the contiguous
+/// sub-range that actually holds a value, since a `NULL` or non-numeric key
+/// (SQLite's storage-class order keeps them together, before or after every
+/// number) sorts to one or both ends rather than scattering through it.
+struct NumericFrameKeys<'a> {
+    keys: &'a [Option<f64>],
+    lo: usize,
+    hi: usize,
+}
+
+/// Everything [`frame_range`] needs beyond the two bounds themselves, one
+/// per window function evaluated — bundled so that generalising from `ROWS`
+/// alone to `ROWS`/`RANGE`/`GROUPS` did not turn every call site into an
+/// eight-argument function call.
+struct FrameContext<'a> {
+    unit: FrameUnit,
+    /// This row's peer group, as `[peer_start[p], peer_end[p]]` — read for
+    /// a `CURRENT ROW` bound under `Range`/`Groups`, on *either* side (a
+    /// `ROWS` `CURRENT ROW` always means the row's own literal position
+    /// instead, on both sides too, so neither is read then).
+    peer_start: &'a [usize],
+    peer_end: &'a [usize],
+    /// This row's 0-based peer-group index, and each group's own first/last
+    /// position — read for a `Groups` `<n> PRECEDING`/`FOLLOWING` bound,
+    /// which counts groups rather than rows.
+    group_of: &'a [usize],
+    group_start: &'a [usize],
+    group_end: &'a [usize],
+    /// Read for a `Range` `<n> PRECEDING`/`FOLLOWING` bound. `None` unless
+    /// at least one of the two bounds actually is one — see this window's
+    /// call site in `evaluate_window_partition`.
+    numeric: Option<NumericFrameKeys<'a>>,
+}
+
 /// A bound's row position relative to `position`, using `i64::MIN`/`MAX` as
-/// sentinels for the two `UNBOUNDED` variants so that the emptiness and
-/// clamping arithmetic in [`frame_range`] does not need to special-case them.
-fn bound_position(bound: &ResolvedBound, position: i64) -> i64 {
+/// sentinels for the `UNBOUNDED` variants — and, past the last group or
+/// before the numeric range, for a `Groups`/`Range` `PRECEDING`/`FOLLOWING`
+/// bound that overruns one — so that the emptiness and clamping arithmetic
+/// in [`frame_range`] does not need to special-case any of them.
+///
+/// `is_start` only matters for `Range`/`Groups`: a `CURRENT ROW` bound reads
+/// `peer_start` as a frame start and `peer_end` as a frame end (the "whole
+/// peer group" reinterpretation [`WindowFrame`]'s doc measures against
+/// sqlite3, on *either* side, unlike the position a `ROWS` `CURRENT ROW`
+/// always means); a `Groups` offset bound resolves to its target group's
+/// first position as a start, last as an end.
+fn bound_position(
+    ctx: &FrameContext,
+    bound: &ResolvedBound,
+    position: usize,
+    is_start: bool,
+) -> i64 {
+    let group_bound = |target: i64| -> i64 {
+        if target < 0 {
+            i64::MIN
+        } else if target as usize >= ctx.group_start.len() {
+            i64::MAX
+        } else if is_start {
+            ctx.group_start[target as usize] as i64
+        } else {
+            ctx.group_end[target as usize] as i64
+        }
+    };
     match bound {
         ResolvedBound::UnboundedPreceding => i64::MIN,
-        ResolvedBound::Preceding(offset) => position.saturating_sub(*offset),
-        ResolvedBound::CurrentRow => position,
-        ResolvedBound::Following(offset) => position.saturating_add(*offset),
         ResolvedBound::UnboundedFollowing => i64::MAX,
+        ResolvedBound::CurrentRow => match ctx.unit {
+            FrameUnit::Rows => position as i64,
+            FrameUnit::Range | FrameUnit::Groups => {
+                if is_start {
+                    ctx.peer_start[position] as i64
+                } else {
+                    ctx.peer_end[position] as i64
+                }
+            }
+        },
+        ResolvedBound::Preceding(offset) | ResolvedBound::Following(offset) => {
+            let preceding = matches!(bound, ResolvedBound::Preceding(_));
+            let sign = if preceding { -1i64 } else { 1i64 };
+            match ctx.unit {
+                FrameUnit::Rows => (position as i64).saturating_add(sign * offset),
+                FrameUnit::Groups => {
+                    group_bound((ctx.group_of[position] as i64).saturating_add(sign * offset))
+                }
+                FrameUnit::Range => {
+                    let numeric = ctx
+                        .numeric
+                        .as_ref()
+                        .expect("a Range offset bound always has one computed");
+                    numeric_range_bound(numeric, position, ctx, preceding, *offset, is_start)
+                }
+            }
+        }
+    }
+}
+
+/// A `RANGE` `<n> PRECEDING`/`FOLLOWING` bound's row position, by binary
+/// search: the first (`is_start`) or last (`!is_start`) sequence position
+/// whose key is within the offset of the current row's own — confirmed
+/// against sqlite3, ASC and DESC both (the window-functions sqllogictest
+/// file has both measurements). `numeric.keys` is already in "comparison
+/// space" — negated for a `DESC` term at the call site that built it — so
+/// it is monotonically non-decreasing in sequence order regardless of
+/// direction, and `PRECEDING` always means "toward a smaller key here",
+/// `FOLLOWING` "toward a larger one", the same either way.
+///
+/// The current row's own key is `None` when it is `NULL` or (a disclosed,
+/// narrower answer than sqlite3's own degenerate one — see [`WindowFrame`]'s
+/// doc) not numeric at all; either way this returns the row's own peer
+/// group rather than attempting a value comparison, matching sqlite3's
+/// measured `NULL` behaviour and standing in for the non-numeric case too.
+fn numeric_range_bound(
+    numeric: &NumericFrameKeys<'_>,
+    position: usize,
+    ctx: &FrameContext,
+    preceding: bool,
+    offset: i64,
+    is_start: bool,
+) -> i64 {
+    let Some(current) = numeric.keys[position] else {
+        return if is_start {
+            ctx.peer_start[position] as i64
+        } else {
+            ctx.peer_end[position] as i64
+        };
+    };
+    let delta = offset as f64;
+    let threshold = if preceding {
+        current - delta
+    } else {
+        current + delta
+    };
+    let region = &numeric.keys[numeric.lo..numeric.hi];
+    if is_start {
+        // Smallest index with key >= threshold.
+        let count = region.partition_point(|k| k.expect("within [lo, hi)") < threshold);
+        (numeric.lo + count) as i64
+    } else {
+        // Largest index with key <= threshold, one past it minus one.
+        let count = region.partition_point(|k| k.expect("within [lo, hi)") <= threshold);
+        (numeric.lo + count) as i64 - 1
     }
 }
 
 /// The frame for the row at `position` (0-based, within a partition of `n`
 /// rows), as an inclusive `(first, last)` pair of indices into the
 /// partition's sequence — `None` when the frame is empty.
-///
-/// `rows` (an explicit `ROWS` frame) counts positions literally. The default,
-/// `RANGE`-shaped frame (`!rows`) reinterprets a `CURRENT ROW` *end* bound as
-/// "the end of this row's peer group" (`peer_end`) instead of the row's own
-/// position — see [`WindowFrame`]'s doc for the sqlite3 measurement this
-/// implements; every other bound (both defaults ever construct are
-/// `UNBOUNDED PRECEDING`/`UNBOUNDED FOLLOWING`/this one `CURRENT ROW`) reads
-/// the same either way.
 ///
 /// Emptiness is decided from the *unclamped* positions first — a frame like
 /// `2 PRECEDING AND 5 PRECEDING` is empty at *every* row (the start is always
@@ -7590,20 +7779,14 @@ fn bound_position(bound: &ResolvedBound, position: i64) -> i64 {
 /// clamped into `0..n`. Confirmed against sqlite3 (see the sqllogictest
 /// file's frame-past-the-edge cases).
 fn frame_range(
+    ctx: &FrameContext,
     start: &ResolvedBound,
     end: &ResolvedBound,
-    rows: bool,
     position: usize,
-    peer_end: usize,
     n: usize,
 ) -> Option<(usize, usize)> {
-    let i = position as i64;
-    let raw_start = bound_position(start, i);
-    let raw_end = if !rows && matches!(end, ResolvedBound::CurrentRow) {
-        peer_end as i64
-    } else {
-        bound_position(end, i)
-    };
+    let raw_start = bound_position(ctx, start, position, true);
+    let raw_end = bound_position(ctx, end, position, false);
     if n == 0 || raw_start > raw_end || raw_end < 0 || raw_start > n as i64 - 1 {
         return None;
     }

@@ -281,3 +281,109 @@ SELECT id, v, sum(v) OVER (w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t WI
 3 20 40
 4 5 25
 5 NULL 5
+
+# RANGE and GROUPS frames, ordered by `v` instead of `id` so the tie (id 2
+# and 3, both v=20) and the NULL (id 5) land inside the frame math itself,
+# not just the peer-group lookups `ROWS BETWEEN ...` above never has to
+# make. Sequence order ascending by `v`, NULLs first (the default): id 5
+# (NULL), id 4 (5), id 1 (10), id 2 and 3 (20, tied).
+
+# A value-offset RANGE: `v` within 5 either side of the current row's own —
+# a peer group's own value stands in for every row in it, so id 2 and 3
+# (both v=20) get the identical sum. id 5's own value is NULL, so its frame
+# is its NULL peer group alone (itself, the only NULL row here) rather than
+# a value comparison — sum of one NULL is NULL.
+
+query IIR nosort
+SELECT id, v, sum(v) OVER (ORDER BY v RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM t ORDER BY id
+----
+1 10 15
+2 20 40
+3 20 40
+4 5 15
+5 NULL NULL
+
+# GROUPS counts peer groups, not rows or values: id 4's frame is one group
+# either side of its own (the NULL group and the v=10 group), even though
+# the NULL group's own `v` cannot be compared numerically at all.
+
+query IIR nosort
+SELECT id, v, sum(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id
+----
+1 10 55
+2 20 50
+3 20 50
+4 5 15
+5 NULL 5
+
+# An explicit RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW is SQLite's
+# implicit default written out — same peer-group-aware CURRENT ROW end this
+# engine already had to get right for the no-frame-at-all case above.
+
+query IIR nosort
+SELECT id, v, sum(v) OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY id
+----
+1 10 15
+2 20 55
+3 20 55
+4 5 5
+5 NULL NULL
+
+# RANGE's value comparison is per partition, not per statement: id 1 (in
+# partition 'a') never reaches id 4's v=5 in partition 'b', even though 5 is
+# within its RANGE BETWEEN 5 PRECEDING.
+
+query ITIR nosort
+SELECT id, g, v, sum(v) OVER (PARTITION BY g ORDER BY v RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) FROM t ORDER BY id
+----
+1 a 10 10
+2 a 20 40
+3 a 20 40
+4 b 5 5
+5 b NULL NULL
+
+# A value-offset RANGE bound needs exactly one ORDER BY term to compare
+# against — confirmed against sqlite3, which refuses both too few and too
+# many with the same message.
+
+statement error
+SELECT sum(v) OVER (ORDER BY v, id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t
+
+statement error
+SELECT sum(v) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t
+
+# DESC with an asymmetric offset, so ASC and DESC actually answer
+# differently (a symmetric offset would not tell them apart): confirmed
+# against sqlite3 with row_number() first, to pin the sequence order this
+# depends on (v descending, id 2 before 3, NULL last — the reverse of
+# ascending's NULL-first default) before trusting the frame math built on
+# top of it.
+
+query I nosort
+SELECT row_number() OVER (ORDER BY v DESC) FROM t ORDER BY id
+----
+3
+1
+2
+4
+5
+
+query IT nosort
+SELECT id, group_concat(id) OVER (ORDER BY v DESC RANGE BETWEEN 3 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY id
+----
+1 1
+2 2,3
+3 2,3
+4 4
+5 5
+
+# A negative frame offset is refused at run time, not prepare time — the
+# same check `ROWS` already goes through (`sql.rs` cannot know until a bound
+# parameter or expression is evaluated), shared rather than duplicated per
+# unit.
+
+statement error
+SELECT sum(v) OVER (ORDER BY v RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) FROM t
+
+statement error
+SELECT sum(v) OVER (ORDER BY v GROUPS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM t

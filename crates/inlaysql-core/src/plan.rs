@@ -2296,42 +2296,59 @@ impl WindowFunc {
 /// fold over. The ranking and navigation functions ([`WindowFunc::reads_frame`]
 /// is `false`) ignore this entirely.
 ///
-/// Only `ROWS` frames (position-counted) are implemented; an explicit `RANGE`
-/// or `GROUPS` frame is refused by name at resolution time (`sql.rs`) rather
-/// than silently treated as `ROWS`, since a value-based `RANGE` frame answers
-/// a different question than a position-based one the moment `ORDER BY` has
-/// ties. What *is* implemented is SQLite's implicit default frame, which is
-/// itself defined in `RANGE` terms and needs its own peer-group-aware
-/// evaluation, not the `ROWS` one — confirmed against sqlite3 3.54 with a
-/// tied `ORDER BY` column (`docs` in the window-functions sqllogictest file
-/// has the measurement):
+/// [`WindowFrame::unit`] tells the executor which of three readings applies —
+/// confirmed against sqlite3 3.54, since a value-based (`RANGE`) or
+/// peer-group-counted (`GROUPS`) frame answers a different question than a
+/// position-counted (`ROWS`) one the moment `ORDER BY` has ties:
 ///
-/// * **No `ORDER BY` at all** (in this window's own clause): the default
-///   frame is the whole partition, whichever function reads it.
-/// * **An `ORDER BY`, no explicit frame**: the default is "`RANGE BETWEEN
-///   UNBOUNDED PRECEDING AND CURRENT ROW`", which despite the name `CURRENT
-///   ROW` extends to the *end of the current row's peer group* — every row
-///   that ties with it under `ORDER BY` — not merely up to the current row's
-///   own position. This is why `last_value()` with no frame so often answers
-///   the current row's own value: it only does when every row is its own
-///   peer group (an `ORDER BY` with no ties), and answers the *whole tied
-///   group's* last row otherwise.
+/// * [`FrameUnit::Rows`] counts positions in the partition's `ORDER BY`
+///   sequence literally, `CURRENT ROW` included — an explicit `ROWS`.
+/// * [`FrameUnit::Range`] and [`FrameUnit::Groups`] both reinterpret a
+///   `CURRENT ROW` bound — start *or* end, unlike `ROWS` where it is always
+///   the row's own position — as the *whole of the current row's peer
+///   group*: every row that ties with it under `ORDER BY`. This is why
+///   `last_value()` with no frame so often answers the current row's own
+///   value: only when every row is its own peer group (an `ORDER BY` with no
+///   ties) does the SQLite default's peer group collapse to one row.
+///   * `Range`'s `<expr> PRECEDING`/`FOLLOWING` bounds compare *values*: the
+///     partition's `ORDER BY` key, offset by `<expr>`, not a row count. Only
+///     legal with exactly one `ORDER BY` term (`sql.rs`'s
+///     `resolve_window_frame` refuses more or fewer, confirmed against
+///     sqlite3) — a value offset over more than one column, or none, does
+///     not mean anything sqlite3 can answer either.
+///   * `Groups`'s `<expr> PRECEDING`/`FOLLOWING` bounds count *peer groups*,
+///     not rows — `1 PRECEDING` is the previous tied group, however many
+///     rows are in it, whatever `ORDER BY` term(s) built it.
 ///
-/// [`WindowFrame::rows`] tells the executor which reading applies:
-/// position-based bounds (an explicit `ROWS` frame) count rows in the
-/// partition's `ORDER BY` sequence; `false` (no explicit frame) asks for the
-/// two defaults above, chosen by whether [`WindowFn::order_by`] is empty.
+/// SQLite's implicit default frame (no explicit frame clause at all) is
+/// [`FrameUnit::Range`] with `UNBOUNDED PRECEDING`/`CURRENT ROW` when the
+/// window has an `ORDER BY` ([`WindowFrame::default_range`]), or the whole
+/// partition when it does not ([`WindowFrame::whole_partition`]) — it is
+/// defined in `RANGE` terms in the standard this engine matches, which is
+/// also why `Range`/`Groups` needed the peer-group machinery `Rows` never
+/// did, rather than being new work layered on top of it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowFrame {
-    /// `true` for an explicit `ROWS BETWEEN ... AND ...` (or its `ROWS <bound>`
-    /// shorthand, equivalent to `... AND CURRENT ROW`): bounds count rows by
-    /// position. `false` is SQLite's implicit default, whose meaning depends
-    /// on whether [`WindowFn::order_by`] is empty — see this type's doc.
-    pub rows: bool,
+    /// Which of the three readings above applies.
+    pub unit: FrameUnit,
     /// The frame's start bound.
     pub start: FrameBound,
     /// The frame's end bound.
     pub end: FrameBound,
+}
+
+/// See [`WindowFrame::unit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameUnit {
+    /// `ROWS`: bounds count positions.
+    Rows,
+    /// `RANGE`: bounds compare `ORDER BY` values, or (for `CURRENT ROW`) the
+    /// current row's whole peer group. Also SQLite's implicit default when a
+    /// window has an `ORDER BY`.
+    Range,
+    /// `GROUPS`: bounds count peer groups, or (for `CURRENT ROW`) the
+    /// current row's own.
+    Groups,
 }
 
 impl WindowFrame {
@@ -2339,7 +2356,7 @@ impl WindowFrame {
     /// whole partition, for every row in it.
     pub fn whole_partition() -> Self {
         Self {
-            rows: false,
+            unit: FrameUnit::Range,
             start: FrameBound::UnboundedPreceding,
             end: FrameBound::UnboundedFollowing,
         }
@@ -2350,7 +2367,7 @@ impl WindowFrame {
     /// the current row's peer group.
     pub fn default_range() -> Self {
         Self {
-            rows: false,
+            unit: FrameUnit::Range,
             start: FrameBound::UnboundedPreceding,
             end: FrameBound::CurrentRow,
         }
