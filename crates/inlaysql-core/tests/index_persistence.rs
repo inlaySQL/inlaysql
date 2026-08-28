@@ -552,6 +552,7 @@ fn a_database_written_before_create_index_is_grandfathered() {
     catalog
         .create_table(Table {
             without_rowid: false,
+            temporary: false,
             primary_key: Vec::new(),
             name: "docs".to_string(),
             columns: vec![

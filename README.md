@@ -602,14 +602,36 @@ mechanism. `INSERT OR IGNORE`/`OR REPLACE`, `UPDATE`, `DELETE`, `DROP TABLE`,
 `RETURNING` and aggregates all work, keyed by the primary key instead of a
 row id throughout.
 
+`CREATE TEMPORARY TABLE` (`CREATE TEMP TABLE` too, `temp_table.test`): an
+ordinary, row-id-keyed table — nothing about how a row is addressed changes,
+unlike `WITHOUT ROWID` above — routed by table name to an in-memory backend
+instead of the durable one it would otherwise share, gone the moment this
+engine closes and invisible to any other handle open on the same file in the
+meantime, the same as sqlite3's own `TEMP` schema. It shadows a durable table
+of the same name for as long as it exists (confirmed against sqlite3: a
+durable and a temporary table of the same name coexist without colliding,
+and an unqualified reference resolves to the temporary one). Because its rows
+are ordinary row-id-keyed rows behind the same `Storage` methods every join
+strategy already reads through, joining one against a durable table works
+with no special-casing at all — the one gap `WITHOUT ROWID` has that this
+does not. Disclosed rather than silent: `CREATE INDEX` on one (and a `UNIQUE`
+beyond a single `INTEGER PRIMARY KEY`) is refused, for the same reason as
+`WITHOUT ROWID`'s — a scalar index entry's key carries the *index's* name,
+not the table's, so the storage router has nothing to route a `CREATE INDEX`
+by; `ALTER TABLE` on one is refused outright; and creating or dropping one
+inside an explicit transaction is refused, because its declaration is not
+buffered the way an ordinary `CREATE TABLE`'s is, so `ROLLBACK` could not
+undo it — row-level writes to one that already exists are unaffected by that
+last restriction and are fully transactional.
+
 Not yet, and refused explicitly rather than silently ignored: `DISTINCT`
 inside a window function's argument list, the partial-write conflict
 resolutions (`INSERT OR ROLLBACK`/`OR FAIL`, `UPDATE OR REPLACE`/`OR IGNORE` —
 a statement here is already atomic, so they cannot mean what they say),
-`CREATE TEMPORARY TABLE`, `COUNT(DISTINCT *)`, `GROUP_CONCAT(DISTINCT ...)`,
-and a collation this engine does not have (there is no `CREATE COLLATION`, so
-a name outside `BINARY`/`NOCASE`/`RTRIM` is refused rather than silently
-compared byte-wise under a name that promises otherwise).
+`COUNT(DISTINCT *)`, `GROUP_CONCAT(DISTINCT ...)`, and a collation this
+engine does not have (there is no `CREATE COLLATION`, so a name outside
+`BINARY`/`NOCASE`/`RTRIM` is refused rather than silently compared byte-wise
+under a name that promises otherwise).
 
 ## SQL Logic Test
 
@@ -625,7 +647,7 @@ cargo run -p inlaysql --bin sqllogictest -- \
   crates/inlaysql/tests/sqllogictest/*.test          # print the pass rate
 ```
 
-Current pass rate over the subset: **1273/1273 (100%)** — covering `CREATE TABLE`,
+Current pass rate over the subset: **1307/1307 (100%)** — covering `CREATE TABLE`,
 `INSERT`, projection, `WHERE`, `DISTINCT`, `ORDER BY` (column, expression,
 alias, multi-key, `NULLS FIRST`/`LAST`), `LIMIT`/`OFFSET` (literal or bound),
 type coercion and affinity, `SELECT`-without-`FROM` scalar expressions,
@@ -648,8 +670,9 @@ and not — `ctes.test`, `recursive_cte.test`), `CREATE TABLE ... AS SELECT`,
 `CREATE TABLE ... STRICT` (`strict.test`), `SAVEPOINT`/`RELEASE`/
 `ROLLBACK TO SAVEPOINT` (`savepoint.test`), the window functions of AHL-494
 including `percent_rank`/`cume_dist` and explicit `RANGE`/`GROUPS` frames
-(`window_functions.test`), and `CREATE TABLE ... WITHOUT ROWID`
-(`without_rowid.test`). The
+(`window_functions.test`), `CREATE TABLE ... WITHOUT ROWID`
+(`without_rowid.test`), and `CREATE TEMPORARY TABLE`/`CREATE TEMP TABLE`
+(`temp_table.test`). The
 number is meant to grow (and be reported) as the dialect matures — it does not
 yet include the parts of the *SQLite project's own* sqllogictest corpus that
 exercise `WITH RECURSIVE`, which this subset has not pulled in and adapted,

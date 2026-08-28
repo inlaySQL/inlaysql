@@ -205,6 +205,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns,
@@ -286,6 +287,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "other".to_string(),
                 columns: vec![Column::new("a", DataType::Integer)],
@@ -339,6 +341,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "tags".to_string(),
                 columns: vec![

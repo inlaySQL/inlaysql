@@ -736,10 +736,15 @@ impl Engine {
         clock: Box<dyn Clock>,
         options: EngineOptions,
     ) -> Result<Self> {
-        // One handle from here on: an index that keeps itself in the database
-        // takes a clone of this, so its writes join the engine's transaction
-        // rather than opening one of their own.
-        let storage = SharedStorage::new(storage);
+        // Wrapped in the temporary-table router before anything else touches
+        // it, so every backend this engine can be opened over — the on-disk
+        // tree, the in-memory simulation backend, `redb` — gets `CREATE
+        // TEMPORARY TABLE` the same way, for free. One handle from here on:
+        // an index that keeps itself in the database takes a clone of this,
+        // so its writes join the engine's transaction rather than opening
+        // one of their own.
+        let storage =
+            SharedStorage::new(Box::new(crate::temp_storage::TempTableRouter::new(storage)));
         let catalog = match storage.get_meta(CATALOG_KEY)? {
             Some(bytes) => Catalog::decode(&bytes)?,
             None => Catalog::new(),
@@ -1587,10 +1592,14 @@ impl Engine {
     /// as on open, which loads a saved index whose stamp matches the new write
     /// version and rebuilds from the rows only when it does not.
     fn adopt_committed_state(&mut self) -> Result<()> {
-        let catalog = match self.storage.get_meta(CATALOG_KEY)? {
+        let mut catalog = match self.storage.get_meta(CATALOG_KEY)? {
             Some(bytes) => Catalog::decode(&bytes)?,
             None => Catalog::new(),
         };
+        // Carried across before the replace below, or this handle's own
+        // `CREATE TEMPORARY TABLE`s would vanish the moment it notices any
+        // other handle's commit — see `Catalog::carry_temp_schema_from`.
+        catalog.carry_temp_schema_from(&mut self.catalog);
         // Not `write_version`: after a rebased commit this handle's indexes
         // describe an *older* version than the counter does. See
         // [`Engine::indexed_version`](Self::indexed_version).
@@ -1942,10 +1951,21 @@ impl Engine {
     ///
     /// The same work [`Engine::open`] does, on an engine that is already open.
     fn reload(&mut self) -> Result<()> {
-        self.catalog = match self.storage.get_meta(CATALOG_KEY)? {
+        let mut catalog = match self.storage.get_meta(CATALOG_KEY)? {
             Some(bytes) => Catalog::decode(&bytes)?,
             None => Catalog::new(),
         };
+        // Carried across for the same reason `Engine::adopt_committed_state`
+        // does: nothing durable ever describes a temporary table, so a plain
+        // replace would silently drop every one this handle holds. Safe to
+        // carry unconditionally even here, on a real rollback path, because
+        // `CREATE TEMPORARY TABLE`/`DROP TABLE` of one are refused inside a
+        // transaction (`Engine::create_table`, `Engine::drop_table`) and
+        // validated *before* mutating `self.catalog` when they run outside
+        // one (`Engine::create_table_uncommitted`) — there is never an
+        // uncommitted temporary-schema change for a reload to need to undo.
+        catalog.carry_temp_schema_from(&mut self.catalog);
+        self.catalog = catalog;
         self.invalidate_rules();
         self.next_row_id =
             read_counter(&self.storage, NEXT_ROW_ID_KEY, "next row id")?.unwrap_or(1);
@@ -1989,13 +2009,38 @@ impl Engine {
     }
 
     fn create_table(&mut self, plan: &CreateTablePlan, params: &[Value]) -> Result<Outcome> {
-        // `IF NOT EXISTS` asks whether the *name* is taken, not whether the
-        // table matches: SQLite does not compare the two definitions either.
-        // `... AS SELECT` leaves with the same answer: a caller finding its
-        // table already there does not have its `SELECT` run either, which
-        // matches a real sqlite3 binary — an existing `t2` is left untouched
-        // by `CREATE TABLE IF NOT EXISTS t2 AS SELECT ...`, byte for byte.
-        if plan.if_not_exists && self.catalog.table(&plan.table.name).is_some() {
+        // A temporary table's declaration lives only in `self.catalog` —
+        // never in `Storage`'s buffered writes, since it is never durable at
+        // all (`Catalog::temp_tables`'s doc) — so there is nothing for
+        // `ROLLBACK` to undo it with. Refusing here rather than letting it
+        // silently survive a rollback is the same choice this feature makes
+        // everywhere else: a disclosed gap, not a wrong answer nobody asked
+        // for. Row-level writes to an already-existing temporary table are
+        // unaffected — those go through `Storage::commit`/`rollback` like any
+        // other table's, via `temp_storage::TempTableRouter`.
+        if plan.table.temporary && self.in_transaction {
+            return Err(Error::Unsupported(
+                "CREATE TEMPORARY TABLE inside a transaction is not supported yet: its \
+                 declaration is not buffered the way an ordinary CREATE TABLE's is, so \
+                 ROLLBACK could not undo it"
+                    .to_string(),
+            ));
+        }
+        // `IF NOT EXISTS` asks whether the *name* is taken **in the schema
+        // this statement targets** — a durable `t` existing is no obstacle to
+        // `CREATE TEMPORARY TABLE IF NOT EXISTS t`, and a temporary `t`
+        // existing is no obstacle to the durable form, the same shadowing
+        // [`Catalog::create_temp_table`]'s doc describes. `... AS SELECT`
+        // leaves with the same answer: a caller finding its table already
+        // there does not have its `SELECT` run either, which matches a real
+        // sqlite3 binary — an existing `t2` is left untouched by `CREATE
+        // TABLE IF NOT EXISTS t2 AS SELECT ...`, byte for byte.
+        let exists = if plan.table.temporary {
+            self.catalog.temp_table(&plan.table.name).is_some()
+        } else {
+            self.catalog.durable_table(&plan.table.name).is_some()
+        };
+        if plan.if_not_exists && exists {
             return Ok(Outcome::Ddl);
         }
         self.create_table_uncommitted(plan)?;
@@ -2047,6 +2092,22 @@ impl Engine {
             ));
         }
         self.invalidate_rules();
+        if table.temporary {
+            // Validated *before* any catalog mutation, deliberately: a
+            // failure here must leave nothing behind for a later
+            // `Engine::reload` to (wrongly) carry forward — see
+            // `Catalog::carry_temp_schema_from`'s doc for why that carry
+            // is otherwise safe. Implicit indexes and `declare_unique_indexes`
+            // do not apply below: a temporary table refuses every `UNIQUE`
+            // beyond a lone `INTEGER PRIMARY KEY` (`sql::plan_create_table`)
+            // and `CREATE INDEX` outright (`sql::plan_create_index`), so
+            // there is never one to declare.
+            sql::table_rules(table, &self.catalog)?;
+            self.catalog
+                .create_temp_table(table.clone(), plan.constraints.clone())?;
+            self.storage.set_temp_table(&table.name, true);
+            return Ok(());
+        }
         self.catalog
             .create_table_with(table.clone(), plan.constraints.clone())?;
         // Resolve the constraints now rather than at the first `INSERT`, so a
@@ -2090,14 +2151,27 @@ impl Engine {
     /// surface — there is no "drop this key range" — so this is O(rows), and
     /// each deletion joins the statement's transaction like any other write.
     fn drop_table(&mut self, plan: &DropTablePlan) -> Result<Outcome> {
-        if self.catalog.table(&plan.name).is_none() {
-            if plan.if_exists {
-                return Ok(Outcome::Ddl);
+        let temporary = match self.catalog.table(&plan.name) {
+            Some(existing) => existing.temporary,
+            None => {
+                if plan.if_exists {
+                    return Ok(Outcome::Ddl);
+                }
+                return Err(Error::Catalog(alloc::format!(
+                    "no such table: {}",
+                    plan.name
+                )));
             }
-            return Err(Error::Catalog(alloc::format!(
-                "no such table: {}",
-                plan.name
-            )));
+        };
+        // Same reasoning as `CREATE TEMPORARY TABLE` inside a transaction:
+        // removing the declaration is a `self.catalog`-only change with
+        // nothing buffered in `Storage` for `ROLLBACK` to undo.
+        if temporary && self.in_transaction {
+            return Err(Error::Unsupported(
+                "DROP TABLE on a temporary table inside a transaction is not supported yet, \
+                 for the same reason CREATE TEMPORARY TABLE inside one is not"
+                    .to_string(),
+            ));
         }
         self.invalidate_rules();
         let (table, indexes) = self.catalog.drop_table(&plan.name)?;
@@ -2115,12 +2189,34 @@ impl Engine {
                 self.storage.delete_row_keyed(&table.name, &key)?;
             }
         } else {
+            // The scan and the deletes below still reach `table`'s rows
+            // through `temp_storage::TempTableRouter` even for a temporary
+            // table, because `Storage::set_temp_table(name, false)` has not
+            // run yet — that has to wait until after the rows are gone, or
+            // these very calls would be routed to the durable side instead
+            // and find nothing.
             for (id, _) in self.scan_all(&table.name)? {
                 self.storage.delete_row(&table.name, id)?;
-                self.note_change(&table.name, id, ChangeKind::Delete);
+                // A temporary table's rows were never visible to another
+                // handle to begin with, so there is nothing for a CDC
+                // consumer — which reads the *durable* change log — to be
+                // told; logging one anyway would describe a table it has no
+                // way to look up.
+                if !table.temporary {
+                    self.note_change(&table.name, id, ChangeKind::Delete);
+                }
             }
         }
-        self.persist_catalog()?;
+        if table.temporary {
+            // Releases the row storage this table's name was routed to —
+            // without this, a long-lived handle that creates and drops many
+            // temporary tables would leak an entry in
+            // `temp_storage::TempTableRouter`'s bookkeeping per drop, none
+            // of them ever reachable again.
+            self.storage.set_temp_table(&table.name, false);
+        } else {
+            self.persist_catalog()?;
+        }
         self.end_write()?;
         Ok(Outcome::Ddl)
     }
@@ -2135,6 +2231,18 @@ impl Engine {
     /// silent misread the format versions exist to prevent.
     fn alter_table(&mut self, plan: &AlterTablePlan) -> Result<Outcome> {
         let before = self.catalog.require_table(&plan.table)?.clone();
+        // Every `ALTER TABLE` action, `RENAME COLUMN` included: the catalog
+        // mutation methods it goes through (`Catalog::add_column`,
+        // `Catalog::rename_column`, ...) only know how to reach
+        // `Catalog::tables`, not `Catalog::temp_tables` — a disclosed gap
+        // rather than a confusing "no such table" from a method that was
+        // never told to look in the other schema.
+        if before.temporary {
+            return Err(Error::Unsupported(alloc::format!(
+                "ALTER TABLE on temporary table `{}` is not supported yet",
+                before.name
+            )));
+        }
         // `RENAME COLUMN` is a pure catalog change — nothing about a stored
         // row changes, only what its ordinal is called — so it needs
         // nothing here. The other three all rewrite every row keyed by
@@ -3750,7 +3858,9 @@ impl Engine {
                             self.remove_btree_entries(&table, conflict.id, &conflict.values)?;
                             self.storage.delete_row(&table.name, conflict.id)?;
                             self.deindex_row_retrieval(&table, conflict.id, &conflict.values)?;
-                            self.note_change(&table.name, conflict.id, ChangeKind::Delete);
+                            if !table.temporary {
+                                self.note_change(&table.name, conflict.id, ChangeKind::Delete);
+                            }
                         }
                     }
                     (ConflictAction::Update(update), Some(index)) => {
@@ -3782,7 +3892,9 @@ impl Engine {
                 self.last_insert_row_id = Some(id);
             }
             self.index_row(&table, id, &row)?;
-            self.note_change(&table.name, id, ChangeKind::Insert);
+            if !table.temporary {
+                self.note_change(&table.name, id, ChangeKind::Insert);
+            }
             written += 1;
             if let Some(items) = &insert.returning {
                 let exec = ExecRow {
@@ -4191,10 +4303,14 @@ impl Engine {
         self.index_row_retrieval(table, moved, &next)?;
 
         if moved != id {
-            self.note_change(&table.name, id, ChangeKind::Delete);
+            if !table.temporary {
+                self.note_change(&table.name, id, ChangeKind::Delete);
+            }
             self.reserve_row_id(moved);
         }
-        self.note_change(&table.name, moved, ChangeKind::Update);
+        if !table.temporary {
+            self.note_change(&table.name, moved, ChangeKind::Update);
+        }
         Ok(moved)
     }
 
@@ -4888,7 +5004,9 @@ impl Engine {
             self.remove_btree_entries(&table, id, &row)?;
             self.storage.delete_row(&table.name, id)?;
             self.deindex_row_retrieval(&table, id, &row)?;
-            self.note_change(&table.name, id, ChangeKind::Delete);
+            if !table.temporary {
+                self.note_change(&table.name, id, ChangeKind::Delete);
+            }
             count += 1;
         }
         self.end_write()?;

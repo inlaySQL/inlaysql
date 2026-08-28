@@ -1033,6 +1033,7 @@ fn plan_create_table(
             strict: create.strict,
             without_rowid: true,
             primary_key: key,
+            temporary: create.temporary,
         };
         for group in &constraints.unique {
             for column in &group.columns {
@@ -1071,12 +1072,31 @@ fn plan_create_table(
         }
     }
 
+    // Same disclosed gap `plan_create_index` refuses by name: a `UNIQUE`
+    // constraint (including a composite or non-integer `PRIMARY KEY`, folded
+    // into one above) gets a secondary index backing it, and the storage
+    // router that gives a temporary table its own rows (`temp_storage`) has
+    // no way to route a scalar-index entry by table — its key carries only
+    // the index's own name, never the table's. A lone `INTEGER PRIMARY KEY`
+    // is unaffected: it is the row id itself, not an index.
+    if create.temporary {
+        if let Some(group) = constraints.unique.first() {
+            return Err(Error::Unsupported(alloc::format!(
+                "UNIQUE on a temporary table's column `{}` is not supported yet, for the same \
+                 reason CREATE INDEX on one is not: it would need a secondary index, and this \
+                 storage router has no table to point one at",
+                group.columns.join(", ")
+            )));
+        }
+    }
+
     let table = Table {
         without_rowid: false,
         primary_key: Vec::new(),
         name,
         columns,
         strict: create.strict,
+        temporary: create.temporary,
     };
     for group in &constraints.unique {
         for column in &group.columns {
@@ -1187,6 +1207,7 @@ fn plan_create_table_as_select(
             name,
             columns,
             strict: false,
+            temporary: create.temporary,
         },
         constraints: TableConstraints::default(),
         if_not_exists: create.if_not_exists,
@@ -1667,9 +1688,6 @@ fn reject_unsupported_create_table(create: &sqlparser::ast::CreateTable) -> Resu
     if create.or_replace {
         return not_yet("CREATE OR REPLACE TABLE");
     }
-    if create.temporary {
-        return not_yet("CREATE TEMPORARY TABLE");
-    }
     if create.like.is_some() {
         return not_yet("CREATE TABLE ... LIKE");
     }
@@ -1740,6 +1758,18 @@ fn plan_create_index(create: sqlparser::ast::CreateIndex, catalog: &Catalog) -> 
         return Err(Error::Unsupported(alloc::format!(
             "CREATE INDEX on WITHOUT ROWID table `{table_name}` is not supported yet: a \
              secondary index's entries point back to a row by row id, and this table has none"
+        )));
+    }
+    // Disclosed for a different reason than `WITHOUT ROWID`'s: a temporary
+    // table's rows live behind `temp_storage::TempTableRouter`, which routes
+    // `put_row`/`get_row`/`scan_batch` by table name, but a scalar-index
+    // entry key (`crate::index::entry_key`) carries only the *index's* name —
+    // there is nothing for the router to route a `put_index_entry` call by.
+    if table.temporary {
+        return Err(Error::Unsupported(alloc::format!(
+            "CREATE INDEX on temporary table `{table_name}` is not supported yet: a scalar \
+             index's entries are keyed by the index's name alone, with no table name for the \
+             temporary-table storage router to route by"
         )));
     }
 
@@ -2496,6 +2526,7 @@ fn resolve_conflict_target(
 fn excluded_scope(table: &Table) -> Scope<'static> {
     let excluded = Table {
         without_rowid: false,
+        temporary: false,
         primary_key: Vec::new(),
         name: "excluded".to_string(),
         columns: table.columns.clone(),
@@ -4745,6 +4776,7 @@ fn derived_table(alias: Option<&str>, body: &SubqueryBody) -> Result<Table> {
     }
     Ok(Table {
         without_rowid: false,
+        temporary: false,
         primary_key: Vec::new(),
         name: alias.unwrap_or(UNNAMED_DERIVED).to_string(),
         columns: labels
@@ -7298,6 +7330,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns: vec![
@@ -7316,6 +7349,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "authors".to_string(),
                 columns: vec![
@@ -7333,6 +7367,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "t".to_string(),
                 columns: vec![Column::new("a", DataType::Integer)],
@@ -7497,6 +7532,7 @@ mod tests {
         keyed
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns: vec![
@@ -7680,23 +7716,18 @@ mod tests {
         }
     }
 
-    /// Still refused, and each for a stated reason rather than because nobody
-    /// got to it: `COLLATE` needs collations the comparison path does not
-    /// have, and the rest are table shapes this storage engine does not build.
+    /// Still refused, for a stated reason rather than because nobody got to
+    /// it: `COLLATE` needs collations the comparison path does not have.
     #[test]
     fn table_clauses_that_remain_unsupported_are_refused() {
-        for sql in [
-            // `COLLATE NOCASE` used to be here. It is a real clause now
-            // (AHL-469); a collation this engine does not have still is not.
-            "CREATE TABLE t (a TEXT COLLATE utf8mb4_unicode_ci)",
-            "CREATE TEMPORARY TABLE t (a INTEGER)",
-        ] {
-            let err = plan(sql, &[], &Catalog::new()).unwrap_err();
-            assert!(
-                matches!(err, Error::Unsupported(_)),
-                "`{sql}` gave {err} instead of a refusal"
-            );
-        }
+        // `COLLATE NOCASE` used to be here. It is a real clause now
+        // (AHL-469); a collation this engine does not have still is not.
+        let sql = "CREATE TABLE t (a TEXT COLLATE utf8mb4_unicode_ci)";
+        let err = plan(sql, &[], &Catalog::new()).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "`{sql}` gave {err} instead of a refusal"
+        );
     }
 
     /// Verified against a real sqlite3 binary: `CREATE TABLE t AS SELECT id,
@@ -8208,6 +8239,7 @@ mod tests {
         moved
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns: vec![
@@ -8221,6 +8253,7 @@ mod tests {
         moved
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "authors".to_string(),
                 columns: vec![
@@ -8336,6 +8369,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "t".to_string(),
                 columns: vec![
@@ -8799,6 +8833,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "vecs".to_string(),
                 columns: vec![

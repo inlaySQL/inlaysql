@@ -291,6 +291,28 @@ pub struct Table {
     /// an ordinary [`UniqueConstraint`] backed by a secondary index — neither
     /// of which is disturbed by this field existing.
     pub primary_key: Vec<String>,
+    /// Whether this table was declared `CREATE TEMPORARY TABLE` (or `CREATE
+    /// TEMP TABLE`).
+    ///
+    /// A temporary table lives in [`Catalog::temp_tables`] rather than
+    /// [`Catalog`]'s durable table map — never persisted, never reachable
+    /// after the [`crate::engine::Engine`] that created it closes, and
+    /// invisible to any other handle open on the same file in the meantime,
+    /// the same as sqlite3's own `TEMP` schema. It shadows a durable table of
+    /// the same name for as long as it exists (confirmed against sqlite3),
+    /// which is why lookup goes through [`Catalog::table`] rather than a
+    /// caller checking this flag and choosing a map itself.
+    ///
+    /// Storage is routed by table name to an in-memory backend
+    /// (`crate::temp_storage::TempTableRouter`) rather than the durable one,
+    /// which is why a temporary table's rows are ordinary [`RowId`](crate::traits::RowId)-keyed
+    /// rows like any other table — unlike [`Table::without_rowid`], nothing
+    /// about how a row is *addressed* changes, only where it lives. That is
+    /// also why `CREATE INDEX` on one, and any `UNIQUE` beyond a single
+    /// `INTEGER PRIMARY KEY`, is refused: the scalar-index entry format has
+    /// no table of its own to route by (see `plan_create_index`), not a
+    /// limit of the row storage itself.
+    pub temporary: bool,
 }
 
 impl Table {
@@ -305,6 +327,7 @@ impl Table {
             strict: false,
             without_rowid: false,
             primary_key: Vec::new(),
+            temporary: false,
         }
     }
 
@@ -556,7 +579,7 @@ pub fn is_reserved_table_name(name: &str) -> bool {
 }
 
 /// All tables and indexes known to a database.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct Catalog {
     tables: BTreeMap<String, Table>,
     /// Declared constraints, keyed by lowercased table name. A table with
@@ -564,12 +587,60 @@ pub struct Catalog {
     constraints: BTreeMap<String, TableConstraints>,
     /// Index declarations, keyed by lowercased name.
     indexes: BTreeMap<String, Index>,
+    /// `CREATE TEMPORARY TABLE`s, keyed by lowercased name, in a namespace of
+    /// their own — a temporary table and a durable table may share a name,
+    /// the same as sqlite3's `TEMP` and `main` schemas may.
+    ///
+    /// **Never encoded.** [`Catalog::encode`]/[`Catalog::decode`] do not read
+    /// or write this map at all, which is what makes a temporary table
+    /// disappear when the [`crate::engine::Engine`] that created it closes,
+    /// without needing a durable "this table is temporary" tombstone or a
+    /// catalog format bump: nothing durable ever describes it in the first
+    /// place. See [`Table::temporary`].
+    temp_tables: BTreeMap<String, Table>,
+    /// [`Catalog::temp_tables`]'s declared constraints, the same relationship
+    /// [`Catalog::constraints`] has to [`Catalog::tables`].
+    temp_constraints: BTreeMap<String, TableConstraints>,
 }
+
+/// Equality ignores the temporary schema.
+///
+/// [`Engine::adopt_committed_state`](crate::engine::Engine) and
+/// [`Engine::reload`](crate::engine::Engine) compare a freshly decoded
+/// catalog against the one this handle held to decide whether the *durable*
+/// schema changed — a decoded catalog never has a temporary table at all
+/// (nothing durable describes one), so including [`Catalog::temp_tables`]
+/// here would make that comparison see a change on every reload of a handle
+/// that has ever created one, for no durable reason.
+impl PartialEq for Catalog {
+    fn eq(&self, other: &Self) -> bool {
+        self.tables == other.tables
+            && self.constraints == other.constraints
+            && self.indexes == other.indexes
+    }
+}
+
+impl Eq for Catalog {}
 
 impl Catalog {
     /// An empty catalog.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Move the temporary schema out of `previous` and into `self`.
+    ///
+    /// [`Engine::adopt_committed_state`](crate::engine::Engine) and
+    /// [`Engine::reload`](crate::engine::Engine) decode a fresh [`Catalog`]
+    /// from durable storage and install it wholesale, in place of the one
+    /// this handle held. A decoded catalog never has a temporary schema of
+    /// its own — [`Catalog::temp_tables`]'s doc explains why — so calling
+    /// this first is what carries a handle's own `CREATE TEMPORARY TABLE`s
+    /// across that replacement instead of silently losing them the next
+    /// time it notices another handle's commit.
+    pub(crate) fn carry_temp_schema_from(&mut self, previous: &mut Catalog) {
+        self.temp_tables = core::mem::take(&mut previous.temp_tables);
+        self.temp_constraints = core::mem::take(&mut previous.temp_constraints);
     }
 
     /// Register a new table with no declared constraints. Fails if the name is
@@ -610,17 +681,66 @@ impl Catalog {
         Ok(())
     }
 
+    /// Register a `CREATE TEMPORARY TABLE`. Fails if a temporary table of
+    /// that name already exists — a durable table of the same name is no
+    /// obstacle, since a temporary table shadows rather than collides with
+    /// one (confirmed against sqlite3: `CREATE TABLE t(...)` followed by
+    /// `CREATE TEMP TABLE t(...)` succeeds).
+    pub fn create_temp_table(&mut self, table: Table, constraints: TableConstraints) -> Result<()> {
+        let key = table.name.to_ascii_lowercase();
+        if self.temp_tables.contains_key(&key) {
+            return Err(Error::Catalog(alloc::format!(
+                "temporary table `{}` already exists",
+                table.name
+            )));
+        }
+        for column in constraints
+            .unique
+            .iter()
+            .flat_map(|group| group.columns.iter())
+            .chain(
+                constraints
+                    .foreign_keys
+                    .iter()
+                    .flat_map(|k| k.columns.iter()),
+            )
+        {
+            table.require_column(column)?;
+        }
+        if !constraints.is_empty() {
+            self.temp_constraints.insert(key.clone(), constraints);
+        }
+        self.temp_tables.insert(key, table);
+        Ok(())
+    }
+
     /// The constraints one table declared, or `None` when it declared none.
+    ///
+    /// Checks the temporary schema first, the same shadowing [`Catalog::table`]
+    /// applies — a durable `t`'s constraints must not leak through a
+    /// temporary `t` that happens to have declared none of its own.
     pub fn constraints(&self, table: &str) -> Option<&TableConstraints> {
-        self.constraints.get(&table.to_ascii_lowercase())
+        let key = table.to_ascii_lowercase();
+        if self.temp_tables.contains_key(&key) {
+            return self.temp_constraints.get(&key);
+        }
+        self.constraints.get(&key)
     }
 
     /// Remove a table, its constraints and every index declared on it.
     ///
     /// Returns the table and the index declarations that went with it, so the
-    /// caller can drop the backends and the rows they describe.
+    /// caller can drop the backends and the rows they describe. Checks the
+    /// temporary schema first — an unqualified `DROP TABLE t` drops whichever
+    /// `t` is currently visible, the same shadowing [`Catalog::table`]
+    /// applies, and a temporary table never has index declarations to
+    /// collect (`CREATE INDEX` on one is refused — see `plan_create_index`).
     pub fn drop_table(&mut self, name: &str) -> Result<(Table, Vec<Index>)> {
         let key = name.to_ascii_lowercase();
+        if let Some(table) = self.temp_tables.remove(&key) {
+            self.temp_constraints.remove(&key);
+            return Ok((table, Vec::new()));
+        }
         let Some(table) = self.tables.remove(&key) else {
             return Err(Error::Catalog(alloc::format!("no such table: {name}")));
         };
@@ -794,9 +914,10 @@ impl Catalog {
     /// still takes the allocating path, and gets the identical answer.
     pub fn table(&self, name: &str) -> Option<&Table> {
         if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            return self.tables.get(&name.to_ascii_lowercase());
+            let key = name.to_ascii_lowercase();
+            return self.temp_tables.get(&key).or_else(|| self.tables.get(&key));
         }
-        self.tables.get(name)
+        self.temp_tables.get(name).or_else(|| self.tables.get(name))
     }
 
     /// Look a table up by name, or fail with a catalog error.
@@ -805,7 +926,31 @@ impl Catalog {
             .ok_or_else(|| Error::Catalog(alloc::format!("no such table: {name}")))
     }
 
-    /// Every table, ordered by lowercased name.
+    /// Look a table up in the temporary schema only, ignoring any durable
+    /// table of the same name.
+    ///
+    /// For the one caller that needs to bypass [`Catalog::table`]'s shadowing
+    /// on purpose: `CREATE TEMPORARY TABLE IF NOT EXISTS t` asks whether a
+    /// *temporary* `t` exists, and a durable `t` existing is no reason to
+    /// skip creating one.
+    pub fn temp_table(&self, name: &str) -> Option<&Table> {
+        self.temp_tables.get(&name.to_ascii_lowercase())
+    }
+
+    /// Look a table up in the durable schema only, ignoring any temporary
+    /// table of the same name. The `CREATE TABLE IF NOT EXISTS` counterpart
+    /// to [`Catalog::temp_table`].
+    pub fn durable_table(&self, name: &str) -> Option<&Table> {
+        self.tables.get(&name.to_ascii_lowercase())
+    }
+
+    /// Every durable table, ordered by lowercased name.
+    ///
+    /// **Excludes the temporary schema**, deliberately: every caller of this
+    /// today — index restore/persist on open and checkpoint, `ANALYZE` with
+    /// no table name, a backup — means "the schema that is actually on
+    /// disk", which a temporary table never joins. A caller that means
+    /// something else should say so, not get it from here by accident.
     pub fn tables(&self) -> impl Iterator<Item = &Table> {
         self.tables.values()
     }
@@ -1483,6 +1628,9 @@ fn decode_tables(cursor: &mut Cursor<'_>, version: u32) -> Result<Catalog> {
                 strict,
                 without_rowid,
                 primary_key,
+                // Never decoded: nothing durable ever describes a temporary
+                // table (`Table::temporary`'s doc).
+                temporary: false,
             },
             constraints,
         )?;
@@ -1609,6 +1757,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns: vec![
@@ -1631,6 +1780,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "MiXeD".to_string(),
                 columns: vec![Column::new("a", DataType::Integer)],
@@ -1665,6 +1815,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "plain".to_string(),
                 columns: vec![Column::new("a", DataType::Integer)],
@@ -1694,6 +1845,7 @@ mod tests {
         let err = catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "DOCS".to_string(),
                 columns: vec![],
@@ -1795,6 +1947,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns: vec![
@@ -1866,6 +2019,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns: vec![
@@ -1960,6 +2114,7 @@ mod tests {
         plain
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "nums".to_string(),
                 columns: vec![Column::new("n", DataType::Integer)],
@@ -1996,6 +2151,7 @@ mod tests {
             .create_table_with(
                 Table {
                     without_rowid: false,
+                    temporary: false,
                     primary_key: Vec::new(),
                     name: "users".to_string(),
                     columns: vec![
@@ -2045,6 +2201,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "t".to_string(),
                 columns: vec![Column::new("n", DataType::Numeric)],
@@ -2067,6 +2224,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "t".to_string(),
                 columns: vec![Column::new("a", DataType::Integer)],
@@ -2091,6 +2249,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "t".to_string(),
                 columns: vec![Column::new("a", DataType::Any)],
@@ -2124,6 +2283,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: true,
+                temporary: false,
                 primary_key: alloc::vec!["a".to_string()],
                 name: "t".to_string(),
                 columns: vec![Column::new("a", DataType::Integer).not_null()],
@@ -2192,6 +2352,7 @@ mod tests {
             .create_table_with(
                 Table {
                     without_rowid: false,
+                    temporary: false,
                     primary_key: Vec::new(),
                     name: "t".to_string(),
                     columns: vec![
@@ -2228,6 +2389,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "people".to_string(),
                 columns: vec![
@@ -2400,6 +2562,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns: vec![Column::new("embedding", DataType::QuantizedVector(384))],

@@ -124,6 +124,10 @@ impl Storage for SharedStorage {
         self.inner.borrow().scan_batch_keyed(table, after, limit)
     }
 
+    fn set_temp_table(&mut self, table: &str, temporary: bool) {
+        self.inner.borrow_mut().set_temp_table(table, temporary)
+    }
+
     fn put_meta(&mut self, key: &str, bytes: &[u8]) -> Result<()> {
         self.inner.borrow_mut().put_meta(key, bytes)
     }

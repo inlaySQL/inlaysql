@@ -23,6 +23,7 @@ fn catalog() -> Catalog {
     catalog
         .create_table(Table {
             without_rowid: false,
+            temporary: false,
             primary_key: Vec::new(),
             name: "t".to_string(),
             columns: vec![

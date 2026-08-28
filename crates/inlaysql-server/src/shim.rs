@@ -1739,6 +1739,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "docs".to_string(),
                 columns: vec![
@@ -1753,6 +1754,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "user_roles".to_string(),
                 columns: vec![Column::new("role", DataType::Text)],
@@ -1917,6 +1919,7 @@ mod tests {
         catalog
             .create_table(Table {
                 without_rowid: false,
+                temporary: false,
                 primary_key: Vec::new(),
                 name: "people".to_string(),
                 columns: vec![

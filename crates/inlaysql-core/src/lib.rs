@@ -53,6 +53,7 @@ pub mod sim;
 pub mod sql;
 pub mod statement;
 pub mod storage;
+pub mod temp_storage;
 pub mod traits;
 pub mod value;
 pub mod wal;

@@ -171,6 +171,21 @@ pub trait Storage {
         Err(unsupported_without_rowid())
     }
 
+    /// Tell this backend that `table` is (or is no longer) a `CREATE
+    /// TEMPORARY TABLE`, for storage-routing purposes.
+    ///
+    /// Only [`crate::temp_storage::TempTableRouter`] does anything with
+    /// this: it is the one backend that holds two places a row could live
+    /// and needs to be told which table goes where. Every other backend —
+    /// an on-disk tree, a plain in-memory map — has exactly one place rows
+    /// live regardless, so the default is a no-op; `put_row`/`get_row`/etc.
+    /// already resolved to the only place they could. Called by
+    /// [`crate::engine::Engine`] at `CREATE TEMPORARY TABLE` and `DROP
+    /// TABLE`, in lockstep with [`crate::catalog::Catalog::temp_tables`].
+    fn set_temp_table(&mut self, table: &str, temporary: bool) {
+        let _ = (table, temporary);
+    }
+
     /// Write an engine metadata entry (the catalog lives here).
     fn put_meta(&mut self, key: &str, bytes: &[u8]) -> Result<()>;
 

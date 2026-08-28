@@ -1,0 +1,158 @@
+# CREATE TEMPORARY TABLE (and CREATE TEMP TABLE).
+#
+# An ordinary, row-id-keyed table routed to in-memory storage by name
+# (`inlaysql_core::temp_storage::TempTableRouter`) rather than a table with a
+# different row shape the way `WITHOUT ROWID` is — which is why, unlike that
+# feature, joining a temporary table against a durable one is not refused.
+# Every expectation here was checked against a real sqlite3 3.54 binary
+# first. See `temp_table.rs` for multi-handle visibility, reopening the
+# file, and transaction-boundary behaviour, none of which a single
+# sqllogictest connection can exercise.
+
+statement ok
+CREATE TEMPORARY TABLE t (a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO t VALUES (2, 'y'), (1, 'x')
+
+query IT nosort
+SELECT a, b FROM t ORDER BY a
+----
+1 x
+2 y
+
+statement ok
+CREATE TEMP TABLE u (a INTEGER)
+
+statement ok
+INSERT INTO u VALUES (1)
+
+query I nosort
+SELECT a FROM u
+----
+1
+
+# A temporary table shadows a durable one of the same name.
+
+statement ok
+CREATE TABLE d (a INTEGER)
+
+statement ok
+INSERT INTO d VALUES (99)
+
+statement ok
+CREATE TEMPORARY TABLE d (a INTEGER)
+
+query I nosort
+SELECT a FROM d
+----
+
+statement ok
+DROP TABLE d
+
+query I nosort
+SELECT a FROM d
+----
+99
+
+statement ok
+DROP TABLE d
+
+# `CREATE INDEX` and a non-key `UNIQUE` are refused, the storage router has
+# no table to route a scalar-index entry by.
+
+statement error
+CREATE INDEX idx ON t (a)
+
+statement error
+CREATE TEMPORARY TABLE v (a INTEGER PRIMARY KEY, b TEXT UNIQUE)
+
+# `ALTER TABLE` is refused outright.
+
+statement error
+ALTER TABLE t ADD COLUMN c TEXT
+
+# Unlike `WITHOUT ROWID`, joining a temporary table against a durable one
+# works: its rows are ordinary row-id-keyed rows behind the storage router,
+# reachable through the same path every join strategy already uses.
+
+statement ok
+CREATE TABLE main_t (id INTEGER, v TEXT)
+
+statement ok
+INSERT INTO main_t VALUES (1, 'durable')
+
+statement ok
+CREATE TEMPORARY TABLE temp_t (id INTEGER, v TEXT)
+
+statement ok
+INSERT INTO temp_t VALUES (1, 'temp')
+
+query TT nosort
+SELECT main_t.v, temp_t.v FROM main_t JOIN temp_t ON main_t.id = temp_t.id
+----
+durable temp
+
+# Creating or dropping a temporary table inside an explicit transaction is
+# refused — its declaration is not buffered the way an ordinary CREATE
+# TABLE's is, so ROLLBACK could not undo it. Row-level writes to one that
+# already exists are unaffected.
+
+statement ok
+BEGIN
+
+statement error
+CREATE TEMPORARY TABLE w (a INTEGER)
+
+statement ok
+INSERT INTO t VALUES (3, 'z')
+
+statement ok
+ROLLBACK
+
+query IT nosort
+SELECT a, b FROM t ORDER BY a
+----
+1 x
+2 y
+
+statement ok
+BEGIN
+
+statement error
+DROP TABLE u
+
+statement ok
+ROLLBACK
+
+query I nosort
+SELECT a FROM u
+----
+1
+
+# RETURNING and aggregates work the same as on a durable table.
+
+query II nosort
+INSERT INTO u VALUES (2) RETURNING a, a * 10
+----
+2 20
+
+query I nosort
+SELECT COUNT(*) FROM u
+----
+2
+
+# `WITHOUT ROWID` and `TEMPORARY` combine: index-organized rows routed to
+# in-memory storage, both at once.
+
+statement ok
+CREATE TEMPORARY TABLE wr (a INTEGER, b TEXT, PRIMARY KEY (a)) WITHOUT ROWID
+
+statement ok
+INSERT INTO wr VALUES (2, 'y'), (1, 'x')
+
+query IT nosort
+SELECT a, b FROM wr
+----
+1 x
+2 y

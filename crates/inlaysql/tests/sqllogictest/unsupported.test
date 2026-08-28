@@ -100,8 +100,7 @@ CREATE TABLE c9(a TEXT, PRIMARY KEY(a COLLATE NOCASE))
 statement error
 CREATE INDEX c7_ft ON c7(a COLLATE NOCASE)
 
-statement error
-CREATE TEMPORARY TABLE c12(a INTEGER)
+# `CREATE TEMPORARY TABLE` is implemented — see `temp_table.test`.
 
 # `WITHOUT ROWID` is implemented — see `without_rowid.test`.
 
