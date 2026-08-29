@@ -165,12 +165,16 @@ bulk load and not for a transaction.
 | 1 | 245 | 87 |
 | 2 | 265 | 87 |
 | 4 | 434 | 87 |
-| 8 | **768** | 86 |
+| 8 | **694** | 86 |
 
-**8.9x SQLite at 8 writers, 0.0% aborted.** The 8-writer scaling (768 against
-245 at one writer is 3.14x) shows group commit batching most fsyncs. The
+**8.1x SQLite at 8 writers, 0.0% aborted.** The 8-writer scaling (694 against
+245 at one writer is 2.83x) shows group commit batching most fsyncs. The
 2-writer case remains relatively flat (265 against 245), still fsync-bound —
 the follower's write usually lands after the leader captured its flush target.
+(This table previously showed 768/8.9x — a number carried over from a spin-
+before-parking experiment that was benchmarked, found not to reproduce, and
+reverted; 694 is the real, twice-confirmed figure for the shipped code, and
+matches the wide sweep below.)
 
 **Published because it is true, not because it flatters us: eight writers is
 the peak, not the ceiling — past it, throughput falls.** A wider sweep the
@@ -187,10 +191,15 @@ writer's turn at that gate, confirmed by profiling (90.4% of samples parked
 waiting for it). The obvious cheap fix — spin before parking, in case
 kernel wake latency rather than the gate itself was the cost — was tried,
 measured clean, and reverted: no change, at 100 or at 5,000 spin iterations.
-See `PERF.md` for the full investigation and what an actual fix would
-require (shrinking the gate to only the conflict check and the sequence/
-offset reservation, moving the encode and the writes after release — a
-real redesign of the commit protocol, not a tuning pass).
+A follow-up idea (shrink the gate to the conflict check and sequence/offset
+reservation only, move the encode and writes after release) turned out to
+be unsafe, not just unscoped: the conflict check walks the tree from the
+latest committed root, so it structurally depends on the previous writer's
+pages already being landed. Finer profiling also found the gate-held
+section was already cheap (under 6% of the time; the rest is pure
+contention) — see `PERF.md` for the full investigation and the one lever
+still standing (logical group commit: batch several waiting writers into
+one gate-held pass), scoped but not started.
 
 ---
 
@@ -406,7 +415,7 @@ here is real for this run and the size of the gap is not to be trusted. What is
 structural, and unchanged: this workload is one commit at a time on one
 connection, so group commit cannot fire by design, and the remaining cost is
 per-commit against InnoDB's redo write. Closing it is scheduled work. The
-concurrent-writer story (768 commits/s on 8 writers above) has no
+concurrent-writer story (694 commits/s on 8 writers above) has no
 MySQL/PostgreSQL counterpart on this page yet — a server-to-server concurrent
 row is the missing apples-to-apples.
 
