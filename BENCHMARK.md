@@ -414,9 +414,15 @@ Python client's GIL, not the server. It did not claim the drop would
 vanish entirely once that confound was removed, and it has not — a smaller,
 real one remains, process isolation and all. `inlaysql-server`'s
 thread-per-connection model (`docs/server.md`'s D2) is the standing
-architectural difference from MySQL's worker pool named below, and this run
-is what finally lets that be named as the suspect with real numbers behind
-it rather than a number contaminated by the tool measuring it. Absolute
+architectural difference from MySQL's worker pool named below and was the
+obvious next suspect — **checked separately, immediately after this run,
+and it did not hold up either**: the same driver against the same server
+running directly on the host (no Docker) scales *up* with concurrency at
+every workload size tried, and a profile of the server during that load
+found it 81.4% idle in `recvfrom`. See "What is not measured here" below
+for the numbers — the container/compose environment, not the server's own
+concurrency model, is now the more likely place this drop lives, though
+that is not proven either. Absolute
 throughput here is well below every other edition of this table on both
 engines — a busier host or a container resource change since the last
 `compare.sh` run, not a regression in either database; only the relative,
@@ -463,16 +469,29 @@ engines. "Comparable" is not "hardware-durable".
   whether to match Lucene's analyzer, since BEIR's published BM25 baselines are
   Anserini's and a gap against them would otherwise be a tokenisation
   difference wearing a scoring result.
-- **Now has a trustworthy driver; what it found is still open.** The
-  server-to-server table above is process-isolated on both sides as of
-  2026-08-29, closing the "the client's own concurrency shape might be the
-  real cause" question the last three editions carried. What it found
-  replacing that question: InlaySQL's read throughput really does drop from
-  one connection to eight (9,033.3 → 6,294.3 ops/s, a real regression, not a
-  GIL artifact this time), where MySQL's own is flat across the same step.
-  Not root-caused here — `inlaysql-server`'s thread-per-connection model
-  (`docs/server.md`'s D2) is the standing architectural difference and the
-  first place to look, but "first place to look" is not "confirmed cause."
+- **Now has a trustworthy driver, and the obvious server-side explanation
+  did not survive checking either.** The server-to-server table above is
+  process-isolated on both sides as of 2026-08-29, closing the "the client's
+  own concurrency shape might be the real cause" question the last three
+  editions carried: InlaySQL's read throughput really does drop from one
+  connection to eight (9,033.3 → 6,294.3 ops/s), where MySQL's own is flat
+  across the same step. But run the same driver against `inlaysql serve
+  --mysql` directly on the host — no Docker, a loopback socket instead of
+  the compose network — at matching and larger workload shapes, and the drop
+  does not reproduce; every shape scales *up* with concurrency instead
+  (1,180 → 9,980 ops/s at the Docker-matched 125-reads-per-connection shape).
+  Sampling the server's own process during that local 8-connection load
+  found it 81.4% idle in `recvfrom`, not CPU-bound — the same "sampled
+  mid-run, its threads sit in `recvfrom`" finding the read-drop
+  investigation two editions ago already made once, independently
+  reproduced here on a different run of a different workload. Two
+  consistent signals now say the container/compose environment is a more
+  likely cause than `inlaysql-server`'s thread-per-connection model, which
+  is the standing architectural difference and *was* the obvious first
+  suspect — not disproven outright (different host path, no other
+  containers competing, not a controlled A/B), but no longer the
+  uncontested one either. See `PLAN.md`'s W5 for the specific next
+  isolation this points to before any worker-pool rewrite.
 - **No server-to-server PostgreSQL row.** `inlaysql serve` speaks the MySQL
   wire protocol and nothing else, so there is no like-for-like transport to
   measure PostgreSQL over; `bench/README.md` says so under
