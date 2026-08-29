@@ -981,6 +981,11 @@ impl<D: Device> CowBTree<D> {
         // other device re-derives them by reading the state block and scanning
         // the log. See [`Device::commit_point`] — this is the whole of AHL-468.
         let cached = self.device.commit_point(region);
+        // Filled the moment the gate-protected read below runs, before this
+        // closure can return `Ok(None)` for a conflict — see the conflict
+        // branch past `prepared?` for why a value read *inside* the gate is
+        // the floor a *post*-gate re-read must never fall behind.
+        let observed_floor = RefCell::new(None);
         let prepared = (|| {
             let (current_root, current_next, current_seq) = match cached {
                 Some(point) => (point.root, point.next, point.seq),
@@ -990,6 +995,7 @@ impl<D: Device> CowBTree<D> {
                     (root, next, seq)
                 }
             };
+            *observed_floor.borrow_mut() = Some((current_root, current_next, current_seq));
             // Rebuild even when the root did not move: an Engine handle can
             // have had its previous transaction rebased by the tree, leaving
             // its in-memory counters behind the values actually reserved on
@@ -1098,13 +1104,34 @@ impl<D: Device> CowBTree<D> {
             // The conflict path re-reads outside the gate, so it takes the
             // generation the ordinary way: counter first, state second.
             let generation = self.device.commit_generation();
-            let (current_root, current_next, current_seq) = match self.device.commit_point(region) {
-                Some(point) => (point.root, point.next, point.seq),
-                None => {
-                    let (root, next, seq, _) =
-                        read_committed_state(&self.device, self.page_size, self.format_version)?;
-                    (root, next, seq)
-                }
+            // `observed_floor` was read inside the gate, above, before the
+            // conflict was even known — nothing racing this handle could have
+            // made it stale. The plain re-read this branch used to do here
+            // instead was outside the gate and could land in `CowBTree::commit`'s
+            // own wrap window (on some *other* handle's commit) and hand back
+            // a state older than the one already proven above; see
+            // `resolve_state_at_least`'s doc comment for that window and why
+            // never adopting a state behind a known floor is always correct
+            // for a live handle, never a legitimate backward move it masks.
+            let (floor_root, floor_next, floor_seq) = observed_floor.into_inner().expect(
+                "the closure above always records observed_floor before returning, \
+                 success or conflict, and this branch only runs on Ok(None)",
+            );
+            let (current_root, current_next, current_seq) = match resolve_state_at_least(
+                &self.device,
+                self.page_size,
+                self.format_version,
+                region,
+                floor_seq,
+            )? {
+                Some(triple) => triple,
+                // Budget exhausted without a read at least as new as the
+                // floor: keep the floor itself. It is a real committed state
+                // this call already confirmed under the gate, so adopting it
+                // costs at most one commit's worth of staleness — never
+                // corruption — and the next refresh picks up anything that
+                // landed after the gate was released.
+                None => (floor_root, floor_next, floor_seq),
             };
             self.dirty.clear();
             self.pending_ops.clear();
@@ -1261,6 +1288,36 @@ impl<D: Device> CowBTree<D> {
     /// separate change with its own DST pass; it is deliberately not folded in
     /// here, because the generation check already takes the cost off the read
     /// path, where it was measured.
+    /// # Never backward
+    ///
+    /// This handle has already observed `self.next_seq - 1` as committed —
+    /// that is what the field means (see its doc comment on why `next_seq -
+    /// 1`, not `checkpoint_seq`, is the value that actually moves on every
+    /// commit) — and no writer outside this process can exist while this
+    /// process holds the file's advisory lock, so nothing can un-commit it.
+    /// Adopting anything older would therefore always be a wrong answer, not
+    /// a legitimate one this guard risks masking: there is no schedule where a
+    /// live handle is *supposed* to see its committed sequence go backward. A
+    /// freshly opened handle is unaffected — it has no prior sequence to
+    /// compare against, so its first read always wins.
+    ///
+    /// [`resolve_state_at_least`] is what enforces that floor, bounded and
+    /// documented at its own definition; read it for the torn-read window
+    /// this closes and why the guard cannot fire on a device that is not
+    /// racing a wrap at all. If every attempt in its budget still reads
+    /// behind the floor, this returns `Ok(false)` and deliberately leaves
+    /// `seen_generation` at its old value rather than the one just read: the
+    /// generation genuinely did move, so the *next* call re-derives from
+    /// scratch instead of trusting a generation number this call was never
+    /// able to pair with a state that deserved it.
+    ///
+    /// This closes the observed failure (a backup handle's successive
+    /// snapshots going backward under sustained write load); it does not
+    /// close the torn-read window itself, which is still reachable and still
+    /// costs a bounded retry when it is. The deeper fix — publishing the wrap
+    /// atomically, so a concurrent raw reader sees either wholly the pre-wrap
+    /// or wholly the post-wrap state and this guard never has anything to
+    /// catch — remains outstanding.
     pub fn refresh(&mut self) -> Result<bool> {
         if self.has_pending {
             return Ok(false);
@@ -1275,13 +1332,21 @@ impl<D: Device> CowBTree<D> {
         // essentially every statement, so this is the common case there rather
         // than the rare one (AHL-468).
         let region = self.device.wal_region() % crate::wal::region_count(self.format_version);
-        let (root, next, seq) = match self.device.commit_point(region) {
-            Some(point) => (point.root, point.next, point.seq),
-            None => {
-                let (root, next, seq, _replay) =
-                    read_committed_state(&self.device, self.page_size, self.format_version)?;
-                (root, next, seq)
-            }
+        let floor_seq = self.next_seq.saturating_sub(1);
+        let Some((root, next, seq)) = resolve_state_at_least(
+            &self.device,
+            self.page_size,
+            self.format_version,
+            region,
+            floor_seq,
+        )?
+        else {
+            // Every attempt still read behind what this handle already knows
+            // is committed — see the "Never backward" section above.
+            // `seen_generation` is deliberately left unchanged so the next
+            // call retries the whole read rather than trusting a generation
+            // number no adopted state ever backed.
+            return Ok(false);
         };
         self.seen_generation = generation;
         if root == self.root {
@@ -3853,6 +3918,82 @@ fn read_committed_state<D: Device>(
     Ok((newest.root, newest.next, newest.seq, best))
 }
 
+/// How many times [`resolve_state_at_least`] re-reads before giving up.
+///
+/// The window it is bridging is [`CowBTree::commit`]'s wrap path — forget,
+/// rewrite the state block, zero the region, write the dirty pages, write the
+/// record, republish — which is a handful of device writes wide, not an
+/// unbounded one. A budget this generous only matters on a device slow enough
+/// that a handful of writes takes a long time, and even then it fails toward
+/// "keep the state already known good" (see call sites), never toward a wrong
+/// answer.
+const RESOLVE_AT_LEAST_RETRY_BUDGET: u32 = 64;
+
+/// Read the committed state without ever handing back one older than
+/// `floor_seq`.
+///
+/// # The window this closes
+///
+/// [`Device::commit_point`] answers from an in-process cache that
+/// [`CowBTree::commit`] forgets (`set_commit_point(region, None)`) before it
+/// rewrites the state block and zeroes the WAL region it is about to reuse,
+/// republishing only once the new record is durable. A caller that finds the
+/// cache empty during that window falls back to [`read_committed_state`],
+/// which issues two *unsynchronized* device reads — the state block, then a
+/// scan of every WAL region — with nothing to stop them from landing on two
+/// different sides of the wrap: a state block read before the rewrite lands
+/// (naming the previous checkpoint), paired with a scan that runs after the
+/// region has already been zeroed and the new record written (so the only
+/// record it finds does not chain from that checkpoint). Finding no
+/// continuation, [`read_committed_state`] stops and returns the stale
+/// checkpoint as-is. That value is always internally consistent — it named a
+/// real past commit — which is exactly why this survived as a "flaky test"
+/// for as long as it did: nothing was corrupt, only late, and only under
+/// concurrent commit load (a wrap is not otherwise reachable in this window).
+///
+/// # The fix is a floor, not a lock
+///
+/// Taking a lock here would mean a reader blocking a writer's commit, which
+/// is the one thing the reservation gate is designed to let readers avoid.
+/// Instead: retry, bounded by [`RESOLVE_AT_LEAST_RETRY_BUDGET`]. The window is
+/// two device writes' worth of wall-clock time wide and republishes the
+/// instant the winning commit finishes, so almost every retry loop ends on
+/// its second iteration — [`Device::commit_point`] simply stops answering
+/// `None`. The few call sites that still exhaust the budget (a very slow
+/// device, or a `commit_point` that never repopulates because the writer's
+/// commit itself failed) get `Ok(None)` back and are expected to keep
+/// whatever state they already trust — see each call site for what that is.
+///
+/// Returns `Ok(Some(_))` the moment a read's `seq` is at least `floor_seq`,
+/// which includes the very first attempt whenever `commit_point` is simply
+/// unpopulated for a reason that has nothing to do with a live wrap (no
+/// commit has happened yet on this file in this process, or the gate was
+/// reset after a failed commit): in that case nothing is being torn, so the
+/// first raw scan already agrees with the floor and this returns immediately.
+fn resolve_state_at_least<D: Device>(
+    device: &D,
+    page_size: usize,
+    format_version: u32,
+    region: usize,
+    floor_seq: u64,
+) -> Result<Option<(PageId, PageId, u64)>> {
+    for _ in 0..=RESOLVE_AT_LEAST_RETRY_BUDGET {
+        let (root, next, seq) = match device.commit_point(region) {
+            Some(point) => (point.root, point.next, point.seq),
+            None => {
+                let (root, next, seq, _replay) =
+                    read_committed_state(device, page_size, format_version)?;
+                (root, next, seq)
+            }
+        };
+        if seq >= floor_seq {
+            return Ok(Some((root, next, seq)));
+        }
+        core::hint::spin_loop();
+    }
+    Ok(None)
+}
+
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([
         bytes[offset],
@@ -5810,5 +5951,91 @@ mod tests {
 
         let reopened = reopen(&db);
         assert_eq!(reopened.scan().unwrap().len(), 66);
+    }
+
+    /// Deterministic regression coverage for the monotonicity guard
+    /// `resolve_state_at_least` adds.
+    ///
+    /// `crates/inlaysql/tests/backup.rs`'s
+    /// `a_backup_taken_while_another_handle_commits_is_one_committed_snapshot`
+    /// is the end-to-end proof, but it only catches the bug probabilistically
+    /// — it needs a real second thread to land its `commit_point` read inside
+    /// `CowBTree::commit`'s wrap window (forget, rewrite the state block, zero
+    /// the region, write the record, republish), and nothing schedules that
+    /// for it. This test needs no such luck: it manufactures, byte for byte,
+    /// exactly what a raw reader sees when it wins that race — a state block
+    /// still naming an old checkpoint, paired with a WAL region whose only
+    /// record cannot chain from it because the records in between were
+    /// zeroed — and checks both halves of the fix directly.
+    ///
+    /// `read_committed_state` itself is not expected to change: the read is
+    /// not wrong, only stale, and the disk really did hold this exact byte
+    /// image at some point in real recovery too (a torn state block behind an
+    /// in-progress wrap). What must not happen is a caller *adopting* it once
+    /// it already knows better, which is what `resolve_state_at_least`
+    /// (`refresh`'s and the post-conflict reload's shared floor) exists to
+    /// refuse.
+    #[test]
+    fn resolve_state_at_least_refuses_a_torn_wrap_read_behind_the_floor() {
+        let mut torn_disk = disk();
+        let old_root: PageId = 7;
+        let old_next: PageId = 8;
+        let old_seq: u64 = 5;
+        Device::write(
+            &mut torn_disk,
+            crate::wal::state_offset(PAGE),
+            &encode_state(old_root, old_next, old_seq),
+        )
+        .unwrap();
+
+        // What is left in a region once it has been zeroed and the wrapped
+        // transaction's own record written: a record that cannot possibly
+        // chain from `old_seq` because everything between them is gone.
+        let far_seq = old_seq + 50;
+        let record = crate::wal::encode_record(&crate::wal::WalRecord {
+            seq: far_seq,
+            prev_seq: far_seq - 1,
+            prev_root: 999,
+            root: 1234,
+            next: 1235,
+            pages: Vec::new(),
+        });
+        Device::write(
+            &mut torn_disk,
+            crate::wal::region_start(PAGE, FORMAT_VERSION, 0),
+            &record,
+        )
+        .unwrap();
+
+        // The mechanism, isolated: this is the exact stale-but-internally-
+        // consistent answer the bug report describes — the integrity check
+        // (a real committed state) never fails, only the ordering guarantee
+        // a caller relies on.
+        let (root, next, seq, replay) =
+            read_committed_state(&torn_disk, PAGE, FORMAT_VERSION).unwrap();
+        assert_eq!((root, next, seq), (old_root, old_next, old_seq));
+        assert!(replay.is_empty());
+
+        // A floor at or behind what is actually on the disk is satisfied on
+        // the first attempt — a legitimate read is never rejected, and a
+        // freshly opened handle (whose floor starts at the state it just
+        // read) always wins.
+        assert_eq!(
+            resolve_state_at_least(&torn_disk, PAGE, FORMAT_VERSION, 0, old_seq).unwrap(),
+            Some((old_root, old_next, old_seq))
+        );
+
+        // A floor ahead of it — this handle already confirmed a newer
+        // sequence committed, exactly the situation `refresh` and the
+        // post-conflict reload are in when they lose this race — is never
+        // adopted. This manufactured disk never advances, so every attempt in
+        // the retry budget sees the same stale answer, and the guard gives up
+        // rather than hand it back; a live wrap instead republishes well
+        // within that budget, which is what the post-fix stress loop over
+        // `backup.rs`'s end-to-end test confirms (see `docs/recovery.md`).
+        assert_eq!(
+            resolve_state_at_least(&torn_disk, PAGE, FORMAT_VERSION, 0, old_seq + 1).unwrap(),
+            None
+        );
     }
 }

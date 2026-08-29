@@ -584,3 +584,101 @@ Coverage is `crates/inlaysql-core/tests/backup_dst.rs` — the same seeded
 `Simulator`/`FaultSchedule` the sweeps above use, asserting each copy equals
 the exact map its workload committed, including one taken from a database that
 has just recovered from whatever fault the schedule drew.
+
+## A concurrent `refresh` could see a backup go backward in time (misdiagnosed as a flaky test, then fixed)
+
+`a_backup_taken_while_another_handle_commits_is_one_committed_snapshot`
+(`crates/inlaysql/tests/backup.rs`) takes twenty backups through one
+read-write handle while a second handle commits continuously on the same
+file, and asserts the transfer counter each backup sees never runs backward.
+It failed intermittently in CI for long enough to be treated as a CI-only
+flake — the ordinary, wrong response to a test that fails 1-in-N: assume the
+harness, not the engine. It reproduces locally too. On the machine this fix
+was written and verified on, a 500-run stress loop of the exact shipped test
+found **1 failure in 500** (0.2%) before the fix — far below the ~13-20% rate
+reported on faster hardware, and the reason why is itself informative: the
+race needs a WAL region to actually wrap during the test's ~100 ms backup
+loop, wrapping needs on the order of a hundred-plus commits to accumulate,
+and each commit here pays a real `fsync`/`F_FULLFSYNC`, so a machine whose
+`fsync` is slower simply fits fewer commits — and therefore fewer wraps —
+into the same wall-clock window. The mechanism is identical either way, and
+the one local failure caught reproduced it exactly: `seen=[…, 71, 77, 72, 87,
+…]` — a real backward jump, not noise.
+
+**Root cause.** `CowBTree::refresh` (`crates/inlaysql-core/src/btree/tree.rs`)
+answers from `Device::commit_point`'s in-process cache when it can. As
+"Commit protocol" above already documents, `CowBTree::commit` forgets that
+cache (`set_commit_point(region, None)`) before it rewrites the state block
+and zeroes the WAL region it is about to reuse, republishing only once the
+new record is durable. What that section does not spell out is what a
+*concurrent* caller sees while the cache reads `None`: it falls back to
+`read_committed_state`, which issues two *unsynchronized* device reads — the
+state block, then a scan of every WAL region — with nothing tying them
+together. Nothing stops those two reads from landing on opposite sides of the
+wrap: a state-block read before the rewrite lands (naming the previous
+checkpoint), paired with a scan that runs after the region has already been
+zeroed and the new record written (so the only record it finds cannot chain
+from that checkpoint — everything in between was just wiped). Finding no
+continuation, `read_committed_state` stops and hands back the stale
+checkpoint exactly as it found it. That value is a real past commit and
+passes every integrity check there is — this is an ordering defect, not
+corruption, which is exactly why it survived as a "flaky test" for as long as
+it did: nothing was ever wrong, only late. The same unguarded re-read exists
+in `CowBTree::commit`'s post-conflict reload (it re-derives the winner's state
+*after* releasing the reservation gate, for the same reason `refresh` does),
+so it carries the identical exposure.
+
+**Fix: a monotonicity floor, not a lock (`resolve_state_at_least`,
+`crates/inlaysql-core/src/btree/tree.rs`).** Both call sites now refuse to
+adopt a `(root, next, seq)` older than the highest sequence the handle already
+knows is committed — `next_seq - 1`, not `checkpoint_seq`; the field's own
+doc comment explains why those two differ between a commit and the next
+checkpoint. The read retries, bounded (`RESOLVE_AT_LEAST_RETRY_BUDGET = 64`):
+the window it bridges is a handful of device writes wide and republishes the
+instant the winning commit finishes, so in practice a retry loop resolves
+within its first couple of iterations. If the budget exhausts anyway — a very
+slow device, or a `commit_point` that never repopulates because the writer's
+own commit failed outright — the caller keeps whatever state it already
+trusts: `refresh` returns `Ok(false)` and deliberately leaves
+`seen_generation` at its old value, so the *next* call re-derives from
+scratch rather than trusting a generation number this call was never able to
+pair with a state that deserved it; the post-conflict reload adopts the state
+it already read *inside* the gate moments earlier, which is real and current
+enough to resume from. Never adopting an older sequence is always correct
+here and never masks a legitimate backward move: this process holds the
+file's exclusive advisory lock for as long as this handle is open, so nothing
+outside it can un-commit a sequence the handle has already observed, and
+there is no schedule in which a live handle is *supposed* to see its own
+committed sequence run backward. A freshly opened handle is unaffected — it
+has no prior sequence to compare against, so its first read always wins.
+
+**What this does not fix.** The torn-read window itself is still reachable;
+`resolve_state_at_least` bridges it with a bounded retry rather than closing
+it. The deeper fix would make the wrap publish atomically, so a concurrent
+raw reader always sees either wholly the pre-wrap or wholly the post-wrap
+state and this guard never has anything to catch. That remains outstanding.
+
+**Verification.** `resolve_state_at_least_refuses_a_torn_wrap_read_behind_the_floor`
+(`crates/inlaysql-core/src/btree/tree.rs`, `mod tests`) is a fully
+deterministic regression test, not a probabilistic one: it manufactures the
+exact torn byte image on a `SimDisk` — an old state block paired with a WAL
+region whose only record cannot chain from it — and checks both halves
+directly: that `read_committed_state` alone reproduces the stale answer (the
+read itself is not wrong, only stale) and that `resolve_state_at_least`
+refuses to adopt it below a floor while adopting it immediately at or below
+the floor. This is deliberately a unit test of the shared helper, not a
+replacement for the end-to-end proof — it cannot show the real `refresh`/
+`commit` call sites are wired to it correctly, only that the helper they both
+call behaves. `a_backup_taken_while_another_handle_commits_is_one_committed_snapshot`
+stays in the suite for that reason: it is what caught this in the first
+place, and a 500-run stress loop after the fix found **0 failures in 500**,
+against 1-in-500 before it. All four DST fault-injection sweeps
+(`dst_sweep`, `index_recovery_dst`, `free_list_reuse_dst`, `backup_dst`) pass
+unchanged, and the concurrency benchmark (`WRITER_LEVELS=1,8,32 ./target/release/inlaysql-bench
+--suite concurrency`) shows no regression: 246-248 / 1150-1233 / 961-1029
+commits/s at 1/8/32 writers across three runs, against the pre-existing
+246/1184/988 baseline, 0.0% conflicts throughout — the added guard sits on
+`refresh`'s already-cold path (a device read only happens when
+`Device::commit_generation` reports something changed) and its retry loop
+only spins when a read is genuinely behind the floor, which normal operation
+never triggers.
