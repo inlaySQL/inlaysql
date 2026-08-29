@@ -899,7 +899,91 @@ when this paragraph was written, with 0% aborts on disjoint rows
 and the commit-gate rework behind it (AHL-468) lifted that to **2.8x** — 692
 commits/s at eight writers against 246 at one, still 0% aborted. The two-writer
 case stays flat (253 vs 246) because the follower's write usually lands after
-the leader captured its flush target, and that is the next thing on this path.
+the leader captured its flush target — still true today (259 vs 249,
+2026-08-29), so this specific line has not gone stale the way several others
+in this document had.
+
+### Eight writers is not the ceiling — it is the peak, and past it throughput falls (AHL-497, 2026-08-29)
+
+The "2.8x at eight writers" framing above answers "does adding writers help",
+not "what happens if you keep adding them." It does not stay flat past eight
+— it **falls**: a fresh sweep (`WRITER_LEVELS=1,2,3,4,5,6,8,12,16,24,32`, one
+row per level, one machine, one session) reads 249 → 259 → 348 → 458 → 541 →
+559 → **694** (peak) → 624 → 607 → 550 → 516 commits/s from 1 to 32 writers.
+32 writers does *worse* than 8, not merely no better — a real, reproducible
+regression (confirmed twice, `WRITER_LEVELS=8,32` alone: 693/493 and 586/499),
+not noise, and **not mentioned anywhere in this document, `BENCHMARK.md`, or
+`PLAN.md`'s W3 before now.** The control that rules out generic thread-count
+overhead: SQLite's own row is flat across the identical sweep (85–93
+commits/s at every level from 1 to 32) — same harness, same OS thread count,
+same host — so whatever gets worse past 8 writers here is specific to this
+engine's own concurrency mechanism, not just "more threads than cores."
+
+**Root cause, read from the code before touching it.** `CommitCoordinator`
+(`crates/inlaysql/src/device.rs`) has exactly one `reserved: Mutex<bool>` +
+`Condvar` gate per file, shared by every writer regardless of
+[`WAL_REGIONS`](../crates/inlaysql-core/src/wal.rs) (4). `CowBTree::commit`
+holds that gate for its *entire* prepare phase — conflict/rebase check,
+`finalize_free_list`, `encode_record_into`, `write_dirty_pages`, and the WAL
+append write itself — and only releases it before the `fsync`. So the four
+WAL regions parallelize exactly one thing: letting one writer's `fsync` (group
+commit) overlap with the *next* writer's gate-held prepare phase. They do not
+parallelize the prepare phase itself, which cannot be sharded by region
+without also sharding the tree it commits into — and there is exactly one
+copy-on-write tree, one root, shared by all four regions, so the "which root
+did this transaction see, and what does its replacement look like" decision
+is inherently one sequential stream regardless of how many regions exist to
+hold the resulting bytes. Profiled directly (`sample`, 32 writers, the
+harness's own release binary): **90.4% of samples are `__psynch_cvwait`** —
+threads parked waiting for the gate — against a combined ~5% for the actual
+encode/write/fsync work the gate protects, confirming the gate, not the
+work, is where the time goes structurally. `decode_record_for_version`
+appearing at all (~1%) in a pure-write benchmark is a second clue worth a
+closer look later: some writers are missing the cached `commit_point` and
+re-scanning their region from disk, on the hot path, under the gate.
+
+**Tried, measured, and it did not move the number: spinning before parking.**
+90% of samples being "parked waiting" looks like wasted park/wake overhead —
+`std::sync::Mutex`+`Condvar`'s kernel round trip is expensive relative to a
+critical section this short. So `begin_reservation` was changed to spin
+(bounded `try_lock` polling, `core::hint::spin_loop()`) before falling back
+to the existing blocking path, on the theory that most waits are shorter
+than one park/wake round trip. Built, benchmarked (`WRITER_LEVELS=8,32`):
+**no change** — 693/493 before, 768/499 and 586/499 after, inside the same
+run-to-run noise band as the unmodified binary. Re-profiled to check whether
+the spin was even taking effect rather than assume: `__psynch_cvwait` was
+still 90.6% of samples, essentially identical to before. Raised the spin
+budget 50x (100 → 5,000 iterations) as the obvious next question — still no
+change (586/484). **Reverted; kept nothing from this attempt.** The
+diagnosis this rules out: the cost is not park/wake overhead that a smarter
+wait strategy can avoid. The diagnosis it leaves standing: with SQLite flat
+across the same sweep as a control, and spinning-longer provably not
+helping, the likely remaining explanations are (a) the gate-holding thread
+itself getting preempted mid-critical-section under 32-way OS thread
+oversubscription on an 18-core machine (6 P-cores), which no spin budget can
+paper over since the wait is bounded by rescheduling latency, not by how
+long the real work takes, or (b) `commit_point` cache misses (the
+`decode_record_for_version` clue above) growing disproportionately more
+frequent as more threads cycle through the same four regions, so the
+*serialized work itself* — not just the wait for it — genuinely grows with
+writer count. Neither was isolated further this round.
+
+**What an actual fix would need, stated honestly rather than attempted under
+time pressure:** the gate's critical section would have to shrink to only
+what genuinely cannot be sharded — the conflict/rebase check against the
+current shared root, and reserving this writer's sequence number, append
+offset and region — with the record encode and the dirty-page/WAL-append
+writes moved *after* release, once each writer's own disjoint page range and
+append offset are already reserved. That is a real redesign of the commit
+protocol's critical section, not a tuning pass: it changes when
+`set_commit_point` can publish (a writer's commit shows up to the cache only
+once its writes actually land, not when it merely finishes preparing them),
+and it needs the same rigor every catalog/storage-format change on this
+project gets — full DST sweep, not just this suite — because a mistake here
+is a data-loss bug, not a slow query. Scoped, not started. `WAL_REGIONS`
+itself is not implicated by this investigation and raising it would not
+help on its own: the bottleneck sits in the single global gate the regions
+sit behind, not in the region count.
 
 **Scans, joins and aggregates are the untested embarrassment**, and AHL-462 and
 AHL-464 made them less embarrassing without making them measured. Joins are

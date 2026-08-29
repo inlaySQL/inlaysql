@@ -838,6 +838,10 @@ flatten: the reservation gate used to hold ~100% of wall clock re-deriving
 committed state on every commit, so no two commits ever overlapped in the
 sync window; with the gate down to ~0.9 ms (AHL-468), group commit (AHL-461)
 batches most fsyncs and 8 writers do 3.14x the work of one instead of 1.45x.
+Eight is the peak, not the ceiling, though: past it throughput falls (694
+commits/s at 8 writers, 516 at 32) because every writer's whole commit
+prepare phase, not only its `fsync`, still serializes behind one gate —
+`BENCHMARK.md` has the fuller sweep and `PERF.md` the profile.
 
 ### Against `sqlite-vec`, DuckDB and pgvector
 

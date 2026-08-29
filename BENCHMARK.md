@@ -156,7 +156,7 @@ One row per commit, one `fsync` per commit.
 to 61,025 ops/s at 10.75 µs — **254x** — which is the number to quote for a
 bulk load and not for a transaction.
 
-### Concurrent writers — we win, and now we scale
+### Concurrent writers — we win up to eight, then the win shrinks
 
 200 transactions per writer, one row each, on real OS threads.
 
@@ -170,8 +170,27 @@ bulk load and not for a transaction.
 **8.9x SQLite at 8 writers, 0.0% aborted.** The 8-writer scaling (768 against
 245 at one writer is 3.14x) shows group commit batching most fsyncs. The
 2-writer case remains relatively flat (265 against 245), still fsync-bound —
-the follower's write usually lands after the leader captured its flush target —
-and is the next thing on that path.
+the follower's write usually lands after the leader captured its flush target.
+
+**Published because it is true, not because it flatters us: eight writers is
+the peak, not the ceiling — past it, throughput falls.** A wider sweep the
+table above stops short of (`WRITER_LEVELS=1,2,3,4,5,6,8,12,16,24,32`, same
+session, same machine): 249 → 259 → 348 → 458 → 541 → 559 → **694** → 624 →
+607 → 550 → **516** commits/s. 32 writers does worse than 8, not merely no
+better, reproduced twice. SQLite's own row stays flat across the identical
+sweep (85–93 throughout), so this is specific to how this engine's writers
+contend, not generic OS thread-count overhead — every writer's whole commit
+*prepare* phase (conflict check, WAL encode, page writes, WAL append) turns
+out to serialize behind one process-wide gate regardless of how many WAL
+regions exist; the regions only let one writer's `fsync` overlap the *next*
+writer's turn at that gate, confirmed by profiling (90.4% of samples parked
+waiting for it). The obvious cheap fix — spin before parking, in case
+kernel wake latency rather than the gate itself was the cost — was tried,
+measured clean, and reverted: no change, at 100 or at 5,000 spin iterations.
+See `PERF.md` for the full investigation and what an actual fix would
+require (shrinking the gate to only the conflict check and the sequence/
+offset reservation, moving the encode and the writes after release — a
+real redesign of the commit protocol, not a tuning pass).
 
 ---
 
