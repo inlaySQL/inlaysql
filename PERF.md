@@ -968,22 +968,58 @@ frequent as more threads cycle through the same four regions, so the
 *serialized work itself* — not just the wait for it — genuinely grows with
 writer count. Neither was isolated further this round.
 
-**What an actual fix would need, stated honestly rather than attempted under
-time pressure:** the gate's critical section would have to shrink to only
-what genuinely cannot be sharded — the conflict/rebase check against the
-current shared root, and reserving this writer's sequence number, append
-offset and region — with the record encode and the dirty-page/WAL-append
-writes moved *after* release, once each writer's own disjoint page range and
-append offset are already reserved. That is a real redesign of the commit
-protocol's critical section, not a tuning pass: it changes when
-`set_commit_point` can publish (a writer's commit shows up to the cache only
-once its writes actually land, not when it merely finishes preparing them),
-and it needs the same rigor every catalog/storage-format change on this
-project gets — full DST sweep, not just this suite — because a mistake here
-is a data-loss bug, not a slow query. Scoped, not started. `WAL_REGIONS`
-itself is not implicated by this investigation and raising it would not
-help on its own: the bottleneck sits in the single global gate the regions
-sit behind, not in the region count.
+**The "shrink the gate, move writes after release" idea above was wrong, and
+reading `rebase_pending` before writing it down would have caught that.**
+`CowBTree::rebase_pending` (`crates/inlaysql-core/src/btree/tree.rs`,
+~line 1822) detects conflicts by walking the tree from *the latest committed
+root* — `self.get_at(self.root, key)? != self.get_at(current_root, key)?` —
+for every key this transaction touched. `current_root` is whatever the
+previous writer just published. That means the previous writer's dirty pages
+must already be physically written and `pread`-visible *before* the next
+writer's conflict check is safe to run. Deferring the encode/write past gate
+release, as previously proposed, would let the next writer's `rebase_pending`
+walk a root whose pages aren't landed yet — not a slow path, a correctness
+hazard. The gate cannot shrink to "reservation only" the way this document
+said it could; that proposal is retracted.
+
+**Finer profiling shows the critical section was never the problem — the
+contention was.** A second `sample` pass, read by full call-stack instead of
+leaf symbol (leaf symbols lie here: `__psynch_cvwait` is the bottom frame for
+*both* the reservation wait and the separate flush-follower wait, and only
+the parent frames tell them apart), breaks `TreeStorage::commit`'s samples
+down as: 2103/2404 (87.5%) parked in `begin_normal_commit`, waiting on
+*another* writer's turn — pure contention, zero work done. Of the remaining
+301, 165 (6.9% of the total) are a *second* wait — the group-commit
+follower parked on the flush condvar inside `sync_commit`, not the gate.
+That leaves only ~136 samples (~5.7%) as actual work: 64 running `fsync` as
+flush leader, 37 as the `pwrite` of the WAL record itself, 12 in a second
+small `Device::sync`, the rest scattered single digits. `rebase_pending`'s
+own tree walk doesn't show up as a distinct bucket at all — it's fast.
+So the gate-held critical section was already cheap; almost all the lost
+time is 32 threads parking and waking on one mutex for a section that takes
+next to no time once acquired — a lock convoy, not a slow critical section.
+Shrinking an already-~2%-of-total critical section further has a low
+ceiling even where it's safe to attempt, which per the paragraph above, the
+encode/write portion isn't.
+
+**Why the gate has to be global, and what a real fix would look like.**
+There is one copy-on-write tree and one root; `rebase_pending` conflict-checks
+against the latest committed root, so the "does this transaction still apply"
+decision is inherently one sequential stream, not an accident of this
+implementation. `WAL_REGIONS` parallelizes physical WAL-append layout and lets
+one writer's `fsync` overlap the next writer's gate-held prepare — it was
+never going to parallelize the prepare decision itself, and raising it still
+won't. The only lever consistent with everything measured here is *logical*
+group commit: let one writer, while holding the gate, absorb other waiting
+writers' pending transactions into the same prepare/encode/WAL-append pass —
+amortizing the fixed contention/wakeup cost over N transactions instead of
+paying it once per transaction — mirroring the `fsync`-side group commit
+this engine already does, just one layer up. That is a real redesign of the
+commit protocol, not a tuning pass: it needs the same rigor every
+catalog/storage-format change on this project gets — full DST sweep, not
+just this suite — because a mistake here is a data-loss bug, not a slow
+query. Scoped, not started, not attempted this session given the time
+already spent correctly ruling out two smaller candidates first.
 
 **Scans, joins and aggregates are the untested embarrassment**, and AHL-462 and
 AHL-464 made them less embarrassing without making them measured. Joins are
