@@ -787,11 +787,20 @@ overhead. Point reads and small joins were confirmed unaffected at the code
 level (`get_from` was never touched), so this does not reproduce AHL-493's
 regression shape — it simply does not help the workload it targeted.
 
-**The next untried idea, not this one again**: extend `get_from`'s
-already-proven retained-cursor technique to the entry-range walk itself — a
-retained cursor for `walk`/`walk_row_ids` — attacking the re-descend-per-outer-row
-cost directly rather than making each individual descent's comparisons
-marginally cheaper.
+**Done, since this section was written — not this one again if you are
+reading it fresh.** `bfac72a` ("retain range leaf cursor", AHL-479) built
+exactly the idea named here: `RangeCursor` retains the entry-range walk's
+last leaf and the key span it answers for, keyed by root and device
+generation the same way AHL-472's point-lookup cursor is, and
+`CowBTree::scan_range_row_ids_from` (what backs `Storage::scan_index_row_ids`,
+the join-probe and index-range path) checks it before falling back to
+`walk_raw_row_ids`. It landed after this section's prose and was never
+folded back in here — caught while re-profiling for W2 (2026-08-29): a fresh
+`joins-limit` profile on the same shape this section describes shows the
+secondary-index-inner join at 7.93x faster than journal SQLite (was 3.65x)
+and its `LIMIT` shape at 2.41x slower (was 5.81x) — see `BENCHMARK.md`'s
+Joins section for the regenerated table and what is left in the profile now
+(the same AHL-488/493 allocation cost, still open, not this).
 
 ### The structural fix: stop allocating per row
 
@@ -1201,3 +1210,18 @@ of expected value, now reordered by the above:
   baseline spanned 6.50–8.63 µs on repeat runs of the identical binary.
 - Publish losses. `README.md` already does this and it is the reason its numbers
   can be trusted at all.
+- **Wait for the phase marker, don't time out past it.** `profile.rs`'s
+  `PROFILE_QUERY_PHASE_START` protocol only works if the caller actually
+  blocks until it appears; a polling loop with a fixed timeout that gives up
+  and samples anyway will, on a large suite, sample the setup instead —
+  bulk-loading 160,000 rows and building a B-tree index over them
+  (`--suite joins`) took over 20 seconds locally, comfortably longer than a
+  timeout that looked generous when it was written. The symptom is
+  unmistakable once you check the call tree rather than trusting the
+  top-of-stack summary: `fcntl`/`File::sync_all` (macOS's `F_FULLFSYNC`)
+  dominating a profile of a *read-only* query loop is index-build commits,
+  not query execution — a write encoder or a `CREATE INDEX`'s
+  `build_btree_index` has no business in one, the same tell AHL-472's
+  original contaminated profile had for a different reason. When in doubt,
+  read the sample's actual call stack for the hot leaf before trusting its
+  percentage.

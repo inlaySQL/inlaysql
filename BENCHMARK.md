@@ -97,10 +97,10 @@ built, so it is the expensive one:
 
 | Query shape | InlaySQL cold → p50 | SQLite journal cold → p50 | vs journal |
 | --- | --- | --- | --- |
-| PK inner, full join | 22.95 ms → 11.47 ms | 10.03 ms → 9.68 ms | **1.20x slower** |
-| PK inner, LIMIT 10 | 108.21 µs → 17.50 µs | 12.17 µs → 3.79 µs | 4.65x slower |
-| Secondary-index inner, full | 26.10 ms → 3.85 ms | 16.07 ms → 14.85 ms | **3.65x faster** |
-| Secondary-index inner, LIMIT 10 | 175.50 µs → 22.17 µs | 12.75 µs → 3.79 µs | 5.81x slower |
+| PK inner, full join | 15.80 ms → 11.28 ms | 11.72 ms → 10.62 ms | **1.07x slower** |
+| PK inner, LIMIT 10 | 61.96 µs → 11.88 µs | 12.54 µs → 3.58 µs | 3.27x slower |
+| Secondary-index inner, full | 26.31 ms → 3.77 ms | 32.12 ms → 32.08 ms | **7.93x faster** |
+| Secondary-index inner, LIMIT 10 | 69.96 µs → 11.25 µs | 27.21 µs → 4.63 µs | 2.41x slower |
 
 The last column is the harness's own throughput ratio (joins/s against joins/s),
 which is what the raw output prints; it is close to but not identical with the
@@ -110,19 +110,37 @@ the throughput figure includes.
 Published because it is true, and because it keeps moving: the
 secondary-index inner shape — the one AHL-464 built the index nested-loop join
 for — went from **10.71x slower** (2026-08-20) to 2.85x faster (`9aba437`) to
-**3.65x faster** here, and the PK inner full join from 5.56x slower to 1.43x to
-**1.20x slower**. What changed across those runs is the join path (AHL-447:
-streaming projection, contiguous CSR hash table, cached prepared joins,
-key-only outer scans) and the borrowed page buffers (AHL-455, AHL-466). Nothing
-in *this* commit touches joins, so the movement between the last edition and
-this one is run-to-run variance and should be read as the width of the error
-bar on these figures, not as progress.
+3.65x faster (`9b2f11e`, AHL-447) to **7.93x faster** here, and the PK inner
+full join from 5.56x slower to 1.43x to 1.20x to **1.07x slower**. Two changes
+since the last edition explain the movement: `1f0bdcb` let the raw leaf scan
+read through the page cache instead of re-`pread`ing and re-copying the same
+pages on every execution of a prepared query (the `LIMIT` rows' fix, below),
+and `bfac72a` (AHL-479) retains the entry-range walk's leaf across calls the
+same way AHL-472 already retained one for point lookups, removing the
+one-descent-per-outer-row cost the secondary-index-inner shape was paying.
+Both are real, reproducible fixes, not run-to-run variance — see `PERF.md`
+for the profiles that motivated each.
 
-The LIMIT rows are the standing loss and they did not improve: **4.65x and
-5.81x slower** warm, against a cold column where the gap is far smaller. That
-is the streaming pipeline's short-circuit working — the scan stops early — so
-what remains is per-row cost, not per-query cost. The full-join shapes and
-these two LIMIT shapes stay the top open performance targets.
+The `LIMIT` rows are still a loss but a much smaller one than last published:
+**3.27x and 2.41x slower** warm, down from 4.65x and 5.81x, moved by the same
+two fixes above (the entry-range retained cursor cuts the per-outer-row
+descent the secondary-index shape pays; the raw-scan cache cuts the
+re-`pread`/re-copy every prepared execution used to pay on both shapes). What
+is left, profiled fresh rather than assumed (`PERF.md`'s AHL-488/493
+sections): the same page-decode allocation cost those sections already
+diagnosed and, in AHL-493's case, already tried twice and rejected for
+regressing point reads and small joins — not a new opportunity, a confirmed
+one still open. The likelier next win is not in this hot path at all: these
+two shapes are the same two tables in opposite `FROM` order, and the
+7.93x-faster shape only wins because it drives the join from the smaller side
+(20,000 outer iterations against a secondary-index range probe) rather than
+the larger one (160,000 outer iterations against a primary-key point probe).
+Nothing here chooses that automatically — `FROM posts JOIN users` and
+`FROM users JOIN posts` get whichever physical order was written, and join
+column ordinals are resolved against that written order at plan time, so
+picking the cheaper side is not a local change: it needs the physical
+iteration order decoupled from the logical column layout a plan's
+expressions already reference. Scoped, not started.
 
 ### Durable writes — we win
 
