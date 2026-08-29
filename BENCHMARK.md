@@ -416,13 +416,22 @@ real one remains, process isolation and all. `inlaysql-server`'s
 thread-per-connection model (`docs/server.md`'s D2) is the standing
 architectural difference from MySQL's worker pool named below and was the
 obvious next suspect — **checked separately, immediately after this run,
-and it did not hold up either**: the same driver against the same server
-running directly on the host (no Docker) scales *up* with concurrency at
-every workload size tried, and a profile of the server during that load
-found it 81.4% idle in `recvfrom`. See "What is not measured here" below
-for the numbers — the container/compose environment, not the server's own
-concurrency model, is now the more likely place this drop lives, though
-that is not proven either. Absolute
+and it did not hold up either, twice**: the same driver against the same
+server running directly on the host (no Docker) scales *up* with
+concurrency at every workload size tried, profiled at 81.4% idle in
+`recvfrom`; then isolated *inside* the compose network too —
+`inlaysql-server` alone, and again with the full five-container stack
+present but idle — and both still scale up cleanly. What does reproduce the
+drop: running `mysql_driver.py` for real immediately before
+`server_driver.py`, in that same idle stack, which is exactly `compare.sh`'s
+own phase order. See "What is not measured here" below for the numbers.
+`inlaysql-server`'s own concurrency handling is now the *less* likely place
+this drop lives — two independent checks, on two different hosts (loopback
+and compose network), say it has spare capacity at this concurrency — and a
+preceding driver phase's burst of activity is the more likely one, though
+the exact mechanism (MySQL's own background catch-up, `drivers`-container
+state carried across phases, a Docker Desktop VM scheduler effect) is not
+pinned down. Absolute
 throughput here is well below every other edition of this table on both
 engines — a busier host or a container resource change since the last
 `compare.sh` run, not a regression in either database; only the relative,
@@ -470,28 +479,35 @@ engines. "Comparable" is not "hardware-durable".
   Anserini's and a gap against them would otherwise be a tokenisation
   difference wearing a scoring result.
 - **Now has a trustworthy driver, and the obvious server-side explanation
-  did not survive checking either.** The server-to-server table above is
+  did not survive checking, twice.** The server-to-server table above is
   process-isolated on both sides as of 2026-08-29, closing the "the client's
   own concurrency shape might be the real cause" question the last three
   editions carried: InlaySQL's read throughput really does drop from one
   connection to eight (9,033.3 → 6,294.3 ops/s), where MySQL's own is flat
-  across the same step. But run the same driver against `inlaysql serve
-  --mysql` directly on the host — no Docker, a loopback socket instead of
-  the compose network — at matching and larger workload shapes, and the drop
-  does not reproduce; every shape scales *up* with concurrency instead
-  (1,180 → 9,980 ops/s at the Docker-matched 125-reads-per-connection shape).
-  Sampling the server's own process during that local 8-connection load
-  found it 81.4% idle in `recvfrom`, not CPU-bound — the same "sampled
-  mid-run, its threads sit in `recvfrom`" finding the read-drop
-  investigation two editions ago already made once, independently
-  reproduced here on a different run of a different workload. Two
-  consistent signals now say the container/compose environment is a more
-  likely cause than `inlaysql-server`'s thread-per-connection model, which
-  is the standing architectural difference and *was* the obvious first
-  suspect — not disproven outright (different host path, no other
-  containers competing, not a controlled A/B), but no longer the
-  uncontested one either. See `PLAN.md`'s W5 for the specific next
-  isolation this points to before any worker-pool rewrite.
+  across the same step. First check: the same driver against `inlaysql
+  serve --mysql` directly on the host (no Docker, a loopback socket) at
+  matching and larger workload shapes never reproduces it, scaling *up*
+  instead (1,180 → 9,980 ops/s at the Docker-matched shape), and a profile
+  of the server during that load found it 81.4% idle in `recvfrom`, not
+  CPU-bound. Second check, ruling out the container environment itself
+  rather than just the host/loopback difference: `inlaysql-server` run
+  *inside* the same compose network, alone and then with the full
+  five-container stack present but idle, both scale up cleanly too
+  (2,336 → 16,549 ops/s with every original container present and running,
+  none of them sent a query). What *does* reproduce the drop: running
+  `mysql_driver.py` for real immediately before `server_driver.py`, in that
+  same idle stack — exactly this table's own generation order
+  (`bench/compare.sh` runs DuckDB, pgvector, PostgreSQL, MySQL, *then*
+  server-to-server). Not root-caused past that — plausibly MySQL's own
+  post-write background work, plausibly something the `drivers` container
+  carries across sequential phases, plausibly a Docker Desktop VM scheduler
+  effect from a preceding burst that a 20-second gap did not clear — but
+  `inlaysql-server`'s thread-per-connection model, the standing
+  architectural difference from MySQL's worker pool and the obvious first
+  suspect, is now the *less* likely explanation: two independent hosts
+  (loopback and compose network) both say it has spare capacity at this
+  concurrency. A worker-pool rewrite aimed at this number would very likely
+  not fix it. See `PLAN.md`'s W5 for what is still open.
 - **No server-to-server PostgreSQL row.** `inlaysql serve` speaks the MySQL
   wire protocol and nothing else, so there is no like-for-like transport to
   measure PostgreSQL over; `bench/README.md` says so under
