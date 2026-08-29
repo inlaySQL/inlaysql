@@ -13,7 +13,7 @@ SUITE=retrieval ./bench/run.sh      # just the retrieval workload
 WRITER_LEVELS=1,32 SUITE=concurrency ./bench/run.sh
 WRITER_LEVELS=1,128 SUITE=concurrency ./bench/run.sh
 
-./bench/compare.sh                  # vs DuckDB, pgvector, MySQL, PostgreSQL (needs Docker)
+./bench/compare.sh                  # vs DuckDB, pgvector, Meilisearch, MySQL, PostgreSQL (needs Docker)
 
 REPEATS=5 ./bench/repeat.sh         # run.sh five times, report the median and the spread
 REPEATS=5 SUITE=retrieval ./bench/repeat.sh
@@ -46,13 +46,14 @@ traceable to what produced it.
 Two scripts, because of one line the project rules draw: every published number
 has to regenerate from a checkout. SQLite and `sqlite-vec` link into the
 harness, so `run.sh` needs nothing but `cargo`. DuckDB is a separate runtime,
-and pgvector/PostgreSQL/MySQL are servers, so `compare.sh` puts all four (plus
-InlaySQL's own MySQL-wire server) in containers with pinned versions —
-reproducible, but only on a machine with Docker. `compare.sh` covers three
-workloads: the retrieval comparison (recall + latency, against DuckDB and
-pgvector), the OLTP comparison (point reads and writes, against MySQL and
-plain PostgreSQL, InlaySQL as a library — see "OLTP: MySQL and PostgreSQL,
-matched durability" below), and the server-to-server OLTP comparison
+and pgvector/Meilisearch/PostgreSQL/MySQL are servers, so `compare.sh` puts
+all five (plus InlaySQL's own MySQL-wire server) in containers with pinned
+versions — reproducible, but only on a machine with Docker. `compare.sh`
+covers three workloads: the retrieval comparison (recall + latency, against
+DuckDB, pgvector and Meilisearch), the OLTP comparison (point reads and
+writes, against MySQL and plain PostgreSQL, InlaySQL as a library — see
+"OLTP: MySQL and PostgreSQL, matched durability" below), and the
+server-to-server OLTP comparison
 (InlaySQL's own MySQL wire against MySQL's, same client, a couple of
 concurrency levels — see "Server-to-server" below).
 
@@ -564,7 +565,7 @@ The corpus and the queries are generated from a seeded PRNG, so `--seed 42`
 asks exactly the same questions on every machine. The external comparison of
 the same workload — against DuckDB and pgvector — is `./bench/compare.sh`.
 
-## ./bench/compare.sh — DuckDB, pgvector, MySQL and PostgreSQL
+## ./bench/compare.sh — DuckDB, pgvector, Meilisearch, MySQL and PostgreSQL
 
 ```sh
 ./bench/compare.sh                      # 5,000 docs, dim 128, 100 queries
@@ -605,17 +606,30 @@ On one developer machine — 5,000 documents, dim 128, 100 queries, top-10:
 
 | Engine | recall@10 | vector p50 | hybrid p50 | agree |
 | --- | --- | --- | --- | --- |
-| InlaySQL (HNSW + BM25) | 1.000 | 147 µs | **191 µs** | 0.988 |
-| DuckDB (exhaustive + `fts` BM25) | 0.999 | 4.81 ms | 11.90 ms | 0.966 |
-| DuckDB (`vss` HNSW + `fts` BM25) | 0.993 | 3.97 ms | 11.38 ms | 0.958 |
-| pgvector (HNSW + `ts_rank`) | 0.987 | 198 µs | 14.16 ms | 0.456 |
-| pgvector (exhaustive + `ts_rank`) | 0.999 | 509 µs | 14.14 ms | 0.465 |
+| InlaySQL (HNSW + BM25) | 1.000 | 126 µs | **197 µs** | 0.988 |
+| DuckDB (exhaustive + `fts` BM25) | 0.999 | 4.88 ms | 11.88 ms | 0.966 |
+| DuckDB (`vss` HNSW + `fts` BM25) | 0.993 | 3.95 ms | 11.51 ms | 0.958 |
+| Meilisearch (`arroy` ANN + its own ranking) | 0.997 | 1.22 ms | 4.04 ms | 0.419 |
+| pgvector (HNSW + `ts_rank`) | 0.988 | 152 µs | 13.64 ms | 0.457 |
+| pgvector (exhaustive + `ts_rank`) | 0.999 | 488 µs | 13.99 ms | 0.465 |
 
-**We win hybrid by roughly 60x**, because it is one statement here and two
-queries plus client-side fusion everywhere else. That multiple was ~10x when
-this table was first written and ~14–17x an edition ago; most of the latest
-jump is the BM25 index rewrite (`crates/inlaysql-core/src/bm25.rs`), which took
-our hybrid p50 from 875 µs to 191 µs while every baseline stayed put.
+**We win hybrid by roughly 20x** against the nearest baseline (Meilisearch,
+the dedicated search engine in this table) and by 60–70x against DuckDB and
+pgvector, because it is one statement here and two queries plus client-side
+fusion everywhere else — Meilisearch included, since its own built-in hybrid
+mode is deliberately not what this table measures (see "Reading the table"
+below). Against DuckDB/pgvector that multiple was ~10x when this table was
+first written and ~14–17x an edition ago; most of the later jump is the BM25
+index rewrite (`crates/inlaysql-core/src/bm25.rs`), which took our hybrid p50
+from 875 µs to 191–197 µs while every baseline stayed put.
+
+**Meilisearch's vector search is the fastest baseline recall-for-recall over
+a network** — 1.22 ms against pgvector's 152 µs is not close, but pgvector's
+number does not include building the equivalent of Meilisearch's typo
+tolerance and ranking pipeline; read the two as different products, not two
+points on one line. Its hybrid `agree` (0.419) lands in the same range as
+pgvector's `ts_rank_cd` (0.457/0.465), for the reason "Reading the table"
+below gives: neither ranks text with BM25.
 
 **The vector-only loss to pgvector is gone, and was never a rout.** This table
 used to read "pgvector beats us on vector search by 4x — over a network"; it is
@@ -631,26 +645,39 @@ similarity, which is not any engine's opinion.
 
 **`agree` is not.** It is overlap with our reference fusion, and an engine that
 ranks text with a different function scores lower without being worse.
-PostgreSQL ranks with `ts_rank_cd` rather than BM25 and lands around 0.49 for
-exactly that reason. DuckDB's `fts` extension does implement Okapi BM25, which
-is why it sits much higher. Read the latencies as the result.
+PostgreSQL ranks with `ts_rank_cd` rather than BM25 and lands around 0.46 for
+exactly that reason; Meilisearch ranks with its own rule chain (typo
+tolerance, proximity, attribute, exactness — no BM25 in it at all) and lands
+at 0.419, in the same range for the same reason. DuckDB's `fts` extension
+does implement Okapi BM25, which is why it sits much higher. Read the
+latencies as the result.
 
 **The hybrid latencies are not measuring equal work.** InlaySQL fuses inside one
-SQL statement. Neither baseline has a fusion operator, so their driver runs two
-queries and combines the ranks in Python. That is what hybrid search costs on
-them today, which is the comparison worth making — but it is not one query
+SQL statement. No baseline here has a fusion operator of its own that this
+comparison uses — Meilisearch does have a built-in hybrid mode
+(`semanticRatio`), but using it would score its *fusion algorithm* against
+ours rather than isolating retrieval quality, so `meilisearch_driver.py`
+runs vector-only and text-only as two separate requests and fuses them with
+the identical `common.rrf` every other driver uses. So every baseline's
+driver runs two queries and combines the ranks in Python, InlaySQL runs one
+statement — what hybrid search costs the comparison way today, not one query
 against one query.
 
-Both baselines are asked for their query plan, and what the plan actually said —
-index scan or sequential scan — is printed with the row. An "HNSW" row that was
-really a sequential scan would be the most misleading number in the table, and
-it happens easily: DuckDB only rewrites `ORDER BY array_cosine_distance(…)` into
-an index scan, never the equivalent `array_cosine_similarity(…) DESC`.
+Both DuckDB and pgvector are asked for their query plan, and what the plan
+actually said — index scan or sequential scan — is printed with the row. An
+"HNSW" row that was really a sequential scan would be the most misleading
+number in the table, and it happens easily: DuckDB only rewrites `ORDER BY
+array_cosine_distance(…)` into an index scan, never the equivalent
+`array_cosine_similarity(…) DESC`. Meilisearch has no equivalent plan to
+check — its vector search always goes through its own `arroy` ANN index,
+with no exhaustive-scan option in the search API — which is also why it has
+one row here instead of two.
 
 ### What it costs to reproduce
 
-Docker, and pinned images: `pgvector/pgvector:pg17`, `postgres:17`, `mysql:8`,
-`python:3.12-slim`, `duckdb==1.1.3`, `mysql-connector-python==9.1.0`, plus
+Docker, and pinned images: `pgvector/pgvector:pg17`, `getmeili/meilisearch:v1.53`,
+`postgres:17`, `mysql:8`, `python:3.12-slim`, `duckdb==1.1.3`,
+`mysql-connector-python==9.1.0`, `requests==2.34.2`, plus
 `docker/Dockerfile`'s `rust:1.91-bookworm` — the same pinned Linux build image
 `docker/test.sh` uses, reused rather than a second one, for the containerised
 InlaySQL OLTP row below *and* for `inlaysql-server`, the container that runs

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# InlaySQL against DuckDB, pgvector (retrieval), MySQL/PostgreSQL (plain OLTP
-# point reads and writes) and, server-to-server, InlaySQL's own MySQL wire
-# against MySQL's, on one corpus.
+# InlaySQL against DuckDB, pgvector and Meilisearch (retrieval), MySQL/
+# PostgreSQL (plain OLTP point reads and writes) and, server-to-server,
+# InlaySQL's own MySQL wire against MySQL's, on one corpus.
 #
 #   ./bench/compare.sh                     # defaults
 #   DOCS=20000 DIM=384 ./bench/compare.sh  # override any parameter
@@ -15,9 +15,10 @@
 #   1. Generates the retrieval corpus and the OLTP workload once, and
 #      measures InlaySQL on both, on the host (`--export` and
 #      `--export-oltp`).
-#   2. Starts pgvector, plain PostgreSQL, MySQL and `inlaysql serve --mysql`
-#      in containers and runs the DuckDB, pgvector, PostgreSQL-OLTP and MySQL
-#      drivers against those same files.
+#   2. Starts pgvector, Meilisearch, plain PostgreSQL, MySQL and `inlaysql
+#      serve --mysql` in containers and runs the DuckDB, pgvector,
+#      Meilisearch, PostgreSQL-OLTP and MySQL drivers against those same
+#      files.
 #   3. Runs the server-to-server driver: the same `mysql.connector` client
 #      library against both the MySQL container and the InlaySQL-server
 #      container, at a couple of concurrency levels — the one row where
@@ -31,8 +32,8 @@
 #      rows, and a server-to-server table — and writes it to bench/results/.
 #
 # Everything except step 1 needs Docker. The engines are not linked into the
-# harness — DuckDB is a separate runtime, and pgvector/PostgreSQL/MySQL need a
-# server — so a container is what makes their numbers reproducible instead of
+# harness — DuckDB is a separate runtime, and pgvector/Meilisearch/PostgreSQL/
+# MySQL need a server — so a container is what makes their numbers reproducible instead of
 # dependent on whatever happens to be installed on the machine. Steps 3 and 4
 # reuse docker/Dockerfile to build this same workspace on Linux, the way
 # docker/test.sh does, rather than a second image.
@@ -103,6 +104,9 @@ echo "==> DuckDB"
 
 echo "==> pgvector"
 "${COMPOSE[@]}" exec -T drivers python pgvector_driver.py
+
+echo "==> Meilisearch"
+"${COMPOSE[@]}" exec -T drivers python meilisearch_driver.py
 
 echo "==> PostgreSQL (OLTP, matched durability)"
 "${COMPOSE[@]}" exec -T drivers python postgres_oltp_driver.py

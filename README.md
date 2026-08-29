@@ -705,8 +705,8 @@ SQLite does, so that one is gone.
 How everything else is tested — deterministic simulation, metamorphic and
 differential logic-bug tests, fuzzing, cross-backend equivalence — and what is
 *not* covered is in [`TESTING.md`](TESTING.md). Benchmarks against SQLite,
-`sqlite-vec`, DuckDB, pgvector, MySQL and PostgreSQL, including the ones we
-lose, are in [`bench/README.md`](bench/README.md) and
+`sqlite-vec`, DuckDB, pgvector, Meilisearch, MySQL and PostgreSQL, including
+the ones we lose, are in [`bench/README.md`](bench/README.md) and
 [`BENCHMARK.md`](BENCHMARK.md); every number in either one regenerates from
 `./bench/run.sh` or `./bench/compare.sh`.
 
@@ -726,7 +726,7 @@ crates/
   inlaysql-bench/   benchmark harness, incl. the SQLite comparison
 fuzz/               cargo-fuzz targets
 bench/run.sh        reproducible benchmark run (SQLite, sqlite-vec)
-bench/compare.sh    the same, against DuckDB, pgvector, MySQL and PostgreSQL in containers
+bench/compare.sh    the same, against DuckDB, pgvector, Meilisearch, MySQL and PostgreSQL in containers
 ```
 
 `inlaysql-core` is where the database actually lives. It is `no_std`, so it
@@ -769,7 +769,7 @@ OS-facing crate turns up in its dependency tree.
 
 ```sh
 ./bench/run.sh                  # points, indexed, joins, vectors, quantisation, retrieval (pinned params)
-./bench/compare.sh              # DuckDB, pgvector, MySQL, PostgreSQL (needs Docker)
+./bench/compare.sh              # DuckDB, pgvector, Meilisearch, MySQL, PostgreSQL (needs Docker)
 REPEATS=5 ./bench/repeat.sh     # run.sh five times: median plus how far the runs disagreed
 ```
 
@@ -866,24 +866,28 @@ cannot reach the `k`-th best found so far. Scores are unchanged bit for bit and
 ranking is unchanged including ties. BM25 used to be 79% of the hybrid p50; it
 is now 50%, and the vector leg is the larger half.
 
-Against DuckDB and pgvector, one corpus and one exhaustive ground truth
-shared by all three engines — see
-[`bench/README.md`](bench/README.md#benchcomparesh--duckdb-pgvector-mysql-and-postgresql)
+Against DuckDB, pgvector and Meilisearch, one corpus and one exhaustive
+ground truth shared by all four engines — see
+[`bench/README.md`](bench/README.md#benchcomparesh--duckdb-pgvector-meilisearch-mysql-and-postgresql)
 for the full methodology. 5,000 documents, dim 128, 100 queries, top-10:
 
 | Engine | recall@10 | vector p50 | hybrid p50 |
 | --- | --- | --- | --- |
-| InlaySQL (HNSW + BM25) | 1.000 | **84.00 µs** | **130.00 µs** |
-| DuckDB (vss HNSW + `fts`) | 0.991 | 5.87 ms | 14.43 ms |
-| pgvector (HNSW + `ts_rank`) | 0.988 | 164.00 µs | 14.24 ms |
+| InlaySQL (HNSW + BM25) | 1.000 | **126.00 µs** | **197.00 µs** |
+| DuckDB (vss HNSW + `fts`) | 0.993 | 3.95 ms | 11.51 ms |
+| Meilisearch (`arroy` ANN + its own ranking) | 0.997 | 1.22 ms | 4.04 ms |
+| pgvector (HNSW + `ts_rank`) | 0.988 | 152.00 µs | 13.64 ms |
 
-**Hybrid is roughly 92x** the nearest baseline and 110x pgvector, up from
-14–17x two editions ago — because it is one statement here and two queries plus
-client-side rank fusion there, not a comparison of equal work either way, and
-`bench/README.md` says so. Vector-only is now ahead too: 84 µs against
-pgvector's 164 µs, where the last edition had us behind. Their number includes a
-socket round trip a library in your process does not pay, so read it as ~2x with
-an asterisk.
+**Hybrid is roughly 20x** the nearest baseline now that Meilisearch, a
+dedicated search engine, is in the comparison, and 60–70x DuckDB/pgvector —
+because it is one statement here and two queries plus client-side rank
+fusion there (Meilisearch's own hybrid mode included: it is deliberately not
+used, so every engine in the table is fused the same way), not a comparison
+of equal work either way, and `bench/README.md` says so. Vector-only stays
+ahead of pgvector: 126 µs against 152 µs, both paying pgvector's socket
+round trip a library in your process does not; Meilisearch's 1.22 ms is
+doing more per query (its own ranking pipeline runs alongside the ANN
+search), so read that gap as two different products, not a rout.
 
 Recall on uniformly random vectors is a structural, not a tuning, problem: on
 text-derived embeddings recall@10 stays flat across a 20x range of corpus

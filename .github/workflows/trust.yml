@@ -144,15 +144,16 @@ jobs:
       - name: Run the benchmark suites
         run: ./bench/run.sh
 
-      # DuckDB and pgvector need containers, so this is best-effort: a runner
-      # without Docker reports that rather than failing the job, because the
-      # numbers above are still worth publishing without it.
-      - name: Compare against DuckDB and pgvector
+      # DuckDB, pgvector and Meilisearch need containers, so this is
+      # best-effort: a runner without Docker reports that rather than
+      # failing the job, because the numbers above are still worth
+      # publishing without it.
+      - name: Compare against DuckDB, pgvector and Meilisearch
         run: |
           if docker info >/dev/null 2>&1; then
             ./bench/compare.sh
           else
-            echo "::warning::docker unavailable on this runner: DuckDB and pgvector were not measured"
+            echo "::warning::docker unavailable on this runner: DuckDB, pgvector and Meilisearch were not measured"
           fi
 
       - name: Summarise

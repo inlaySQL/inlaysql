@@ -8,11 +8,12 @@ FROM python:3.12-slim
 RUN pip install --no-cache-dir \
       duckdb==1.1.3 \
       "psycopg[binary]==3.2.3" \
-      mysql-connector-python==9.1.0
+      mysql-connector-python==9.1.0 \
+      requests==2.34.2
 
 WORKDIR /drivers
 COPY common.py duckdb_driver.py pgvector_driver.py postgres_oltp_driver.py mysql_driver.py \
-     server_driver.py report.py ./
+     server_driver.py meilisearch_driver.py report.py ./
 
 # The corpus is mounted, never baked in: the image is the environment and the
 # corpus is the experiment.

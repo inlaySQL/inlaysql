@@ -9,7 +9,7 @@ beside wins, because a table that only contains wins is advertising.
 
 ```sh
 ./bench/run.sh                  # points, indexed, joins, vectors, quantisation, retrieval (pinned params)
-./bench/compare.sh              # DuckDB, pgvector, MySQL, PostgreSQL (needs Docker)
+./bench/compare.sh              # DuckDB, pgvector, Meilisearch, MySQL, PostgreSQL (needs Docker)
 ```
 
 | | |
@@ -19,7 +19,7 @@ beside wins, because a table that only contains wins is advertising.
 | Tree | source clean (`dirty: no` in both raw outputs) |
 | Machine | Apple Mac17,9, 18 cores, macOS 27.0 (Darwin 27.0.0 arm64) |
 | Toolchain | rustc 1.91.1 (ed61e7d7e 2025-11-07) |
-| Raw output | `bench/results/20260825T103354Z.txt` and `20260825T104132Z.txt` (SQLite, `sqlite-vec`; two runs, median published); `20260825T110513Z-compare.txt` (DuckDB, pgvector, MySQL, PostgreSQL) |
+| Raw output | `bench/results/20260825T103354Z.txt` and `20260825T104132Z.txt` (SQLite, `sqlite-vec`; two runs, median published); `20260825T110513Z-compare.txt` (DuckDB, pgvector, MySQL, PostgreSQL). Retrieval section regenerated 2026-08-29 (Meilisearch added): `20260829T084502Z-compare.txt` |
 
 One developer machine. Reproduce it; do not trust it. Both runs are new this
 edition, so — unlike the previous one — every table below comes from the same
@@ -309,33 +309,49 @@ and are not implemented.
 
 ---
 
-## Against DuckDB and pgvector
+## Against DuckDB, pgvector and Meilisearch
 
 One corpus, one set of queries, one exhaustive ground truth, each engine asked
 for its own query plan so an unindexed row cannot masquerade as an indexed one.
-5,000 documents, dim 128.
+5,000 documents, dim 128. **Meilisearch added 2026-08-29** — a dedicated
+search engine, the other kind of thing this retrieval story competes with
+beyond "a database with vectors added"; see `bench/README.md`'s
+`bench/external/meilisearch_driver.py` notes for what it measures and does
+not (its own hybrid mode is deliberately not used — this driver fuses with
+the identical `common.rrf` every engine in this table is fused with, so the
+fusion algorithm stays constant and only the raw rankings differ).
 
 | Engine | recall@10 | vector p50 | hybrid p50 |
 | --- | --- | --- | --- |
-| **InlaySQL** (HNSW + BM25) | 1.000 | **84.00 µs** | **130.00 µs** |
-| DuckDB (exhaustive + fts BM25) | 0.999 | 4.86 ms | 11.93 ms |
-| DuckDB (vss HNSW + fts BM25) | 0.991 | 5.87 ms | 14.43 ms |
-| pgvector (HNSW + `ts_rank`) | 0.988 | 164.00 µs | 14.24 ms |
-| pgvector (exhaustive + `ts_rank`) | 0.999 | 499.00 µs | 14.42 ms |
+| **InlaySQL** (HNSW + BM25) | 1.000 | **126.00 µs** | **197.00 µs** |
+| DuckDB (exhaustive + fts BM25) | 0.999 | 4.88 ms | 11.88 ms |
+| DuckDB (vss HNSW + fts BM25) | 0.993 | 3.95 ms | 11.51 ms |
+| Meilisearch (`arroy` ANN + its own ranking) | 0.997 | 1.22 ms | 4.04 ms |
+| pgvector (HNSW + `ts_rank`) | 0.988 | 152.00 µs | 13.64 ms |
+| pgvector (exhaustive + `ts_rank`) | 0.999 | 488.00 µs | 13.99 ms |
 
-**Hybrid is roughly 92x** the nearest baseline (11.93 ms, DuckDB exhaustive)
-and **110x** pgvector, up from 14–17x two editions ago and 60x in the last one.
-The BM25 index rewrite is most of that: our hybrid p50 has gone 875 µs → 191 µs
-→ 130 µs while every baseline stayed inside its own noise. It is still not one
+**Hybrid is roughly 20x** the nearest baseline now that one exists
+(4.04 ms, Meilisearch) and **60–70x** DuckDB/pgvector, up from 14–17x two
+editions ago and 60–92x in the last one (a same-session, same-run
+regeneration — read the InlaySQL row's own movement, 84 µs/130 µs last
+edition to 126 µs/197 µs here, as the noise band this page keeps warning
+about, not a regression). The BM25 index rewrite is most of the multiple
+against DuckDB/pgvector: our hybrid p50 has gone 875 µs → 191 µs → 130–197 µs
+while those two baselines stayed inside their own noise. It is still not one
 query against one query — it is one statement here against two queries plus
-client-side rank fusion there — and `bench/README.md` says so plainly.
+client-side rank fusion there, Meilisearch included — and `bench/README.md`
+says so plainly.
 
-**Vector-only is now a win rather than a near-miss.** 84 µs against pgvector's
-164 µs, where the last edition had us behind at 147 µs to their 198 µs. Their
-number includes a socket round trip that a library in your own process does not
-pay, so read it as roughly 2x with an asterisk, not as a rout — and note our own
-figure was 147 µs an edition ago on the same code path, which is the spread this
-page keeps warning about.
+**Vector-only stays a win against pgvector, and Meilisearch is the fastest
+baseline recall-for-recall over a network.** 126 µs against pgvector's
+152 µs (both include pgvector's socket round trip a library in your own
+process does not pay, so read it as close rather than as a rout) and against
+Meilisearch's 1.22 ms — not a fair fight in InlaySQL's favour so much as a
+different product: Meilisearch's ANN search also runs its own typo-tolerance
+and ranking pipeline, which pgvector's raw `<=>` operator does not.
+Meilisearch's `agree` (0.419) sits in the same range as pgvector's
+`ts_rank_cd` rows (0.457/0.465) for the same reason both are below DuckDB's
+real BM25: neither ranks text with BM25 at all.
 
 ---
 
@@ -496,9 +512,10 @@ engines. "Comparable" is not "hardware-durable".
   (2,336 → 16,549 ops/s with every original container present and running,
   none of them sent a query). What *does* reproduce the drop: running
   `mysql_driver.py` for real immediately before `server_driver.py`, in that
-  same idle stack — exactly this table's own generation order
-  (`bench/compare.sh` runs DuckDB, pgvector, PostgreSQL, MySQL, *then*
-  server-to-server). Not root-caused past that — plausibly MySQL's own
+  same idle stack — exactly this table's own generation order at the time
+  (`bench/compare.sh` ran DuckDB, pgvector, PostgreSQL, MySQL, *then*
+  server-to-server; Meilisearch was added to the sequence afterward, between
+  pgvector and PostgreSQL). Not root-caused past that — plausibly MySQL's own
   post-write background work, plausibly something the `drivers` container
   carries across sequential phases, plausibly a Docker Desktop VM scheduler
   effect from a preceding burst that a 20-second gap did not clear — but

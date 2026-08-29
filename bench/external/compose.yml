@@ -30,6 +30,25 @@ services:
     tmpfs:
       - /var/lib/postgresql/data
 
+  # A dedicated search engine, not a SQL database with vectors added — the
+  # other side of the retrieval comparison from pgvector/DuckDB. Pinned to
+  # the major version for the same reason pgvector is: index behaviour moves
+  # between releases and `latest` would silently attribute that to us.
+  # `MEILI_NO_ANALYTICS` opts this container out of Meilisearch's own
+  # phone-home telemetry, which a benchmark image has no business sending.
+  meilisearch:
+    image: getmeili/meilisearch:v1.53
+    environment:
+      MEILI_MASTER_KEY: bench
+      MEILI_NO_ANALYTICS: "true"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:7700/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      - /meili_data
+
   # Plain PostgreSQL — no pgvector extension — for the OLTP point-read/
   # point-write comparison. Configured for real durability, the opposite of
   # the `pgvector` service above: that container measures query latency and
@@ -154,6 +173,8 @@ services:
     environment:
       PG_DSN: postgresql://postgres:postgres@pgvector:5432/postgres
       PG_OLTP_DSN: postgresql://postgres:postgres@postgres:5432/bench
+      MEILISEARCH_URL: http://meilisearch:7700
+      MEILISEARCH_KEY: bench
       MYSQL_HOST: mysql
       MYSQL_PORT: "3306"
       MYSQL_USER: root
@@ -174,6 +195,8 @@ services:
       SERVER_LOOKUPS: ${SERVER_LOOKUPS:-1000}
     depends_on:
       pgvector:
+        condition: service_healthy
+      meilisearch:
         condition: service_healthy
       postgres:
         condition: service_healthy
