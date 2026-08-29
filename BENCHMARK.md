@@ -19,7 +19,7 @@ beside wins, because a table that only contains wins is advertising.
 | Tree | source clean (`dirty: no` in both raw outputs) |
 | Machine | Apple Mac17,9, 18 cores, macOS 27.0 (Darwin 27.0.0 arm64) |
 | Toolchain | rustc 1.91.1 (ed61e7d7e 2025-11-07) |
-| Raw output | `bench/results/20260825T103354Z.txt` and `20260825T104132Z.txt` (SQLite, `sqlite-vec`; two runs, median published); `20260825T110513Z-compare.txt` (DuckDB, pgvector, MySQL, PostgreSQL). Retrieval section regenerated 2026-08-29 (Meilisearch added): `20260829T084502Z-compare.txt` |
+| Raw output | `bench/results/20260825T103354Z.txt` and `20260825T104132Z.txt` (SQLite, `sqlite-vec`; two runs, median published); `20260825T110513Z-compare.txt` (DuckDB, pgvector, MySQL, PostgreSQL). Retrieval section regenerated 2026-08-29 (Meilisearch added): `20260829T084502Z-compare.txt`. Concurrent-writers section regenerated 2026-08-30 on base commit `63b6cb2` with an adaptive commit-coalesce window applied and uncommitted at capture time (committed immediately after regeneration — see PERF.md), median of three runs each: `20260830T031300Z.txt`/`20260830T032800Z.txt`/`20260830T032900Z.txt` (published 1/2/4/8 sweep) and `20260830T031500Z.txt`/`20260830T032100Z.txt`/`20260830T033600Z.txt` (wide sweep) |
 
 One developer machine. Reproduce it; do not trust it. Both runs are new this
 edition, so — unlike the previous one — every table below comes from the same
@@ -156,50 +156,81 @@ One row per commit, one `fsync` per commit.
 to 61,025 ops/s at 10.75 µs — **254x** — which is the number to quote for a
 bulk load and not for a transaction.
 
-### Concurrent writers — we win up to eight, then the win shrinks
+### Concurrent writers — the peak moved from eight to the mid-teens, and past it the win still shrinks
 
-200 transactions per writer, one row each, on real OS threads.
+200 transactions per writer, one row each, on real OS threads. Median of
+three runs each (`bench/results/20260830T031300Z.txt`,
+`20260830T032800Z.txt`, `20260830T032900Z.txt`), load 3.2–3.7/18 throughout.
 
 | Writers | InlaySQL commits/s | SQLite commits/s |
 | --- | --- | --- |
-| 1 | 245 | 87 |
-| 2 | 265 | 87 |
-| 4 | 434 | 87 |
-| 8 | **694** | 86 |
+| 1 | 246 | 90 |
+| 2 | 394 | 91 |
+| 4 | 615 | 91 |
+| 8 | **1184** | 91 |
 
-**8.1x SQLite at 8 writers, 0.0% aborted.** The 8-writer scaling (694 against
-245 at one writer is 2.83x) shows group commit batching most fsyncs. The
-2-writer case remains relatively flat (265 against 245), still fsync-bound —
-the follower's write usually lands after the leader captured its flush target.
-(This table previously showed 768/8.9x — a number carried over from a spin-
-before-parking experiment that was benchmarked, found not to reproduce, and
-reverted; 694 is the real, twice-confirmed figure for the shipped code, and
-matches the wide sweep below.)
+**13.0x SQLite at 8 writers, 0.0% aborted — up from the 8.1x this table
+previously published, and not from a faster fsync.** The commit gate's
+existing pre-`fsync` gather window (`coalesce_normal_commits`,
+`crates/inlaysql/src/device.rs`) used to spend a fixed 8 scheduler yields
+deciding whether another writer was about to arrive, which is roughly
+200-250x too short — a `yield_now` costs ~135-145ns and a competing writer
+needs ~30µs to reach the gate and publish its ticket — so the window almost
+always closed before a second writer had a real chance to be gathered,
+regardless of how many were waiting. It is now adaptive: it keeps yielding
+while a normal commit is inflight or waiting and progress keeps happening,
+closing on stalled progress instead of a fixed count. The 8-writer scaling
+(1184 against 246 at one writer is 4.81x, up from 2.83x) shows more commits
+riding each `fsync`. The 2-writer case is no longer nearly flat either
+(394 against 246, 1.60x, up from 1.08x) but is still far from proportional —
+see `PERF.md`'s new section for the `pwrite`-during-concurrent-`fsync`
+mechanism this fixes and the full before/after. (This table previously
+showed 768/8.9x from a spin-before-parking experiment that did not reproduce
+and was reverted, then 694/8.1x for the shipped code before this fix; 1184 is
+the current, three-times-measured figure and matches the wide sweep below.)
 
 **Published because it is true, not because it flatters us: eight writers is
-the peak, not the ceiling — past it, throughput falls.** A wider sweep the
-table above stops short of (`WRITER_LEVELS=1,2,3,4,5,6,8,12,16,24,32`, same
-session, same machine): 249 → 259 → 348 → 458 → 541 → 559 → **694** → 624 →
-607 → 550 → **516** commits/s. 32 writers does worse than 8, not merely no
-better, reproduced twice. SQLite's own row stays flat across the identical
-sweep (85–93 throughout), so this is specific to how this engine's writers
-contend, not generic OS thread-count overhead — every writer's whole commit
-*prepare* phase (conflict check, WAL encode, page writes, WAL append) turns
-out to serialize behind one process-wide gate regardless of how many WAL
-regions exist; the regions only let one writer's `fsync` overlap the *next*
-writer's turn at that gate, confirmed by profiling (90.4% of samples parked
-waiting for it). The obvious cheap fix — spin before parking, in case
-kernel wake latency rather than the gate itself was the cost — was tried,
-measured clean, and reverted: no change, at 100 or at 5,000 spin iterations.
-A follow-up idea (shrink the gate to the conflict check and sequence/offset
-reservation only, move the encode and writes after release) turned out to
-be unsafe, not just unscoped: the conflict check walks the tree from the
-latest committed root, so it structurally depends on the previous writer's
-pages already being landed. Finer profiling also found the gate-held
-section was already cheap (under 6% of the time; the rest is pure
-contention) — see `PERF.md` for the full investigation and the one lever
-still standing (logical group commit: batch several waiting writers into
-one gate-held pass), scoped but not started.
+no longer the peak, but there still is one, and past it throughput still
+falls.** A wider sweep the table above stops short of
+(`WRITER_LEVELS=1,2,3,4,5,6,8,12,16,24,32`, same session, same machine,
+median of three runs — `bench/results/20260830T031500Z.txt`,
+`20260830T032100Z.txt`, `20260830T033600Z.txt`): 247 → 357 → 474 → 630 → 796
+→ 978 → 1195 → **1519** → **1597** → 1325 → 988 commits/s from 1 to 32
+writers. The peak is now a plateau across 12 and 16 writers rather than a
+single point at 8 — 1519 and 1597 are close enough across three runs each
+that which one nominally wins swaps run to run — and the falloff past it is
+still real and still reproduces: 16 → 24 is a 17% drop, 24 → 32 a further
+25%. **This is not the same regression re-appearing unfixed — it is the same
+shape at roughly double the height.** Every point on the new curve, including
+its declining tail, sits well above the old curve's own peak: 32 writers now
+does 988 commits/s where the old published ceiling at *any* writer count was
+694, and the old 32-writer figure was 516 — 1.91x higher even at the new
+curve's worst point. SQLite's own row stays flat across the identical sweep
+(89–92 throughout), so this remains specific to how this engine's writers
+contend, not generic OS thread-count overhead.
+
+The root cause of the *original* 8-then-falls shape is unchanged and is not
+what this fix touches: every writer's whole commit *prepare* phase (conflict
+check, WAL encode, page writes, WAL append) still serializes behind one
+process-wide gate regardless of how many WAL regions exist; the regions only
+let one writer's `fsync` overlap the *next* writer's turn at that gate,
+confirmed by profiling (90.4% of samples parked waiting for it). The obvious
+cheap fix — spin before parking, in case kernel wake latency rather than the
+gate itself was the cost — was tried, measured clean, and reverted: no
+change, at 100 or at 5,000 spin iterations. A follow-up idea (shrink the gate
+to the conflict check and sequence/offset reservation only, move the encode
+and writes after release) turned out to be unsafe, not just unscoped: the
+conflict check walks the tree from the latest committed root, so it
+structurally depends on the previous writer's pages already being landed.
+Finer profiling also found the gate-held section was already cheap (under 6%
+of the time; the rest is pure contention). What *did* move the needle this
+time was a different, smaller lever: the fixed-yield gather window on the
+*flush* side, described above — not the gate itself. See `PERF.md` for the
+full investigation and the one lever still standing for the residual
+regression above the new, higher peak: *commit-side* logical group commit
+(one gate holder absorbing other waiting writers' whole transactions into
+one prepare/encode/WAL-append pass, not just one `fsync` covering several
+already-encoded ones), scoped but not started.
 
 ---
 
@@ -415,7 +446,7 @@ here is real for this run and the size of the gap is not to be trusted. What is
 structural, and unchanged: this workload is one commit at a time on one
 connection, so group commit cannot fire by design, and the remaining cost is
 per-commit against InnoDB's redo write. Closing it is scheduled work. The
-concurrent-writer story (694 commits/s on 8 writers above) has no
+concurrent-writer story (1184 commits/s on 8 writers above) has no
 MySQL/PostgreSQL counterpart on this page yet — a server-to-server concurrent
 row is the missing apples-to-apples.
 

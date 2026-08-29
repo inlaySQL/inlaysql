@@ -1021,6 +1021,153 @@ just this suite — because a mistake here is a data-loss bug, not a slow
 query. Scoped, not started, not attempted this session given the time
 already spent correctly ruling out two smaller candidates first.
 
+### The fixed 8-yield gather window was three orders of magnitude too short, and a `pwrite`-during-`fsync` penalty is why batching was stuck at ~2 (2026-08-30)
+
+The section above named "logical group commit" — one gate holder absorbing
+other writers' *transactions* into its own prepare/encode/append pass — as the
+one lever left, and left it unstarted because it is a real commit-protocol
+redesign. This is not that. It is the flush-side half of group commit that
+already shipped (AHL-461/AHL-468): the leader that wins the reservation gate
+still calls `coalesce_normal_commits` (`crates/inlaysql/src/device.rs`) to give
+other writers a window to publish their post-write tickets before it captures
+`target = writes_completed.load(..)` and calls `fsync`. That window existed
+since AHL-461 and was never the suspect, because nobody had counted what it was
+actually buying.
+
+**Counted, with `INLAYSQL_COMMIT_STATS=1` printing `commit-stats: ...
+normal_flushes=N normal_tickets=N` at exit.** The ratio
+`normal_tickets / normal_flushes` is commits landed per `fsync` call — exactly
+the number section 3's own "lifted that to 2.8x" line above and
+`BENCHMARK.md`'s "8-writer scaling is 2.83x" line have both been implicitly
+reporting all along without ever printing it directly. Instrumented
+across the writer-count sweep, the ratio sat at **~2.0, essentially flat from 2
+writers to 32**. A gather window that is doing its job should make that ratio
+*rise* with writer count, the way `fsync` overlap already does one layer up.
+It wasn't rising at all, which means the window was closing before a second
+writer had any real chance to arrive — regardless of how many were waiting.
+
+**Why: `pwrite` on this device gets ~18-23x slower while another handle's
+`F_FULLFSYNC` is in flight on the same file.** Measured directly: an ordinary
+`pwrite` costs ~30-40µs; the same call while a concurrent `F_FULLFSYNC` is
+running against the same file costs ~600-800µs. A flush round holds the file
+for its whole ~3.3ms `fsync`, and with several writers active there is nearly
+always one running, so most commits' own writes land inside that penalized
+window — inflating each commit's gate-hold time to ~1.2-1.9ms. That is exactly
+what pins the ratio near 2: `ratio ≈ fsync_duration / gate_hold ≈
+3300 / 1400 ≈ 2.3`, matching the measured ~2.0-2.8 without anyone having to
+guess at a mechanism.
+
+**And the gather window itself was closing about 200-250x too early to do
+anything about it.** `yield_now` costs ~135-145ns; a competing writer needs
+~30µs to get scheduled, pass the reservation gate and publish its ticket — a
+~200-250x gap. The old `COMMIT_COALESCE_YIELDS = 8` spent a total of roughly
+1.1-1.2µs yielding before declaring "no cohort arriving" and proceeding to
+`fsync` — it had given up before a second thread had a realistic chance to
+even be scheduled, which is why this window never gathered more than one or
+two extra writers no matter how many were queued.
+
+**The fix makes the window adaptive instead of fixed.**
+`coalesce_normal_commits` now keeps yielding as long as a normal commit is
+inflight or waiting *and* `writes_completed` keeps advancing, and only gives up
+after `COMMIT_COALESCE_STALL_YIELDS = 1500` consecutive yields with no new
+ticket observed (a hard ceiling, `COMMIT_COALESCE_MAX_YIELDS = 16384`, bounds
+the worst case regardless). It costs nothing on the solo path — the emptiness
+check fires before the first yield, exactly as before — and it works precisely
+because *no `fsync` is in flight yet* during this pre-flush gather window: a
+writer that arrives and publishes its ticket here pays the fast ~30-40µs rate,
+not the penalized one, and its ticket is folded into the one upcoming `fsync`
+instead of needing a flush of its own. Durability ordering is untouched: this
+only ever delays the moment the flush target is captured, strictly before that
+capture, so it can only grow the set of tickets one `fsync` covers, never
+shrink it or acknowledge a ticket before its bytes are written — see the
+function's own doc comment for the argument in full.
+
+**Measured, three interleaved A/B pairs, 0.0% conflicts throughout:**
+
+| Writers | Baseline commits/s | Patched commits/s | Ratio (tickets/flush) before → after |
+| --- | --- | --- | --- |
+| 1 (solo) | 246 / 247 / 296 | 246 / 244 / 246 | n/a — solo path takes zero yields either way |
+| 8 | 629 / 677 / 778 | 1208 / 1194 / 1223 | 2.64-2.77 → 6.09-6.31 |
+| 32 | 488 / 477 / 579 | 956 / 1009 / 986 | 1.84-1.95 → 4.76-5.07 |
+
+Solo does not regress, and 8/32-writer throughput both roughly double with the
+ratio moving the same direction, which is the causal chain this section
+claims, not just a correlated number.
+
+**The published sweep, regenerated on this machine (median of three runs each,
+load 3.2-4.1/18 throughout — see `bench/results/20260830T03{13,28,29}00Z.txt`
+for the published 1/2/4/8 sweep and `20260830T03{15,21,36}00Z.txt` for the wide
+one):**
+
+| Writers | InlaySQL commits/s | SQLite commits/s | vs SQLite |
+| --- | --- | --- | --- |
+| 1 | 246 | 90 | 2.73x |
+| 2 | 394 | 91 | 4.33x |
+| 4 | 615 | 91 | 6.76x |
+| 8 | 1184 | 91 | 13.01x |
+
+**This also moves the shape this document has published since AHL-497, and
+that section's own framing — "eight writers is the peak" — is now stale and is
+corrected here rather than silently.** The wide sweep
+(`WRITER_LEVELS=1,2,3,4,5,6,8,12,16,24,32`, same session, median of three):
+247 → 357 → 474 → 630 → 796 → 978 → **1195** → **1519** → **1597** → 1325 →
+988 commits/s from 1 to 32 writers, against SQLite's own flat 89-92 across the
+same sweep (same control as AHL-497 used: not generic thread-count overhead).
+The peak is no longer at 8 — it is a plateau across 12-16 writers (1519 and
+1597, close enough across three runs each that which one nominally wins swaps
+run to run), and the falloff past it is real and reproduces across all three
+runs: 16 → 24 is a 17% drop, 24 → 32 a further 25%. So the AHL-497 finding
+that throughput falls past a peak is **still true** — the peak just moved from
+8 to roughly 12-16, and every point on the curve, including the declining
+tail, is now well above where the old curve's peak used to be: 32 writers now
+does 988-1088 commits/s against SQLite's ~90, 11-12x, where the old published
+32-writer number was 516 commits/s, ~6x. See `BENCHMARK.md`'s Concurrent
+writers section for the full regenerated table and prose.
+
+**Why this session went looking at the flush side at all: two earlier,
+correctly-executed attempts at the wait side had already come back as no-ops.**
+Spinning before parking on the reservation gate (documented above, this
+section) changed nothing at 8 or 32 writers across a 50x range of spin
+budgets, ruling out park/wake overhead as the cost. Gate admission-capping —
+the explicit normal-commit-ready ticket prototype (`962558d`, publish the
+ticket before releasing the gate, PLAN.md's W3 baseline) — also measured flat,
+508 commits/s at 32 writers against the pre-existing baseline, no stable
+improvement across setup-separated and focused reruns. Both were real
+experiments on the *wait* side of the gate, both were measured honestly, and
+both correctly reported no effect — which is exactly why the next pass moved
+to instrumenting the *flush* side directly with `INLAYSQL_COMMIT_STATS`
+instead of proposing a third variation on the same idea.
+
+**Two follow-ups this change surfaces, neither fixed here:**
+
+1. A checkpoint holds the reservation gate while parked as a flush follower,
+   which makes `normal_waiters` look like a live cohort that can never
+   actually publish a ticket — from the coalescing leader's point of view,
+   indistinguishable from a writer that is merely slow. The stall detector
+   (`COMMIT_COALESCE_STALL_YIELDS`) breaks out of that reliably, in ~200µs
+   worst case, so this is a bounded latency tax on the next normal flush, not
+   a deadlock — but no test drives a checkpoint and a concurrent normal commit
+   through this path at the same time to pin that bound directly;
+   `normal_commits_and_checkpoints_use_separate_flush_paths` (`device.rs`)
+   runs them sequentially, not concurrently.
+2. `normal_inflight`/`normal_waiters` have no RAII scope guard the way the
+   flush leader's own state does (`LeaderGuard`). A panic between
+   `begin_normal_commit` and `end_normal_commit` already leaked one of these
+   counters permanently before this change; it is a pre-existing gap, not
+   introduced here. What this change does do is raise the price of that
+   pre-existing bug: a leaked counter used to cost roughly one spurious
+   `~1µs`-scale coalesce attempt per future flush, and now costs up to the
+   full `COMMIT_COALESCE_MAX_YIELDS` ceiling, ~2.3ms, every time a future
+   leader coalesces against a cohort that can never actually shrink.
+
+**And one thing this change does not measure at all.** The concurrency
+benchmark reports throughput and conflict rate, nothing else — there is no
+latency-percentile output, so whether a wider gather window moves the tail
+(some writers now wait up to ~2.3ms longer for their ticket to be gathered
+before a slow leader gives up on them) is genuinely unknown. Widening
+`COMMIT_COALESCE_MAX_YIELDS` for a throughput win without any visibility into
+p99 commit latency is a real gap in what this document can honestly claim.
+
 **Scans, joins and aggregates are the untested embarrassment**, and AHL-462 and
 AHL-464 made them less embarrassing without making them measured. Joins are
 still nested-loop in written order, and there is still no join reordering — but

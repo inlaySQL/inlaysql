@@ -440,23 +440,57 @@ impl CommitCoordinator {
         }
     }
 
-    /// Give normal commits that are already in the reservation pipeline a
-    /// bounded chance to publish their post-write tickets. No wait is taken on
-    /// the reservation mutex: a checkpoint may own it and may itself be
-    /// waiting for this flush to finish. If no normal commit is active or
-    /// queued, the solo path takes no scheduler turn at all.
+    /// Give normal commits that are already in the reservation pipeline an
+    /// adaptive chance to publish their post-write tickets before this leader
+    /// captures its flush target. No wait is taken on the reservation mutex:
+    /// a checkpoint may own it and may itself be waiting for this flush to
+    /// finish. If no normal commit is active or queued, the solo path takes
+    /// no scheduler turn at all — the very first check below fires before any
+    /// `yield_now`.
+    ///
+    /// Unlike a fixed yield count, this window stays open only while writers
+    /// are actually still arriving: it keeps yielding as long as a normal
+    /// commit is inflight or waiting *and* [`Self::writes_completed`] keeps
+    /// advancing. That matters because no real `fsync` is in flight yet
+    /// during this window, so every writer this gathers publishes its ticket
+    /// at the fast, un-penalized `pwrite` rate instead of the ~18-23x slower
+    /// rate a write pays while racing a concurrent `F_FULLFSYNC` on the same
+    /// file — and every ticket gathered here is folded into the one upcoming
+    /// flush instead of needing a flush of its own.
+    ///
+    /// It closes as soon as either progress stalls — no new ticket observed
+    /// for [`COMMIT_COALESCE_STALL_YIELDS`] consecutive polls — or no normal
+    /// commit remains inflight or queued, and it never spends more than
+    /// [`COMMIT_COALESCE_MAX_YIELDS`] turns in total, so a cohort that never
+    /// stops arriving cannot stall durability indefinitely.
+    ///
+    /// # Durability ordering
+    ///
+    /// This only ever *delays* the moment [`Self::make_durable_with_cohort`]
+    /// captures its flush `target`, never the other way around — the call
+    /// site captures `target = writes_completed.load(..)` strictly after this
+    /// function returns. Waiting longer before that capture can only grow the
+    /// set of tickets the upcoming `fsync` covers; it can never shrink it or
+    /// let a ticket be acknowledged before its bytes were actually written.
     fn coalesce_normal_commits(&self) {
         let mut observed = self.writes_completed.load(Ordering::Acquire);
-        for _ in 0..COMMIT_COALESCE_YIELDS {
+        let mut stalled = 0usize;
+        for _ in 0..COMMIT_COALESCE_MAX_YIELDS {
             if self.normal_inflight.load(Ordering::Acquire) == 0
                 && self.normal_waiters.load(Ordering::Acquire) == 0
             {
-                break;
+                return;
             }
             std::thread::yield_now();
             let next = self.writes_completed.load(Ordering::Acquire);
             if next != observed {
                 observed = next;
+                stalled = 0;
+            } else {
+                stalled += 1;
+                if stalled >= COMMIT_COALESCE_STALL_YIELDS {
+                    return;
+                }
             }
         }
     }
@@ -512,11 +546,28 @@ type FileId = (u64, u64);
 const LOCK_ATTEMPTS: u32 = 10;
 const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
-/// Maximum scheduler turns in the conditional normal-commit coalescing hint.
-/// It is only entered when another normal commit is active or waiting, and it
-/// is never a correctness dependency — a late ticket simply takes the next
-/// flush round.
-const COMMIT_COALESCE_YIELDS: usize = 8;
+/// Hard ceiling on scheduler turns the adaptive gather window in
+/// [`CommitCoordinator::coalesce_normal_commits`] may spend, no matter how
+/// many writers keep arriving. It is only entered when another normal commit
+/// is active or waiting, and it is never a correctness dependency — a ticket
+/// that misses this round simply takes the next flush — but without a ceiling
+/// a cohort that never stops arriving could delay every fsync indefinitely.
+const COMMIT_COALESCE_MAX_YIELDS: usize = 16384;
+
+/// Consecutive scheduler turns with no new ticket observed before the
+/// adaptive gather window in [`CommitCoordinator::coalesce_normal_commits`]
+/// decides the cohort has stopped arriving and lets the leader proceed to
+/// `fsync`. This is "has anyone just published a ticket", not a backoff
+/// schedule, and it has to be large enough to survive real scheduling noise:
+/// measurement (`INLAYSQL_COALESCE_DEBUG`, removed before landing) showed a
+/// single `yield_now` costs a small fraction of a microsecond, so a small
+/// stall count — e.g. the original fixed `8` — reads as "no progress" long
+/// before another thread has actually had a turn, which is why the old fixed
+/// window never gathered more than one or two extra writers in practice. This
+/// value costs nothing when solo (the emptiness check above still fires
+/// before any yield), and only ever adds latency when a real cohort is
+/// present to amortize an `fsync` over.
+const COMMIT_COALESCE_STALL_YIELDS: usize = 1500;
 
 type CoordinatorRegistry = Mutex<HashMap<FileId, Weak<CommitCoordinator>>>;
 
