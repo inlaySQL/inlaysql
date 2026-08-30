@@ -37,6 +37,43 @@ pub struct CommitPoint {
     pub append_offset: usize,
 }
 
+/// How strong a barrier [`Device::sync_commit`] must use for an ordinary
+/// user commit.
+///
+/// This governs [`Device::sync_commit`] **only**. [`Device::sync`] — used by
+/// [`crate::btree::CowBTree`]'s state-block rewrite and by
+/// [`crate::btree::CowBTree::checkpoint`] — is never affected by this enum;
+/// see [`Device::sync`]'s doc comment for why weakening it would let a
+/// checkpoint or WAL-region wrap roll back further than a level's own loss
+/// bound promises, not merely lose the bound's own commits.
+///
+/// The exact syscall each level maps to is a real-device concern — see
+/// `inlaysql::FileDevice`'s implementation and `docs/recovery.md`'s
+/// "Durability levels" section for the full loss-bound argument and the
+/// per-platform mapping. A device that has only one barrier strength (every
+/// [`crate::sim`] device, the WASM in-memory device) is free to ignore the
+/// level entirely; [`Device::set_durability`]'s default is a no-op for
+/// exactly that reason.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Durability {
+    /// Nothing committed is ever lost. The default, and the only level every
+    /// caller got before this option existed — no existing behaviour changes
+    /// unless a caller opts into [`Durability::Normal`] explicitly.
+    #[default]
+    Full,
+    /// Survives a process crash and an OS crash with zero loss — the bytes
+    /// have left the process and the kernel's page cache either way. Only a
+    /// **power failure** can lose a commit at this level: bytes that reached
+    /// the drive's own volatile write cache but not the platter. Loss is
+    /// bounded to commits since the last checkpoint or WAL-region wrap, and
+    /// — because commit-chain validation on reopen is file-wide, not
+    /// per-handle — one writer's lost sync can roll back another writer's
+    /// individually-synced commits on the same file too. Never torn or
+    /// invented state either way: recovery always lands on a real past
+    /// commit. See `docs/recovery.md`.
+    Normal,
+}
+
 /// A byte-addressable, randomly-accessible durable store.
 ///
 /// Offsets are in bytes. Implementations are expected to buffer writes until
@@ -51,6 +88,22 @@ pub trait Device {
     fn write(&mut self, offset: usize, data: &[u8]) -> Result<()>;
 
     /// Make all previously written bytes durable.
+    ///
+    /// # This must always run at full strength — never relaxed by [`Durability`]
+    ///
+    /// [`crate::btree::CowBTree`] calls this for the state-block rewrite
+    /// (`write_state_values`) and for [`crate::btree::CowBTree::checkpoint`],
+    /// both of which can truncate or reuse a write-ahead-log region the
+    /// instant they return. [`Device::sync_commit`] is the only method a
+    /// [`Durability`] level may weaken. Weakening this one instead would let
+    /// a checkpoint publish a state block, or a wrap zero a WAL region,
+    /// before the writes they depend on are actually durable — so a later
+    /// crash could roll recovery back past commits the *caller* was
+    /// individually told were durable at whatever level they used, not just
+    /// past the ones this handle's own relaxed level admits losing. That
+    /// breaks the promised loss bound (though it still cannot corrupt: see
+    /// [`Durability::Normal`]'s doc comment). Keep every implementation of
+    /// this method at its platform's strongest barrier, unconditionally.
     fn sync(&mut self) -> Result<()>;
 
     /// Mark a normal commit's record and data pages ready for a grouped flush.
@@ -71,6 +124,25 @@ pub trait Device {
     fn sync_commit(&mut self) -> Result<()> {
         self.sync()
     }
+
+    /// Request a [`Durability`] level for this handle's future
+    /// [`Device::sync_commit`] calls.
+    ///
+    /// Called by [`crate::btree::CowBTree::set_durability`] once, at open
+    /// (unlike [`Device::note_page_reuse_enabled`], this is called for
+    /// *every* level, including [`Durability::Full`] — a device shared by
+    /// several handles needs to see a `Full` request even when it is the
+    /// default, so it can tell "nobody has asked for anything yet" apart
+    /// from "somebody explicitly needs the strongest barrier"; see
+    /// `inlaysql::FileDevice`'s `CommitCoordinator` for why that distinction
+    /// is exactly what makes cross-handle "strongest wins" possible).
+    ///
+    /// The default is a no-op: a device with only one barrier strength
+    /// (every [`crate::sim`] device, the WASM in-memory device, the
+    /// `io_uring` backend, which does not yet implement this split) has
+    /// nothing to relax, and every existing implementation stays correct by
+    /// doing nothing.
+    fn set_durability(&self, _durability: Durability) {}
 
     /// Enter the short commit-reservation critical section.
     ///
@@ -370,6 +442,10 @@ impl<T: Device> Device for Rc<RefCell<T>> {
 
     fn sync_commit(&mut self) -> Result<()> {
         self.borrow_mut().sync_commit()
+    }
+
+    fn set_durability(&self, durability: Durability) {
+        self.borrow().set_durability(durability);
     }
 
     fn begin_commit(&self) -> Result<()> {

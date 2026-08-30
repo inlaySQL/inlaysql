@@ -1304,9 +1304,64 @@ scan, but the pipeline collects before `ORDER BY` today — and a join probe is
 not cached across outer rows that repeat a key, so a many-to-many join re-reads
 an entry range it has already read.
 
----
+### Opt-in relaxed-durability tier, shipped (2026-08-30)
 
-## 4. Retrieval
+Phase 0 above (previous section) measured the barrier a normal commit's
+`sync_commit` waits on — `F_FULLFSYNC` on this host — at 97.1% of commit
+wall-clock, and found that swapping it (temporarily, reverted, never
+shipped) for plain `fsync(2)` measured 32x single-writer throughput. This is
+that swap, shipped as an actual opt-in: `EngineOptions::durability`
+(`Durability::Full`, the unchanged default, or `Durability::Normal`), scoped
+to `Device::sync_commit` only — `Device::sync` (checkpoints, the state
+block) is never weakened at any level, so a relaxed file's checkpoint/wrap
+truncation cannot roll back further than the level's own documented loss
+bound. See `docs/recovery.md`'s "Durability levels" section for the exact
+guarantees, the per-platform mapping, and the multi-writer coupling.
+
+**Single-writer commits/s, real end-to-end `INSERT` transactions through the
+concurrency suite (`inlaysql-bench --suite concurrency --writers 1 --txns
+3000`), 5 repeated runs each, this host:**
+
+| Level | commits/s (5 runs) | median | vs `Full` |
+| --- | --- | --- | --- |
+| `Durability::Full` (default) | 246, 248, 268, 270, 271 | 268 | 1x |
+| `Durability::Normal` | 4,229, 4,299, 4,332, 4,377, 4,441 | 4,332 | **16.2x** |
+
+Tighter and more reproducible than it first looked: an earlier pass at 200
+and 2,000 transactions per run showed `Normal` swinging 1,000-3,600
+commits/s run to run — a small-sample artefact this shared, loaded machine
+exaggerates, exactly the ±10% (here, worse) run-to-run noise this file's own
+measurement rules warn about. 3,000 transactions per run was enough for
+`Full` to sit in its already-published 246-271 range and for `Normal` to
+settle into a tight ~4,229-4,441 band (±2.4% of its median) across all 5
+runs. Multi-writer throughput at the default level was re-measured
+alongside this change (`WRITER_LEVELS=1,8,32`, 3 runs) to confirm no
+regression: 246-249 / 1,248-1,378 / 994-1,000 commits/s at 1/8/32 writers,
+0.0% conflicts throughout — the same shape as the committed baseline
+(~246/1,184/988), since the default `Full` path's code is untouched by this
+change (`FileDevice::sync`, which every existing call still reaches, is
+identical to before this change; only `FileDevice::sync_commit`'s barrier
+choice is new).
+
+**16.2x, not the Phase 0 probe's 32x, and that gap is expected, not a
+discrepancy to chase.** The Phase 0 probe timed the bare `sync_all()` call in
+isolation; this measurement times a whole SQL `INSERT` transaction — parse,
+plan, execute, the tree's copy-on-write page walk, WAL encode, and the
+group-commit coordinator's own bookkeeping, none of which shrink when the
+barrier does. At `Full` those costs are a rounding error next to a
+~3.3-4ms `F_FULLFSYNC`; at `Normal` the barrier drops to tens of
+microseconds and those other costs become the new floor, so the measured
+speedup asymptotes below the pure-barrier ratio — precisely the caveat
+Phase 0's own Finding 3 already put a number on (`fsync` at 97.1%, meaning
+~2.9% of commit time was never going to shrink with the barrier). 16.2x of
+the available headroom landing is a good outcome, not a shortfall.
+
+Not published in `BENCHMARK.md`'s comparison tables — those are
+full-durability-only on every side of every comparison, on purpose (see
+`BENCHMARK.md`'s "Durable writes" section for the one-line pointer back
+here).
+
+
 
 Already winning where it is measured: ~15.8x over `sqlite-vec` at 100k vectors
 (7.56x on the 2,000-vector suite `BENCHMARK.md` publishes), and ~60x over

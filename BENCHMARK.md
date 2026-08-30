@@ -156,6 +156,11 @@ One row per commit, one `fsync` per commit.
 to 61,025 ops/s at 10.75 µs — **254x** — which is the number to quote for a
 bulk load and not for a transaction.
 
+Every row above is full-durability, on both sides of every comparison, on
+purpose — an opt-in relaxed-durability tier also exists
+(`EngineOptions::durability`) and is measured separately, in `PERF.md`, not
+mixed into these tables.
+
 ### Concurrent writers — the peak moved from eight to the mid-teens, and past it the win still shrinks
 
 200 transactions per writer, one row each, on real OS threads. Median of

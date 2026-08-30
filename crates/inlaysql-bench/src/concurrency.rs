@@ -39,10 +39,46 @@ use std::path::Path;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use inlaysql::{Database, Error, Value};
+use inlaysql::{Database, EngineOptions, Error, FileDevice, Value};
 
-use crate::points::{open_sqlite, remove_sqlite_files, Durability};
+// `crate::points::Durability` is SQLite's own `synchronous` levels, not
+// InlaySQL's — aliased so the two do not collide in this file, which
+// measures both.
+use crate::points::{open_sqlite, remove_sqlite_files, Durability as SqliteDurability};
 use crate::Config;
+
+/// InlaySQL's [`Durability`](inlaysql::Durability) for the writers this suite
+/// opens, from `INLAYSQL_BENCH_DURABILITY` (`full` or `normal`, case
+/// insensitive) — `full` when unset, matching every other suite and the
+/// engine's own default. Read once per process; every writer thread and the
+/// schema-creating handle share the same choice, and the baseline sweep in
+/// `docs`/`PERF.md` is `full` (unset), so the multi-writer numbers already
+/// published are reproduced by not setting this at all.
+fn bench_durability() -> inlaysql::Durability {
+    match std::env::var("INLAYSQL_BENCH_DURABILITY") {
+        Ok(value) if value.eq_ignore_ascii_case("normal") => inlaysql::Durability::Normal,
+        Ok(value) if value.eq_ignore_ascii_case("full") => inlaysql::Durability::Full,
+        Ok(other) => {
+            eprintln!(
+                "ignoring INLAYSQL_BENCH_DURABILITY={other:?} (expected \"full\" or \"normal\"); using full"
+            );
+            inlaysql::Durability::Full
+        }
+        Err(_) => inlaysql::Durability::Full,
+    }
+}
+
+/// Open `path` with [`bench_durability`]'s level — the concurrency suite's
+/// own stand-in for `Database::open`, which always opens at `Durability::Full`.
+fn open_inlaysql(path: &Path) -> Result<Database, inlaysql::Error> {
+    Database::open_on_with_options(
+        FileDevice::open(path)?,
+        EngineOptions {
+            durability: bench_durability(),
+            ..EngineOptions::default()
+        },
+    )
+}
 
 /// One engine's result at one writer count.
 struct Outcome {
@@ -94,7 +130,7 @@ pub fn run(config: &Config, dir: &Path) -> Result<(), Box<dyn std::error::Error>
             &dir.join("concurrency-sqlite.db"),
             writers,
             config.txns,
-            Durability::JournalFull,
+            SqliteDurability::JournalFull,
         )?);
     }
 
@@ -186,7 +222,7 @@ fn inlaysql_writers(
     txns: usize,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(path);
-    let mut creator = Database::open(path)?;
+    let mut creator = open_inlaysql(path)?;
     // No TEXT or VECTOR column: this suite is about the tree and the sync, and
     // an indexed column would also make every conflict pay for an index
     // rebuild, which is a different measurement.
@@ -206,7 +242,7 @@ fn inlaysql_writers(
             let ready = ready.clone();
             let start = start.clone();
             handles.push(scope.spawn(move || {
-                let mut db = Database::open(path)?;
+                let mut db = open_inlaysql(&path)?;
                 ready.wait();
                 start.wait();
                 let mut committed = 0;
@@ -289,7 +325,7 @@ fn sqlite_writers(
     path: &Path,
     writers: usize,
     txns: usize,
-    durability: Durability,
+    durability: SqliteDurability,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
     remove_sqlite_files(path);
 

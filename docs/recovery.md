@@ -134,6 +134,190 @@ that never survives a torn write is simply not a commit.
 The state block is *not* rewritten on every commit. It is rewritten on
 checkpoint (see below), which keeps the hot path to one sync.
 
+## Durability levels
+
+Step 4 above names the barrier a normal commit's `sync_commit` waits on:
+`fsync`/`F_FULLFSYNC`. That barrier is 97.1% of a single-writer commit's
+wall-clock time, measured flat with respect to the bytes queued behind it
+(`PERF.md`'s Phase 0 section) — a real commit dirties on the order of five
+pages regardless of how big the barrier's own cost is. `EngineOptions::durability`
+(`crates/inlaysql-core/src/engine.rs`) is the opt-in to relax it.
+
+**Only `Device::sync_commit` is ever weakened by this option.**
+`Device::sync` — used by the state-block rewrite in step 4's own commit path
+and by [checkpoint](#checkpointing) — always runs at its platform's strongest
+barrier, unconditionally, at every `Durability` level. This is not an
+oversight to be tightened later; it is load-bearing. A checkpoint or a
+WAL-region wrap zeroes and reuses log bytes the instant its own sync
+returns, so if that sync were weakened, a later crash could roll recovery
+back past commits a *different* handle was individually told were durable —
+not merely admit the loss its own level promised, but exceed it. Weakening
+`sync_commit` cannot do that: the record it protects is exactly one
+handle's own not-yet-durable commit, and losing it is precisely the bound
+`Durability::Normal` states below. See `Device::sync`'s doc comment in
+`crates/inlaysql-core/src/btree/device.rs` for the same argument written as
+the trait's contract, and `FileDevice::sync`'s doc comment in
+`crates/inlaysql/src/device.rs` for where it is enforced on a real file.
+
+### The two levels, and their exact loss bounds
+
+Two levels exist for v1 — `Full` and `Normal`. There is deliberately no
+`Off`/no-barrier level: `Normal` already captures 32x of the 60x available on
+this project's reference host (`PERF.md`), and its only exposure is power
+loss — rare, and well understood by every engine that offers a level like
+it (SQLite's `synchronous = NORMAL`, PostgreSQL's
+`synchronous_commit = off`, InnoDB's `innodb_flush_log_at_trx_commit = 2`).
+A no-barrier level's exposure is a *process crash* — common, and orders of
+magnitude more frequent than a power failure on most deployments — which is
+a materially different, harder-to-justify default risk. If a compelling
+reason to ship `Off` in v1 shows up, it should be argued for on its own,
+not slipped in beside this change.
+
+* **`Durability::Full`** (the default — no existing caller's behaviour
+  changes). Nothing committed is ever lost, under any of the faults this
+  document describes: process crash, OS crash, or power failure.
+* **`Durability::Normal`.** Survives a process crash and an OS crash with
+  zero loss — the bytes have already left the process (a `write`/`pwrite`
+  syscall returned) and the kernel's own page cache (the weaker barrier
+  still forces the kernel to hand the bytes to the device) either way. Only
+  a **power failure** can lose a commit at this level: bytes that reached
+  the drive's own volatile write cache but never reached the platter. Loss
+  is bounded to commits **since the last checkpoint or WAL-region wrap** —
+  the same bound a crash under `Durability::Full` already has for the
+  *unsynced* tail, just reached by a different, rarer fault. Recovery never
+  invents or tears state at this level either: chain validation
+  (`decode_record_for_version`, `read_committed_state`'s "break at the first
+  gap") is unaffected by which barrier produced the bytes it validates, so
+  the worst a lost sync produces is "walk forward from the last good
+  checkpoint as far as the chain holds" — always a real past commit. See
+  "The safety argument, restated" below for why that holds independent of
+  which level committed the bytes.
+
+**Multi-writer coupling — easy to miss, so stated explicitly.** Because
+commit-chain validation on reopen is file-wide, not per-handle, **one
+writer's lost sync can roll back another writer's individually-synced
+commits on the same file too.** A handle that always used `Durability::Full`
+for its own commits is not insulated from a sibling handle's
+`Durability::Normal` commit being lost on power failure, if the recovered
+chain has to walk back past it to find a point every region agrees on. This
+is not per-connection loss, and a caller reasoning about "my commits are
+safe" needs to reason about the whole file, not its own handle.
+
+### Per-platform mapping — stated explicitly, because a level meaning different things per platform is a documentation trap
+
+| Level | macOS | Linux |
+| --- | --- | --- |
+| `Full` | `F_FULLFSYNC` (`fcntl`, via `File::sync_all()`) | `fsync` (via `File::sync_all()`) |
+| `Normal` | plain `fsync(2)` | `fdatasync` |
+
+**On Linux these two levels are much closer in strength than on macOS.**
+Linux's plain `fsync` already flushes the drive's write cache when the
+device honours `FLUSH`/`FUA` (most do); `fdatasync` skips only the
+inode-metadata update `fsync` also performs, which this engine's own writes
+essentially never need (every write is either an append within a region
+that already exists or a rewrite of a page that already exists — the file
+never changes size or permissions through the write path). So on Linux,
+`Normal`'s exposure is closer to "the rare and specific case where the
+metadata sync mattered" than to a wide window of volatile-cache loss.
+**On macOS the gap is real and large:** `F_FULLFSYNC` issues an explicit
+cache-flush command the drive must honour before returning; plain
+`fsync(2)` does not, and Apple's own documentation says so — the two are not
+a small tuning difference on this platform, they are the whole 32x this
+option exists to unlock. Getting the actual weaker barrier on macOS needed a
+raw `fsync(2)` syscall in the first place: `std::fs::File::sync_data()` was
+measured directly (not assumed) to cost the same ~3-4ms as `sync_all()` on
+this platform — i.e. it also goes through `F_FULLFSYNC` — so it is not a
+usable "weaker" primitive here at all. `crates/inlaysql/src/device.rs`
+therefore reaches the real syscall through `rustix`, a small, audited crate
+that wraps it in a safe function, so `inlaysql`'s `#![forbid(unsafe_code)]`
+stays intact rather than needing a second unsafe-carrying crate the way
+`inlaysql-uring` exists for `io_uring`.
+
+Any platform other than macOS or Linux falls back to the `Full` barrier for
+`Normal` too, rather than guessing at a syscall nobody has measured there.
+
+### Durability is per-file, not freely mixable per-handle
+
+`FileDevice`'s `CommitCoordinator` (`crates/inlaysql/src/device.rs`) is
+shared by every handle this process has open on a given `(dev, ino)` — the
+same structure `EngineOptions::page_reuse`'s cross-handle/cross-process
+constraint above already rests on. A `Durability` level is requested per
+handle (`EngineOptions::durability`, threaded through
+`Database::open_on_with_options` → `TreeStorage::open_on_with_options` →
+`CowBTree::set_durability`), but the barrier `sync_commit` actually runs is
+the coordinator's, not any one handle's — so two handles on the same file
+asking for different levels do not each get their own.
+
+The arbitration is **strongest wins, for as long as the coordinator is
+alive**: `CommitCoordinator::durability` is a small ratchet
+(`AtomicU8::fetch_max`) that only ever moves toward `Full`, never back.
+Once any handle sharing a file has required `Full` — including simply
+being opened with the default, since every request is forwarded to the
+device, not only the non-default ones — that file's commits stay at `Full`
+until every handle sharing that coordinator closes (dropping the last
+`Arc<CommitCoordinator>`, which removes it from the process-wide registry)
+and a fresh one is created on the next open. Relaxation to `Normal` takes
+effect only when every handle that has ever shared that coordinator asked
+for it explicitly.
+
+This is the safe reading of "two handles disagree," and the alternative
+(refusing the second, disagreeing request) was rejected: refusing would
+turn opening a second, ordinary handle with default options into a hard
+error whenever a sibling handle happened to have relaxed the file first,
+which punishes the caller who asked for nothing unusual. Strongest-wins
+instead means a caller who forgets to opt a handle into `Normal` gets the
+guarantee they already expected — `Full` — rather than silently inheriting
+a weaker one somebody else chose. See `CommitCoordinator::durability`'s doc
+comment (`crates/inlaysql/src/device.rs`) and
+`EngineOptions::durability`'s doc comment for the same argument at the two
+other layers it has to be repeated at.
+
+### The safety argument, restated for this option specifically
+
+The design pass behind this option rests on facts already true of the
+format, not on anything new `Durability::Normal` adds:
+
+* `CowBTree::commit` builds every WAL record from `self.dirty` — full page
+  images, not deltas — via `encode_record_into`. `CowBTree::open` replays
+  those images before trusting the root they name. Whether the separate
+  data-area write landed is therefore irrelevant to whether a record, once
+  present and valid, describes a real commit.
+* `decode_record_for_version` rejects any record that fails its length or
+  checksum, and `read_committed_state` only ever replays a strictly linked
+  `prev_seq`/`prev_root` chain, stopping at the first gap. No reordering of
+  which syncs happened can produce anything other than "the chain as far
+  back as it still links" — always a state some commit actually produced,
+  never a mix of two.
+
+`Durability::Normal` changes *how far back* that chain might have to be
+walked on power failure. It does not change what walking it can produce.
+That is also why the DST coverage for this level
+(`crates/inlaysql-core/tests/durability_dst.rs`) asserts the identical
+invariant `dst_sweep.rs` does — recovered state is byte-for-byte one of the
+states the workload actually committed — rather than a weaker one.
+
+**The honest limit of that coverage.** `SimDisk`/`Simulator`, the
+deterministic fault-injection harness every DST sweep in this repository
+runs on, do not implement `Device::sync_commit` any differently from
+`Device::sync` — both inherit the trait's default (`sync_commit` calls
+`sync`), so the harness has no notion of two barrier strengths to begin
+with. Turning `Durability::Normal` on for a simulated handle exercises the
+option's *plumbing* (it threads through without erroring, panicking, or
+changing which bytes a commit writes) and confirms the recovery invariant
+above holds under every fault the harness can express with that plumbing
+wired in. It cannot exercise the actual `F_FULLFSYNC`-vs-`fsync`-vs-
+`fdatasync` distinction, because that distinction only exists once real
+syscalls are involved. That half is covered instead by
+`crates/inlaysql/tests/durability.rs`'s real-`FileDevice` round trip, the
+white-box `CommitCoordinator` ratchet tests beside the real implementation,
+and the measured throughput difference in `PERF.md`.
+
+A second, narrower harness gap: `Fault::ReorderedSync` rolls the *whole*
+durable image back to a prior whole-sync snapshot. It cannot express "an
+arbitrary subset of one unsynced batch survived, in arbitrary order" — the
+more granular thing a real drive's write cache could in principle do.
+Nothing in this workspace's fault model can express that today.
+
 ## Checkpointing
 
 A checkpoint refreshes and rewrites the state block (committed root/next/seq)

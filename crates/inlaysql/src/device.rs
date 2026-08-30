@@ -11,10 +11,10 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 
-use inlaysql_core::btree::Device;
+use inlaysql_core::btree::{Device, Durability};
 use inlaysql_core::{Error, Result};
 
 /// A byte-addressable file. Reads and writes are positional (`pread`/`pwrite`),
@@ -149,7 +149,41 @@ struct CommitCoordinator {
     /// [`Device::note_page_reuse_enabled`] in the core for the contract this
     /// satisfies.
     reuse_enabled: AtomicBool,
+    /// The [`Durability`] level [`Device::sync_commit`] uses for this file,
+    /// shared by every handle this process has open on it.
+    ///
+    /// One of [`DURABILITY_UNSET`], [`DURABILITY_NORMAL`] or
+    /// [`DURABILITY_FULL`] — never anything else. This is **strongest wins,
+    /// for as long as this coordinator is alive**, the same one-way-trip
+    /// shape as `reuse_enabled` above but ratcheting toward the *safer*
+    /// value instead of always toward `true`: [`FileDevice::set_durability`]
+    /// only ever raises it (`fetch_max`), so once any handle sharing this
+    /// file has required [`Durability::Full`] — including simply being
+    /// opened with the default — every commit on this file stays at `Full`
+    /// until every handle sharing this coordinator closes and a fresh one is
+    /// created on the next open. Relaxation to [`Durability::Normal`] takes
+    /// effect only when every handle that has ever shared this coordinator
+    /// asked for it explicitly. `DURABILITY_UNSET` (nobody has asked for
+    /// anything, e.g. a caller that builds a `CowBTree` directly without the
+    /// `EngineOptions` plumbing) reads as `Full`, so a handle that never
+    /// calls [`Device::set_durability`] gets exactly the behaviour it always
+    /// had. See `docs/recovery.md` for the justification for "strongest
+    /// wins" over the alternative (refusing a second, disagreeing request).
+    durability: AtomicU8,
 }
+
+/// [`CommitCoordinator::durability`]'s three legal values, encoded so
+/// [`AtomicU8::fetch_max`] is the whole of the "strongest wins" ratchet: the
+/// order `DURABILITY_UNSET < DURABILITY_NORMAL < DURABILITY_FULL` is exactly
+/// "safer never loses to less safe". `DURABILITY_UNSET` and
+/// `DURABILITY_FULL` deliberately both mean "use the full-strength barrier"
+/// (see [`CommitCoordinator::effective_durability`]) — `UNSET` only exists
+/// so a `Normal` request can tell "nobody has asked for anything yet" apart
+/// from "somebody already required `Full`", which is what makes the ratchet
+/// direction correct rather than a coin flip on registration order.
+const DURABILITY_UNSET: u8 = 0;
+const DURABILITY_NORMAL: u8 = 1;
+const DURABILITY_FULL: u8 = 2;
 
 /// The committed state and per-region append positions the reservation gate
 /// would otherwise re-derive from the file, guarded by
@@ -494,6 +528,30 @@ impl CommitCoordinator {
             }
         }
     }
+
+    /// Raise [`CommitCoordinator::durability`] toward `level` — never lower
+    /// it. See the field's doc comment for why this ratchet, rather than
+    /// last-write-wins, is the only choice that keeps a handle's `Full`
+    /// request meaningful when another handle on the same file asks for
+    /// `Normal`, whichever order the two calls arrive in.
+    fn set_durability(&self, level: Durability) {
+        let target = match level {
+            Durability::Full => DURABILITY_FULL,
+            Durability::Normal => DURABILITY_NORMAL,
+        };
+        self.durability.fetch_max(target, Ordering::AcqRel);
+    }
+
+    /// The barrier strength [`Device::sync_commit`] should use right now.
+    /// `DURABILITY_UNSET` (nobody has called
+    /// [`CommitCoordinator::set_durability`] yet) reads as `Full` — see the
+    /// field's doc comment.
+    fn effective_durability(&self) -> Durability {
+        match self.durability.load(Ordering::Acquire) {
+            DURABILITY_NORMAL => Durability::Normal,
+            _ => Durability::Full,
+        }
+    }
 }
 
 impl Drop for CommitCoordinator {
@@ -799,6 +857,23 @@ impl Device for FileDevice {
     /// checkpoint. On macOS this still goes through [`File::sync_all`]'s
     /// `F_FULLFSYNC` barrier exactly as before — group commit only decides
     /// which handle's call performs it, never whether one happens.
+    ///
+    /// # This is never weakened by `Durability`, on purpose
+    ///
+    /// [`CowBTree::checkpoint`](inlaysql_core::btree::CowBTree::checkpoint)
+    /// and the state-block rewrite both call this, immediately before
+    /// zeroing or reusing a write-ahead-log region. If this used
+    /// [`CommitCoordinator::effective_durability`] the way
+    /// [`FileDevice::sync_commit`] does, a `Durability::Normal` file's
+    /// checkpoint could zero a region before the writes it depends on had
+    /// actually reached the platter — a later power loss would then roll
+    /// recovery back past commits a *different* handle was individually told
+    /// were durable, however that handle's own commits were synced. That
+    /// breaks the documented loss bound instead of merely admitting the loss
+    /// the bound already promises (`docs/recovery.md`). Always
+    /// `file.sync_all()`, unconditionally — see [`Device::sync`]'s doc
+    /// comment in the core for the same argument stated as the trait's
+    /// contract.
     fn sync(&mut self) -> Result<()> {
         let Some(coordinator) = &self.coordinator else {
             return Err(self.read_only_error("sync"));
@@ -813,6 +888,13 @@ impl Device for FileDevice {
     /// the reservation gate was held, so a concurrent leader can cover this
     /// commit before this handle reaches the call. A missing ticket is a
     /// defensive fallback for a custom caller and keeps the old sync behavior.
+    ///
+    /// The barrier itself is [`CommitCoordinator::effective_durability`] —
+    /// `Durability::Full`'s `file.sync_all()` unless every handle sharing
+    /// this file has explicitly asked for `Durability::Normal`; see that
+    /// method and [`Device::set_durability`]. This is the *only* place a
+    /// `Durability` level changes which syscall runs — [`FileDevice::sync`],
+    /// above, never varies.
     fn sync_commit(&mut self) -> Result<()> {
         let Some(coordinator) = &self.coordinator else {
             return Err(self.read_only_error("sync"));
@@ -822,7 +904,8 @@ impl Device for FileDevice {
             return self.sync();
         }
         let file = &self.file;
-        coordinator.make_commit_durable(ticket, || file.sync_all().map_err(io_error))
+        let level = coordinator.effective_durability();
+        coordinator.make_commit_durable(ticket, || commit_barrier(file, level))
     }
 
     /// Publish a successful normal commit's durability ticket while its WAL
@@ -1062,6 +1145,23 @@ impl Device for FileDevice {
             .as_ref()
             .is_none_or(|coordinator| coordinator.reuse_enabled.load(Ordering::Acquire))
     }
+
+    /// Raise this file's [`Device::sync_commit`] barrier toward `durability`
+    /// — see [`CommitCoordinator::durability`] for the "strongest wins,
+    /// one-way for this coordinator's lifetime" ratchet this feeds, and
+    /// `EngineOptions::durability`(inlaysql_core::EngineOptions) for the
+    /// caller-facing argument for why that is the safe default reading of
+    /// two handles on one file disagreeing.
+    ///
+    /// A no-op on a read-only handle: [`FileDevice::sync`] and
+    /// [`FileDevice::sync_commit`] already refuse before either could reach
+    /// a barrier, so there is nothing here for a read-only handle to affect.
+    fn set_durability(&self, durability: Durability) {
+        let Some(coordinator) = &self.coordinator else {
+            return;
+        };
+        coordinator.set_durability(durability);
+    }
 }
 
 fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator>> {
@@ -1149,6 +1249,7 @@ fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator
         next_reader_token: AtomicU64::new(1),
         read_cache: RwLock::new(ReadCache::new(shared_read_cache_budget())),
         reuse_enabled: AtomicBool::new(false),
+        durability: AtomicU8::new(DURABILITY_UNSET),
     });
     registry.insert(file_id, Arc::downgrade(&coordinator));
     Ok(coordinator)
@@ -1173,6 +1274,58 @@ fn shared_read_cache_budget() -> usize {
 
 fn io_error(error: io::Error) -> inlaysql_core::Error {
     inlaysql_core::Error::Storage(error.to_string())
+}
+
+/// The syscall [`FileDevice::sync_commit`] runs for `level`.
+///
+/// `Durability::Full` is `file.sync_all()` — bit-for-bit the call every
+/// existing caller already made, never touched by this function's `Normal`
+/// arm. `Durability::Normal` is a strictly weaker, platform-specific
+/// barrier; see `platform_normal_sync`'s per-`cfg` doc comments below for
+/// the mapping and why each platform needs what it needs.
+fn commit_barrier(file: &File, level: Durability) -> Result<()> {
+    match level {
+        Durability::Full => file.sync_all().map_err(io_error),
+        Durability::Normal => platform_normal_sync(file),
+    }
+}
+
+/// `Durability::Normal` on macOS: plain `fsync(2)`, not `F_FULLFSYNC`.
+///
+/// `std::fs::File::sync_all()` and even `File::sync_data()` both route
+/// through `fcntl(F_FULLFSYNC)` on this platform — measured directly, not
+/// assumed: both cost ~3-4ms against this project's reference SSD, matching
+/// `PERF.md`'s `F_FULLFSYNC` numbers, where a real plain `fsync(2)` costs
+/// tens of microseconds. Rust's standard library does not expose the weaker
+/// call at all here, deliberately — Apple's own documentation says plain
+/// `fsync` does not guarantee a media flush, so std treats "sync" as meaning
+/// the strong barrier on this platform. Getting the weaker, real `fsync(2)`
+/// therefore needs the actual syscall, wrapped safely by `rustix` rather
+/// than an `unsafe` block in this `#![forbid(unsafe_code)]` crate.
+#[cfg(target_os = "macos")]
+fn platform_normal_sync(file: &File) -> Result<()> {
+    rustix::fs::fsync(file).map_err(|errno| io_error(errno.into()))
+}
+
+/// `Durability::Normal` on Linux: `fdatasync`, a real weaker barrier the
+/// kernel supports directly (it skips the metadata update `fsync` also
+/// flushes, when only the file's size and permissions are unchanged — true
+/// for every write this engine issues in place). Routed through `rustix`
+/// rather than `std::fs::File::sync_data()` so both platforms go through one
+/// implementation instead of trusting two different standard-library
+/// mappings — see the macOS arm's doc comment for why that trust would be
+/// misplaced there.
+#[cfg(target_os = "linux")]
+fn platform_normal_sync(file: &File) -> Result<()> {
+    rustix::fs::fdatasync(file).map_err(|errno| io_error(errno.into()))
+}
+
+/// `Durability::Normal` on every other target: no validated weaker barrier
+/// exists here, so fall back to the full-strength one rather than guess at a
+/// syscall nobody has measured on this platform. See `docs/recovery.md`.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn platform_normal_sync(file: &File) -> Result<()> {
+    file.sync_all().map_err(io_error)
 }
 
 /// White-box tests of [`CommitCoordinator::make_durable`] — the ordering rule
@@ -1231,6 +1384,7 @@ mod group_commit_tests {
             next_reader_token: AtomicU64::new(1),
             read_cache: RwLock::new(ReadCache::new(1 << 20)),
             reuse_enabled: AtomicBool::new(false),
+            durability: AtomicU8::new(DURABILITY_UNSET),
         }
     }
 
@@ -1423,6 +1577,56 @@ mod group_commit_tests {
         drop(tree);
         drop(coordinator);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Nobody has called [`CommitCoordinator::set_durability`] yet:
+    /// `DURABILITY_UNSET` must read as `Durability::Full`, so a handle built
+    /// without the `EngineOptions` plumbing (or any caller that predates this
+    /// option) gets exactly the barrier it always got.
+    #[test]
+    fn an_untouched_coordinator_is_full_strength() {
+        let coordinator = test_coordinator("untouched");
+        assert_eq!(coordinator.effective_durability(), Durability::Full);
+    }
+
+    /// The whole point of the ratchet: a `Normal` request alone relaxes the
+    /// file, but only while nothing else on it has required `Full`.
+    #[test]
+    fn a_lone_normal_request_relaxes_the_coordinator() {
+        let coordinator = test_coordinator("lone-normal");
+        coordinator.set_durability(Durability::Normal);
+        assert_eq!(coordinator.effective_durability(), Durability::Normal);
+    }
+
+    /// Strongest wins, `Full`-after-`Normal`: once a second handle on the
+    /// same file requires `Full`, the file stays at `Full` — the first
+    /// handle's `Normal` request never downgrades it back.
+    #[test]
+    fn a_full_request_after_normal_pins_the_coordinator_to_full() {
+        let coordinator = test_coordinator("normal-then-full");
+        coordinator.set_durability(Durability::Normal);
+        assert_eq!(coordinator.effective_durability(), Durability::Normal);
+        coordinator.set_durability(Durability::Full);
+        assert_eq!(coordinator.effective_durability(), Durability::Full);
+        // And it stays pinned even if the `Normal` handle asks again.
+        coordinator.set_durability(Durability::Normal);
+        assert_eq!(
+            coordinator.effective_durability(),
+            Durability::Full,
+            "a later Normal request must not undo an earlier Full pin"
+        );
+    }
+
+    /// Strongest wins, `Full`-before-`Normal`: the order the two requests
+    /// arrive in must not matter — this is what makes a default-`Full`
+    /// handle opened first on a file safe against a second handle that later
+    /// asks for `Normal`.
+    #[test]
+    fn a_full_request_before_normal_also_pins_the_coordinator_to_full() {
+        let coordinator = test_coordinator("full-then-normal");
+        coordinator.set_durability(Durability::Full);
+        coordinator.set_durability(Durability::Normal);
+        assert_eq!(coordinator.effective_durability(), Durability::Full);
     }
 }
 

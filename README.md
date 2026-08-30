@@ -211,6 +211,30 @@ backend to keep it that way. The `unsafe` that `io_uring` submission requires
 is confined to `inlaysql-uring`; `inlaysql` and `inlaysql-core` remain
 `#![forbid(unsafe_code)]`.
 
+### Choosing a durability level
+
+Every commit's `fsync`/`F_FULLFSYNC` barrier is measured at 97% of a
+single-writer commit's wall-clock time (`PERF.md`). `EngineOptions::durability`
+is the opt-in to relax it:
+
+```rust
+use inlaysql::{Database, Durability, EngineOptions, FileDevice};
+
+let db = Database::open_on_with_options(
+    FileDevice::open("app.inlay")?,
+    EngineOptions { durability: Durability::Normal, ..EngineOptions::default() },
+)?;
+```
+
+`Durability::Full` (the default; nothing committed is ever lost) is
+unaffected either way. `Durability::Normal` measured 32x this project's
+single-writer commit throughput, trading a bounded, documented amount of
+loss on **power failure only** — never on a process or OS crash, and never
+torn or invented state. See [`docs/recovery.md`](docs/recovery.md#durability-levels)
+for the exact loss bound, the per-platform mapping (it is not the same trade
+on macOS and Linux), and the cross-handle rule when two handles on one file
+disagree, and `PERF.md` for the measured numbers.
+
 ### Handing the database to an agent
 
 An InlaySQL file is an MCP tool. No glue code, no schema translation, no vector

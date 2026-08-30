@@ -24,7 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use inlaysql::{Database, EngineOptions, FileDevice, Value};
-use inlaysql_core::btree::{CowBTree, DEFAULT_PAGE_CACHE_BYTES, DEFAULT_PAGE_SIZE};
+use inlaysql_core::btree::{CowBTree, Durability, DEFAULT_PAGE_CACHE_BYTES, DEFAULT_PAGE_SIZE};
 use inlaysql_core::{RowId, Storage, TreeStorage};
 
 /// A database file that deletes itself when the test ends, whatever the
@@ -326,8 +326,9 @@ fn print_size_over_time_for_report() {
 fn the_size_question_covers_the_free_list_rows_committing_will_add() {
     let db = TempDb::new("nearly-full-with-reuse");
     let device = FileDevice::open(db.path()).expect("open");
-    let mut storage = TreeStorage::open_on_with_options(device, DEFAULT_PAGE_CACHE_BYTES, true)
-        .expect("open_on_with_options");
+    let mut storage =
+        TreeStorage::open_on_with_options(device, DEFAULT_PAGE_CACHE_BYTES, true, Durability::Full)
+            .expect("open_on_with_options");
 
     // Wide enough that every value needs an overflow chain of its own.
     const ROWS: RowId = 200;

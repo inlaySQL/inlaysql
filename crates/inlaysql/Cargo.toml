@@ -11,6 +11,12 @@ rust-version.workspace = true
 inlaysql-core = { workspace = true }
 redb = { workspace = true }
 
+# `Durability::Normal`'s barrier — see the workspace `Cargo.toml` comment.
+# macOS and Linux only: every other target falls back to `Durability::Full`'s
+# barrier for `Normal` too (see `device.rs`), so it never reaches this crate.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+rustix = { workspace = true }
+
 # SQLite as an oracle for `tests/differential.rs` — a second implementation to
 # disagree with, which is the only way to catch a logic bug that a metamorphic
 # property does not cover. A dev-dependency: it never reaches a consumer, and

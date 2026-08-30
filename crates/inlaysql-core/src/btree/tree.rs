@@ -42,7 +42,7 @@ use crate::traits::RowId;
 
 use super::backup::{self, BackupSummary};
 use super::cache::{self, PageCache, DEFAULT_PAGE_CACHE_BYTES};
-use super::device::{CommitPoint, Device};
+use super::device::{CommitPoint, Device, Durability};
 use super::page::{self, Entry, Key, Node, PageId, Separator, ValueRef};
 
 /// The magic bytes at the front of the header.
@@ -215,6 +215,10 @@ pub struct CowBTree<D: Device> {
     /// ever written — a database nobody opts in for is byte-for-byte
     /// unaffected. See [`CowBTree::set_page_reuse`].
     reuse_enabled: bool,
+    /// The [`Durability`] level this handle has requested for
+    /// [`Device::sync_commit`]. `Durability::Full` by default and for every
+    /// existing caller — see [`CowBTree::set_durability`].
+    durability: Durability,
     /// `(freed_at, id)` pairs the free list currently believes are
     /// reclaimable and this handle has proven durable and live, read ahead
     /// from the tree so [`CowBTree::alloc_page`] does not pay a descent on
@@ -450,6 +454,7 @@ impl<D: Device> CowBTree<D> {
             range_cursor: RefCell::new(None),
             row_scan_cursor: RefCell::new(None),
             reuse_enabled: false,
+            durability: Durability::Full,
             free_candidates: Vec::new(),
             freed_this_txn: Vec::new(),
             consumed_this_txn: Vec::new(),
@@ -504,6 +509,54 @@ impl<D: Device> CowBTree<D> {
     /// [`CowBTree::set_page_reuse`].
     pub fn page_reuse(&self) -> bool {
         self.reuse_enabled
+    }
+
+    /// Request a [`Durability`] level for this handle's commits.
+    ///
+    /// Governs [`Device::sync_commit`] only — the barrier an ordinary user
+    /// commit waits on (`CowBTree::commit`). [`Device::sync`], used by the
+    /// state-block rewrite and by [`CowBTree::checkpoint`], is never
+    /// affected by this; see [`Device::sync`]'s doc comment for why it must
+    /// not be. `Durability::Full` (the default) never loses a committed
+    /// write; `Durability::Normal` trades that for throughput and can lose
+    /// commits since the last checkpoint on power failure only — see
+    /// [`Durability`]'s doc comment for the exact bound.
+    ///
+    /// # Read this before requesting `Durability::Normal`
+    ///
+    /// Unlike [`CowBTree::set_page_reuse`], this method calls
+    /// [`Device::set_durability`] **every time**, for every level, including
+    /// the default `Full` — never only on the non-default branch. A real
+    /// file's commit barrier is shared by every handle this process has open
+    /// on it (`inlaysql::FileDevice`'s `CommitCoordinator` is keyed per
+    /// `(dev, ino)`, not per handle), so durability is effectively
+    /// **per-file, not freely mixable per-handle**: two handles asking for
+    /// different levels do not each get their own barrier. The device is the
+    /// one place that can see every request and arbitrate, so every request
+    /// — including the ones that ask for nothing unusual — has to reach it.
+    /// A device that shares no state across handles (every [`crate::sim`]
+    /// device, used in single-handle tests) can simply ignore the level; see
+    /// [`Device::set_durability`]'s default.
+    ///
+    /// The arbitration itself is the device's call, not this method's —
+    /// `inlaysql::FileDevice` picks **strongest wins, for the coordinator's
+    /// whole lifetime**: once *any* handle sharing a file has requested
+    /// `Full` (including simply being opened with the default), that file's
+    /// commits stay at `Full` until every handle on it closes, even if a
+    /// later handle asks for `Normal`. Relaxation only takes effect when
+    /// every handle that has ever shared that file's coordinator explicitly
+    /// asked for `Normal`. See `docs/recovery.md` for the justification.
+    pub fn set_durability(&mut self, durability: Durability) {
+        self.device.set_durability(durability);
+        self.durability = durability;
+    }
+
+    /// The [`Durability`] level this handle last requested. See
+    /// [`CowBTree::set_durability`] — this is what *this handle* asked for,
+    /// not necessarily what the shared device is honouring, if another
+    /// handle on the same file asked for something stronger.
+    pub fn durability(&self) -> Durability {
+        self.durability
     }
 
     /// How many pages this handle has drawn from the free list instead of

@@ -84,8 +84,8 @@ pub use inlaysql_core::hnsw::{HnswIndex, VectorMetric};
 pub use inlaysql_core::TreeStorage;
 pub use inlaysql_core::{
     is_reserved_table_name, Cancel, Catalog, Change, ChangeKind, Changes, Collation, Column,
-    ColumnInfo, DataType, Error, Index, IndexKind, Outcome, Reindexed, Result, ResultSet, Stopped,
-    Table, TableAccess, Value, VectorTuning, RESERVED_TABLE_PREFIX,
+    ColumnInfo, DataType, Durability, Error, Index, IndexKind, Outcome, Reindexed, Result,
+    ResultSet, Stopped, Table, TableAccess, Value, VectorTuning, RESERVED_TABLE_PREFIX,
 };
 pub use statement::Statement;
 pub use storage::RedbStorage;
@@ -264,6 +264,7 @@ impl Database {
             device,
             options.page_cache_bytes,
             options.page_reuse,
+            options.durability,
         )?;
         Ok(Self {
             engine: Engine::open_with_options(

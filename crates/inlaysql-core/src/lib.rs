@@ -58,6 +58,7 @@ pub mod traits;
 pub mod value;
 pub mod wal;
 
+pub use btree::Durability;
 pub use catalog::{
     is_reserved_table_name, Catalog, Column, Index, IndexKind, Table, RESERVED_TABLE_PREFIX,
 };

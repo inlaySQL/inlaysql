@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
 use crate::bm25_paged::PagedBm25Index;
-use crate::btree::BackupSummary;
+use crate::btree::{BackupSummary, Durability};
 use crate::catalog::{
     auto_index_name, auto_unique_index_name, Catalog, Index, IndexKind, Table, CATALOG_KEY,
 };
@@ -429,6 +429,47 @@ pub struct EngineOptions {
     /// reason this defaults to off instead of being reclaimed automatically.
     /// See `CowBTree::set_page_reuse`'s doc comment for the full argument.
     pub page_reuse: bool,
+    /// How strong a barrier an ordinary commit waits on before returning.
+    ///
+    /// `F_FULLFSYNC`/`fsync` (macOS/Linux, [`Durability::Full`], the
+    /// default) is measured at 97.1% of a single-writer commit's wall-clock
+    /// time on this project's reference host, and its cost is flat with
+    /// respect to bytes queued — see `PERF.md`'s Phase 0 section.
+    /// [`Durability::Normal`] trades a documented, bounded amount of loss
+    /// for most of that: measured 32x single-writer throughput on the same
+    /// host (`PERF.md`).
+    ///
+    /// # Read this before setting anything other than `Durability::Full`
+    ///
+    /// **This changes what "committed" can mean on power loss, not just
+    /// speed.** [`Durability::Full`] never loses a committed write, ever.
+    /// [`Durability::Normal`] survives a process crash or an OS crash with
+    /// zero loss, but a **power failure** can lose commits still sitting in
+    /// the drive's own volatile write cache, bounded to commits since the
+    /// last checkpoint or WAL-region wrap. It can never corrupt or invent
+    /// state — recovery always lands on a real past commit — but it can
+    /// hand back one older than the caller last saw acknowledged. See
+    /// [`Durability`]'s doc comment and `docs/recovery.md`'s "Durability
+    /// levels" section for the exact bound, the per-platform syscall
+    /// mapping, and why `Device::sync` (checkpoints, the state block) is
+    /// never weakened by this option regardless of the level chosen here.
+    ///
+    /// **This is effectively per-file, not freely mixable per-handle** — the
+    /// same cross-process/in-process distinction [`EngineOptions::page_reuse`]
+    /// already has to draw, for a related reason: `inlaysql::FileDevice`'s
+    /// commit barrier is shared by every handle this process has open on a
+    /// given `(dev, ino)`, not held per handle. Two handles on the same file
+    /// requesting different levels do not each get their own barrier — the
+    /// device arbitrates with **strongest wins, for as long as any handle
+    /// sharing it stays open**: once one handle has required `Full`
+    /// (including simply defaulting to it), that file stays at `Full` until
+    /// every handle on it closes, even if another handle asked for `Normal`.
+    /// This is the safe default read of "different levels on one file": a
+    /// caller who forgets to opt a handle into `Normal` gets the guarantee
+    /// it already expected instead of silently inheriting a weaker one
+    /// somebody else chose. See `CowBTree::set_durability`'s doc comment for
+    /// the full argument.
+    pub durability: Durability,
 }
 
 impl Default for EngineOptions {
@@ -441,6 +482,7 @@ impl Default for EngineOptions {
             hash_join_cache_bytes: DEFAULT_HASH_JOIN_CACHE_BYTES,
             query_memory_bytes: DEFAULT_QUERY_MEMORY_BYTES,
             page_reuse: false,
+            durability: Durability::Full,
         }
     }
 }
