@@ -679,7 +679,7 @@ once per commit*, which for a single sequential connection means either group
 commit (which cannot fire — one writer, one commit in flight, by design) or a
 durability relaxation this engine deliberately does not offer.
 
-**What is owed.** Two measurements, and one of them is cheap:
+**What is owed.** Three measurements, two of them cheap:
 
 1. ~~Re-run the whole containerised comparison **in one session, interleaved**,
    InlaySQL and PostgreSQL and MySQL and the raw `pwrite`+`fsync` floor
@@ -700,7 +700,21 @@ durability relaxation this engine deliberately does not offer.
    source of the remaining noise; something else (driver overhead, process-
    spawn jitter, or the compose network) is. Raw data:
    `bench/results/20260830T095714Z-interleaved-oltp-compare.txt`.
-2. If the write path is picked up again, the target is the **6.5 pages**, not
+2. Repeat the **transport-matched** comparison (`bench/external/
+   server_driver.py`, the "Server-to-server" table, `inlaysql serve --mysql`
+   against MySQL over the same `mysql.connector` client) interleaved, several
+   repetitions, on a quiet machine — the same discipline item 1 just applied
+   to the containerised comparison. The one matched-transport run that exists
+   (2026-08-30, alongside the interleaved rerun above: InlaySQL 627.6 ops/s
+   against MySQL's 849.4 at one connection) did not confirm this section's
+   own prediction that a fair, transport-matched comparison would show
+   InlaySQL doing worse, not better — the matched-transport gap (MySQL
+   ~1.35x faster) came out *smaller* than the containerised one (MySQL
+   1.43x faster, this rerun's own median), the opposite of the predicted
+   direction. It is one run on a workload already shown to swing 50-81%, so
+   it settles nothing on its own; see `BENCHMARK.md`'s "Transport-matched,
+   single run" for the full arithmetic. This is now open, not closed.
+3. If the write path is picked up again, the target is the **6.5 pages**, not
    the code around them. In descending order of what the count says: the second
    root-to-leaf path for the metadata cluster (~43% of the bytes), the 1 MiB
    zero-fill per wrap (~34% of the bytes — and it may not be needed at all,
@@ -1649,16 +1663,23 @@ now tested and rejected, not merely unconfirmed. It does not settle what a
 fair, transport-matched, quiet, repeated comparison would show — only that
 the published sequential single-run table should not be read as one.
 AHL-496's "what is owed" item 1 — re-run interleaved, repeated, on a quiet
-machine — was the *only* item left on that list, and it is now **paid**
-(2026-08-30, same day): see the "What is owed" list above for the summary and
-`BENCHMARK.md`'s "Interleaved, repeated, quiet-machine rerun" section for the
-full table. Short version: 5 repetitions found the MySQL/PostgreSQL ordering
-stable (PostgreSQL ahead, 5/5 — this section's own sequential flip did not
-reproduce under interleaving) and the median multiple close to the published
-one (1.81x/1.43x against 1.90x/1.39x), so the sequential rerun above was the
-noisy measurement, not the published table. There is no commit-path profiling
-still outstanding, in host or in container, and no methodology item left on
-AHL-496's list either.
+machine — was the *only* item on that list at the time, and it is now
+**paid** (2026-08-30, same day): see the "What is owed" list above for the
+summary and `BENCHMARK.md`'s "Interleaved, repeated, quiet-machine rerun"
+section for the full table. Short version: 5 repetitions found the
+MySQL/PostgreSQL ordering stable (PostgreSQL ahead, 5/5 — this section's own
+sequential flip did not reproduce under interleaving) and the median
+multiple close to the published one (1.81x/1.43x against 1.90x/1.39x), so
+the sequential rerun above was the noisy measurement, not the published
+table. There is no commit-path profiling still outstanding, in host or in
+container. One new methodology item has since joined the list, and it is
+not yet paid: the single transport-matched run taken alongside this rerun
+(InlaySQL 627.6 ops/s against MySQL's 849.4 at one connection) did not
+confirm the transport-asymmetry prediction above — the matched-transport
+gap came out smaller, not larger, than the containerised one — so that
+prediction's direction is open, not settled, until it gets the same
+interleaved-repeat treatment item 1 just got. See the "What is owed" list's
+new item 2.
 
 Already winning where it is measured: ~15.8x over `sqlite-vec` at 100k vectors
 (7.56x on the 2,000-vector suite `BENCHMARK.md` publishes), and ~60x over

@@ -546,21 +546,37 @@ row skips and both MySQL and PostgreSQL pay on every statement** — the same
 order of magnitude as the entire published PostgreSQL gap (620 µs). A reader
 should come away understanding that this row flatters InlaySQL, and that a
 transport-matched comparison would very likely reverse part of this gap, not
-just narrow it.
+just narrow it. **That prediction is so far unconfirmed.** The one
+transport-matched run that exists (see "Transport-matched, single run"
+under the interleaved rerun below) points the other way — treat the
+predicted direction as open, not settled, until a repeated, interleaved
+transport-matched run checks it.
 
-**The numbers are unstable across runs, and the ordering flips.** A fresh,
-same-session rerun of this table's own drivers today (`ROWS=3000
-LOOKUPS=1000 ./bench/compare.sh`, host load ~6.2/18 — not quiet, disclosed
-rather than hidden): InlaySQL host 240.9 ops/s, InlaySQL containerised 730.4,
-MySQL 931.2 (**1.27x**), PostgreSQL 805.0 (**1.10x**) — against the published
-849.7 / 1,184.2 (1.39x) / 1,612.8 (1.90x). **PostgreSQL is now slower than
-MySQL, where the published table has it leading**, and the multiple against
-both shrank by about a third in one sequential rerun. Root cause, measured
-directly rather than inferred: the Docker named volume's own `fsync` cost
-drifted 1.5-1.8x within the same session — roughly 1,150 µs before the
-MySQL/PostgreSQL containers were up, 640-800 µs ten minutes later with them
-running. This reproduces `PERF.md`'s AHL-496 finding of a 2.1x drift 90
-minutes apart, at a shorter timescale and inside one benchmark run.
+**The numbers are noisy run-to-run — but this sequential rerun's own
+apparent ordering flip and shrunk multiple turned out to be the artifact,
+not the finding.** A fresh, same-session rerun of this table's own drivers
+today (`ROWS=3000 LOOKUPS=1000 ./bench/compare.sh`, host load ~6.2/18 — not
+quiet, disclosed rather than hidden, and part of why this specific rerun
+turned out unreliable): InlaySQL host 240.9 ops/s, InlaySQL containerised
+730.4, MySQL 931.2 (**1.27x**), PostgreSQL 805.0 (**1.10x**) — against the
+published 849.7 / 1,184.2 (1.39x) / 1,612.8 (1.90x). Read at face value, this
+run says PostgreSQL fell behind MySQL and the multiple against both shrank
+by about a third. **It does not hold up.** The "Interleaved, repeated,
+quiet-machine rerun" section below repeats this same comparison five times
+on a quiet, load-gated machine and finds PostgreSQL ahead of MySQL in 5 of 5
+repetitions, with median multiples (1.81x/1.43x) close to the published
+table's own (1.90x/1.39x) — not to this sequential check's shrunken ones.
+This same-session sequential rerun was itself the unreliable measurement;
+see that section for the full data before drawing a conclusion from this
+one. What genuinely does stand from this rerun: the numbers ARE noisy
+run-to-run (the interleaved section below measures engine spreads of
+50-81% across five repetitions) and the volume's `fsync` cost really does
+drift within a session. Root cause, measured directly rather than inferred:
+the Docker named volume's own `fsync` cost drifted 1.5-1.8x within the same
+session — roughly 1,150 µs before the MySQL/PostgreSQL containers were up,
+640-800 µs ten minutes later with them running. This reproduces `PERF.md`'s
+AHL-496 finding of a 2.1x drift 90 minutes apart, at a shorter timescale and
+inside one benchmark run.
 
 **And it is not our CPU path.** A hypothesis was tested and rejected: that
 in-container, where the barrier is weaker than the host's `F_FULLFSYNC`,
@@ -659,14 +675,25 @@ below) and reaches both `inlaysql serve --mysql` and MySQL with the same
 `mysql.connector` client, so it was run once more alongside this rerun
 (`SERVER_ROWS=2000 SERVER_LOOKUPS=1000`, load ~3.8/18, disclosed, single run,
 not median-of-N): at one connection, InlaySQL wrote 627.6 ops/s against
-MySQL's 849.4 — **0.74x**, not the 1.43x loss the containerised library row
-above shows. That is the same direction the correction above predicts: over
-a matched transport, more of the published write gap closes than the
-containerised row alone suggests. It is one run, not a repeated median, so
-it is reported as a data point for feasibility rather than a replacement
-number — see "Server-to-server" below for the fuller, disclosed-load
-(also single-run, also not repeated) edition of this same comparison,
-including concurrency levels this rerun did not touch.
+MySQL's 849.4 — **0.74x**, meaning MySQL is ~1.35x faster over this matched
+transport (849.4 / 627.6), against the 1.43x MySQL leads by in the
+containerised library row above (1,002.3 / 698.9, median). **That is not the
+direction the correction above predicts — it points the other way.** The
+correction predicted that a fair, transport-matched comparison would very
+likely show InlaySQL doing *worse*, not better, once both engines pay the
+same socket round trip; here InlaySQL's loss shrank (1.43x → 1.35x) instead
+of growing. This single run does not confirm that prediction. It is also
+weak evidence on its own: one run, not a repeated median, on a workload the
+interleaved section above measured swinging 50-81% run to run — nowhere near
+enough to overturn the correction by itself. The structural claim underneath
+the correction — the containerised row is an in-process library call while
+MySQL/PostgreSQL pay a socket round trip per statement, quantified at
+~420-620 µs by reading the drivers — is unaffected and stands regardless;
+what is now in question is only its predicted *net effect on the multiple*,
+which needs a repeated, interleaved, transport-matched run to settle — see
+"Server-to-server" below for the fuller, disclosed-load (also single-run,
+also not repeated) edition of this same comparison, including concurrency
+levels this rerun did not touch.
 
 **Raw data.** `bench/results/20260830T095714Z-interleaved-oltp-compare.txt`
 (the full session: header, both discarded attempts with their `uptime`
