@@ -681,10 +681,25 @@ durability relaxation this engine deliberately does not offer.
 
 **What is owed.** Two measurements, and one of them is cheap:
 
-1. Re-run the whole containerised comparison **in one session, interleaved**,
+1. ~~Re-run the whole containerised comparison **in one session, interleaved**,
    InlaySQL and PostgreSQL and MySQL and the raw `pwrite`+`fsync` floor
    alternating, on a quiet machine. Until that exists, no ordering in that
-   table should be believed — including the ones that flatter us.
+   table should be believed — including the ones that flatter us.~~ **Paid
+   2026-08-30.** See "The containerised comparison, profiled instead of
+   trusted" below for the sequential rerun that first confirmed the
+   instability, and `BENCHMARK.md`'s "Interleaved, repeated, quiet-machine
+   rerun" section for the fix: 5 repetitions, each InlaySQL/MySQL/PostgreSQL/
+   floor run back to back, load-gated manually (`bench/compare.sh` still has
+   no automated gate — see the recommendation there). Result: PostgreSQL led
+   MySQL in 5/5 repetitions (the published table's ordering, not the flipped
+   one the sequential rerun found), median multiples 1.81x/1.43x against the
+   published 1.90x/1.39x, and the raw fsync floor's own spread (15.4%) was far
+   smaller than any engine's (50-81%) and weakly/inconsistently correlated
+   with them (Pearson r: MySQL +0.51, PostgreSQL +0.46, InlaySQL **-0.51**) —
+   so on an already-warm, already-quiet stack the floor is not the dominant
+   source of the remaining noise; something else (driver overhead, process-
+   spawn jitter, or the compose network) is. Raw data:
+   `bench/results/20260830T095714Z-interleaved-oltp-compare.txt`.
 2. If the write path is picked up again, the target is the **6.5 pages**, not
    the code around them. In descending order of what the count says: the second
    root-to-leaf path for the metadata cluster (~43% of the bytes), the 1 MiB
@@ -1634,8 +1649,16 @@ now tested and rejected, not merely unconfirmed. It does not settle what a
 fair, transport-matched, quiet, repeated comparison would show — only that
 the published sequential single-run table should not be read as one.
 AHL-496's "what is owed" item 1 — re-run interleaved, repeated, on a quiet
-machine — is now the *only* item left on that list; there is no commit-path
-profiling still outstanding, in host or in container.
+machine — was the *only* item left on that list, and it is now **paid**
+(2026-08-30, same day): see the "What is owed" list above for the summary and
+`BENCHMARK.md`'s "Interleaved, repeated, quiet-machine rerun" section for the
+full table. Short version: 5 repetitions found the MySQL/PostgreSQL ordering
+stable (PostgreSQL ahead, 5/5 — this section's own sequential flip did not
+reproduce under interleaving) and the median multiple close to the published
+one (1.81x/1.43x against 1.90x/1.39x), so the sequential rerun above was the
+noisy measurement, not the published table. There is no commit-path profiling
+still outstanding, in host or in container, and no methodology item left on
+AHL-496's list either.
 
 Already winning where it is measured: ~15.8x over `sqlite-vec` at 100k vectors
 (7.56x on the 2,000-vector suite `BENCHMARK.md` publishes), and ~60x over

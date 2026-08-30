@@ -19,7 +19,7 @@ beside wins, because a table that only contains wins is advertising.
 | Tree | source clean (`dirty: no` in both raw outputs) |
 | Machine | Apple Mac17,9, 18 cores, macOS 27.0 (Darwin 27.0.0 arm64) |
 | Toolchain | rustc 1.91.1 (ed61e7d7e 2025-11-07) |
-| Raw output | `bench/results/20260825T103354Z.txt` and `20260825T104132Z.txt` (SQLite, `sqlite-vec`; two runs, median published); `20260825T110513Z-compare.txt` (DuckDB, pgvector, MySQL, PostgreSQL). Retrieval section regenerated 2026-08-29 (Meilisearch added): `20260829T084502Z-compare.txt`. Concurrent-writers section regenerated 2026-08-30 on base commit `63b6cb2` with an adaptive commit-coalesce window applied and uncommitted at capture time (committed immediately after regeneration — see PERF.md), median of three runs each: `20260830T031300Z.txt`/`20260830T032800Z.txt`/`20260830T032900Z.txt` (published 1/2/4/8 sweep) and `20260830T031500Z.txt`/`20260830T032100Z.txt`/`20260830T033600Z.txt` (wide sweep). Tail-latency table and the old-vs-new A/B regenerated 2026-08-30 on `08f5fd4` (which added the percentile columns), `WRITER_LEVELS=1,8,32`, median of three runs each: `bench/results/ab-head-run{1,2,3}-*.txt` (current adaptive window) and `bench/results/ab-pre94d96a6-run{1,2,3}-*.txt` (temporarily reverted to the pre-`94d96a6` fixed 8-yield window for the A/B only; not shipped) |
+| Raw output | `bench/results/20260825T103354Z.txt` and `20260825T104132Z.txt` (SQLite, `sqlite-vec`; two runs, median published); `20260825T110513Z-compare.txt` (DuckDB, pgvector, MySQL, PostgreSQL). Retrieval section regenerated 2026-08-29 (Meilisearch added): `20260829T084502Z-compare.txt`. Concurrent-writers section regenerated 2026-08-30 on base commit `63b6cb2` with an adaptive commit-coalesce window applied and uncommitted at capture time (committed immediately after regeneration — see PERF.md), median of three runs each: `20260830T031300Z.txt`/`20260830T032800Z.txt`/`20260830T032900Z.txt` (published 1/2/4/8 sweep) and `20260830T031500Z.txt`/`20260830T032100Z.txt`/`20260830T033600Z.txt` (wide sweep). Tail-latency table and the old-vs-new A/B regenerated 2026-08-30 on `08f5fd4` (which added the percentile columns), `WRITER_LEVELS=1,8,32`, median of three runs each: `bench/results/ab-head-run{1,2,3}-*.txt` (current adaptive window) and `bench/results/ab-pre94d96a6-run{1,2,3}-*.txt` (temporarily reverted to the pre-`94d96a6` fixed 8-yield window for the A/B only; not shipped). "Against MySQL and PostgreSQL"'s interleaved rerun regenerated 2026-08-30 on this same commit, 5 repetitions, load-gated: `bench/results/20260830T095714Z-interleaved-oltp-compare.txt` and `bench/results/20260830T095714Z-rep{1..5}-{inlaysql-container,mysql,postgres}.json` |
 
 One developer machine. Reproduce it; do not trust it. Both runs are new this
 edition, so — unlike the previous one — every table below comes from the same
@@ -501,7 +501,15 @@ not hidden.
 **Writes: we lose to both.** PostgreSQL is 1.90x faster than the containerised
 row (1,612.8 against 849.7) and MySQL 1.39x (1,184.2). Which of the two servers
 leads has now flipped between editions while our own figure barely moved, so
-read the ordering as noise and the fact that we trail both as the finding. The previous edition had
+read the ordering as noise and the fact that we trail both as the finding.
+**This single run should not be read on its own — see "Interleaved, repeated,
+quiet-machine rerun" below the correction that follows this section**: a
+same-session sequential rerun found the ordering flipped and the multiple
+shrunk by about a third, but a properly interleaved, repeated, load-gated
+rerun found the opposite — PostgreSQL ahead of MySQL in 5 of 5 repetitions,
+median multiples of 1.81x/1.43x, close to this table's own 1.90x/1.39x. Read
+this table's ordering and multiple as closer to right than the sequential
+check below suggested, not as replaced by it. The previous edition had
 us beating PostgreSQL and within 1.08x of MySQL; our own figure improved
 (723.1 → 847.2) and both servers improved more, on a run where they had eleven
 unrelated containers for company and we did not control for it. So the ranking
@@ -568,6 +576,124 @@ in the transport asymmetry above, not in this engine's code. The honest next
 step is a methodology fix — interleaved, repeated, quiet-machine runs
 publishing median and spread (`bench/README.md`'s "How many times to run
 it") — not more profiling of the commit path.
+
+### Interleaved, repeated, quiet-machine rerun (2026-08-30): AHL-496's "what is owed" item, paid
+
+The correction above named the fix and did not do it: this section is that
+rerun. One repetition is InlaySQL (containerised), MySQL and PostgreSQL, run
+back to back against the same warm containers, immediately followed by a
+control — a raw `pwrite`(80 KiB)+`fsync` loop (5 warm-up + 25 timed reps) on
+`inlaysql-bench-floor-data`, a named Docker volume of the same `local`-driver
+class as `postgres-oltp-data`/`mysql-oltp-data`/`inlaysql-oltp-data` but
+written by nothing except the probe — so every repetition carries its own
+reading of what the volume's barrier cost at that moment, the instrument
+`PERF.md`'s AHL-496 section used to explain the original drift. The cycle
+repeated 5 times. `ROWS=20000 LOOKUPS=5000` — unchanged from the published
+table above.
+
+**Load, disclosed.** `bench/compare.sh` has no load gate (see the
+recommendation below), so the gate was manual, matching `bench/run.sh`'s
+`BENCH_MAX_LOAD_PER_CPU=0.25` rule (18 logical CPUs → keep the 1-minute
+average well under ~4.5): checked before every repetition, waiting and
+rechecking rather than running and caveating. Two repetitions were caught
+and discarded mid-run by processes with nothing to do with this benchmark —
+an unrelated Xcode-beta build (dozens of parallel `clang` processes) spiked
+the 1-minute average past 150, and later an unrelated codesigning/indexing
+burst spiked it past 80 — and redone once the host settled back under 4. The
+5 repetitions published below all started at a 1-minute load between 2.0 and
+4.0 and stayed there throughout; the raw file
+(`bench/results/20260830T095714Z-interleaved-oltp-compare.txt`) carries the
+`uptime` reading before and after every repetition, including the two
+discarded ones, rather than only the ones that looked clean.
+
+**Write ops/s, median and spread (min-max) over the 5 repetitions:**
+
+| Series | median | min | max | spread |
+| --- | ---: | ---: | ---: | ---: |
+| `pwrite`+`fsync` floor (control) | 985.2 | 854.0 | 1,005.6 | 15.4% |
+| InlaySQL, containerised | 698.9 | 557.0 | 909.5 | 50.4% |
+| MySQL 8 | 1,002.3 | 722.9 | 1,535.9 | 81.1% |
+| PostgreSQL 17 | 1,265.7 | 954.2 | 1,621.5 | 52.7% |
+
+**The honest multiple: PostgreSQL 1.81x, MySQL 1.43x** (median against
+median) — close to the published 1.90x/1.39x, not the shrunken 1.10x/1.27x
+the single sequential rerun above found. Read that as the sequential rerun
+having been the noisy measurement, not this one: the published table's
+multiple was closer to right than its own same-session sequential check
+suggested.
+
+**The MySQL/PostgreSQL ordering is stable, not flipped.** PostgreSQL beat
+MySQL in **5 of 5 repetitions** (ratio 1.06-1.32x each time — see the raw
+file for all five). The single sequential rerun's flip (PostgreSQL behind
+MySQL) does not reproduce under interleaving; it looks like exactly the kind
+of sequential-measurement artifact this rerun exists to catch, not a second
+data point about which server is really faster.
+
+**The floor does not explain most of this run's variance, which is itself a
+finding.** The control's own spread (15.4%) is far smaller than any engine's
+(50-81%), and the correlation between the floor and each engine across the 5
+repetitions is weak: MySQL +0.51, PostgreSQL +0.46, InlaySQL **-0.51**
+(Pearson r, n=5 — small enough to read the sign more than the precision).
+On an already-warm, already-quiet stack, the raw fsync floor stayed close to
+one value; the engines still swung 50-81%. That does not contradict the
+1.5-2.1x floor drift `PERF.md`'s AHL-496 section and the correction above
+both measured — those were captured while containers were cold-starting or
+the host was still settling, exactly the conditions this rerun's load gate
+and container-warm-up were designed to avoid. It does mean that once that
+condition is controlled for, most of the remaining run-to-run noise in this
+table is not the storage volume — it is more likely the Python driver/
+connector overhead, `docker exec`/process-spawn jitter, or the compose
+bridge network, none of which this rerun isolated further.
+
+**This does not make the comparison fair, only quieter.** The transport
+asymmetry the correction above quantifies (~420-620 µs/commit, the same
+order as the entire published PostgreSQL gap) is untouched by any of this —
+interleaving and repetition remove noise, not the library-vs-socket
+asymmetry. If anything, a cleaner multiple that lands close to the original
+1.39-1.90x is a *more* confident restatement of a comparison that already
+favours InlaySQL by construction, not evidence that the engine got faster.
+
+**Transport-matched, single run (cheap, not interleaved or repeated).**
+`bench/external/server_driver.py` already exists (AHL-489, "Server-to-server"
+below) and reaches both `inlaysql serve --mysql` and MySQL with the same
+`mysql.connector` client, so it was run once more alongside this rerun
+(`SERVER_ROWS=2000 SERVER_LOOKUPS=1000`, load ~3.8/18, disclosed, single run,
+not median-of-N): at one connection, InlaySQL wrote 627.6 ops/s against
+MySQL's 849.4 — **0.74x**, not the 1.43x loss the containerised library row
+above shows. That is the same direction the correction above predicts: over
+a matched transport, more of the published write gap closes than the
+containerised row alone suggests. It is one run, not a repeated median, so
+it is reported as a data point for feasibility rather than a replacement
+number — see "Server-to-server" below for the fuller, disclosed-load
+(also single-run, also not repeated) edition of this same comparison,
+including concurrency levels this rerun did not touch.
+
+**Raw data.** `bench/results/20260830T095714Z-interleaved-oltp-compare.txt`
+(the full session: header, both discarded attempts with their `uptime`
+readings and the reason each was thrown out, all 5 published repetitions,
+the summary table above, and the transport-matched bonus run) and, per
+repetition, `bench/results/20260830T095714Z-rep{1..5}-{inlaysql-container,
+mysql,postgres}.json` — the exact files each driver/replay wrote, copied out
+before the next repetition overwrote them. `bench/results/` is git-ignored
+per this repo's convention; the filenames above are cited so the run is
+traceable even though the files themselves are not committed.
+
+**Recommended, not implemented.** This session's own experience argues for
+it: two of the seven repetition attempts above were caught only because a
+human was watching `uptime` between phases, and a load gate would have
+refused both automatically instead. `bench/run.sh`'s check (`bench/run.sh`,
+the `BENCH_MAX_LOAD_PER_CPU` block near the top) is a ~25-line, self-contained
+`awk`/`uptime`/`sysctl` block that reads cleanly onto `compare.sh`'s own
+preamble, before the corpus is generated. It was not ported here because
+`compare.sh` is also run from `trust.yml`'s `benchmarks` job in CI
+(`ubuntu-latest`, shared runners, 2-4 vCPUs), where `run.sh`'s identical gate
+is already a known, tolerated flake (a `uptime`-format/CPU-count mismatch or
+a genuinely busy shared runner exits 3) — verifying that adding the same
+behaviour to `compare.sh` would not turn an already-accepted single flake
+into two, or interact with the job's Docker-availability fallback, needs
+someone to actually watch a CI run do it, not a static read of the workflow.
+That verification did not happen in this session, so the port stays a
+recommendation.
 
 ### Server-to-server: MySQL wire protocol
 
