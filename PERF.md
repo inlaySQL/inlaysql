@@ -1168,6 +1168,100 @@ before a slow leader gives up on them) is genuinely unknown. Widening
 `COMMIT_COALESCE_MAX_YIELDS` for a throughput win without any visibility into
 p99 commit latency is a real gap in what this document can honestly claim.
 
+### Deferred/checkpointed page durability, measured before being built — Phase 0, and the redesign does not pay (2026-08-30)
+
+`PLAN.md`'s §6 named deferred/checkpointed page durability — defer B-tree page
+writes behind an async checkpoint so a commit's `fsync` only covers a small WAL
+tail, the way InnoDB/PostgreSQL's redo log works — as the largest remaining
+piece of work and the only way left to close the single-connection sequential
+durable-write loss, once commit-side group commit (still unbuilt) is also
+done. Before building it, Phase 0 measured whether it would actually help.
+**It does not, on this platform, and the redesign should not be built.**
+`F_FULLFSYNC` here is a fixed barrier almost independent of the bytes queued
+behind it, and a real commit dirties too few pages for byte count to matter
+even where the barrier did scale.
+
+**Finding 1 — `F_FULLFSYNC` is a fixed barrier, not a bytes-proportional
+cost.** Standalone probe, 4096B pages, N ∈ {0,1,2,4,8,16,32,64,128,256} pages,
+round-robin interleaved order, 95 timed reps per N after 5 warm-up reps, two
+independent full runs, timing only the `sync_all` call:
+
+| N (pages) | Bytes | p50 |
+| --- | --- | --- |
+| 1 | 4 KiB | 3,085–3,119 µs |
+| 8 | 32 KiB | 3,085–3,141 µs |
+| 64 | 256 KiB | 3,735–3,740 µs |
+| 256 | 1 MiB | 3,658–3,754 µs |
+
+Floor across every N: flat ~2.7–2.9 ms. A 256x increase in bytes queued moves
+the median by only ~20% — inside this project's own stated ±10% run-to-run
+noise band doubled, not a scaling curve. The N=0 (nothing dirty) case is
+bimodal: 30–60% of calls return in ~5–15µs, the rest pay the same ~2.7–4ms,
+apparently when the device's write cache had unrelated pending work — itself
+evidence the barrier's cost is device-state-dependent, not byte-count-dependent.
+
+**Finding 2 — a real commit dirties far too few pages for bytes to ever
+matter, even on a platform where they did.** Instrumented `write_dirty_pages`:
+single-row commits (200 samples) median **5 dirty pages (20,480 B)**, p95 5,
+max 6 — consistent with AHL-496's 6.45-page count above, one B-tree level
+shallower. The `points --rows 2000` suite (2,003 commits) also medians 5
+pages, maxing at 60 pages (245,760 B) on structural B-tree reorganisation —
+and 60 pages is still inside the flat region of Finding 1's curve.
+
+**Finding 3 — fsync already dominates commit wall-clock, matching AHL-480/496
+above.** Per-commit phase split, concurrency suite, n=201, µs:
+
+| Phase | p50 | p95 | max |
+| --- | --- | --- | --- |
+| prepare (rebase/free-list/encode) | 63.1 | 88.4 | 4,132 |
+| `write_dirty_pages` | 39.8 | 59.3 | 70.5 |
+| WAL append | 8.2 | 10.2 | 233.3 |
+| `fsync` (`F_FULLFSYNC`) | 3,727.5 | 3,998.7 | 4,269.1 |
+
+`fsync` is **97.1%** of commit time. Removing `write_dirty_pages` from the
+critical path entirely — which is the whole mechanism the redesign buys —
+would save ~40µs of ~3.84ms, about **1%**.
+
+**Finding 4 — the relaxed-durability ceiling is where the actual prize is.**
+Single-writer commits/s, two reps each, barrier temporarily swapped (change
+reverted, never shipped):
+
+| Barrier | commits/s | vs today |
+| --- | --- | --- |
+| `F_FULLFSYNC` (today) | 246–247 | 1x |
+| plain `fsync(2)` (weaker; Apple's own docs say it does not guarantee a media flush) | 7,839–7,894 | **32x** |
+| no barrier (pure upper bound, never shippable) | 14,342–14,684 | 60x |
+
+So the deferred-page-durability redesign targets the ~1% of commit time that
+is not already `fsync`, and the already-named-but-unbuilt relaxed-durability
+tier (§3 "Re-opened", R11 in `PLAN.md`) targets the 97% and is worth up to 32x
+on this host path.
+
+**The containerised caveat, stated plainly rather than glossed over.** All
+four findings above are host measurements, where `fsync` really is 97% of
+commit time on this Mac's internal SSD. `BENCHMARK.md`'s published loss to
+MySQL (1.39x) and PostgreSQL (1.90x) is a *containerised* comparison, and this
+file's own AHL-496 section already found containerised InlaySQL measuring
+849.7 ops/s against ~253 on the host at the same shape — Docker's virtual disk
+is already handing out a much weaker barrier there than `F_FULLFSYNC` gives on
+the host. So in the comparison `BENCHMARK.md` actually publishes, `fsync` is
+*not* 97% of commit time, and this Phase 0 result does not say a
+relaxed-durability tier would close that specific 1.39x/1.90x gap. Whether it
+would is a separate, currently unprofiled question — nobody has run
+AHL-496-style phase-split instrumentation inside the container, and until that
+exists the 32x above must not be quoted against the published containerised
+numbers. Conflating the two would be exactly the kind of methodology error §6
+of this file exists to prevent.
+
+**What stays true in principle.** The redesign itself is not wrong as an
+idea — it is wrong *for this platform's barrier semantics*. On a platform
+where `fsync`/`fdatasync` cost genuinely scales with bytes written (a
+PLP-protected NVMe under Linux, which R1 was scoped to go measure), deferring
+page writes behind a checkpoint would shrink the barrier's own cost, not just
+the ~1% of commit time sitting outside it, and would be worth revisiting
+there. The verdict above is scoped to `F_FULLFSYNC` on this Mac's internal
+APFS SSD, not to the architecture.
+
 **Scans, joins and aggregates are the untested embarrassment**, and AHL-462 and
 AHL-464 made them less embarrassing without making them measured. Joins are
 still nested-loop in written order, and there is still no join reordering — but
