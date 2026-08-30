@@ -160,6 +160,7 @@ Full map: [`README.md#layout`](README.md#layout). Short version:
 | SQLancer / fuzzing | [`docs/sqlancer.md`](docs/sqlancer.md) |
 | Benchmark methodology | [`bench/README.md`](bench/README.md) |
 | The current published numbers, wins and losses | [`BENCHMARK.md`](BENCHMARK.md) |
+| Win/lose/tie verdicts per workload x SQLite/MySQL/PostgreSQL, and the fairness audit behind them | [`SCOREBOARD.md`](SCOREBOARD.md) |
 
 ## PRs
 

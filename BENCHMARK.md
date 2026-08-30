@@ -5,6 +5,14 @@ rule `AGENTS.md` sets and it is the only reason these are worth reading — a
 figure nobody can reproduce is worse than no figure. Losses are published
 beside wins, because a table that only contains wins is advertising.
 
+**For a workload x SQLite/MySQL/PostgreSQL matrix with a WIN/LOSS/TIE/
+FLOOR-BOUND/N/A/UNKNOWN verdict per cell, and the fairness audit (durability,
+transport, tuning, structural asymmetry) that verdict rests on, see
+[`SCOREBOARD.md`](SCOREBOARD.md).** This file remains the source of truth for
+every headline figure; that one turns the figures below into a defined win/
+lose/tie, cell by cell, and states plainly which cells nobody has filled in
+yet.
+
 > **Read this before trusting any number below: the measurement floor.**
 > An A/A test — the identical binary, the identical data, measured against
 > itself with no code change at all — moves this harness's own figures by up
@@ -682,6 +690,21 @@ all.
 ---
 
 ## Against MySQL and PostgreSQL
+
+**Tuning asymmetry, found auditing this section for `SCOREBOARD.md`
+(2026-08-31), not previously disclosed here:** `compose.yml`'s `postgres`
+service runs `shared_buffers=512MB`, roughly 4x PostgreSQL's own stock
+default; the `mysql` service gets no equivalent bump to
+`innodb_buffer_pool_size`, which sits at MySQL 8's stock 128MB. Likely inert
+for the numbers below — this workload's 20,000 short rows fit either
+engine's *stock* cache, and the commit path is `fsync`-dominated (88-97% of
+commit time) regardless — but it is a real inconsistency a reviewer would
+flag, and it would matter for any future range-scan/join/aggregate row
+against these servers, where a bigger working set could make the comparison
+about the tuning choice rather than the engine. See `bench/README.md`'s new
+"Tuning" subsection (below "The structural asymmetry that cannot be
+removed") for the full note, and `SCOREBOARD.md` §4.3 for the audit this was
+found during.
 
 **Carried forward from `b4798ce` (2026-08-30), not regenerated this
 edition.** This whole section — the table immediately below, its

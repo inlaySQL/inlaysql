@@ -866,6 +866,37 @@ correction and `PERF.md`'s 2026-08-30 section for the full measurement,
 including why it is not this engine's commit-path CPU cost either (`fsync`
 is 88-89% of a containerised commit, matching the host's 97.1%).
 
+### Tuning — not matched, and it should be, before this comparison grows
+
+Found auditing `compose.yml` for `SCOREBOARD.md` (2026-08-31), not previously
+written down anywhere: the `postgres` service runs with `shared_buffers=512MB`
+(`compose.yml`), roughly 4x PostgreSQL's own ~128MB stock default. The
+`mysql` service gets no equivalent bump — its command is exactly
+`--innodb-flush-log-at-trx-commit=1 --skip-log-bin`, so
+`innodb_buffer_pool_size` sits at MySQL 8's stock 128MB. A reviewer would
+reasonably ask why one server was tuned and the other was not, in the same
+file, for the same comparison.
+
+**Likely inert for the numbers published today, for the same reason the
+transport tax above is not this engine's CPU cost:** the OLTP workload is
+20,000 rows of a short `body TEXT`, comfortably resident in either engine's
+*stock* buffer cache, and every write-path profile in this document and
+`PERF.md` found the commit path `fsync`-dominated (88-97% of commit time),
+leaving little room for a buffer-pool difference to move a single-row-commit
+number. **It would matter a great deal if this comparison ever grows to an
+indexed range scan, a join, or an aggregate against these servers** — a
+working set that overflows a stock 128MB `innodb_buffer_pool_size` but fits
+a tuned `shared_buffers` would make that comparison about the tuning choice,
+not the engine. Recommendation, for whoever builds that next comparison: set
+`innodb_buffer_pool_size` to match `shared_buffers`'s multiple of stock (or
+size the corpus past every configuration's cache and make the mismatch
+moot) before publishing. Also unmatched, and named for the same reason:
+`innodb_flush_method` is left at MySQL's own default rather than
+`O_DIRECT` — which, if anything, costs MySQL a double-buffered write through
+the OS page cache a tuned deployment would skip, cutting the other way from
+the buffer-pool point above. Neither item is fixed here; see `SCOREBOARD.md`
+for the fuller fairness audit this was found during.
+
 ### What today's rerun found, and what a fair comparison needs
 
 A same-session rerun of this section's own drivers, done to check whether
