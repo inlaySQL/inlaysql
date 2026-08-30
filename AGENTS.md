@@ -48,6 +48,17 @@ in this repo — read it before your first commit here.
   (`bench/run.sh`, `bench/compare.sh`). Don't add a performance claim to
   `README.md` or `bench/README.md` that isn't backed by one of those scripts.
   A number nobody can reproduce is worse than no number.
+- **`BENCHMARK.md` is the source of truth for every headline figure quoted
+  elsewhere** (`README.md`'s "## Performance" section,
+  `crates/inlaysql-wasm/www/index.html`'s benchmark blocks). Those two are
+  hand-copied, and the copy has drifted before — `bench/run.sh`/
+  `bench/repeat.sh` regenerate `BENCHMARK.md`, not the other two, so after
+  regenerating it, update the copies too. `./bench/check_benchmark_sync.py`
+  (also in CI, `ci.yml`'s `check` job) checks that every ops/s, latency and
+  commits/s figure quoted in either copy still appears in one of
+  `BENCHMARK.md`'s own tables — run it after touching any of the three files
+  and before assuming the copy is still current. It compares committed text
+  to committed text; it does not run a benchmark and cannot flake.
 - **A change to the storage engine, WAL, recovery path or an index format
   needs a DST pass**, not just `cargo test`. `inlaysql_core::mem` provides a
   full in-memory environment (`BTreeMap` storage, logical clock, seeded PRNG)

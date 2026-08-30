@@ -46,6 +46,16 @@ DROP = re.compile(r"^\s*(?:date|commit|dirty|rustc|host|docker|load|written to)\
 # double-counts the metric and makes an otherwise valid summary fail.
 PROSE = re.compile(r"^\s*===|^\s*\(|^InlaySQL is ")
 
+# `bench/run.sh` samples machine load throughout a run, not just before it
+# starts, and marks the result file with this word, prominently, when a
+# sample exceeded the configured threshold mid-run. It lives on a `load:`
+# line, so `DROP` above would otherwise strip it out along with the rest of
+# that provenance — which would make a contaminated run indistinguishable
+# from a clean one the moment it is combined with others. Checked directly
+# against the raw file text rather than through `parse()`, so it survives
+# regardless of what `DROP`/`PROSE` do to the line it sits on.
+CONTAMINATED = re.compile(r"\bCONTAMINATED\b")
+
 
 @dataclass
 class Slot:
@@ -173,10 +183,41 @@ def measured(run: list[Line | str]) -> list[Line]:
     return [item for item in run if isinstance(item, Line)]
 
 
+def contaminated(path: str) -> bool:
+    """True if `path` flagged itself as taken under a mid-run load spike.
+
+    This is a raw-text check, deliberately independent of `parse()`: the
+    marker lives on a `load:` line, which `DROP` strips before a single
+    `Line` is ever built, and a check built on top of `parse()`'s output
+    would silently lose the one thing it is supposed to catch.
+    """
+    with open(path, encoding="utf-8") as handle:
+        return any(CONTAMINATED.search(line) for line in handle)
+
+
+def warn_contaminated(paths: list[str]) -> list[str]:
+    flagged = [path for path in paths if contaminated(path)]
+    if not flagged:
+        return flagged
+    print("!" * 72)
+    print(f"CONTAMINATED: {len(flagged)} of {len(paths)} input run(s) recorded a load")
+    print("spike mid-run (bench/run.sh's own load monitor, not this script). Every")
+    print("figure below is built from at least one run taken while the machine was")
+    print("busier than the gate allows. Treat this summary as unreliable until it is")
+    print("re-run on a quiet machine throughout. See PERF.md §4.")
+    for path in flagged:
+        print(f"  {path}")
+    print("!" * 72)
+    print()
+    return flagged
+
+
 def main(paths: list[str]) -> int:
     if len(paths) < 2:
         print("usage: summarise.py <result.txt> <result.txt> [...]", file=sys.stderr)
         return 2
+
+    flagged = warn_contaminated(paths)
 
     runs = [parse(path) for path in paths]
     reference = measured(runs[0])
@@ -250,6 +291,11 @@ def main(paths: list[str]) -> int:
             continue
         print(rewrite(item, [render(slot.median(), slot.unit) for slot in slots[index]]))
         index += 1
+
+    if flagged:
+        print()
+        warn_contaminated(paths)
+
     return 0
 
 

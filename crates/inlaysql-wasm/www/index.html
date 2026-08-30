@@ -300,12 +300,12 @@
   </p>
   <div class="figures">
     <div class="figure">
-      <b>523k</b>
+      <b>522,562</b>
       <span>point reads per second</span>
-      <em>3.3× SQLite in journal mode, durable</em>
+      <em>~2-4× SQLite in journal mode, durable</em>
     </div>
     <div class="figure">
-      <b>13.7×</b>
+      <b>~13×</b>
       <span>SQLite on concurrent writes</span>
       <em>1,209 commits/s at 8 writers, 0% aborted</em>
     </div>
@@ -466,25 +466,25 @@
           <td>Point read by primary key</td>
           <td class="num">522,562 ops/s</td>
           <td>SQLite, journal (durable)</td>
-          <td class="win">~3.3× faster</td>
+          <td class="win">~2-4× faster</td>
         </tr>
         <tr>
           <td>Concurrent writes, 8 writers</td>
           <td class="num">1,209 commits/s</td>
           <td>SQLite, journal</td>
-          <td class="win">13.7× faster</td>
+          <td class="win">~13× faster</td>
         </tr>
         <tr>
           <td>Vector search, recall@10 1.000</td>
           <td class="num">78.96 µs</td>
           <td><code>sqlite-vec</code></td>
-          <td class="win">8.46× faster</td>
+          <td class="win">~8-10× faster</td>
         </tr>
         <tr>
           <td>Hybrid search (BM25 + vector)</td>
           <td class="num">198.0 µs</td>
           <td>DuckDB, pgvector</td>
-          <td class="win">56–69× faster</td>
+          <td class="win">~55-70× faster</td>
         </tr>
         <tr>
           <td>Durable write, one row per commit (containerised)</td>
@@ -502,16 +502,25 @@
           <td>Secondary-index inner join, 20k × 160k rows</td>
           <td class="num">4.22 ms</td>
           <td>SQLite</td>
-          <td class="win">7.23× faster</td>
+          <td class="win">~5-9× faster</td>
         </tr>
         <tr>
           <td>Indexed range scan, 50 rows</td>
           <td class="num">14.00 µs</td>
           <td>SQLite, journal</td>
-          <td class="loss">1.94× slower</td>
+          <td class="loss">~2× slower</td>
         </tr>
       </tbody>
     </table>
+    <p class="note">
+      These multiples are rounded to the precision <a
+      href="https://github.com/inlaySQL/inlaysql/blob/main/BENCHMARK.md">BENCHMARK.md</a>'s
+      own measured run-to-run spread supports — repeating the identical
+      binary against identical data moves these figures by several percent
+      on a quiet machine and more under normal load, so a bare "3.3×" would
+      claim more precision than the measurement has. See that file's opening
+      note.
+    </p>
     <p class="note">
       One developer machine, one commit, one sitting. Reproduce it; do not
       trust it — <code>./bench/run.sh</code> and <code>./bench/compare.sh</code>

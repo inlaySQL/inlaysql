@@ -44,5 +44,54 @@ class ParseTests(unittest.TestCase):
             self.assertEqual(len(summarise.measured(summarise.parse(str(faster)))), 2)
 
 
+class ContaminationTests(unittest.TestCase):
+    """`bench/run.sh` now samples load throughout a run and marks the result
+    file CONTAMINATED, on a `load:` line, when a sample exceeded the gate
+    mid-run. That line is provenance (`DROP` strips it from `parse()`'s
+    measured lines), so the only way this flag can do its job is if
+    `summarise.py` checks for it independently of `parse()` and refuses to
+    let it go missing when runs are combined.
+    """
+
+    def _write_pair(self, directory: str, *, contaminate_one: bool) -> tuple[Path, Path]:
+        clean_a = Path(directory, "a.txt")
+        clean_b = Path(directory, "b.txt")
+        body_a = "engine ops/s\nInlaySQL 100\n"
+        body_b = "engine ops/s\nInlaySQL 102\n"
+        if contaminate_one:
+            body_a += (
+                "\nload:   *** CONTAMINATED: load exceeded "
+                "BENCH_MAX_LOAD_PER_CPU=0.25 during this run (max 9.0/18) — "
+                "do not treat these numbers as clean; see PERF.md §4 ***\n"
+            )
+        clean_a.write_text(body_a, encoding="utf-8")
+        clean_b.write_text(body_b, encoding="utf-8")
+        return clean_a, clean_b
+
+    def test_clean_runs_report_no_contamination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            a, b = self._write_pair(directory, contaminate_one=False)
+            self.assertEqual(summarise.contaminated(str(a)), False)
+            self.assertEqual(summarise.contaminated(str(b)), False)
+            self.assertEqual(summarise.warn_contaminated([str(a), str(b)]), [])
+
+    def test_one_contaminated_run_is_detected_and_named(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            a, b = self._write_pair(directory, contaminate_one=True)
+            self.assertEqual(summarise.contaminated(str(a)), True)
+            self.assertEqual(summarise.contaminated(str(b)), False)
+            self.assertEqual(summarise.warn_contaminated([str(a), str(b)]), [str(a)])
+
+    def test_contamination_survives_being_combined_with_a_clean_run(self) -> None:
+        # The load: line must not turn into a measured `Line` and break the
+        # cross-run structural comparison just because it also happens to be
+        # the run this test wants flagged.
+        with tempfile.TemporaryDirectory() as directory:
+            a, b = self._write_pair(directory, contaminate_one=True)
+            self.assertEqual(len(summarise.measured(summarise.parse(str(a)))), 1)
+            self.assertEqual(len(summarise.measured(summarise.parse(str(b)))), 1)
+            self.assertEqual(summarise.main([str(a), str(b)]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

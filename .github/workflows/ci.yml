@@ -67,6 +67,15 @@ jobs:
       - name: Benchmark instrument tests
         run: python3 bench/test_summarise.py
 
+      # README.md and the wasm demo page hand-copy their headline benchmark
+      # figures from BENCHMARK.md, and that copy has drifted before — an
+      # earlier edition carried GIL-contaminated OLTP and server-to-server
+      # numbers two editions stale. This reads only committed files and
+      # never runs a benchmark, so it cannot flake the way a live
+      # measurement would.
+      - name: Benchmark figures match BENCHMARK.md
+        run: python3 bench/check_benchmark_sync.py
+
       - name: Demo still runs
         run: cargo run --example hybrid_search -p inlaysql
 

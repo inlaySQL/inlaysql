@@ -809,6 +809,14 @@ sides, matched durability (`fullfsync` on macOS, which is what makes these
 numbers mean anything at all), and each engine's own query plan checked
 rather than assumed.
 
+**`BENCHMARK.md` measured this harness's own noise floor and it is not
+small**: repeating the identical binary against identical data moves these
+figures by a median 4.0-7.3% (worse under real desktop load) and roughly half
+of the metrics in the main suite disagree by 10% or more run to run. The
+multiples below are rounded to what that floor supports (`~2-4x`, not
+`3.26x`) — see `BENCHMARK.md`'s opening note and its §4 reference into
+`PERF.md` before quoting any of these to more digits than that.
+
 ### Against SQLite
 
 SQLite is measured two ways, because they are two different promises:
@@ -818,29 +826,34 @@ harder target.
 
 | Workload | InlaySQL | SQLite, durable | SQLite, fastest |
 | --- | --- | --- | --- |
-| Point read by primary key | **522,562 ops/s**, 1.38 µs p50 | 160,236 ops/s (**~3.3x**) | 1,118,819 ops/s (we lose 2.14x) |
-| Point read, secondary index | **371,478 ops/s**, 2.25 µs p50 | 245,790 ops/s (**1.51x**) | 619,985 ops/s (we lose 1.67x) |
-| Indexed range scan, 50 rows | 64,250 ops/s, 14.00 µs p50 | 124,662 ops/s (we lose 1.94x) | 182,357 ops/s (we lose 2.84x) |
-| Join, PK inner, full scan | 12.51 ms p50 | 10.70 ms p50 (we lose 1.19x) | — |
-| Join, secondary-index inner, full scan | **4.22 ms p50** | 31.78 ms p50 (we win 7.23x) | — |
-| Durable write, one commit each | **240 ops/s**, 3.97 ms p50 | 90 ops/s (**2.67x**) | — |
-| Concurrent durable writers, 8 threads | **1,209 commits/s**, 0.0% aborted | 88 commits/s (**13.7x**) | — |
+| Point read by primary key | **522,562 ops/s**, 1.38 µs p50 | 160,236 ops/s (**~2-4x**) | 1,118,819 ops/s (we lose ~2x) |
+| Point read, secondary index | **371,478 ops/s**, 2.25 µs p50 | 245,790 ops/s (**~1.5x**) | 619,985 ops/s (we lose ~1.7x) |
+| Indexed range scan, 50 rows | 64,250 ops/s, 14.00 µs p50 | 124,662 ops/s (we lose ~2x) | 182,357 ops/s (we lose ~2.9x) |
+| Join, PK inner, full scan | 12.51 ms p50 | 10.70 ms p50 (we lose ~1.1-1.3x) | — |
+| Join, secondary-index inner, full scan | **4.22 ms p50** | 31.78 ms p50 (we win ~5-9x) | — |
+| Durable write, one commit each | **240 ops/s**, 3.97 ms p50 | 90 ops/s (**~2.7x**) | — |
+| Concurrent durable writers, 8 threads | **1,209 commits/s**, 0.0% aborted | 88 commits/s (**~13x**) | — |
 
-A single indexed point probe wins — the index itself is worth 548.71x over the
-engine's own unindexed scan. **Iterating rows is where we lose**: the 50-row
-range scan is behind both SQLite configurations (1.94x and 2.84x), and the
-`LIMIT 10` form of both join shapes stays 2.5–3.0x behind (down from 4.7–5.8x
-two editions ago, after two fixes described in `BENCHMARK.md`), which is what
-pins the remaining cost as per-row rather than per-query. This is the top open
-performance target — [`PERF.md`](PERF.md) has the profile, and index selection
-stops at the narrow rule in [What this is not](#what-this-is-not).
+A single indexed point probe wins — the index itself is worth roughly 550x
+over the engine's own unindexed scan. **Iterating rows is where we lose**:
+the 50-row range scan is behind both SQLite configurations (roughly 2x and
+2.9x), and the `LIMIT 10` form of both join shapes stays roughly 2.2-3.5x
+behind (down from 4.7–5.8x two editions ago, after two fixes described in
+`BENCHMARK.md`), which is what pins the remaining cost as per-row rather than
+per-query. Every multiple in this paragraph is stated to the precision
+`BENCHMARK.md`'s own measured run-to-run spread supports, not to three
+digits — see that file's opening note. This is the top open performance
+target — [`PERF.md`](PERF.md) has the profile, and index selection stops at
+the narrow rule in [What this is not](#what-this-is-not).
 
 The point-read row has now been published at 636,980, then 342,747, then
 901,158, and now 522,562 ops/s across four editions, with nothing identified
 in the commit history as touching that path. Read the ratio against the
 durable configuration, not the absolute figure — and read that ratio loosely
 too: the three individual runs behind this edition's median disagreed with
-each other by nearly 2x. `BENCHMARK.md` walks through why.
+each other by nearly 2x, and a same-binary A/A test on this exact metric
+alone (`PERF.md` §4) found a 20.4% max-min spread on a quiet machine.
+`BENCHMARK.md` walks through why.
 
 The point-read win is the page cache (AHL-420): caching decoded pages took
 warm p50 from 6.75 µs to roughly 1 µs on a good run, past SQLite's *durable*
@@ -857,15 +870,15 @@ up more slowly.
 
 Durable writes win because we pay one `fsync` per commit against the
 journal's several; batching the same workload into one commit per many rows
-reaches 58,320 ops/s at 11.25 µs (**243x**) — a bulk-load number, not the
+reaches 58,320 ops/s at 11.25 µs (**~240x**) — a bulk-load number, not the
 transaction one above. Concurrent writers scale well past eight now: the
-adaptive commit-coalesce window (94d96a6) lets 8 writers do 4.96x the work of
-one. Eight is not the peak, though — the fuller sweep in `BENCHMARK.md` finds
-it at 16 writers (1,616 commits/s) — and past the peak throughput falls (1,307
-commits/s at 24 writers, 974 at 32) because every writer's whole commit
-prepare phase, not only its `fsync`, still serializes behind one gate —
-`BENCHMARK.md` has the fuller sweep, including the p99 tail latency, and
-`PERF.md` the profile.
+adaptive commit-coalesce window (94d96a6) lets 8 writers do roughly 5x the
+work of one. Eight is not the peak, though — the fuller sweep in
+`BENCHMARK.md` finds it at 16 writers (1,616 commits/s) — and past the peak
+throughput falls (1,307 commits/s at 24 writers, 974 at 32) because every
+writer's whole commit prepare phase, not only its `fsync`, still serializes
+behind one gate — `BENCHMARK.md` has the fuller sweep, including the p99 tail
+latency, and `PERF.md` the profile.
 
 ### Against `sqlite-vec`, DuckDB and pgvector
 
@@ -874,8 +887,8 @@ exhaustive oracle:
 
 | Corpus | recall@10 | InlaySQL p50 | vs `sqlite-vec` |
 | --- | --- | --- | --- |
-| Text-derived embeddings | 1.000 | 78.96 µs | **8.46x faster at 100% of its recall** |
-| Uniform random | 0.922 | 100.29 µs | 6.66x faster at 92.2% of its recall |
+| Text-derived embeddings | 1.000 | 78.96 µs | **~8-10x faster at 100% of its recall** |
+| Uniform random | 0.922 | 100.29 µs | ~6.5-7x faster at 92.2% of its recall |
 
 Both corpus shapes are published because only one of them flatters us:
 uniformly random vectors in 384 dimensions have no structure for a graph
@@ -907,12 +920,15 @@ for the full methodology. 5,000 documents, dim 128, 100 queries, top-10:
 | pgvector (HNSW + `ts_rank`) | 0.987 | 147.00 µs | 13.40 ms |
 
 **Hybrid is roughly 20x** the nearest baseline now that Meilisearch, a
-dedicated search engine, is in the comparison, and 56–69x DuckDB/pgvector —
-because it is one statement here and two queries plus client-side rank
-fusion there (Meilisearch's own hybrid mode included: it is deliberately not
-used, so every engine in the table is fused the same way), not a comparison
-of equal work either way, and `bench/README.md` says so. Vector-only stays
-ahead of pgvector: 135 µs against 147 µs, both paying pgvector's socket
+dedicated search engine, is in the comparison, and roughly 55-70x
+DuckDB/pgvector — because it is one statement here and two queries plus
+client-side rank fusion there (Meilisearch's own hybrid mode included: it is
+deliberately not used, so every engine in the table is fused the same way),
+not a comparison of equal work either way, and `bench/README.md` says so.
+This table is a single run with no repeat wrapper (`bench/compare.sh` has
+none), so its own multiples carry no measured spread of their own — read
+them as less precise than the SQLite table above, not more. Vector-only
+stays ahead of pgvector: 135 µs against 147 µs, both paying pgvector's socket
 round trip a library in your process does not; Meilisearch's 1.17 ms is
 doing more per query (its own ranking pipeline runs alongside the ANN
 search), so read that gap as two different products, not a rout.

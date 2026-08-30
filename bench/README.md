@@ -27,7 +27,7 @@ cargo run --release -p inlaysql-bench -- --suite sweep --docs 20000
 bench/ann/.venv/bin/python bench/ann/run.py --dataset glove-25-angular
 ```
 
-`bench/run.sh` refuses to write a result when the one-minute load average is
+`bench/run.sh` refuses to *start* a run when the one-minute load average is
 above `0.25` per logical CPU, because a busy host has moved the concurrency
 rows by more than the code changes being measured. For a deliberate
 under-load experiment only, override it explicitly:
@@ -36,8 +36,35 @@ under-load experiment only, override it explicitly:
 BENCH_MAX_LOAD_PER_CPU=off SUITE=concurrency ./bench/run.sh
 ```
 
-The raw result records the observed load and the threshold/override, so a
-later reader can tell whether a run passed the quiet-machine gate.
+A gate checked once, before anything runs, cannot catch a spike that arrives
+seconds later — `PERF.md` §4 measured the correlation between disclosed
+start-load and actual point-read throughput at r≈0.18 across runs that all
+passed this exact gate, because nothing was still watching once the run was
+under way. `run.sh` now samples the load every `BENCH_LOAD_SAMPLE_SECONDS`
+(default 5) for the run's whole duration, not just at the start, and folds
+start + in-flight + end into a min/median/max the result file publishes
+alongside the original start-of-run reading. **Policy for a spike mid-run: the
+run is not aborted** (a long suite can take minutes, and discarding it wastes
+more than the contamination costs) — it finishes, but the result file is
+marked `CONTAMINATED`, loudly, on a `load:` line, and a matching warning is
+printed to the terminal the moment the spike is seen. `bench/summarise.py`
+checks every input file it is given for that marker independently of its
+normal parsing (the marker lives on a `load:` line, which is provenance and
+would otherwise be silently dropped along with the rest of that line) and
+prints the same loud warning, both before and after the combined report, if
+any run it combined was contaminated — the flag survives being averaged
+together with clean runs precisely because it is never allowed to disappear
+into the median. Set `BENCH_LOAD_SAMPLE_SECONDS` to change the sampling
+interval; setting `BENCH_MAX_LOAD_PER_CPU=off` disables monitoring
+altogether, exactly as it disables the start-of-run gate, since that variable
+is the documented escape hatch for a deliberate under/over-load measurement.
+
+The raw result records the observed load (start, and now the full sampled
+range) and the threshold/override, so a later reader can tell whether a run
+passed the quiet-machine gate throughout, not just at the starting gun.
+`bench/compare.sh` has no equivalent gate at all yet — see "Server-to-server"
+below for why porting one needs a real CI run to verify first, and why this
+sampling fix is recommended for it rather than applied.
 
 Writes a timestamped file to `bench/results/` (git-ignored) containing the
 toolchain, host and commit alongside the numbers, so a result is always
