@@ -1835,20 +1835,27 @@ shipped default is on the curve, not above it.
 So the remaining vector work is the **48% that is not arithmetic** — candidate
 heaps, the visited set, neighbour-list fetches — and the graph's own
 selectivity at small corpus sizes. Both need a profile of the query phase
-before anything is written; `bin/profile.rs` does not cover the retrieval suite
-yet, and adding it is the first step.
+before anything is written; ~~`bin/profile.rs` does not cover the retrieval
+suite yet, and adding it is the first step~~ — **done, 2026-08-30.** See
+"The retrieval suite, and where the non-kernel 48% actually goes" below.
 
 The avenues below are the ones that would widen the pgvector margin, in order
 of expected value, now reordered by the above:
-1. **The traversal, not the kernel.** Half the query is heap and set
-   bookkeeping around the distance calls. Profile it first.
+1. ~~**The traversal, not the kernel.** Half the query is heap and set
+   bookkeeping around the distance calls. Profile it first.~~ — **profiled,
+   2026-08-30.** It is not one thing; see the breakdown below.
 2. **Memory layout.** Neighbour lists and vectors laid out for sequential access
-   during a graph walk, so the prefetcher works for us.
-3. **Quantised distance kernels.** `VECTOR(n, INT8)` already shrinks storage 4x;
+   during a graph walk, so the prefetcher works for us. Still open; the
+   2026-08-30 profile names this as the likely explanation for the largest
+   single bucket but a leaf sampler cannot confirm a cache stall directly —
+   see below.
+3. ~~**Quantised distance kernels.** `VECTOR(n, INT8)` already shrinks storage 4x;
    computing distances *in* int8, rather than converting to `f32` first, makes
    the memory-bandwidth win a compute win too. Note the int8 path currently
    measures *slower* than exact (155.21 µs against 88.29 µs on the published
-   suite), so this is a repair before it is an optimisation.
+   suite), so this is a repair before it is an optimisation.~~ — **diagnosed,
+   2026-08-30, and it is not a small repair.** The kernel is already
+   vectorised; the loss is structural. See below.
 4. **Quantised paged nodes**  — `PagedHnswIndex` stores exact
    `f32` even for an int8 column, so the paged path currently forfeits the 4x.
 5. ~~**Filter-aware walks** instead of over-fetching.~~ — **done.** The
@@ -1856,6 +1863,208 @@ of expected value, now reordered by the above:
    rejected rows are traversed but neither returned nor counted, so a
    selective filter no longer widens the probe in geometric re-runs. See
    `Engine::retrieve_filtered`.
+
+### The retrieval suite, and where the non-kernel 48% actually goes (2026-08-30)
+
+**Machine state, disclosed per section 6's rule:** `uptime` 1-minute load ran
+1.5–5.2 over this session (four users logged in, nothing else identified as
+consuming CPU), mostly 2–4. Every `sample` capture below was taken with 1-minute
+load under 4.5; the one moment it touched 5.2 was between runs, not during a
+capture. Treat absolute microseconds as a noise band, proportions as the
+finding, same as every other profile in this file.
+
+**The suite.** `crates/inlaysql-bench/src/bin/profile.rs` gained a `retrieval`
+suite (`--suite retrieval`), mirroring `crates/inlaysql-bench/src/main.rs`'s
+own retrieval workload byte-for-byte: the same corpus generator (`VOCABULARY`,
+`synthetic_document`/`synthetic_query`, `hashed_embedding`), the same schema
+(`docs (id INTEGER, body TEXT, embedding VECTOR(dim))`, indexed on both `body`
+and `embedding`) and the same three query shapes (`vector_score`, `bm25_score`,
+`fuse`). `--query vector|bm25|hybrid` picks one shape for the timed loop
+instead of cycling all three — cycling would give the shape under
+investigation about one sample in three, the same dilution `joins-limit`
+exists to avoid for joins — and `--quantized true` switches the embedding
+column to `VECTOR(dim, INT8)`, to profile int8 in isolation. Both indexes are
+warmed (one `vector_score` query, one `bm25_score` query) before
+`announce_query_phase()`, so neither the HNSW graph build nor the BM25 index
+build leaks into the timed window.
+
+**Method.** `--suite retrieval --rows 2000 --dim 384 --limit 10 --query vector`
+(text-derived corpus, the realistic shape, matching what `BENCHMARK.md`'s
+headline vector numbers use), `sample <pid> <seconds> -f <file>` attached after
+`PROFILE_QUERY_PHASE_START`, then every leaf symbol traced up to its parent
+frames before being trusted — this codebase has a standing example
+(`__psynch_cvwait`) of one leaf meaning two different things, and it held here
+too: `_platform_memcmp` and `PageCache::get` in the leaf table below turned out
+to belong to a *different* part of the query than the graph walk (see "a
+second finding" below), not to the HNSW code at all.
+
+**The breakdown, as a share of `HnswIndex::search_with_ef` itself** — the same
+scope `PERF.md`'s 52%-kernel figure used, so the two numbers are comparable —
+from two independent samples (22s/15,325 samples and 15s/11,011 samples;
+`evaluate_score`'s call into `search_with_ef` was 11,411 and 8,458 samples of
+those totals respectively, confirmed by summing every `search_with_ef`
+call-site node in the tree):
+
+| Bucket | Share (2 runs) | Where |
+| --- | --- | --- |
+| Kernel (`stored_distance`, i.e. `lane_sum`) | **~40–42%** | `crates/inlaysql-core/src/hnsw.rs:1785` |
+| Traversal bookkeeping (`search_layer` self time) | **~46–48%** | `crates/inlaysql-core/src/hnsw.rs:1219-1310` |
+| Candidate/results heap `pop` (sift-down) | **~8–9%** | `BinaryHeap::pop` on the two heaps at `hnsw.rs:1242-1243` |
+| Heap `push` growth (reallocation) | **~1.4%** | same two heaps — see below |
+| Final `results.into_vec(); sort_unstable()` | **~1–1.3%** | `hnsw.rs:1307-1308` |
+| `VectorMetric::prepare` (query normalisation) | **~0.5%** | `hnsw.rs:1511` |
+| `Visited::new` allocation + `memset` | **~0.2%** | `hnsw.rs:1512`, `hnsw.rs:1609-1614` |
+
+**This does not exactly reproduce the 52% figure, and that is disclosed rather
+than papered over.** The kernel's measured share here (~40–42%) is lower than
+the 57.16 µs/30.01 µs = 52% isolated-timing figure. Two things differ and
+either could account for it: the corpus (this profile used the text-derived
+shape the published suite reports; the 52% figure used the uniform-random
+"ANN worst case" shape, which needs more distance calls per query at the same
+`ef`) and the method (statistical leaf-sampling of the compiled kernel in situ
+versus a hand-timed isolated loop of just the multiply-adds). The
+**conclusion** the 52% figure supported — kernel work is a minority of the
+query, not the majority, so it is not where a 100x lives — reproduces and is
+if anything stronger here. The **specific number** should not be treated as
+portable across corpora or measurement methods.
+
+**Traversal bookkeeping (~46–48%), broken down by what is actually in it,**
+since a sampler cannot split `search_layer`'s own self-time further than the
+compiler's inlining left it: reading `hnsw.rs:1219-1310`, every visited node
+pays `visited.visit(neighbor)` (`hnsw.rs:1277`, a bounds-checked array write —
+cheap), a `Candidate` struct build and the `enters`/`admits` comparisons
+(`hnsw.rs:1280-1296`, branchy float comparisons via `total_cmp`), a
+non-growing heap `push` in the common case, and — the part the task asked
+about by name — `neighbors_at(nodes, current.node, layer)` (`hnsw.rs:1276`,
+`hnsw.rs:1317-1323`). That call walks `nodes[node].neighbors[layer]`, and
+`Node` (`hnsw.rs:472-487`) stores `neighbors: Vec<Vec<usize>>` — a *separate
+heap allocation per node per layer* — and `vector: StoredVector`, itself a
+`Vec<f32>` or `Q8Vector { values: Vec<i8>, .. }`, another separate allocation.
+Every neighbour a walk visits is therefore two more pointer chases (one for
+its neighbour list, one for its vector) beyond the `Vec<Node>` index itself,
+each potentially a cold cache line unless the allocator happened to place them
+together. This is a plausible, structurally-grounded explanation for why
+`search_layer`'s own bookkeeping — which on its face is a handful of
+comparisons and an array write per node — costs as much as the arithmetic
+kernel itself. It is **not a confirmed cache-miss count**: `sample`'s 1ms
+statistical sampling reports where the instruction pointer was, not stall
+cycles, and this machine has no hardware-counter profiler set up in this
+session (Instruments' "Time Profiler w/ CPU counters" template or `perf stat`
+would be the next step, not attempted here). Stated as what it is: the
+strongest *available* explanation, not a measured one.
+
+**The two `BinaryHeap`s reallocate during the hot per-query loop.** `frontier`
+and `results` at `hnsw.rs:1242-1243` are both `BinaryHeap::new()` — zero
+capacity — even though `ef` (the target beam width) is known at the top of
+`search_layer`. The call tree shows real `alloc::raw_vec::RawVec::grow_one` →
+`finish_grow` → `realloc`/`memmove` activity hanging off `search_layer`'s
+`push` call sites, on *every* query, not just the first: roughly 1.4% of
+`search_with_ef`'s time in the run above. `BinaryHeap::with_capacity(ef + 1)`
+(or similar) for both heaps is a small, bounded, easy-to-A/B candidate — not
+implemented here, this is reconnaissance.
+
+**A second finding, outside the scope the task asked about but real and
+measured on the same corpus:** through the *full SQL path* (as opposed to the
+isolated `HnswIndex::search` call `PERF.md`'s 52% figure measured), roughly
+18–20% of the *entire query's* wall time — separate from and in addition to
+`search_with_ef`'s own ~74–75% share of the query — is spent in
+`Engine::retrieve_rows` fetching each of the `LIMIT k` result rows from the
+underlying B-tree by row id (`TreeStorage::get_row` → `CowBTree::get_from`,
+`crates/inlaysql-core/src/btree/tree.rs`), after the HNSW search has already
+returned the winning ids. This is where the `_platform_memcmp` and
+`PageCache::get` leaf samples actually come from — B-tree key comparison and
+page-cache lookups during ten point reads per query, not the vector index.
+Naming it because "where vector search actually spends its time" through SQL
+includes it even though it is not part of `HnswIndex` at all; not counted in
+the 48% breakdown above, which is scoped to `search_with_ef` to stay
+comparable with the 52% figure.
+
+### The int8 path: diagnosed, and it is (b) not (a) (2026-08-30)
+
+**Reproduced.** `--suite retrieval --rows 2000 --dim 384 --limit 10 --query
+vector --quantized true`, three repeated 5s runs against three exact runs,
+same corpus, same machine, interleaved: exact 18,283–18,570 ops/s (~54–55 µs),
+int8 6,531–6,772 ops/s (~148–153 µs) — **int8 2.7–2.9x slower**, tight spread
+(~2%) within each side. The direct published-suite protocol
+(`inlaysql-bench --suite quantization`, text-derived corpus) reproduces the
+same direction on four runs: exact p50 71.00–97.50 µs, int8 p50
+153.13–171.71 µs — int8 1.76–2.16x slower, median around 2x. **The 155.21 µs
+int8 figure holds up closely (measured 153–172 µs); the 88.29 µs exact figure
+is on the high side of what this session measured (71–97.5 µs, median ~79)** —
+the gap between exact and int8 is, if anything, a little worse today than
+`BENCHMARK.md` currently states, not better. This session's machine load
+(2–5, not idle) is disclosed as the likely source of the spread; call the
+88.29 µs figure provisional rather than wrong, and note the direction (int8
+slower than exact) is not in question either way.
+
+**Why, traced to the instruction level.** `vector_score` defaults to cosine,
+so a query (kept exact `f32` — see `hnsw.rs:1506-1511`'s own comment on why:
+quantising the query too would cost recall without saving resident memory)
+against an int8-quantised corpus calls `stored_distance` →
+`Q8Vector::dot_f32` (`crates/inlaysql-core/src/quantize.rs:42-48`). Reading the
+source, this looked like an unvectorised scalar loop — no `LANES`-style
+accumulator the way `lane_sum` (`hnsw.rs:1756-1774`) has. **That reading was
+wrong**, and finding out required disassembly, not inference: `otool -tV -p`
+on the compiled `stored_distance` symbol, at the exact call-site offset
+`sample` attributed 9,390 of 13,067 `search_with_ef` samples to (71.9%, one
+run), shows real NEON — `tbl.16b` (byte-lane shuffle), `scvtf.4s ... #0x18`
+(vectorised int8→`f32` convert via a fixed-point trick), `fmul.4s` (four
+lanes) — the compiler auto-vectorised `dot_f32` despite the plain
+`.zip().map().sum()` source. **The kernel is vectorised. It is still the
+majority of the query's time anyway**, because unpacking costs more per
+element than the exact path pays: four `tbl`+`scvtf.4s`+`fmul.4s` groups to
+convert and scale 16 packed `i8` bytes into four lanes of `f32` each, against
+zero unpack instructions for `lane_sum`'s direct `f32` loads. Measured:
+kernel share of `search_with_ef` went from ~40–42% (exact) to **75.4%**
+(int8, 9,857/13,067 one run) — not because more distance calls ran (recall at
+the shipped `ef` is within 0.014 of exact per `BENCHMARK.md`, consistent with
+a similar call count), but because each call got dearer.
+
+**The verdict: (b), an inherent property of the current structure, with one
+small (a)-shaped detail riding along.**
+- **(b), primarily.** Comparing a persisted int8 corpus against a
+  full-precision `f32` query — the recall-preserving choice `hnsw.rs` already
+  defends — means every query-time distance call *must* reconstruct `f32`
+  from the corpus's packed bytes. There is no query-time comparison that
+  avoids this without either quantising the query (rejected on recall
+  grounds, and not attempted here either) or a different kernel strategy.
+  `Q8Vector::dot_q8` (`quantize.rs:51-60`), the pure-integer path that
+  *would* avoid the conversion, is never reached at query time — the query is
+  never a `Q8Vector` — and, checked in the same disassembly pass, it is not
+  even vectorised itself: `ldrsb`+`smaddl` in a scalar loop, not the `SDOT`
+  instruction ARM NEON has for exactly this. PERF.md's own unimplemented
+  avenue 3 ("computing distances *in* int8 ... makes the memory-bandwidth win
+  a compute win too") describes what would actually close this gap, and nothing
+  in the current code does it.
+- **(a), a small piece.** `dot_f32` multiplies by `self.scale` on every
+  element (`quantize.rs:46`) instead of factoring the constant out of the sum
+  and applying it once at the end — algebraically safe for a dot product
+  (`sum(code_i * scale * q_i) == scale * sum(code_i * q_i)`), and it is fused
+  cheaply into the existing `fmul.4s` so the saving is one vector instruction
+  per four-lane group, not the dominant cost. Bounded, low-risk, worth an
+  A/B — but on its own it will not close a 1.76–2.9x gap whose majority is
+  the unpack, not the scale multiply. `l2_f32`/`l2_q8` do not get this same
+  fix for free: the delta `code*scale - query` does not let the scale factor
+  out of the sum the way a pure product does.
+- **Not (c).** The slowdown is not a measurement artefact — it reproduces
+  across two harnesses (this session's `profile.rs retrieval` suite and the
+  published `inlaysql-bench --suite quantization`), is directionally stable
+  across seven total runs, and is explained down to the instruction level.
+
+**Named candidates, not implemented — this was reconnaissance:**
+1. Factor `self.scale` out of `dot_f32`'s (and `dot_q8`'s) summation —
+   bounded, cheap to try, will not close most of the gap on its own.
+2. `BinaryHeap::with_capacity(ef + 1)` for `search_layer`'s two heaps —
+   bounded, ~1.4% of `search_with_ef` on this corpus, larger at bigger `ef`.
+3. A query-time int8 comparison kernel that does not materialise `f32` at
+   all — quantising the query transiently (never persisted, never affecting
+   stored recall) and running a genuinely vectorised `i8`×`i8` dot product
+   (ARM `SDOT`, which nothing in this codebase currently emits) instead of
+   `dot_f32`'s convert-then-multiply. This is the real fix for the int8 loss
+   and it is a redesign, not a patch — scope and A/B it separately.
+4. Memory layout for `Node.neighbors`/`Node.vector` (candidate 2 in the list
+   above) — plausible from the structure, not yet confirmed by a stall-cycle
+   profiler.
 
 ---
 

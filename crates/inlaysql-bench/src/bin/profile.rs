@@ -45,11 +45,34 @@
 //! measures against MySQL/PostgreSQL. Setup pre-loads past
 //! [`CDC_WARMUP_ROWS`] so the timed window is steady state, not the first
 //! 4,096 commits before the change-log retention window fills.
+//!
+//! And `retrieval`, 2026-08-30: `PERF.md`'s vector-kernel section named this
+//! the missing piece — "`bin/profile.rs` does not cover the retrieval suite
+//! yet, and adding it is the first step" — because everything downstream of
+//! the exact-`f32` kernel finding (the ~48% that is not arithmetic: candidate
+//! heap, visited set, neighbour-list fetches) needed a way to isolate the
+//! query phase the same way `joins` and `writes` already do. It mirrors
+//! `crates/inlaysql-bench/src/main.rs`'s own retrieval suite: the same corpus
+//! generator (`VOCABULARY`, `synthetic_document`/`synthetic_query`,
+//! `hashed_embedding`), the same schema (`docs (id INTEGER, body TEXT,
+//! embedding VECTOR(dim))`, indexed on both `body` and `embedding`) and the
+//! same three query shapes (`vector_score`, `bm25_score`, `fuse`). The
+//! generator is restated here rather than imported: `profile` and
+//! `inlaysql-bench` are two separate binary crates in one package (see this
+//! crate's `Cargo.toml`), so there is no library target to share it through —
+//! the same reason `run_points`/`run_indexed`/`run_joins` restate their
+//! siblings' schemas instead of calling into them. `--query` selects which
+//! one shape the timed loop measures (`vector`, `bm25` or `hybrid`, default
+//! `vector`) rather than cycling all three, for the reason `Shapes::LimitOnly`
+//! exists on `joins`: the shape under investigation would otherwise get one
+//! sample in three. `--quantized true` switches the embedding column to
+//! `VECTOR(dim, INT8)`, to profile the int8 path in isolation.
 
 use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use inlaysql::embedding::hashed_embedding;
 use inlaysql::{Database, EngineOptions, FileDevice, Statement, Value};
 use inlaysql_core::mem::SeededRng;
 use inlaysql_core::Rng;
@@ -74,6 +97,19 @@ struct Config {
     /// is a cleaner way to force misses than merely growing `--rows`, because
     /// it does not also change how many distinct pages the suite touches.
     page_cache_bytes: Option<usize>,
+    /// Embedding width. `retrieval` only; matches
+    /// `crates/inlaysql-bench/src/main.rs`'s `Config::dim` default so
+    /// `--suite retrieval` without overrides reproduces the corpus behind the
+    /// published `PERF.md`/`BENCHMARK.md` vector numbers (`--rows` stands in
+    /// for that suite's `--docs`, which every other profiled suite already
+    /// aliases to `--rows`).
+    dim: usize,
+    /// `retrieval` only: which of the three query shapes the timed loop runs
+    /// — `vector`, `bm25` or `hybrid`.
+    query: String,
+    /// `retrieval` only: `VECTOR(dim, INT8)` instead of `VECTOR(dim)`, to
+    /// profile the int8 path in isolation.
+    quantized: bool,
 }
 
 impl Config {
@@ -86,6 +122,9 @@ impl Config {
             seed: 42,
             payload: 64,
             page_cache_bytes: None,
+            dim: 384,
+            query: "vector".to_string(),
+            quantized: false,
         };
         let args: Vec<String> = std::env::args().skip(1).collect();
         for pair in args.chunks(2) {
@@ -106,6 +145,18 @@ impl Config {
                         inlaysql_core::btree::DEFAULT_PAGE_CACHE_BYTES
                     }))
                 }
+                "--dim" => config.dim = value.parse().unwrap_or(config.dim),
+                "--query" => match value.as_str() {
+                    "vector" | "bm25" | "hybrid" => config.query = value.clone(),
+                    other => {
+                        eprintln!("unknown --query {other:?}, expected vector, bm25 or hybrid")
+                    }
+                },
+                "--quantized" => match value.as_str() {
+                    "true" | "1" => config.quantized = true,
+                    "false" | "0" => config.quantized = false,
+                    other => eprintln!("bad --quantized {other:?}, expected true or false"),
+                },
                 other => eprintln!("unknown flag {other}"),
             }
         }
@@ -153,10 +204,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "joins" => run_joins(&config, &path, Shapes::All),
         "joins-limit" => run_joins(&config, &path, Shapes::LimitOnly),
         "writes" => run_writes(&config, &path),
+        "retrieval" => run_retrieval(&config, &path),
         other => {
             eprintln!(
                 "unknown suite `{other}`, expected points, indexed, indexed-range, joins, \
-                 joins-limit or writes"
+                 joins-limit, writes or retrieval"
             );
             std::process::exit(2);
         }
@@ -529,6 +581,153 @@ fn run_writes(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// Words the synthetic corpus is drawn from — restated verbatim from
+/// `crates/inlaysql-bench/src/main.rs`'s `VOCABULARY`. See the module note on
+/// why this is a copy rather than an import.
+const VOCABULARY: &[&str] = &[
+    "database",
+    "embedded",
+    "vector",
+    "search",
+    "index",
+    "storage",
+    "engine",
+    "query",
+    "rust",
+    "async",
+    "cache",
+    "page",
+    "commit",
+    "replica",
+    "shard",
+    "tokenizer",
+    "ranking",
+    "recall",
+    "latency",
+    "throughput",
+    "hybrid",
+    "retrieval",
+    "segment",
+    "compaction",
+    "journal",
+];
+
+/// A corpus document: 12-35 words, matching
+/// `crates/inlaysql-bench/src/main.rs`'s `synthetic_document`.
+fn synthetic_document(rng: &mut SeededRng) -> String {
+    let length = 12 + (rng.next_u64() % 24) as usize;
+    words(rng, length)
+}
+
+/// A query: 2-4 words, matching `crates/inlaysql-bench/src/main.rs`'s
+/// `synthetic_query`.
+fn synthetic_query(rng: &mut SeededRng) -> String {
+    let length = 2 + (rng.next_u64() % 3) as usize;
+    words(rng, length)
+}
+
+fn words(rng: &mut SeededRng, count: usize) -> String {
+    (0..count)
+        .map(|_| VOCABULARY[(rng.next_u64() % VOCABULARY.len() as u64) as usize])
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `retrieval`, 2026-08-30: vector / BM25 / hybrid query latency, matching
+/// `crates/inlaysql-bench/src/main.rs`'s retrieval suite — the same schema
+/// (`docs (id INTEGER, body TEXT, embedding VECTOR(dim))`, indexed on both
+/// `body` and `embedding`) and the same corpus generator. See the module note
+/// for why `--query` measures one shape at a time instead of cycling all
+/// three, and for `--quantized`.
+fn run_retrieval(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut db = config.open(path)?;
+    let vector_type = if config.quantized {
+        format!("VECTOR({}, INT8)", config.dim)
+    } else {
+        format!("VECTOR({})", config.dim)
+    };
+    db.execute(
+        &format!("CREATE TABLE docs (id INTEGER, body TEXT, embedding {vector_type})"),
+        &[],
+    )?;
+    db.execute("CREATE INDEX docs_body ON docs (body)", &[])?;
+    db.execute("CREATE INDEX docs_embedding ON docs (embedding)", &[])?;
+
+    let insert = db.prepare("INSERT INTO docs (id, body, embedding) VALUES (?, ?, ?)")?;
+    let mut rng = SeededRng::new(config.seed);
+    // The corpus is generated before the query stream, exactly as
+    // `main.rs`'s retrieval suite draws both from one seeded stream in that
+    // order, so `--seed` reproduces the same documents here too.
+    let corpus: Vec<String> = (0..config.rows)
+        .map(|_| synthetic_document(&mut rng))
+        .collect();
+
+    db.begin()?;
+    for (index, body) in corpus.iter().enumerate() {
+        let bound = [
+            Value::Integer(index as i64),
+            Value::Text(body.clone().into()),
+            Value::Vector(hashed_embedding(body, config.dim)),
+        ];
+        if let Err(inlaysql::Error::Transaction(_)) = db.execute_prepared(&insert, &bound) {
+            db.commit()?;
+            db.begin()?;
+            db.execute_prepared(&insert, &bound)?;
+        }
+    }
+    db.commit()?;
+
+    let vector_only = db.prepare(&format!(
+        "SELECT id, vector_score(embedding, ?) AS score FROM docs ORDER BY score DESC LIMIT {}",
+        config.limit
+    ))?;
+    let text_only = db.prepare(&format!(
+        "SELECT id, bm25_score(body, ?) AS score FROM docs ORDER BY score DESC LIMIT {}",
+        config.limit
+    ))?;
+    let hybrid = db.prepare(&format!(
+        "SELECT id, fuse(vector_score(embedding, ?), bm25_score(body, ?)) AS score \
+         FROM docs ORDER BY score DESC LIMIT {}",
+        config.limit
+    ))?;
+
+    // Both indexes commit on first read, not on `CREATE INDEX` — warm both
+    // kinds of build here, whichever shape ends up timed, so neither the
+    // HNSW graph build nor the BM25 index build leaks into the timed window.
+    db.query_prepared(
+        &vector_only,
+        &[Value::Vector(hashed_embedding("warmup", config.dim))],
+    )?;
+    db.query_prepared(&text_only, &[Value::Text("warmup".to_string().into())])?;
+
+    announce_query_phase();
+    let (iterations, elapsed) = run_for(config.seconds, || {
+        let query = synthetic_query(&mut rng);
+        match config.query.as_str() {
+            "bm25" => db
+                .query_prepared(&text_only, &[Value::Text(query.into())])
+                .map(|_| ()),
+            "hybrid" => db
+                .query_prepared(
+                    &hybrid,
+                    &[
+                        Value::Vector(hashed_embedding(&query, config.dim)),
+                        Value::Text(query.into()),
+                    ],
+                )
+                .map(|_| ()),
+            _ => db
+                .query_prepared(
+                    &vector_only,
+                    &[Value::Vector(hashed_embedding(&query, config.dim))],
+                )
+                .map(|_| ()),
+        }
+    })?;
+    report(&format!("retrieval-{}", config.query), iterations, elapsed);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     /// Pins [`CDC_WARMUP_ROWS`] to the real, private
@@ -613,6 +812,9 @@ mod tests {
                 seed: 7,
                 payload: 64,
                 page_cache_bytes: Some(page_cache_bytes),
+                dim: 384,
+                query: "vector".to_string(),
+                quantized: false,
             };
 
             let mut db = config.open(&path).unwrap();
