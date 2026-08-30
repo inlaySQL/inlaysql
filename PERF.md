@@ -1418,6 +1418,21 @@ done. Before building it, Phase 0 measured whether it would actually help.
 behind it, and a real commit dirties too few pages for byte count to matter
 even where the barrier did scale.
 
+**Cross-reference (2026-08-31): this section's own "what stays true in
+principle" caveat below was re-tested, not just repeated, in the Linux
+container this project's benchmarks actually run in** — see "The
+deferred-durability rejection, re-tested in-container" further down §3. That
+section found the same flat, floor-dominated shape there too (a lower
+absolute floor, ~1.0-1.2ms against this section's ~2.7-2.9ms, but the same
+non-scaling curve), so this section's verdict is now confirmed on both
+platforms this project measures on, not merely the host. The conclusion below
+remains correctly scoped to `F_FULLFSYNC` on this Mac's APFS SSD *as
+written*, but read it together with the in-container section: the
+platform-scoping caveat this section itself raised (a byte-proportional
+barrier "would be worth revisiting there") did not pan out on the other
+platform tried either. A PLP-protected NVMe under bare-metal Linux — the
+platform that caveat actually named — remains untested by either section.
+
 **Finding 1 — `F_FULLFSYNC` is a fixed barrier, not a bytes-proportional
 cost.** Standalone probe, 4096B pages, N ∈ {0,1,2,4,8,16,32,64,128,256} pages,
 round-robin interleaved order, 95 timed reps per N after 5 warm-up reps, two
@@ -1497,7 +1512,12 @@ PLP-protected NVMe under Linux, which R1 was scoped to go measure), deferring
 page writes behind a checkpoint would shrink the barrier's own cost, not just
 the ~1% of commit time sitting outside it, and would be worth revisiting
 there. The verdict above is scoped to `F_FULLFSYNC` on this Mac's internal
-APFS SSD, not to the architecture.
+APFS SSD, not to the architecture. **Update (2026-08-31):** the Docker
+container this project's own benchmarks run in (further down §3, "The
+deferred-durability rejection, re-tested in-container") is *not* that
+platform either — same flat, non-scaling shape, just a lower floor. R1's
+actual target, a PLP-protected NVMe under bare-metal Linux, is still
+unmeasured by either section.
 
 **Scans, joins and aggregates are the untested embarrassment**, and AHL-462 and
 AHL-464 made them less embarrassing without making them measured. Joins are
@@ -1702,6 +1722,155 @@ and two queries plus client-side fusion there.
 dense document ordinals, a bounded top-`k` heap and a MaxScore walk took it to
 47.75 µs of a 95.17 µs hybrid — 50%, with the vector leg now the larger share.
 Scores and ranking are unchanged, ties included.
+
+### The deferred-durability rejection, re-tested in-container: still flat, still rejected (2026-08-31)
+
+`SCOREBOARD.md`/`BENCHMARK.md`'s server-to-server sweep (2026-08-31) found
+InlaySQL losing to MySQL 8 by **4.7x at 16 connections** (1,308.1 vs 6,120.7
+ops/s), with batching efficiency roughly comparable (InlaySQL's in-process
+proxy ~4.76-6.31x, MySQL's measured 7.42x) but implied `fsync` *rate* not:
+~238 fsyncs/s for InlaySQL against ~825/s for MySQL, on the same volume, in
+the same container. The candidate explanation was that InnoDB's commit
+`fsync` flushes a small sequential redo-log tail while InlaySQL's flushes
+~5 dirty B-tree pages plus a WAL record — and that this would only matter on
+a platform where `fsync` cost scales with bytes, which the Phase 0 section
+above explicitly was not (macOS `F_FULLFSYNC`, `~2.7-2.9ms` flat regardless of
+bytes queued). This section is that platform-scoped question, asked properly:
+does `fsync` scale with bytes **in the Linux container this comparison
+actually runs in**?
+
+**Method, mirroring Phase 0's Finding 1 exactly, moved into the container.**
+A standalone probe (not part of the workspace; written, compiled with the
+container's own `rustc`, run, and discarded) writes N pages (4096 B — this
+engine's `DEFAULT_PAGE_SIZE`, same as Phase 0's host probe) to a fixed offset
+in an already-sized file, then calls `File::sync_all()`, timing only the
+sync. `sync_all()` is what `FileDevice`'s `Durability::Full` path actually
+calls on every platform — on Linux this resolves to plain `fsync(2)`, not
+`F_FULLFSYNC`. N swept over {0,1,2,4,8,16,32,64,128,256} pages, 5 warm-up
+rounds discarded, 55 timed rounds kept (≥ the 50-rep floor). Run on
+`bench/external/compose.yml`'s own named volume for `inlaysql-server`
+(`inlaysql-bench_inlaysql-server-data`, the exact volume the 4.7x loss above
+was measured on), inside the same `docker/Dockerfile` image
+(`inlaysql-bench-inlaysql-server:latest`), reached with a bare `docker run`
+rather than `docker compose` (no need to bring up MySQL/PostgreSQL/etc. for a
+single-file probe). Docker backend here is OrbStack, not Docker Desktop
+(`docker version` → context `orbstack`); the volume is backed by a `btrfs`
+filesystem on a virtio block device inside its Linux VM (`df -T /data` →
+`/dev/vdb1 btrfs`). Machine load checked before every run: 1-minute average
+3.4-4.6 of this 18-CPU box's 4.5 quiet-machine ceiling throughout (busy
+interactive desktop, disclosed rather than forced past).
+
+**First pass manufactured a spurious slope, and it is worth showing rather
+than quietly fixing.** An initial design swept N in fixed ascending order
+every round (0,1,2,4,...,256, repeat) — "round-robin", but not shuffled.
+Averaged over 3 runs, this measured medians climbing from 1,119.4 µs at N=1
+to 1,480.3 µs at N=256: a 32% increase, R²=0.91 against bytes. That looked
+exactly like the hypothesis predicted. It was an artefact: N=256 is always
+the *last* fsync of every round in a fixed-ascending sweep, so any drift over
+the course of a round — write-buffer or journal pressure accumulating,
+background container activity — lands disproportionately on the largest N
+regardless of whether bytes have anything to do with it. Position-in-round
+and byte-count were perfectly confounded by construction.
+
+**Corrected: N shuffled independently every round** (Fisher-Yates over a
+tiny dependency-free xorshift64* PRNG), so any temporal drift is spread
+evenly across every N instead of concentrating on whichever one is swept
+last. Three independent runs, averaged medians (µs), and the range each
+individual run's median fell in:
+
+| N (pages) | Bytes | p50 range across 3 runs | p95 range across 3 runs |
+| --- | --- | --- | --- |
+| 0 | 0 | 854.0–1,123.8 | 1,897.5–2,270.1 |
+| 1 | 4 KiB | 979.1–1,120.3 | 1,595.5–2,000.2 |
+| 8 | 32 KiB | 1,028.1–1,164.2 | 1,756.8–1,908.1 |
+| 64 | 256 KiB | 1,043.4–1,156.0 | 1,571.7–1,848.9 |
+| 256 | 1 MiB | 1,036.7–1,155.3 | 1,535.8–2,120.2 |
+
+Averaged-median regression across all 9 non-zero N: slope ≈ **-0.007 µs/KB**
+(sign flips run to run — indistinguishable from zero), **R² = 0.017** (was
+0.91 with the confound), ratio of N=256's median to N=1's ranged 1.01-1.06x
+across the 3 runs (average 1.03x) — inside this machine's own disclosed
+noise floor for a busy desktop, nowhere near a scaling curve. The N=0 case,
+which was bimodal on the host (sometimes ~10µs, sometimes the full barrier),
+is *not* bimodal here once shuffled: it costs the same ~0.9-1.1ms as every
+non-zero N, evidence the floor is the barrier/device round trip itself, not
+anything proportional to what is queued behind it — a cleaner version of
+Phase 0's own host conclusion, not a different one.
+
+**Verdict: FLAT, not sloped — said loudly, because the hypothesis this
+session set out to test was that it would slope.** The curve is the same
+shape as the macOS host's (Phase 0 Finding 1): a fixed floor, ~1.0-1.2ms
+here against ~2.7-2.9ms on the host — lower in absolute terms (matching
+`BENCHMARK.md`'s already-published finding that this container's barrier is
+weaker than `F_FULLFSYNC`), but not differently shaped. `fsync`
+cost inside this container does not scale with dirty bytes over 0B-1MiB, a
+range that comfortably spans both InlaySQL's own per-commit dirty-byte count
+(below) and any plausible InnoDB redo-log-tail size.
+
+**Task 2: what InlaySQL actually writes per commit, confirmed in-container.**
+Temporary instrumentation (a small atomic histogram in
+`CowBTree::write_dirty_pages`, `crates/inlaysql-core/src/btree/tree.rs`,
+read back and printed from `inlaysql-bench`'s `oltp_export::replay`;
+reverted after use, never shipped) counted dirty pages per commit for 2,001
+commits (2,000 sequential single-row `INSERT`s plus the initial `CREATE
+TABLE`) run through `inlaysql-oltp`'s own `--oltp-replay` path against
+`inlaysql-bench_inlaysql-oltp-data` — the same volume class, same container
+image, same code path `BENCHMARK.md`'s containerised InlaySQL row measures:
+
+| Dirty pages | Commits | Share |
+| --- | --- | --- |
+| 1 | 27 | 1.3% |
+| 3 | 29 | 1.4% |
+| 4 | 25 | 1.2% |
+| 5 | 1,849 | 92.4% |
+| 6 | 70 | 3.5% |
+| 7 | 1 | 0.05% |
+
+Median **5 pages (20,480 B)**, mean 4.94 pages (~20,234 B), p95 5, max 7 —
+matching Phase 0's host figure (median 5, p95 5, max 6 for single-row
+commits) almost exactly. **Confirmed, not corrected**: the containerised
+workload dirties the same ~5 pages / ~20 KB per commit the host does. (The
+host's separate "points --rows 2000" figure maxed at 60 pages on a
+structural B-tree reorganisation that this pure-sequential-insert run did
+not happen to hit — not a discrepancy in the typical case, which both
+measurements agree on.)
+
+**How much of the 3.5x fsync-rate gap does the byte difference explain?**
+Given the curve above is flat — no statistically real slope over the entire
+0B-1MiB range — the honest quantitative answer is **essentially none of
+it**. There is no reliable per-byte coefficient to multiply through:
+R² = 0.017 means the regression slope is noise, not a measurement. Framed
+against `SCOREBOARD.md`'s own numbers: MySQL's implied inter-fsync interval
+is ~1.212ms (1/825 fsyncs/s) against InlaySQL-server's proxy ~4.20ms
+(1/238 fsyncs/s) — a ~2.99ms gap per fsync. Nothing in the measured curve
+moves by more than run-to-run noise (tens of µs) across the entire byte
+range separating a plausible InnoDB redo-tail write from InlaySQL's ~20KB
+commit, so the byte-count mechanism accounts for on the order of **0% of
+that ~3ms gap, not merely "a small fraction"** — and even the first,
+confound-inflated pass above (0.30 µs/KB, since retracted) would only have
+put the difference between a 20KB and a ~1KB write at ~6µs, itself under 1%
+of the gap. **The hypothesis's proposed mechanism is refuted by direct
+in-container measurement, not merely unconfirmed.** The remaining ~100% of
+the gap is unexplained by dirty-byte volume and must come from elsewhere —
+`BENCHMARK.md`'s own instrument-gap section already points at
+`inlaysql-server`'s thread-per-connection design (D2, no connection pool)
+as the more likely locus, since the in-process commit-coordinator's own
+batching ratio (4.76-6.31x) sits in the same order of magnitude as MySQL's
+7.42x; this session's finding is consistent with that and does not change
+it.
+
+**Verdict on reopening the deferred/checkpointed-page-durability redesign:
+do not.** Phase 0's rejection (above, host-scoped) holds in-container too,
+on the specific volume and container backend (OrbStack, btrfs) this
+project's own benchmark runs on. Phase 0's own caveat — "on a platform where
+`fsync`/`fdatasync` cost genuinely scales with bytes... would be worth
+revisiting there" — named a PLP-protected NVMe under Linux specifically,
+which is not what was tested here (a virtualised block device inside a
+Docker-alternative VM, not bare-metal Linux on real NVMe); that specific
+platform remains formally untested, and this section does not close the
+question for it. For the platform this project actually benchmarks on, the
+one `SCOREBOARD.md`'s 4.7x figure was measured on, the answer is unambiguous:
+flat, not sloped, and the redesign would not close this gap.
 
 ### Block-max WAND: built, measured, reverted
 
@@ -2409,3 +2578,14 @@ is about the *read* path only, which does not fsync, matching the brief.
   does today, does not catch a spike that arrives mid-run — section 4's r≈0.18
   correlation between disclosed start-load and measured throughput is the
   evidence.
+- **A "round-robin" sweep still confounds unless the order is re-randomised
+  every round.** The in-container fsync curve above (§3, "The
+  deferred-durability rejection, re-tested in-container") first swept N in
+  fixed ascending order every round and measured a 32% increase, R²=0.91
+  against bytes — exactly what the hypothesis under test predicted, and
+  wrong: N=256 was always the *last* fsync of every round, so ordinary
+  within-round drift landed on it every time and looked like a byte-count
+  effect. Shuffling the order independently every round (not just varying it
+  once per whole run) dropped R² to 0.017. Any sweep whose factor of interest
+  also determines position-in-round needs the order re-randomised per round,
+  not merely chosen once before the loop starts.

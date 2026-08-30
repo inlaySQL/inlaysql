@@ -389,13 +389,18 @@ impl Metrics {
 /// requested `scope`. `registry` supplies the two numbers that are counted
 /// nowhere — the connection counts — because deriving them from the list
 /// `SHOW PROCESSLIST` shows is what stops the two ever disagreeing.
+/// `commit_stats` supplies four more the same way: read live off the shared
+/// [`inlaysql::FileDevice`] rather than counted by this module, and `None`
+/// only if the server's own keeper handle could not report (never expected
+/// in practice — see `Server::run`).
 pub fn status_variables(
     scope: Scope,
     session: &Metrics,
     global: &Metrics,
     registry: &Registry,
+    commit_stats: Option<inlaysql::CommitStats>,
 ) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::with_capacity(COUNT + 3);
+    let mut out: Vec<(String, String)> = Vec::with_capacity(COUNT + 7);
     for (index, (name, per_session)) in DESCRIPTIONS.iter().enumerate() {
         let from = if *per_session && scope == Scope::Session {
             session
@@ -417,6 +422,30 @@ pub fn status_variables(
     out.push((
         "Threads_running".to_string(),
         registry.running_count().to_string(),
+    ));
+    // The commit-batching counters: global-only, like the connection counts
+    // above, and for the same reason — a per-session flush count would not
+    // mean anything, since every handle on this file shares one
+    // `CommitCoordinator`. `Inlaysql_normal_commit_tickets /
+    // Inlaysql_normal_commit_flushes` is commits landed per `fsync`, the
+    // server-side answer to the question `INLAYSQL_COMMIT_STATS` could
+    // previously only answer for a process that exits normally.
+    let stats = commit_stats.unwrap_or_default();
+    out.push((
+        "Inlaysql_commit_flushes".to_string(),
+        stats.flushes.to_string(),
+    ));
+    out.push((
+        "Inlaysql_commit_tickets".to_string(),
+        stats.tickets_flushed.to_string(),
+    ));
+    out.push((
+        "Inlaysql_normal_commit_flushes".to_string(),
+        stats.normal_flushes.to_string(),
+    ));
+    out.push((
+        "Inlaysql_normal_commit_tickets".to_string(),
+        stats.normal_tickets_flushed.to_string(),
     ));
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
@@ -544,7 +573,7 @@ mod tests {
         global.record(Counter::Connections);
 
         let read = |scope, name: &str| -> String {
-            status_variables(scope, &session, &global, &registry)
+            status_variables(scope, &session, &global, &registry, None)
                 .into_iter()
                 .find(|(variable, _)| variable == name)
                 .map(|(_, value)| value)
@@ -570,7 +599,7 @@ mod tests {
         let session = Metrics::new();
         let global = Metrics::new();
         let read = |name: &str| -> String {
-            status_variables(Scope::Global, &session, &global, &registry)
+            status_variables(Scope::Global, &session, &global, &registry, None)
                 .into_iter()
                 .find(|(variable, _)| variable == name)
                 .map(|(_, value)| value)

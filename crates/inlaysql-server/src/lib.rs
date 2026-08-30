@@ -551,7 +551,12 @@ impl Server {
     /// second `inlaysql serve` on the same file is refused at startup rather
     /// than at some later connection. (The lock belongs to the per-file
     /// `CommitCoordinator`, which lives as long as any `FileDevice` on that
-    /// file does — see `crates/inlaysql/src/device.rs`.)
+    /// file does — see `crates/inlaysql/src/device.rs`.) The same handle also
+    /// gives `SHOW STATUS` a live read of that `CommitCoordinator`'s
+    /// commit-batching counters (`inlaysql::FileDevice::commit_stats`) —
+    /// every connection's own `FileDevice` shares this one's coordinator, so
+    /// this single long-lived handle sees the whole server's flush/ticket
+    /// totals without any connection needing its own copy.
     ///
     /// **A device, not a `Database`, and that difference is load-bearing when
     /// [`ServerOptions::page_reuse`] is on.** Every read-write `CowBTree`
@@ -567,9 +572,13 @@ impl Server {
     /// `FileDevice` opens no tree, so it registers no reader and holds only
     /// the lock it is here for.
     pub fn run(&self) -> io::Result<()> {
-        let _keeper = FileDevice::open(&self.path).map_err(|error| {
+        // Not `_keeper` any more: `SHOW STATUS` reads its commit-batching
+        // counters (see this method's doc comment), so it is now used, not
+        // just held for its lock. `Arc` because every connection thread below
+        // needs its own read access to the same handle.
+        let keeper = Arc::new(FileDevice::open(&self.path).map_err(|error| {
             io::Error::other(format!("cannot open {}: {error}", self.path.display()))
-        })?;
+        })?);
 
         let live = Arc::new(AtomicUsize::new(0));
         let next_id = AtomicU32::new(1);
@@ -657,6 +666,7 @@ impl Server {
             let owned = live.clone();
             let registry_for_thread = registry.clone();
             let counters_for_thread = counters.clone();
+            let keeper_for_thread = keeper.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("inlaysql-conn-{id}"))
                 .spawn(move || {
@@ -671,6 +681,7 @@ impl Server {
                         bootstrap,
                         registry_for_thread,
                         counters_for_thread,
+                        keeper_for_thread,
                     ) {
                         // Never the statement, never the credentials — a
                         // server log is not the place for either.
@@ -722,6 +733,7 @@ fn serve_connection(
     bootstrap: acl::Bootstrap,
     registry: Arc<Registry>,
     counters: Arc<Metrics>,
+    keeper: Arc<FileDevice>,
 ) -> io::Result<()> {
     // A request/response protocol gains nothing from waiting to coalesce small
     // writes, and loses a round trip's latency to it every time.
@@ -767,7 +779,7 @@ fn serve_connection(
     db.set_vector_tuning(Box::new(control::Tuning::new(Arc::clone(&control))));
 
     let result = connection::Connection::new(
-        stream, write_half, db, control, limits, bootstrap, registry, counters,
+        stream, write_half, db, control, limits, bootstrap, registry, counters, keeper,
     )
     .serve();
     // A socket timeout arrives as a bare `WouldBlock`/`TimedOut` from whatever

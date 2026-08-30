@@ -305,6 +305,31 @@ would point the server's throughput and tail-latency loss at
 `fsync` batching — not confirmed, since the direct measurement this would
 take is exactly the gap that could not be closed this session.
 
+**A candidate mechanism for the fsync-*rate* gap specifically was tested and
+refuted (2026-08-31), and the instrument gap above is now closed** — see
+`PERF.md`'s "The deferred-durability rejection, re-tested in-container" and
+`PLAN.md` item 6 (`W3`) for the full write-up. The candidate: InnoDB's
+commit `fsync` flushes a small redo-log tail while InlaySQL's flushes ~5
+dirty B-tree pages (~20KB, confirmed in-container this session, matching
+`PERF.md`'s host figure), and if `fsync` cost scaled with bytes that
+difference alone could explain the ~238-vs-~825-fsyncs/s gap implied by this
+section's ops/s and commits-per-fsync numbers. Measured directly, in the
+same container this comparison runs in, on `inlaysql-server-data`'s own
+named volume: the curve is flat (R²=0.017 after correcting an
+order-of-measurement confound that first produced a spurious R²=0.91), not
+sloped, over the full 0B-1MiB range spanning both engines' plausible
+per-commit byte counts. The byte-count mechanism therefore explains
+approximately none of the gap, not "a small fraction" — reinforcing rather
+than replacing the thread-per-connection hypothesis above as the more likely
+cause. Separately, `FileDevice::commit_stats()` now gives `inlaysql-server`
+a live, `SHOW GLOBAL STATUS`-readable version of the counters this
+paragraph's "could not be measured" referred to
+(`Inlaysql_normal_commit_flushes`/`Inlaysql_normal_commit_tickets`); the
+instrument exists and is tested, but the actual `SERVER_CONCURRENCY_LEVELS`
+sweep using it to measure InlaySQL-server's own ratio directly — which would
+upgrade "weak evidence" above to a real confirmation — was not run this
+session.
+
 Durability: MySQL `innodb_flush_log_at_trx_commit=1`, binlog off,
 `innodb_buffer_pool_size=512M` (matched to PostgreSQL's `shared_buffers`
 this session — §4.3 — though PostgreSQL has no row in this table); InlaySQL
@@ -748,3 +773,22 @@ design (no pool, `docs/server.md`'s D2) as the more likely place this
 project's server-side concurrent-write loss lives, not the underlying
 commit coordinator's batching logic. Not confirmed; the instrument gap above
 is exactly what would need closing to confirm it directly.
+
+**The instrument gap is closed, 2026-08-31 — the confirming measurement is
+still not run.** `inlaysql::FileDevice::commit_stats()`
+(`crates/inlaysql/src/device.rs`) is a live snapshot of the same
+`normal_flushes`/`normal_tickets_flushed` counters `INLAYSQL_COMMIT_STATS`
+prints on `Drop`, now readable from a running server too:
+`Server::run`'s existing keeper handle (already held open for the file lock,
+`crates/inlaysql-server/src/lib.rs`) is shared into every connection thread
+and read on `SHOW GLOBAL STATUS` as `Inlaysql_normal_commit_flushes`/
+`Inlaysql_normal_commit_tickets` (plus the checkpoint-inclusive
+`Inlaysql_commit_flushes`/`Inlaysql_commit_tickets`). Tested end-to-end
+(`show_global_status_reports_the_commit_batching_counters`,
+`crates/inlaysql-server/tests/wire.rs`) — a second connection's commits move
+the count, `SESSION`/`GLOBAL` agree since the counter is process-wide. What
+this does *not* do is run the actual `SERVER_CONCURRENCY_LEVELS` sweep
+against these counters alongside MySQL's `Handler_commit`/
+`Innodb_os_log_fsyncs`; that measurement — the one that would turn "weak,
+harness-mismatched evidence" above into a real confirmation or refutal — is
+still owed. See `PLAN.md` item 6 for the same note in planning form.

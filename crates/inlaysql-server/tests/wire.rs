@@ -6939,6 +6939,63 @@ fn show_status_counts_the_statements_a_session_ran() {
     client.quit();
 }
 
+/// The commit-batching counters are readable from a running server, not just
+/// from a one-shot process's `INLAYSQL_COMMIT_STATS` exit-time dump — the gap
+/// `crates/inlaysql/src/device.rs`'s `FileDevice::commit_stats` closes.
+/// Global only, like the connection counts: every handle on this file shares
+/// one `CommitCoordinator`, so a per-session reading would not mean anything,
+/// and a second connection's commits must move the count exactly like the
+/// first connection's do.
+#[test]
+fn show_global_status_reports_the_commit_batching_counters() {
+    let server = TestServer::start("status-commit-stats");
+    let mut first = server.client();
+    first.ok_query("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+
+    let flushes_before = status(&mut first, "GLOBAL", "Inlaysql_normal_commit_flushes");
+    let tickets_before = status(&mut first, "GLOBAL", "Inlaysql_normal_commit_tickets");
+    assert!(
+        flushes_before >= 1,
+        "the CREATE TABLE above already committed at least once"
+    );
+
+    let mut second = server.client();
+    for id in 1..=3 {
+        second.ok_query(&format!("INSERT INTO t VALUES ({id})"));
+    }
+
+    let flushes_after = status(&mut first, "GLOBAL", "Inlaysql_normal_commit_flushes");
+    let tickets_after = status(&mut first, "GLOBAL", "Inlaysql_normal_commit_tickets");
+    assert!(
+        flushes_after > flushes_before,
+        "a second connection's commits did not move the server's flush count"
+    );
+    assert!(
+        tickets_after >= tickets_before + 3,
+        "3 durable commits did not add at least 3 tickets"
+    );
+    // Every flush covers at least one ticket, so the ratio this counter pair
+    // exists to compute is never undefined.
+    assert!(tickets_after >= flushes_after);
+
+    // Global, not per-session: `first` never issued the inserts, but reads
+    // the same server-wide total `second` would.
+    assert_eq!(
+        status(&mut first, "SESSION", "Inlaysql_normal_commit_flushes"),
+        flushes_after,
+        "this counter is global-only and must answer the same under SESSION"
+    );
+
+    // `Inlaysql_commit_flushes`/`Inlaysql_commit_tickets` include
+    // checkpoint-triggered flushes too, so they are never smaller than the
+    // "normal" (commit-only) subset above.
+    assert!(status(&mut first, "GLOBAL", "Inlaysql_commit_flushes") >= flushes_after);
+    assert!(status(&mut first, "GLOBAL", "Inlaysql_commit_tickets") >= tickets_after);
+
+    first.quit();
+    second.quit();
+}
+
 /// Session and global are two different numbers, and confusing them is the
 /// easiest way to make a status counter useless. A second connection's work
 /// must show in the server's total and not in this one's.

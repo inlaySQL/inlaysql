@@ -178,6 +178,25 @@ struct CommitCoordinator {
     durability: AtomicU8,
 }
 
+/// A snapshot of [`CommitCoordinator`]'s diagnostic flush/ticket counters —
+/// see [`FileDevice::commit_stats`] for why this exists and what it reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommitStats {
+    /// Completed `fsync`/`F_FULLFSYNC` calls, any cause — a normal commit or
+    /// a checkpoint.
+    pub flushes: u64,
+    /// Durability tickets covered by [`CommitStats::flushes`].
+    pub tickets_flushed: u64,
+    /// Of `flushes`, the ones a normal (non-checkpoint) commit entered
+    /// through [`Device::sync_commit`] — the subset a group-commit ratio
+    /// should be measured against.
+    pub normal_flushes: u64,
+    /// Durability tickets covered by [`CommitStats::normal_flushes`].
+    /// `normal_tickets_flushed / normal_flushes` is commits landed per
+    /// `fsync` — the same ratio `INLAYSQL_COMMIT_STATS` prints on `Drop`.
+    pub normal_tickets_flushed: u64,
+}
+
 /// [`CommitCoordinator::durability`]'s three legal values, encoded so
 /// [`AtomicU8::fetch_max`] is the whole of the "strongest wins" ratchet: the
 /// order `DURABILITY_UNSET < DURABILITY_NORMAL < DURABILITY_FULL` is exactly
@@ -800,6 +819,31 @@ impl FileDevice {
     /// Whether the file has no bytes yet (a fresh database).
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.file.metadata().map_err(io_error)?.len() == 0)
+    }
+
+    /// A live snapshot of this file's [`CommitCoordinator`] flush/ticket
+    /// counters — the same numbers `INLAYSQL_COMMIT_STATS` prints on
+    /// [`Drop`](struct@CommitCoordinator), but readable while the process is
+    /// still running.
+    ///
+    /// That distinction is the whole reason this exists: the `Drop` impl
+    /// never fires for a long-running server killed by `SIGTERM`, so a
+    /// server's own commit-batching ratio (`normal_tickets_flushed /
+    /// normal_flushes` — commits landed per `fsync`) was previously
+    /// unmeasurable from outside the process. Every handle sharing this
+    /// file's coordinator (every connection `inlaysql-server` opens, D2) sees
+    /// the same counters, so any one handle's snapshot is the whole file's.
+    ///
+    /// `None` for a handle opened with [`FileDevice::open_read_only`], which
+    /// shares no coordinator and commits nothing.
+    pub fn commit_stats(&self) -> Option<CommitStats> {
+        let coordinator = self.coordinator.as_ref()?;
+        Some(CommitStats {
+            flushes: coordinator.flushes.load(Ordering::Relaxed),
+            tickets_flushed: coordinator.tickets_flushed.load(Ordering::Relaxed),
+            normal_flushes: coordinator.normal_flushes.load(Ordering::Relaxed),
+            normal_tickets_flushed: coordinator.normal_tickets_flushed.load(Ordering::Relaxed),
+        })
     }
 
     fn read_only_error(&self, what: &str) -> Error {

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
-use inlaysql::{Database, Error, Outcome, ResultSet, Value};
+use inlaysql::{Database, Error, FileDevice, Outcome, ResultSet, Value};
 
 use crate::acl;
 use crate::auth;
@@ -82,6 +82,11 @@ pub struct Connection<S: Read + Write> {
     /// server's total. Owned outright — nothing else can reach it — so its
     /// atomics are uncontended.
     session_counters: Metrics,
+    /// `Server::run`'s long-lived keeper handle, shared with every other
+    /// connection: not opened for its own commits, only so `SHOW STATUS` can
+    /// read the file's commit-batching counters — see
+    /// [`FileDevice::commit_stats`].
+    keeper: Arc<FileDevice>,
 }
 
 impl<S: Read + Write> Connection<S> {
@@ -96,6 +101,7 @@ impl<S: Read + Write> Connection<S> {
         bootstrap: acl::Bootstrap,
         registry: Arc<Registry>,
         server_counters: Arc<Metrics>,
+        keeper: Arc<FileDevice>,
     ) -> Self {
         Self {
             stream: Stream::new(read_half, write_half),
@@ -109,6 +115,7 @@ impl<S: Read + Write> Connection<S> {
             registry,
             server_counters,
             session_counters: Metrics::new(),
+            keeper,
         }
     }
 
@@ -818,6 +825,7 @@ impl<S: Read + Write> Connection<S> {
                     &self.session_counters,
                     &self.server_counters,
                     &self.registry,
+                    self.keeper.commit_stats(),
                 );
                 Ok(Answer::Rows {
                     rows: ResultSet {
