@@ -320,8 +320,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nquery latency ({} queries each)", config.queries);
     println!(
-        "{:<12} {:>10} {:>10} {:>10}",
-        "workload", "p50", "p95", "max"
+        "{:<12} {:>10} {:>10} {:>10} {:>10}",
+        "workload", "p50", "p95", "p99", "max"
     );
 
     let vector_times = measure(&queries, |query| {
@@ -481,8 +481,8 @@ fn measure(
     Ok(timings)
 }
 
-/// The p50, p95 and maximum of a set of timings.
-pub fn percentiles(timings: &[Duration]) -> (Duration, Duration, Duration) {
+/// The p50, p95, p99 and maximum of a set of timings.
+pub fn percentiles(timings: &[Duration]) -> (Duration, Duration, Duration, Duration) {
     let mut sorted = timings.to_vec();
     sorted.sort();
     let percentile = |p: f64| {
@@ -495,17 +495,19 @@ pub fn percentiles(timings: &[Duration]) -> (Duration, Duration, Duration) {
     (
         percentile(0.50),
         percentile(0.95),
+        percentile(0.99),
         sorted.last().copied().unwrap_or_default(),
     )
 }
 
 fn report(label: &str, timings: &[Duration]) {
-    let (p50, p95, max) = percentiles(timings);
+    let (p50, p95, p99, max) = percentiles(timings);
     println!(
-        "{:<12} {:>10} {:>10} {:>10}",
+        "{:<12} {:>10} {:>10} {:>10} {:>10}",
         label,
         format!("{p50:.2?}"),
         format!("{p95:.2?}"),
+        format!("{p99:.2?}"),
         format!("{max:.2?}")
     );
 }

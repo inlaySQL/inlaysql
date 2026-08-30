@@ -358,8 +358,8 @@ fn result_json(
     hybrid_samples: &[Duration],
     notes: &str,
 ) -> String {
-    let (vp50, vp95, vmax) = percentiles(vector_samples);
-    let (hp50, hp95, hmax) = percentiles(hybrid_samples);
+    let (vp50, vp95, _vp99, vmax) = percentiles(vector_samples);
+    let (hp50, hp95, _hp99, hmax) = percentiles(hybrid_samples);
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
     format!(
         "{{\n  \"engine\": \"{engine}\",\n  \"build_seconds\": {:.3},\n  \

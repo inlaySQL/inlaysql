@@ -79,7 +79,7 @@ fn run_shape(config: &Config, shape: Shape) -> Result<(), Box<dyn std::error::Er
                 params.ef_search = ef_search;
                 index.set_params(params);
                 let (score, samples) = measure(&index, &queries, &truth, k)?;
-                let (p50, p95, _) = percentiles(&samples);
+                let (p50, p95, _, _) = percentiles(&samples);
                 println!(
                     "{m:>4} {ef_construction:>7} {ef_search:>7} {score:>10.3} \
                      {:>10} {:>10} {:>10}",

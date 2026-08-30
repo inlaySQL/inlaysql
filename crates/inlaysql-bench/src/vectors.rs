@@ -179,7 +179,7 @@ fn run_shape(
         "engine", "recall@k", "build", "p50", "p95", "max"
     );
     for outcome in [&ours, &quantized, &theirs] {
-        let (p50, p95, max) = percentiles(&outcome.samples);
+        let (p50, p95, _p99, max) = percentiles(&outcome.samples);
         println!(
             "{:<28} {:>10.3} {:>12} {:>10} {:>10} {:>10}",
             outcome.label,
@@ -229,7 +229,7 @@ fn run_shape(
         ("~1%", &ours_selective),
         ("~0.1%", &ours_pathological),
     ] {
-        let (p50, p95, max) = percentiles(&filtered.samples);
+        let (p50, p95, _p99, max) = percentiles(&filtered.samples);
         println!("\n=== filtered ({label} of rows per bucket) ===");
         println!(
             "{:<28} {:>10} {:>10} {:>10} {:>10}",

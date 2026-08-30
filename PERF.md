@@ -433,6 +433,42 @@ runs after a `scan_prefix` has warmed leaves into the cache — a unit test, not
 a fault-injection sweep. **A fault-injection sweep that drives the raw scan
 under page reuse does not exist and is owed.**
 
+**Paid (2026-08-30).** `crates/inlaysql-core/tests/free_list_reuse_dst.rs`
+gained `raw_scan_sweep`. `scan_prefix_row_values_raw_from` is crate-private,
+so an external integration test can only reach it through the public
+`Storage`/`RowScan` seam — `TreeStorage` plus `inlaysql_core::traits::scan_all`,
+which is exactly `RowScan` → `Storage::scan_batch` →
+`scan_prefix_row_values_raw_from`, the path a real `SELECT` uses — rather than
+a raw `CowBTree`. It reuses this file's own `TrustedDevice` (the durability
+and reader-watermark trust reclaim needs), turns page reuse on from creation,
+and verifies through that raw-scan path twice: **live**, after every commit,
+against the workload's own in-memory model, over a row space (96) wider than
+`RowScan`'s first batch (32) so this genuinely drives more than one
+`Storage::scan_batch` call per scan — "retained across calls" meaning
+something, not one raw-leaf walk measured in isolation — and **after
+recovery**, against every snapshot the workload actually committed, exactly
+`sweep`'s own invariant. 300 seeds by default, 5,000 under `--ignored`
+(`thousands_of_seeds_of_raw_scan_under_reuse_recover_to_a_committed_snapshot`,
+now part of the same CI sweep job as `heavy_churn_with_reuse_on_recovers_to_a_committed_snapshot`).
+
+**One honest limitation, found while writing this.** Reading
+`scan_range_row_values_raw_from` closely first: `RawScanCursor` retention is
+already gated on `!self.device.page_reuse_enabled()` (`tree.rs`), so once a
+device reports reuse enabled, the cursor is structurally never retained or
+consulted — the staleness this debt worried about cannot occur through this
+path, by construction. `raw_scan_sweep` therefore cannot manufacture a
+stale-cursor read to prove a guard catches one; there is no such reachable
+state. What it proves instead, and what was genuinely missing, is that the
+raw leaf-parsing walk itself — the code that runs on every call whether or
+not a cursor is retained — is correct under page reuse with fault injection,
+live and after recovery, across thousands of seeds, and that the
+generation-gate keeps holding as a standing regression guard: a future change
+that broke it would show up here as a live-scan mismatch, immediately, not
+only after a crash. It does not probe the one way the gate itself could be
+defeated — a device reporting `page_reuse_enabled() == false` while reuse is
+genuinely live — because no device in this workspace can be made to do that
+today; that would need a harness change, not a test.
+
 The two guards that make it safe, by reading: `cached_page` refuses the cache
 when `pending && dirty.contains_key(&id)` — the same two-step `node_at` and
 `committed_node` already perform, so a transaction still reads its own writes —
@@ -1167,6 +1203,74 @@ latency-percentile output, so whether a wider gather window moves the tail
 before a slow leader gives up on them) is genuinely unknown. Widening
 `COMMIT_COALESCE_MAX_YIELDS` for a throughput win without any visibility into
 p99 commit latency is a real gap in what this document can honestly claim.
+
+**All three of the above paid (2026-08-30).**
+
+1. `a_checkpoint_concurrent_with_a_normal_commit_still_makes_progress`
+   (`device.rs`, beside `normal_commits_and_checkpoints_use_separate_flush_paths`)
+   now drives the exact interleaving instead of leaving it unproven. A fake
+   flush leader — a real `CommitCoordinator::make_durable_with_cohort` call
+   this test controls, the same technique the leader/follower tests above it
+   already use — blocks mid-flush; a real checkpoint takes the reservation
+   gate, and its own `sync()` must see the fake leader in progress and become
+   a follower *without releasing the gate*; six real normal commits, each its
+   own handle, are then started and confirmed (a bounded poll, not assumed)
+   to have piled into `normal_waiters` behind that held gate; only then is
+   the fake leader released. Every commit and the checkpoint succeed, every
+   committed row survives a fresh handle, and `normal_inflight`,
+   `normal_waiters` and `reserved` are all back at rest afterward.
+   Deterministic — the only timing assertion is a deliberately loose overall
+   ceiling (30s) meant to fail loudly on a genuine hang, not to bound the
+   ~200µs stall itself.
+2. `normal_inflight`/`normal_waiters` now have an RAII guard
+   (`NormalCommitGuard`, `crates/inlaysql/src/device.rs`), covering the same
+   kind of span `LeaderGuard` already covers for the flush leader's own
+   state. Because the code that can actually panic between
+   `begin_normal_commit` and `end_normal_commit` runs in `inlaysql-core`'s
+   `CowBTree::commit`, on the other side of the `Device` trait, the guard is
+   stashed in a `FileDevice` field rather than a local — reachable, and still
+   dropped, when a panic there unwinds this handle's owning thread, which
+   (nothing in this workspace catches such a panic and keeps a `FileDevice`
+   alive past it) is already how such a thread ends. Dropping it releases
+   the *entire* unfinished reservation, not just the counter: leaving
+   `reserved` stuck at `true` would have deadlocked every later committer on
+   the file outright, not merely taxed them the ~2.3ms this section
+   describes.
+   `a_panic_between_begin_and_end_normal_commit_does_not_leak_the_inflight_counter`
+   proves it — a real `FileDevice` moved into a `catch_unwind`ing closure
+   that begins a normal commit and panics before `end_normal_commit` ever
+   runs, with the coordinator's counters and reservation gate both read back
+   at rest afterward.
+3. The concurrency suite now reports p50/p95/p99/max per commit, per writer
+   level, alongside throughput and conflict rate
+   (`crates/inlaysql-bench/src/concurrency.rs`), reusing the crate-root
+   `percentiles` helper — extended to add p99 everywhere it is used —
+   `indexed.rs`'s `report` already reused rather than reinventing. Measured
+   per commit, not per attempt: a conflicted attempt's own duration is not
+   counted, since the conflict rate already prices retries. `WRITER_LEVELS=1,8,32`,
+   three runs, this host (range across the three; commits/s reproduces the
+   ~246 / ~1,248-1,378 / ~994-1,000 baseline within its own noise at 1 and 32
+   writers, and a little under it at 8 — see the gate report for this run):
+
+   | Writers | commits/s | p50 | p95 | p99 | max |
+   | --- | --- | --- | --- | --- | --- |
+   | 1 | 244–266 | 3.85–4.09ms | 4.28–4.48ms | 5.95–7.95ms | 8.05–9.05ms |
+   | 8 | 1,132–1,246 | 4.84–5.14ms | 18.88–23.00ms | 34.31–40.86ms | 50.91–63.14ms |
+   | 32 | 976–1,003 | 20.70–23.94ms | 92.97–96.78ms | 114.89–125.27ms | 141.32–186.02ms |
+
+   **The 2x throughput win did come at a real tail-latency price, and the
+   price grows with writer count rather than staying flat.** p99 at 8 writers
+   is roughly 4-7x p99 at 1 writer; at 32 writers roughly 14-21x. SQLite's own
+   p99 stays roughly flat (~13-17ms) across the same sweep, because its
+   writers serialize on a lock rather than gathering — so at 32 writers
+   InlaySQL's throughput is ~10-11x SQLite's, but its p99 is now ~7-9x
+   *worse* than SQLite's, a genuine trade the throughput number alone never
+   showed and this document could not previously state. This run has no
+   concurrent checkpoint, so item 1's fix is not itself a contributor to the
+   tail measured here — what remains is the gather window's own cost: more
+   writers means both a bigger cohort to gather before the leader's `fsync`
+   and a longer queue behind the reservation gate, and both grow the tail
+   directly, not just the median.
 
 ### Deferred/checkpointed page durability, measured before being built — Phase 0, and the redesign does not pay (2026-08-30)
 

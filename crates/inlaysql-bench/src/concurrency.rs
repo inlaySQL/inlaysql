@@ -24,6 +24,16 @@
 //!   [`Error::Conflict`] existed that is exactly what this suite would have
 //!   printed, because the engine reported a rolled-back transaction as
 //!   committed.
+//! * **Per-commit latency (p50/p95/p99/max).** Throughput and the conflict
+//!   rate say nothing about the tail: the adaptive gather window
+//!   (`CommitCoordinator::coalesce_normal_commits` in `inlaysql`'s
+//!   `device.rs`) can hold a flush leader for as long as
+//!   `COMMIT_COALESCE_MAX_YIELDS` — up to about 2.3ms — to gather a bigger
+//!   cohort before its `fsync`, which is exactly the kind of cost a
+//!   commits/s average hides and a p99 exposes. Measured per successful
+//!   `db.execute` call (a conflicted attempt's own duration is not counted —
+//!   the conflict rate above already prices retries in), merged across every
+//!   writer thread at a given writer count.
 //!
 //! # The SQLite baseline
 //!
@@ -45,7 +55,7 @@ use inlaysql::{Database, EngineOptions, Error, FileDevice, Value};
 // InlaySQL's — aliased so the two do not collide in this file, which
 // measures both.
 use crate::points::{open_sqlite, remove_sqlite_files, Durability as SqliteDurability};
-use crate::Config;
+use crate::{percentiles, Config};
 
 /// InlaySQL's [`Durability`](inlaysql::Durability) for the writers this suite
 /// opens, from `INLAYSQL_BENCH_DURABILITY` (`full` or `normal`, case
@@ -89,6 +99,11 @@ struct Outcome {
     /// Transactions rolled back and retried.
     conflicts: usize,
     elapsed: Duration,
+    /// One entry per committed transaction: the wall-clock time of exactly
+    /// the `db.execute`/`Connection::execute` call that committed it, merged
+    /// across every writer thread at this writer count. Never a conflicted
+    /// attempt's duration — see the module doc's latency bullet.
+    samples: Vec<Duration>,
 }
 
 impl Outcome {
@@ -135,17 +150,22 @@ pub fn run(config: &Config, dir: &Path) -> Result<(), Box<dyn std::error::Error>
     }
 
     println!(
-        "\n{:<40} {:>8} {:>12} {:>12} {:>10}",
-        "engine", "writers", "commits/s", "committed", "conflicts"
+        "\n{:<40} {:>8} {:>12} {:>12} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "engine", "writers", "commits/s", "committed", "conflicts", "p50", "p95", "p99", "max"
     );
     for outcome in &outcomes {
+        let (p50, p95, p99, max) = percentiles(&outcome.samples);
         println!(
-            "{:<40} {:>8} {:>12.0} {:>12} {:>9.1}%",
+            "{:<40} {:>8} {:>12.0} {:>12} {:>9.1}% {:>10} {:>10} {:>10} {:>10}",
             outcome.label,
             outcome.writers,
             outcome.per_second(),
             outcome.committed,
             outcome.conflict_rate() * 100.0,
+            format!("{p50:.2?}"),
+            format!("{p95:.2?}"),
+            format!("{p99:.2?}"),
+            format!("{max:.2?}"),
         );
     }
 
@@ -216,6 +236,11 @@ fn writer_counts(max: usize) -> Vec<usize> {
     counts
 }
 
+/// One writer thread's outcome: transactions committed, transactions
+/// conflicted, and one latency sample per commit — see the module doc's
+/// latency bullet for what each sample times.
+type WriterResult = Result<(usize, usize, Vec<Duration>), Error>;
+
 fn inlaysql_writers(
     path: &Path,
     writers: usize,
@@ -247,14 +272,24 @@ fn inlaysql_writers(
                 start.wait();
                 let mut committed = 0;
                 let mut conflicts = 0;
+                let mut samples = Vec::with_capacity(txns);
                 for round in 0..txns {
                     let id = (round * writers + index + 1) as i64;
                     loop {
+                        // Timed around exactly this attempt, not the whole
+                        // retry loop: a conflict's own duration is real work
+                        // (already counted in `conflicts`), but folding it
+                        // into a commit's latency would blur "how long did a
+                        // commit take" with "how many times did this writer
+                        // have to retry", which the conflict rate already
+                        // answers.
+                        let attempted = Instant::now();
                         match db.execute(
                             "INSERT INTO kv (id, n) VALUES (?, ?)",
                             &[Value::Integer(id), Value::Integer(id)],
                         ) {
                             Ok(_) => {
+                                samples.push(attempted.elapsed());
                                 committed += 1;
                                 break;
                             }
@@ -263,13 +298,13 @@ fn inlaysql_writers(
                         }
                     }
                 }
-                Ok((committed, conflicts))
+                Ok((committed, conflicts, samples))
             }));
         }
         ready.wait();
         let started = Instant::now();
         start.wait();
-        let results: Vec<Result<(usize, usize), Error>> = handles
+        let results: Vec<WriterResult> = handles
             .into_iter()
             .map(|handle| {
                 handle.join().unwrap_or_else(|panic| {
@@ -281,10 +316,12 @@ fn inlaysql_writers(
     });
     let mut committed = 0;
     let mut conflicts = 0;
+    let mut samples = Vec::new();
     for result in results {
-        let (worker_committed, worker_conflicts) = result?;
+        let (worker_committed, worker_conflicts, worker_samples) = result?;
         committed += worker_committed;
         conflicts += worker_conflicts;
+        samples.extend(worker_samples);
     }
 
     verify(path, txns * writers)?;
@@ -295,6 +332,7 @@ fn inlaysql_writers(
         committed,
         conflicts,
         elapsed,
+        samples,
     })
 }
 
@@ -338,14 +376,17 @@ fn sqlite_writers(
         .collect::<Result<_, _>>()?;
 
     let mut committed = 0;
+    let mut samples = Vec::with_capacity(txns * writers);
     let started = Instant::now();
     for round in 0..txns {
         for (index, conn) in connections.iter().enumerate() {
             let id = (round * writers + index + 1) as i64;
+            let attempted = Instant::now();
             conn.execute(
                 "INSERT INTO kv (id, n) VALUES (?1, ?2)",
                 rusqlite::params![id, id],
             )?;
+            samples.push(attempted.elapsed());
             committed += 1;
         }
     }
@@ -365,5 +406,6 @@ fn sqlite_writers(
         // A lock made every writer wait its turn; none was ever rolled back.
         conflicts: 0,
         elapsed,
+        samples,
     })
 }

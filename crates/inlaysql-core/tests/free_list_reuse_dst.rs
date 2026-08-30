@@ -38,15 +38,29 @@
 //! committed — plus one more: across the sweep, reclamation must actually
 //! have fired at least once (`CowBTree::pages_reused`), or this file would
 //! be exercising nothing.
+//!
+//! # The raw-leaf scan path
+//!
+//! Everything above drives `CowBTree` directly and reads back with
+//! `CowBTree::scan` — the decoded walk. The engine's actual table-scan path,
+//! `CowBTree::scan_prefix_row_values_raw_from` (`walk_raw_row_values`,
+//! parsing leaf cells in place, and the `RawScanCursor` it may retain across
+//! calls) is a different, crate-private method never exercised by that
+//! reopen-and-`scan` check, and — before `raw_scan_sweep` below — was never
+//! run under page reuse with fault injection at all. Reachable from outside
+//! `inlaysql-core` only through the public `Storage`/`RowScan` seam
+//! (`TreeStorage`, `inlaysql_core::traits::scan_all`), which is what
+//! `raw_scan_sweep` uses in place of a raw `CowBTree`.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 
-use inlaysql_core::btree::{CommitPoint, CowBTree, Device};
+use inlaysql_core::btree::{CommitPoint, CowBTree, Device, DEFAULT_PAGE_CACHE_BYTES};
 use inlaysql_core::error::{Error, Result};
 use inlaysql_core::mem::SeededRng;
 use inlaysql_core::sim::{FaultSchedule, SimDisk, Simulator, SyncOutcome};
-use inlaysql_core::traits::Rng;
+use inlaysql_core::traits::{scan_all, Rng, RowId, Storage};
+use inlaysql_core::{Durability, TreeStorage};
 
 const PAGE: usize = 256;
 const BLOCK: usize = 512;
@@ -64,6 +78,21 @@ const BATCHES: usize = 200;
 /// rather than growing monotonically — heavy churn is what the free list
 /// exists for.
 const KEY_SPACE: u64 = 24;
+
+/// How many distinct row ids `raw_scan_sweep`'s workload cycles through.
+/// Larger than `KEY_SPACE` above and, deliberately, larger than
+/// `inlaysql_core::traits::RowScan`'s first batch size (32, private to that
+/// module): a verifying read has to actually cross a `Storage::scan_batch`
+/// boundary — more than one call — for "the `RawScanCursor` retained across
+/// calls" to mean anything. A row count that never forces a second batch
+/// would prove only that one raw-leaf walk is correct, not that repeated
+/// calls into the same scan stay correct while pages keep being reused
+/// underneath it.
+const RAW_SCAN_ROW_SPACE: u64 = 96;
+
+/// The table `raw_scan_sweep`'s workload writes under. Arbitrary — this
+/// exercises `Storage`/`RowScan` directly, not SQL, so nothing parses it.
+const RAW_SCAN_TABLE: &str = "t";
 
 /// A [`Device`] over one [`Simulator`], trustworthy for
 /// [`Device::commit_point`], [`Device::commit_generation`] and the reader
@@ -300,6 +329,147 @@ fn thousands_of_seeds_of_heavy_churn_with_reuse_on_recover_to_a_committed_snapsh
     let mut total_reused = 0u64;
     for seed in 0..5_000u64 {
         total_reused += sweep(seed);
+    }
+    assert!(
+        total_reused > 0,
+        "no seed ever reused a page — this sweep is not testing reuse"
+    );
+}
+
+/// Run one seed's churn workload with page reuse on from the moment the
+/// database is created — matching `EngineOptions::page_reuse`'s own "decide
+/// at creation, not a tuning knob" contract (see `TreeStorage::open_on_with_options`'s
+/// doc comment) rather than flipping it mid-workload — and read the table
+/// back through [`scan_all`]: `RowScan` -> `Storage::scan_batch` ->
+/// `CowBTree::scan_prefix_row_values_raw_from`, the exact path a real
+/// `SELECT` uses and the one this module's other sweep never touches.
+///
+/// Verified twice, both through that same raw-scan path:
+///
+/// * **Live**, after every commit — not just once at the end — against the
+///   workload's own in-memory model. `RAW_SCAN_ROW_SPACE` is wide enough that
+///   this genuinely drives `RowScan` across more than one
+///   `Storage::scan_batch` call, so a regression that let a stale
+///   `RawScanCursor` survive page reuse (the condition
+///   `scan_range_row_values_raw_from`'s `generation` gate exists to rule
+///   out — see this module's doc comment) would show up as soon as a page
+///   reused between two calls of the same scan was read back wrong, not only
+///   after a crash.
+/// * **After recovery**, against every snapshot the workload actually
+///   committed — the same invariant `sweep` above checks, over the same raw
+///   path this one exists to cover.
+fn raw_scan_sweep(seed: u64) -> u64 {
+    let sim = Simulator::with_disk(
+        seed,
+        SimDisk::with_block_size(BLOCK, CAPACITY),
+        FaultSchedule::random_with(seed, 10, 10, 0),
+    );
+    let mut storage = match TreeStorage::open_on_with_options(
+        TrustedDevice::new(sim),
+        DEFAULT_PAGE_CACHE_BYTES,
+        true,
+        Durability::Full,
+    ) {
+        Ok(storage) => storage,
+        Err(_) => return 0,
+    };
+    if storage.device().crashed() {
+        return 0;
+    }
+
+    let mut rng = SeededRng::new(seed ^ 0x1357_9BDF_2468_ACE0);
+    let mut snapshots: Vec<BTreeMap<RowId, Vec<u8>>> = vec![BTreeMap::new()];
+    let mut expected: BTreeMap<RowId, Vec<u8>> = BTreeMap::new();
+
+    'workload: for batch in 0..BATCHES {
+        let ops = 1 + (rng.next_u64() % 6) as usize;
+        for _ in 0..ops {
+            let id = rng.next_u64() % RAW_SCAN_ROW_SPACE;
+            if rng.next_u64().is_multiple_of(3) {
+                expected.remove(&id);
+                storage.delete_row(RAW_SCAN_TABLE, id).unwrap();
+            } else {
+                let value = format!("v{:016x}-{batch}", rng.next_u64()).into_bytes();
+                expected.insert(id, value.clone());
+                storage.put_row(RAW_SCAN_TABLE, id, &value).unwrap();
+            }
+        }
+        let commit_result = storage.commit();
+        // Same reasoning as `sweep`, above: this batch's state belongs in the
+        // recoverable set regardless of `commit_result`, since a torn write
+        // can still leave the whole record durable.
+        snapshots.push(expected.clone());
+        if commit_result.is_err() || storage.device().crashed() {
+            break 'workload;
+        }
+
+        // Live check, through the raw-scan path, right now — not deferred to
+        // the post-recovery check below.
+        match scan_all(&storage, RAW_SCAN_TABLE) {
+            Ok(rows) => {
+                let observed: BTreeMap<RowId, Vec<u8>> = rows
+                    .into_iter()
+                    .map(|(id, value)| (id, value.into_vec()))
+                    .collect();
+                assert_eq!(
+                    observed, expected,
+                    "seed {seed} batch {batch}: a live raw-leaf scan under page \
+                     reuse disagreed with the workload's own model"
+                );
+            }
+            // The device may have crashed inside this scan's own reads;
+            // treat that exactly like a crash during commit, above.
+            Err(_) => break 'workload,
+        }
+        if storage.device().crashed() {
+            break 'workload;
+        }
+    }
+
+    let reused = storage.tree().pages_reused();
+    let image = storage.device().image();
+    drop(storage);
+
+    let reopened = match TreeStorage::open_on(SimDisk::with_image(BLOCK, &image)) {
+        Ok(storage) => storage,
+        Err(err) => panic!("seed {seed}: recovery failed: {err}"),
+    };
+    let recovered: BTreeMap<RowId, Vec<u8>> = scan_all(&reopened, RAW_SCAN_TABLE)
+        .unwrap_or_else(|err| panic!("seed {seed}: raw scan of recovered table failed: {err}"))
+        .into_iter()
+        .map(|(id, value)| (id, value.into_vec()))
+        .collect();
+    assert!(
+        snapshots.contains(&recovered),
+        "seed {seed}: a raw-leaf scan of the recovered table is not any \
+         committed snapshot"
+    );
+    reused
+}
+
+#[test]
+fn raw_scan_under_reuse_recovers_to_a_committed_snapshot() {
+    let mut total_reused = 0u64;
+    for seed in 0..300u64 {
+        total_reused += raw_scan_sweep(seed);
+    }
+    // Same defensive check as `heavy_churn_with_reuse_on_recovers_to_a_committed_snapshot`:
+    // if this is ever 0, `RAW_SCAN_ROW_SPACE` and `BATCHES` are not actually
+    // forcing reclamation, and every assertion above it would be passing for
+    // the wrong reason — proving the raw-leaf walk is correct with reuse
+    // *off* in every seed, not on.
+    assert!(
+        total_reused > 0,
+        "no seed ever reused a page — this sweep is not testing reuse"
+    );
+}
+
+#[test]
+#[ignore = "expensive: run with --release -- --ignored, or in CI"]
+fn thousands_of_seeds_of_raw_scan_under_reuse_recover_to_a_committed_snapshot() {
+    let mut total_reused = 0u64;
+    for seed in 0..5_000u64 {
+        total_reused += raw_scan_sweep(seed);
     }
     assert!(
         total_reused > 0,

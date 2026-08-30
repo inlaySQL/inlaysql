@@ -180,18 +180,19 @@ pub fn run(config: &Config, dir: &Path) -> Result<(), Box<dyn std::error::Error>
 fn report(workload: &str, operations: usize, timings: &[&Timing]) {
     println!("\n{workload}");
     println!(
-        "{:<46} {:>12} {:>10} {:>10} {:>10} {:>10}",
-        "engine", "joins/s", "cold", "p50", "p95", "max"
+        "{:<46} {:>12} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "engine", "joins/s", "cold", "p50", "p95", "p99", "max"
     );
     for timing in timings {
-        let (p50, p95, max) = percentiles(&timing.samples);
+        let (p50, p95, p99, max) = percentiles(&timing.samples);
         println!(
-            "{:<46} {:>12.0} {:>10} {:>10} {:>10} {:>10}",
+            "{:<46} {:>12.0} {:>10} {:>10} {:>10} {:>10} {:>10}",
             timing.label,
             timing.per_second(operations),
             format!("{:?}", timing.cold),
             format!("{p50:.2?}"),
             format!("{p95:.2?}"),
+            format!("{p99:.2?}"),
             format!("{max:.2?}")
         );
     }

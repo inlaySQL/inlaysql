@@ -283,8 +283,8 @@ fn oltp_result_json(
     read_samples: &[Duration],
     notes: &str,
 ) -> String {
-    let (wp50, wp95, wmax) = percentiles(write_samples);
-    let (rp50, rp95, rmax) = percentiles(read_samples);
+    let (wp50, wp95, _wp99, wmax) = percentiles(write_samples);
+    let (rp50, rp95, _rp99, rmax) = percentiles(read_samples);
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
     let ops_s =
         |count: usize, elapsed: Duration| count as f64 / elapsed.as_secs_f64().max(f64::EPSILON);

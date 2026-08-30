@@ -36,6 +36,12 @@ pub struct FileDevice {
     /// commit, consumed by [`Device::sync_commit`]. Zero means no ticket is
     /// waiting; tickets start at one.
     pending_commit_ticket: AtomicU64,
+    /// This handle's [`NormalCommitGuard`] between a successful
+    /// [`FileDevice::begin_normal_commit`] and the matching
+    /// [`FileDevice::end_normal_commit`] — see that guard's doc comment for
+    /// why it lives here, as a field, rather than as a local in whichever
+    /// function is between the two calls.
+    normal_commit_guard: Mutex<Option<NormalCommitGuard>>,
     /// Kept only to name the file in an error message — [`FileDevice`] itself
     /// never needs to re-open or re-derive a path.
     path: PathBuf,
@@ -591,6 +597,92 @@ impl Drop for LeaderGuard<'_> {
     }
 }
 
+/// The complete effect of leaving a normal commit's reservation: bump
+/// [`CommitCoordinator::generation`], clear the gate, wake one waiter on
+/// [`CommitCoordinator::reservation_done`], and remove this commit from the
+/// coalescing hint ([`CommitCoordinator::normal_inflight`]).
+///
+/// This is its own function — rather than inlined at each call site — so
+/// [`NormalCommitGuard::finish`] (the ordinary path, reached through
+/// [`FileDevice::end_normal_commit`]) and [`NormalCommitGuard::drop`] (a
+/// panic that skipped straight past it) can never disagree about what "done"
+/// means. Doing only the counter half here and not the reservation half would
+/// trade one bug for a worse one: every later committer on this file would
+/// block on [`CommitCoordinator::reservation_done`] forever, since nothing
+/// else ever clears [`CommitCoordinator::reserved`].
+fn release_normal_reservation(coordinator: &CommitCoordinator) -> u64 {
+    let generation = coordinator.generation.fetch_add(1, Ordering::AcqRel) + 1;
+    let mut reserved = coordinator
+        .reserved
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *reserved = false;
+    drop(reserved);
+    coordinator.normal_inflight.fetch_sub(1, Ordering::AcqRel);
+    coordinator.reservation_done.notify_one();
+    generation
+}
+
+/// RAII guard for a normal commit's residency in the reservation gate,
+/// covering the span [`FileDevice::begin_normal_commit`] opens and
+/// [`FileDevice::end_normal_commit`] ordinarily closes.
+///
+/// Unlike [`LeaderGuard`], which is constructed and dropped within one
+/// function's stack frame in this file, the code that can actually panic
+/// here — encoding and appending the write-ahead-log record, writing dirty
+/// pages — runs in `inlaysql-core`'s `CowBTree::commit`, on the other side of
+/// the [`inlaysql_core::btree::Device`] trait, in a different crate. This
+/// trait's methods return by value rather than an RAII object, so there is no
+/// borrowed-from-`begin_normal_commit` local for that caller to hold. Instead
+/// this guard is stashed in [`FileDevice::normal_commit_guard`] — a field,
+/// not a local — where it is still reachable, and still gets dropped, when a
+/// panic in that other crate unwinds this handle's owning thread. That is not
+/// a hypothetical fallback: nothing in this codebase catches such a panic and
+/// keeps a `FileDevice` alive past it (there is no `catch_unwind` anywhere in
+/// this workspace), so tearing the handle down *is* how a thread that panics
+/// mid-commit ends today, and this field's `Drop` runs as part of that.
+///
+/// Before this guard existed, a panic in that window left
+/// [`CommitCoordinator::normal_inflight`] incremented and
+/// [`CommitCoordinator::reserved`] stuck at `true` for as long as the file's
+/// shared [`CommitCoordinator`] stayed alive — on a long-running server, in
+/// practice forever. The stuck reservation would have deadlocked every later
+/// committer outright; the stuck counter alone (had the reservation been
+/// released some other way) still cost every subsequent flush leader up to
+/// the full [`COMMIT_COALESCE_MAX_YIELDS`], because
+/// [`CommitCoordinator::coalesce_normal_commits`] reads a nonzero
+/// `normal_inflight` as "a cohort is still arriving".
+struct NormalCommitGuard {
+    coordinator: Arc<CommitCoordinator>,
+    finished: bool,
+}
+
+impl NormalCommitGuard {
+    fn new(coordinator: Arc<CommitCoordinator>) -> Self {
+        NormalCommitGuard {
+            coordinator,
+            finished: false,
+        }
+    }
+
+    /// The ordinary path: release the reservation and report the generation
+    /// it produced, exactly as leaving the gate always has. Consumes the
+    /// guard (via `mut self`, marked finished first) so `Drop` never releases
+    /// a second time.
+    fn finish(mut self) -> u64 {
+        self.finished = true;
+        release_normal_reservation(&self.coordinator)
+    }
+}
+
+impl Drop for NormalCommitGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            release_normal_reservation(&self.coordinator);
+        }
+    }
+}
+
 type FileId = (u64, u64);
 
 /// How many times a lock attempt is retried before the file is reported as
@@ -656,6 +748,7 @@ impl FileDevice {
             coordinator: Some(coordinator),
             wal_region,
             pending_commit_ticket: AtomicU64::new(0),
+            normal_commit_guard: Mutex::new(None),
             path: path.to_path_buf(),
         })
     }
@@ -699,6 +792,7 @@ impl FileDevice {
             coordinator: None,
             wal_region: 0,
             pending_commit_ticket: AtomicU64::new(0),
+            normal_commit_guard: Mutex::new(None),
             path: path.to_path_buf(),
         })
     }
@@ -800,7 +894,32 @@ impl FileDevice {
     /// Publish the reservation boundary and optionally remove one normal
     /// commit from the coalescing hint. The generation increment remains
     /// atomic with the boundary, as it was before the normal/checkpoint split.
+    ///
+    /// The `normal` branch hands off to whatever [`NormalCommitGuard`]
+    /// `begin_normal_commit` stashed in [`FileDevice::normal_commit_guard`]
+    /// rather than repeating the release inline, so this path and a panic
+    /// that skips it both go through [`NormalCommitGuard::finish`] /
+    /// [`release_normal_reservation`] and can never disagree.
     fn end_reservation(&self, coordinator: &CommitCoordinator, normal: bool) -> u64 {
+        if normal {
+            let guard = self
+                .normal_commit_guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            return match guard {
+                Some(guard) => guard.finish(),
+                None => {
+                    // Defensive only: `begin_normal_commit` always stashes a
+                    // guard on success, and this is the only place that ever
+                    // takes it back out. Falling back to a direct release
+                    // still leaves the coordinator correct instead of
+                    // silently skipping the decrement if that invariant is
+                    // ever broken.
+                    release_normal_reservation(coordinator)
+                }
+            };
+        }
         let generation = coordinator.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let mut reserved = coordinator
             .reserved
@@ -808,9 +927,6 @@ impl FileDevice {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *reserved = false;
         drop(reserved);
-        if normal {
-            coordinator.normal_inflight.fetch_sub(1, Ordering::AcqRel);
-        }
         coordinator.reservation_done.notify_one();
         generation
     }
@@ -932,15 +1048,35 @@ impl Device for FileDevice {
     /// Acquire the reservation for a normal user commit and advertise that a
     /// normal committer is active. Checkpoints continue to use `begin_commit`
     /// and therefore do not make a post-commit leader wait on them.
+    ///
+    /// `normal_waiters` is guarded by a small scope guard rather than the
+    /// bare `fetch_add`/`fetch_sub` pair this replaced, so a panic inside
+    /// `begin_reservation` — none is reachable today, but nothing here
+    /// depends on that staying true — cannot leave it elevated either.
+    /// `normal_inflight` gets the sturdier [`NormalCommitGuard`] instead of a
+    /// matching scope guard because its region does not end inside this
+    /// function; see that type's doc comment.
     fn begin_normal_commit(&self) -> Result<()> {
         let Some(coordinator) = &self.coordinator else {
             return Err(self.read_only_error("begin a commit"));
         };
         coordinator.normal_waiters.fetch_add(1, Ordering::AcqRel);
+        struct WaiterGuard<'a>(&'a CommitCoordinator);
+        impl Drop for WaiterGuard<'_> {
+            fn drop(&mut self) {
+                self.0.normal_waiters.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let waiter_guard = WaiterGuard(coordinator);
         let result = self.begin_reservation(coordinator);
-        coordinator.normal_waiters.fetch_sub(1, Ordering::AcqRel);
+        drop(waiter_guard);
         if result.is_ok() {
             coordinator.normal_inflight.fetch_add(1, Ordering::Release);
+            *self
+                .normal_commit_guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(NormalCommitGuard::new(Arc::clone(coordinator)));
         }
         result
     }
@@ -1575,6 +1711,351 @@ mod group_commit_tests {
         );
 
         drop(tree);
+        drop(coordinator);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The test above proves normal commits and checkpoints use separate
+    /// flush paths, but runs them sequentially — it never proves what
+    /// happens when a checkpoint's own `write_state` → `device.sync()`
+    /// arrives while a normal commit is *already* flush-leading.
+    ///
+    /// That interleaving matters because a checkpoint holds the reservation
+    /// gate across its own in-gate sync (`CowBTree::checkpoint`, unlike a
+    /// normal commit, does not release the gate until *after* its sync
+    /// returns). If that sync sees `flush.in_progress` already set, it
+    /// becomes a follower on `flush_done` — while still holding the gate.
+    /// Every other normal commit that starts in that window piles into
+    /// `normal_waiters`, which the real leader's `coalesce_normal_commits`
+    /// reads as "cohort still arriving", even though none of those waiters
+    /// can publish a ticket until the checkpoint releases the gate it is
+    /// itself stuck behind. Not a deadlock — `coalesce_normal_commits`'s own
+    /// stall detector (`COMMIT_COALESCE_STALL_YIELDS`) notices
+    /// `writes_completed` has stopped moving and breaks the leader out,
+    /// letting its real flush run, which wakes the checkpoint, which becomes
+    /// leader of its own flush, which finally releases the gate — but until
+    /// this test, nothing ever exercised it.
+    ///
+    /// Real `fsync` timing cannot be trusted to land this deterministically,
+    /// so this pins the interleaving the same way the leader/follower tests
+    /// above do: a fake "leader" drives `CommitCoordinator::make_durable_with_cohort`
+    /// directly, through a closure this test controls, standing in for a real
+    /// normal commit's `sync_commit`.
+    ///
+    /// 1. The fake leader takes `flush.in_progress` and blocks.
+    /// 2. A real checkpoint starts, takes the reservation gate — confirmed by
+    ///    a bounded poll before this test proceeds, so the next step can
+    ///    never race it — then its own `sync()` must see the fake leader in
+    ///    progress and become a follower without ever releasing the gate.
+    /// 3. `WAITERS` real normal commits, each on its own handle, start only
+    ///    after the gate is confirmed held, so every one of them is forced to
+    ///    pile into `normal_waiters` rather than possibly slipping through
+    ///    first depending on how the scheduler happens to run this test.
+    /// 4. Once every one of them is actually counted — again a bounded poll,
+    ///    not a fixed sleep — the fake leader is released, proving the
+    ///    leader really did keep the cohort waiting on it and not the other
+    ///    way around.
+    ///
+    /// The assertions that matter are on outcome, not timing: every commit
+    /// and the checkpoint must succeed, every row a commit was told it
+    /// committed must survive a fresh handle, and the coordinator's counters
+    /// and reservation gate must be back at rest afterward — never a torn,
+    /// partial or invented row, and never a counter or gate left stuck by the
+    /// interleaving. The one timing assertion is a deliberately loose overall
+    /// ceiling: generous enough not to be flaky on a loaded runner, but tight
+    /// enough to fail loudly on a genuine hang instead of leaving the test
+    /// binary to time out on its own with no useful message.
+    #[test]
+    fn a_checkpoint_concurrent_with_a_normal_commit_still_makes_progress() {
+        use inlaysql_core::btree::{CommitOutcome, CowBTree, DEFAULT_PAGE_SIZE};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        const WAITERS: usize = 6;
+        const POLL_TIMEOUT: Duration = Duration::from_secs(10);
+        const OVERALL_CEILING: Duration = Duration::from_secs(30);
+
+        let path = std::env::temp_dir().join(format!(
+            "inlaysql-checkpoint-concurrent-commit-{}-{}.inlay",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        // Seeded and dropped before the race starts: `CowBTree` holds a
+        // thread-local (`Rc`-based) page cache internally, so it is not
+        // `Send` and cannot be built here and moved into a spawned thread —
+        // every handle below, the checkpoint's included, is opened fresh on
+        // the thread that uses it, exactly like the writers already have to
+        // be.
+        let seed_device = FileDevice::open(&path).expect("open seed handle");
+        let coordinator = Arc::clone(seed_device.coordinator.as_ref().expect("coordinator"));
+        let mut seed_tree =
+            CowBTree::open_or_create(seed_device, DEFAULT_PAGE_SIZE).expect("create");
+        seed_tree.put(b"seed", b"value").expect("seed put");
+        seed_tree.commit().expect("seed commit");
+        drop(seed_tree);
+
+        let started = Instant::now();
+        let (leading_tx, leading_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let leader_flushed = AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            let coordinator: &CommitCoordinator = &coordinator;
+            let leader_flushed = &leader_flushed;
+
+            // The fake leader: becomes flush leader for real, through the
+            // exact `make_durable_with_cohort(_, coalesce_normal_commits:
+            // true, _)` path a real normal commit's `sync_commit` uses, and
+            // blocks there until this test releases it.
+            let leader = scope.spawn(move || {
+                let ticket = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+                coordinator.make_durable_with_cohort(ticket, true, || {
+                    leading_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    leader_flushed.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+
+            leading_rx
+                .recv()
+                .expect("the fake leader must signal before this test proceeds");
+
+            // The checkpoint: takes the reservation gate, then its own
+            // `sync()` must see the fake leader in progress and become a
+            // follower — without ever releasing the gate first.
+            let checkpoint = scope.spawn({
+                let path = path.clone();
+                move || {
+                    let device = FileDevice::open(&path).expect("open checkpoint handle");
+                    let mut tree = CowBTree::open_or_create(device, DEFAULT_PAGE_SIZE)
+                        .expect("open checkpoint tree");
+                    tree.checkpoint()
+                }
+            });
+
+            // Confirmed, not assumed: the checkpoint must actually be
+            // holding the gate before a single writer is spawned below, or a
+            // writer could slip through first depending on how the scheduler
+            // happens to interleave the two spawns — which would make the
+            // rest of this test flaky rather than deterministic.
+            let gate_deadline = Instant::now() + POLL_TIMEOUT;
+            loop {
+                if *coordinator
+                    .reserved
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < gate_deadline,
+                    "the checkpoint never took the reservation gate"
+                );
+                std::thread::yield_now();
+            }
+
+            // `WAITERS` real normal commits, each its own handle, piling
+            // into `normal_waiters` behind the checkpoint's held gate.
+            let mut writers = Vec::new();
+            for index in 0..WAITERS {
+                let path = path.clone();
+                writers.push(scope.spawn(move || {
+                    let device = FileDevice::open(&path).expect("open writer handle");
+                    let mut tree = CowBTree::open_or_create(device, DEFAULT_PAGE_SIZE)
+                        .expect("open writer tree");
+                    let key = format!("writer-{index}").into_bytes();
+                    tree.put(&key, b"value").expect("writer put");
+                    let outcome = tree.commit().expect("writer commit");
+                    (key, outcome)
+                }));
+            }
+
+            // Wait for every one of them to actually be counted as waiting
+            // on the gate the checkpoint holds — proving the pile-up really
+            // happened, not just that the threads were spawned.
+            let waiters_deadline = Instant::now() + POLL_TIMEOUT;
+            loop {
+                if coordinator.normal_waiters.load(Ordering::Acquire) >= WAITERS {
+                    break;
+                }
+                assert!(
+                    Instant::now() < waiters_deadline,
+                    "writers never piled into normal_waiters behind the checkpoint's \
+                     held reservation gate — the race this test exists to exercise \
+                     never set up"
+                );
+                std::thread::yield_now();
+            }
+
+            // Everything downstream — the checkpoint waking as a follower,
+            // then becoming its own leader once the fake leader's flush does
+            // not cover its ticket, then releasing the gate, then each
+            // writer taking its turn — happens on its own from here.
+            release_tx.send(()).unwrap();
+
+            let leader_result = leader.join().unwrap();
+            assert!(
+                leader_result.is_ok(),
+                "the fake leader's flush must succeed"
+            );
+            assert!(
+                leader_flushed.load(Ordering::SeqCst),
+                "the fake leader's closure must actually have run"
+            );
+
+            checkpoint.join().unwrap().expect(
+                "the checkpoint must succeed despite becoming a follower while \
+                 holding the reservation gate",
+            );
+
+            let mut committed_keys = Vec::new();
+            for writer in writers {
+                let (key, outcome) = writer.join().unwrap();
+                assert_eq!(
+                    outcome,
+                    CommitOutcome::Committed,
+                    "every writer used a disjoint key and must never conflict"
+                );
+                committed_keys.push(key);
+            }
+
+            assert!(
+                started.elapsed() < OVERALL_CEILING,
+                "a checkpoint concurrent with normal commits took {:?} — the stall \
+                 detector should break the leader out in microseconds, not this",
+                started.elapsed()
+            );
+
+            // Progress and correctness: every committed key survives a fresh
+            // handle — never torn, partial or invented.
+            let reader_device = FileDevice::open(&path).expect("open reader");
+            let reader = CowBTree::open_or_create(reader_device, DEFAULT_PAGE_SIZE)
+                .expect("open reader tree");
+            for key in &committed_keys {
+                let value = reader.get(key).expect("read committed key").expect(
+                    "a key a writer was told it committed must be readable \
+                             from a fresh handle",
+                );
+                assert_eq!(&value[..], b"value");
+            }
+            drop(reader);
+
+            // And the coordinator itself is back at rest.
+            assert_eq!(
+                coordinator.normal_inflight.load(Ordering::Acquire),
+                0,
+                "normal_inflight must return to zero once every commit has left the gate"
+            );
+            assert_eq!(
+                coordinator.normal_waiters.load(Ordering::Acquire),
+                0,
+                "normal_waiters must return to zero once every commit has left the gate"
+            );
+            assert!(
+                !*coordinator
+                    .reserved
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                "the reservation gate must be free once every commit and the \
+                 checkpoint have left it"
+            );
+        });
+
+        drop(coordinator);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Before [`NormalCommitGuard`] existed, a panic between
+    /// `begin_normal_commit` and `end_normal_commit` left `normal_inflight`
+    /// incremented and `reserved` stuck at `true` for as long as this file's
+    /// shared `CommitCoordinator` stayed alive — every later committer would
+    /// have deadlocked on the stuck reservation, and even had that not been
+    /// true, `coalesce_normal_commits` would have read the stuck counter as
+    /// "a cohort is still arriving" on every subsequent flush, forever.
+    ///
+    /// This reproduces exactly that window: `device` is moved into a closure
+    /// that begins a normal commit and then panics before ever calling
+    /// `end_normal_commit`, which is what a connection thread panicking
+    /// mid-commit looks like in this codebase today — nothing here catches
+    /// such a panic and keeps the handle alive past it, so the handle (and
+    /// its stashed [`NormalCommitGuard`]) is torn down by the unwind. The
+    /// white-box read of `normal_inflight` and `reserved` afterward proves
+    /// the guard's `Drop` ran and put the coordinator back the way a
+    /// successful `end_normal_commit` would have.
+    ///
+    /// (This test's panic message and backtrace on stderr are expected —
+    /// `catch_unwind` still lets the default panic hook run before it
+    /// catches the unwind.)
+    #[test]
+    fn a_panic_between_begin_and_end_normal_commit_does_not_leak_the_inflight_counter() {
+        let path = std::env::temp_dir().join(format!(
+            "inlaysql-normal-commit-panic-{}-{}.inlay",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let device = FileDevice::open(&path).expect("open");
+        let coordinator = Arc::clone(device.coordinator.as_ref().expect("coordinator"));
+        let coordinator_in_closure = Arc::clone(&coordinator);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            device.begin_normal_commit().expect("begin normal commit");
+            assert_eq!(
+                coordinator_in_closure
+                    .normal_inflight
+                    .load(Ordering::Acquire),
+                1,
+                "begin_normal_commit must mark the reservation held before this \
+                 test panics on it"
+            );
+            assert!(
+                *coordinator_in_closure
+                    .reserved
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                "begin_normal_commit must hold the reservation gate before this \
+                 test panics on it"
+            );
+            panic!(
+                "simulated panic between begin_normal_commit and \
+                 end_normal_commit — end_normal_commit is deliberately never \
+                 reached"
+            );
+            // `device` — and the `NormalCommitGuard` it stashed — is dropped
+            // right here as this closure's frame unwinds.
+        }));
+        assert!(
+            result.is_err(),
+            "the closure above must have actually panicked, or this test proves \
+             nothing"
+        );
+
+        assert_eq!(
+            coordinator.normal_inflight.load(Ordering::Acquire),
+            0,
+            "a panic between begin_normal_commit and end_normal_commit must not \
+             leave normal_inflight incremented forever"
+        );
+        assert!(
+            !*coordinator
+                .reserved
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            "a panic between begin_normal_commit and end_normal_commit must not \
+             leave the reservation gate held forever — every later committer on \
+             this file would deadlock waiting for it"
+        );
+
         drop(coordinator);
         let _ = std::fs::remove_file(&path);
     }
