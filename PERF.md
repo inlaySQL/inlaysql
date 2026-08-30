@@ -2089,6 +2089,218 @@ small (a)-shaped detail riding along.**
 
 ---
 
+## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
+
+Every engine optimisation decision is frozen pending this section. The harness
+has been observed to move up to 2.6x on unchanged code, which means it cannot
+currently distinguish a real win from noise. This section measures the floor
+rather than assuming it, states the project's acceptance criterion, and
+dissects the flagship point-read swing (636,980 → 342,747 → 901,158 → 522,562
+ops/s across four editions with no commit touching that path).
+
+### The A/A floor, per suite — the acceptance criterion
+
+An A/A test is the identical binary against identical data, repeated. Three of
+the four suite groups below reuse `2cb2539`'s already-published, already
+load-disclosed regeneration runs (`bench/results/20260830T{120941,122626,
+123414}Z.txt`, `20260830T{124155,124632,125240}Z.txt`,
+`20260830T{125800,131326,132715}Z.txt` — load 2.3–4.8/18 throughout, gated by
+`bench/run.sh`'s own quiet-machine check, `dirty: no`, unrebuilt binary
+throughout). This session adds a fourth, deliberately homogeneous group: the
+flagship point-read row alone, isolated across five separate `run.sh`
+invocations tonight, still on the identical unrebuilt `ee1a5c4` binary
+(`20260830T{120941,122626,123414,151233,152024}Z.txt` — the last two are
+tonight's, load 3.0–4.4/18 throughout, `dirty: no`).
+
+| Suite | n | metrics | median spread | p95 spread | CoV (median) | CoV (p95) | ≥10% disagreement |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Main (points/indexed/joins/vectors/concurrency-narrow/retrieval), all columns | 3 | 343 | 13.6% | 193.1%\* | 6.2% | 62.8% | 196/343 (57.1%) |
+| Main, **core columns only** (ops/s, p50, joins/s, commits/s, recall@k — excludes `max`/`p95`/`p99`/`cold`, which are expected to swing) | 3 | 108 | 9.5% | 74.6% | 4.0% | 34.7% | 53/108 (49.1%) |
+| Concurrency wide sweep (`WRITER_LEVELS=1,2,3,4,5,6,8,12,16,24,32`), core columns | 3 | 45 | 8.8% | 25.5% | 3.6% | 10.3% | 18/45 (40.0%) |
+| Quantisation spot-check (`DOCS=100000`), core columns | 3 | 24 | 0.6% | 14.7% | 0.3% | 6.1% | 5/24 (20.8%) |
+| **Flagship: point-read ops/s alone**, 5 independent runs, identical unrebuilt binary | 5 | 1 | 20.4% | — | 7.3% | — | 1/1 |
+
+\* The 193.1%/24764.4%-class outliers are exclusively `max` columns — a single
+unlucky tail sample in one of three runs (e.g. SQLite WAL's read `max` was
+1.20ms in one run against 4.8µs and 3.9µs in the other two). `summarise.py`'s
+own commentary calls this out: a `max` is one sample and is expected to swing;
+a `p50` or an `ops/s` figure is the measurement itself. The core-columns rows
+above are the ones to quote.
+
+**The acceptance criterion, stated prominently: this project will not report
+an A/B result smaller than the CoV shown above for its suite. The target for
+a repaired harness is CoV < 3%. The harness does not meet it today** — even
+on a `run.sh`-gated, disclosed-quiet machine, the median core-metric CoV is
+3.6–4.0% and the p95 is 10–35%. On the single most scrutinised metric (point
+read), five runs of the *same unrebuilt binary* on a nominally quiet machine
+already produce a 20.4% max-min spread (7.3% CoV) — a floor that exists before
+any rebuild, any edition change, or any code touches the read path at all.
+
+**A second, directly measured number: the floor is worse on a real desktop.**
+This machine is shared and was actively in interactive use throughout this
+session (see the next section). Three more point-read samples, taken back to
+back on the identical rebuilt binary while the machine's 1-minute load average
+was confirmed at 7.7–31.4/18 (`bench/run.sh`'s gate would have refused all
+three — they were run by invoking the binary directly, as a deliberate,
+disclosed diagnostic, not published as an A/B result): 1,031,814 / 620,299 /
+855,310 ops/s — a 48.1% max-min spread, **20.2% CoV, essentially triple the
+quiet-machine figure for the same metric.** The floor is not one number; it is
+"~7% CoV on a quiet, gated machine" and "~20% CoV on this machine as normally
+used," and a reader should be told which one a future A/B claim is being
+compared against.
+
+### The noise-growth claim, recomputed
+
+`BENCHMARK.md` currently states: "median of three complete runs: 196 of 343
+metrics disagreed by 10% or more across the three — worse than the last full
+edition's 56 of 285" — i.e., noise roughly tripled. Two problems with quoting
+that comparison directly:
+
+1. **The two figures were computed with two different versions of
+   `bench/summarise.py`.** The old edition's 56/285 predates the commit that
+   added `^InlaySQL is ` to the `PROSE` exclusion regex (`86d7a0c`), so it
+   double-counted six derived comparison sentences ("InlaySQL is 2.68x faster
+   than...") as if they were independent measurements. Re-running today's
+   `summarise.py` against the exact two old files it cites
+   (`bench/results/20260825T{103354,104132}Z.txt`) gives **54/279**, not
+   56/285.
+2. **The two editions do not measure the same metrics.** The new edition's
+   `run.sh` added a `p99` column to every latency table and added latency
+   percentiles to the concurrency table for the first time (it previously
+   reported only `commits/s`/`committed`/`conflicts`). That is 77 of the new
+   edition's 343 metrics (22%) that simply did not exist when the old
+   edition's 285 were counted — inflating both denominators mechanically,
+   independent of any real noise change.
+
+Recomputing on **only the metrics measured in both editions** (matched by row
+label and column name — 266 metric-instances in common, using today's
+`summarise.py` for both sides so the tool is held constant):
+
+| | old edition (2 runs, `20260825T{103354,104132}Z`) | new edition (3 runs, `20260830T{120941,122626,123414}Z`) |
+| --- | --- | --- |
+| Disagreement ≥10% on the 266 common metrics | **54/266 (20.3%)** | **146/266 (54.9%)** |
+
+**The growth is real — 2.7x on an apples-to-apples metric set, essentially the
+same magnitude as the originally published 2.9x (19.6%→57.1%).** It is not an
+artifact of the new edition simply measuring more things. One caveat that
+cuts the other way and should temper "tripled": the old figure comes from a
+2-run pairwise difference while the new figure comes from a 3-run
+max-min/median spread, and a 3-sample spread is expected to run somewhat wider
+than a 2-sample one purely from having one extra draw of the tail, independent
+of any true increase in per-run variance. The direction and rough size of the
+growth hold up under recomputation; the exact "2.9x" or "2.7x" should be read
+as "the noise roughly doubled to tripled," not to two significant figures.
+
+### Environment diff
+
+- **OS/kernel, reboot:** unchanged and ruled out. `sw_vers` reports macOS
+  27.0, build 26A5416b, `Darwin 27.0.0` throughout. `sysctl kern.boottime`
+  shows the machine booted 2026-08-18 and has been up 12+ days continuously —
+  no reboot, no OS update, between any of the editions this file discusses
+  (2026-08-25 through 2026-08-30).
+- **Disk fill:** not implicated. `/System/Volumes/Data` is 74% full, 472GB
+  free of 1.8TB — well short of the >90% range where APFS/SSD performance
+  typically degrades. Cannot rule out a fuller state on the specific days of
+  earlier editions (no historical `df` samples exist), but today's state is
+  not tight.
+- **CPU frequency / thermal state: not measured.** `powermetrics` (the
+  standard way to read Apple Silicon P/E-core frequency residency) requires
+  `sudo`, and `sudo -n true` fails ("a password is required") in this
+  non-interactive session. `pmset -g therm` returns "no thermal warning level
+  recorded" for all three of its readings — on Apple Silicon this is not
+  evidence of *no* throttling, just evidence the lightweight query does not
+  populate without dedicated tooling running. Substitute used: wall-clock
+  duration vs. reported CPU-seconds per invocation (see the point-read
+  dissection below) as an indirect proxy for scheduling delay, which is a
+  different thing from frequency and does not resolve this dimension.
+- **Background load: directly observed, not inferred.** During this session's
+  measurement window the machine's 1-minute load average ranged from 2.4 to
+  **459.9**/18 logical CPUs inside about ten minutes, then took over twenty
+  minutes to settle back under `bench/run.sh`'s 4.5 gate. `ps aux` at the peak
+  identified an interactive desktop session, not a runaway benchmark: `opencode`
+  at 57.9% CPU, `WindowServer` at 42.8%, four Google Chrome renderer processes
+  at ~41% combined, three VS Code processes at ~21% combined, plus (at a
+  different point in the same window) an Xcode-beta/`CoreSimulator` iOS 17.4
+  simulator boot (`diagnosticd`, `MobileCal` widget, `ibtoold`), Playwright
+  headless-Chromium test workers, a `php artisan serve` dev server, and —
+  notably — a **second, independent `inlaysql-bench --suite all` process**
+  running with default parameters that this session did not start, confirming
+  the box is shared with other concurrent work on this exact repository. One
+  benchmark invocation crashed outright with `SqliteFailure(SystemIoFailure,
+  "disk I/O error")` during this contention; it is recorded, not retried into
+  invisibility.
+- **Harness defect this directly exposes:** `bench/run.sh`'s load gate samples
+  the 1-minute average **once, immediately before the run starts**, then never
+  checks again. A run that begins during a lull and collides with a load
+  spike seconds later completes anyway and publishes a contaminated number
+  with no record that anything happened. Evidence this is a real gap, not a
+  theoretical one: across the five quiet-gated, disclosed-load point-read runs
+  above (start load 3.03–4.42/18), the Pearson correlation between disclosed
+  start-load and measured point-read ops/s is **r ≈ 0.18** — weak and, at n=5,
+  not distinguishable from no correlation at all — despite the same metric's
+  CoV nearly tripling (7.3%→20.2%) when the *actual* load during measurement
+  is confirmed heavy. The disclosed number and the real number can diverge
+  freely under the current gate. **Recommendation:** sample load throughout
+  the run (bracket each timed section, not just the invocation) and flag or
+  discard sections whose load moved outside the gate's threshold mid-run,
+  rather than trusting one snapshot taken before anything ran.
+
+### The point-read 2.6x, dissected
+
+Four candidate dimensions, tested rather than assumed:
+
+1. **Page-cache / warm-vs-cold state — ruled out by code inspection.**
+   `points.rs`'s `inlaysql_points` (and the SQLite equivalents) write all
+   `rows` on one open handle, then immediately run all `lookups` on that same
+   handle in the same process, with no close/reopen between. The data is
+   necessarily resident in both InlaySQL's own page cache and the OS buffer
+   cache when the timed read loop starts — there is no code path here that
+   could measure a cold read. Whatever moves the point-read number, it is not
+   this.
+2. **CPU frequency scaling / thermal throttling — not measured.** As above:
+   no `sudo`, no `powermetrics`, `pmset -g therm` uninformative on this
+   hardware. This dimension is neither confirmed nor ruled out.
+3. **Background load / scheduling contention — directly measured, and it
+   moves both wall-clock and the timed metric.** One points-suite invocation,
+   run while the machine's load average was 31.4/18, took 1:15.77 wall-clock
+   for 4.12s of reported user+system CPU time — an 18x wall/CPU ratio, i.e.
+   the process spent the overwhelming majority of its life descheduled,
+   waiting for a core. That contention mostly lands outside the specifically
+   *timed* read loop (each phase re-starts its own `Instant::now()`), which is
+   why the reported ops/s under confirmed heavy load (620k–1.03M) was not
+   catastrophically different in absolute terms from the quiet-machine
+   figures (466k–572k at a different, larger row count) — but the *variance*
+   of the timed metric itself still tripled (CoV 7.3%→20.2%, see above). This
+   is the dimension with the clearest, directly-collected evidence that it
+   tracks the noise.
+4. **Code and memory layout (ASLR, link order) — plausible, not cleanly
+   isolated.** One deliberate rebuild was performed (`touch
+   crates/inlaysql-bench/src/main.rs && cargo build --release`, confirmed by
+   MD5 that the resulting binary differs from the pre-rebuild one). The
+   no-rebuild floor already established above (five runs of one unrebuilt
+   binary, 20.4% spread / 7.3% CoV) shows meaningful process-level noise
+   exists with zero rebuild involved — consistent with per-exec ASLR alone
+   being a real contributor, exactly the Mytkowicz et al. mechanism the task
+   brief cites. The three post-rebuild samples (620k–1.03M ops/s, 48.1%
+   spread) were unfortunately confounded with the confirmed-heavy-load window
+   above, so this session cannot cleanly separate "rebuilding added variance"
+   from "this batch happened to run under much worse contention." Honest
+   verdict: **not ruled out, not isolated — a clean rebuild-vs-no-rebuild
+   comparison needs a quiet machine for both arms, which this session did not
+   get.**
+
+**Verdict:** of the four dimensions, background load/scheduling contention is
+the one this session directly measured moving the metric (CoV roughly
+tripling from confirmed-quiet to confirmed-busy); warm/cold cache is ruled
+out by construction; CPU frequency and thermal state could not be measured at
+all (no `sudo`); code/memory layout is plausible and contributes to the
+already-nonzero no-rebuild floor but was not isolated from load in this
+session's data. None of this contradicts the documented fsync drift being a
+separate, already-explained cause for the *write*-side numbers — this section
+is about the *read* path only, which does not fsync, matching the brief.
+
+---
+
 ## 5. Order of work
 
 1. **Profile first.** Section 2's ordering is inference from the code. A profile
@@ -2189,3 +2401,11 @@ small (a)-shaped detail riding along.**
   original contaminated profile had for a different reason. When in doubt,
   read the sample's actual call stack for the hot leaf before trusting its
   percentage.
+- **Never report an A/B difference smaller than the suite's own A/A floor.**
+  Section 4 measures that floor directly (CoV 3.6–7.3% on a quiet, gated
+  machine; ~20% on this machine as normally shared) and it is the acceptance
+  criterion this project now holds every future perf claim to. A one-minute
+  load-average gate sampled only at the start of a run, as `bench/run.sh`
+  does today, does not catch a spike that arrives mid-run — section 4's r≈0.18
+  correlation between disclosed start-load and measured throughput is the
+  evidence.
