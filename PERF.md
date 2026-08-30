@@ -1361,7 +1361,84 @@ full-durability-only on every side of every comparison, on purpose (see
 `BENCHMARK.md`'s "Durable writes" section for the one-line pointer back
 here).
 
+### The containerised comparison, profiled instead of trusted — the predicted cause was wrong (2026-08-30)
 
+AHL-496's "what is owed" list, above, named two things: an interleaved,
+repeated, quiet-machine rerun of the containerised MySQL/PostgreSQL
+comparison, and — if the write path were picked up again — the 6.5 pages.
+Neither of those is what this section did. Instead it tested a specific,
+falsifiable prediction this document had been implicitly making since
+AHL-480/AHL-496: that in-container, where the barrier is weaker than the
+host's `F_FULLFSYNC`, our own non-`fsync` commit cost would be a much larger
+share of the total than the host's ~11% — large enough to be a real,
+engine-side cause of the published MySQL/PostgreSQL loss. **It is not. The
+prediction was wrong, and it is worth saying plainly rather than quietly
+dropping it.**
+
+**Measured, not assumed.** A temporary `TimingDevice` shim wrapping
+`FileDevice` — built to answer this question, reverted after use, never
+shipped — split a containerised commit into `prepare` / `write` (data + WAL)
+/ `fsync`, on the same Docker named volume the published table's
+containerised row runs on. Two runs:
+
+| Phase | Run 1 p50 | Run 2 p50 |
+| --- | --- | --- |
+| prepare | 119.5 µs (8.6%) | 147.7 µs (9.5%) |
+| write (data+WAL) | 17.0 µs (1.2%) | 22.5 µs (1.4%) |
+| fsync | 1,239.1 µs (**89.1%**) | 1,371.8 µs (**87.8%**) |
+| total | 1,391.7 µs | 1,561.6 µs |
+
+Same barrier-dominated shape as the host's 97.1% (this section's Phase 0
+above), just a smaller absolute barrier: `fsync` is 88-89% of a
+containerised commit too, not the ~50-60% a weaker barrier could plausibly
+have left room for. InlaySQL's own non-`fsync` work is ~11-12% of commit
+time here — barely moved from the host's ~9%. So even a hypothetical
+zero-cost commit path caps the achievable win over today's containerised
+number at roughly 1.15x. That is nowhere near the 1.39-1.90x gap
+`BENCHMARK.md` publishes against MySQL and PostgreSQL. **There is no
+engine-side fix for this workload's gap** — not the checksum, not the page
+count, not the encode path, all already measured and closed above. The gap
+lives in the volume and the transport, not in this engine's code.
+
+**The transport half, quantified.** `BENCHMARK.md`'s containerised InlaySQL
+row is a library call — `bench/external/compose.yml`'s `inlaysql-oltp`
+service runs `cargo run -p inlaysql-bench -- --oltp-replay`, in-process, no
+socket — while `mysql_driver.py` and `postgres_oltp_driver.py` reach their
+servers with `mysql.connector`/`psycopg` over the compose bridge network, a
+socket round trip on every statement. That asymmetry favours InlaySQL, and
+it is large enough to matter: `inlaysql serve --mysql` at one connection (the
+Server-to-server table) writes at 1,795.6 µs/commit over the identical
+protocol MySQL pays, against the containerised library row's 1,177.0 µs
+(published) / 1,369.3 µs (a same-session rerun today) — **~420-620 µs of
+transport/driver tax that InlaySQL's published row skips and both MySQL and
+PostgreSQL pay on every statement**, the same order of magnitude as the
+entire published PostgreSQL gap. A transport-matched comparison would very
+likely reverse part of that gap, not just narrow it.
+
+**And the comparison is not reproducible run to run, which AHL-496 already
+warned about and this confirms directly.** A fresh, same-session rerun of
+`bench/compare.sh`'s own OLTP drivers today (`ROWS=3000 LOOKUPS=1000`, host
+load ~6.2/18 — disclosed, not quiet): InlaySQL host 240.9 ops/s, InlaySQL
+containerised 730.4, MySQL 931.2 (**1.27x**), PostgreSQL 805.0 (**1.10x**) —
+against the published 849.7 / 1,184.2 (1.39x) / 1,612.8 (1.90x).
+**PostgreSQL is now slower than MySQL, where the published table has it
+leading**, and both multiples shrank by about a third in one sequential
+rerun. Root cause, measured directly rather than inferred: the Docker named
+volume's own `fsync` cost drifted 1.5-1.8x within the same session — roughly
+1,150 µs before the MySQL/PostgreSQL containers were up, 640-800 µs ten
+minutes later with them running. This is AHL-496's own 2.1x/90-minute drift
+finding, reproducing at a shorter timescale and inside a single benchmark
+run rather than across two.
+
+**What this settles, and what it does not.** It settles that the allocation
+story (AHL-488/493) and this section's own checksum/page-count findings are
+not where the containerised MySQL/PostgreSQL gap lives — that hypothesis is
+now tested and rejected, not merely unconfirmed. It does not settle what a
+fair, transport-matched, quiet, repeated comparison would show — only that
+the published sequential single-run table should not be read as one.
+AHL-496's "what is owed" item 1 — re-run interleaved, repeated, on a quiet
+machine — is now the *only* item left on that list; there is no commit-path
+profiling still outstanding, in host or in container.
 
 Already winning where it is measured: ~15.8x over `sqlite-vec` at 100k vectors
 (7.56x on the 2,000-vector suite `BENCHMARK.md` publishes), and ~60x over

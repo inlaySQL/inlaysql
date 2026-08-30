@@ -455,6 +455,62 @@ concurrent-writer story (1184 commits/s on 8 writers above) has no
 MySQL/PostgreSQL counterpart on this page yet — a server-to-server concurrent
 row is the missing apples-to-apples.
 
+### Correction (2026-08-30): this table is not apples-to-apples, and the asymmetry favours InlaySQL
+
+The Reads line above already says the in-process-vs-socket asymmetry is
+structural. It undersold it. Read as written, "we lose to both" on writes
+reads like an engine-side finding against a matched comparison. It is not a
+matched comparison, and a same-engine control shows the write row above is
+already skipping roughly as much transport cost as the entire published gap
+to PostgreSQL.
+
+**The transport tax, measured with InlaySQL against itself.** The
+containerised row above is a library call: `bench/external/compose.yml`'s
+`inlaysql-oltp` service runs `cargo run -p inlaysql-bench --
+--oltp-replay ...`, in-process, no socket. `mysql_driver.py` and
+`postgres_oltp_driver.py` (below MySQL's and PostgreSQL's rows) reach their
+servers with `mysql.connector`/`psycopg` over the compose bridge network — a
+socket round trip on *every* statement. `inlaysql serve --mysql` at one
+connection (the "Server-to-server" table below) writes at 556.7 ops/s —
+1,795.6 µs/commit — over the identical wire protocol MySQL's own row pays.
+The containerised library row writes at 1,177.0 µs/commit (849.7 ops/s,
+published) or 1,369.3 µs/commit (730.4 ops/s, a same-session rerun today).
+That is **~420-620 µs of transport/driver tax that InlaySQL's containerised
+row skips and both MySQL and PostgreSQL pay on every statement** — the same
+order of magnitude as the entire published PostgreSQL gap (620 µs). A reader
+should come away understanding that this row flatters InlaySQL, and that a
+transport-matched comparison would very likely reverse part of this gap, not
+just narrow it.
+
+**The numbers are unstable across runs, and the ordering flips.** A fresh,
+same-session rerun of this table's own drivers today (`ROWS=3000
+LOOKUPS=1000 ./bench/compare.sh`, host load ~6.2/18 — not quiet, disclosed
+rather than hidden): InlaySQL host 240.9 ops/s, InlaySQL containerised 730.4,
+MySQL 931.2 (**1.27x**), PostgreSQL 805.0 (**1.10x**) — against the published
+849.7 / 1,184.2 (1.39x) / 1,612.8 (1.90x). **PostgreSQL is now slower than
+MySQL, where the published table has it leading**, and the multiple against
+both shrank by about a third in one sequential rerun. Root cause, measured
+directly rather than inferred: the Docker named volume's own `fsync` cost
+drifted 1.5-1.8x within the same session — roughly 1,150 µs before the
+MySQL/PostgreSQL containers were up, 640-800 µs ten minutes later with them
+running. This reproduces `PERF.md`'s AHL-496 finding of a 2.1x drift 90
+minutes apart, at a shorter timescale and inside one benchmark run.
+
+**And it is not our CPU path.** A hypothesis was tested and rejected: that
+in-container, where the barrier is weaker than the host's `F_FULLFSYNC`,
+hidden per-commit CPU cost would surface as a real, engine-side cause of the
+gap. Measured directly (`PERF.md`'s 2026-08-30 section has the method and
+both runs), `fsync` is **87.8-89.1%** of a containerised commit — the same
+barrier-dominated shape as the host's 97.1%, just a smaller absolute
+barrier. InlaySQL's own non-`fsync` work is only ~11-12% of commit time, so
+even a zero-cost commit path caps the achievable win at roughly 1.15x —
+nowhere near the published 1.39-1.90x gap. **There is no engine-side fix for
+this workload's gap.** It lives in the volume's barrier and its drift, and
+in the transport asymmetry above, not in this engine's code. The honest next
+step is a methodology fix — interleaved, repeated, quiet-machine runs
+publishing median and spread (`bench/README.md`'s "How many times to run
+it") — not more profiling of the commit path.
+
 ### Server-to-server: MySQL wire protocol
 
 `inlaysql serve --mysql` reached over the compose network by `mysql.connector`,

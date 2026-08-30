@@ -825,6 +825,38 @@ exactly what "Server-to-server" below now does, over `inlaysql serve --mysql`,
 so both sides pay a socket round trip and the asymmetry disappears from that
 table alone.
 
+**Quantified, 2026-08-30, with InlaySQL as its own control.** `inlaysql
+serve --mysql` at one connection (the "Server-to-server" section below)
+writes at 1,795.6 µs/commit over the same wire protocol MySQL's row pays;
+the containerised library row above writes at 1,177.0-1,369.3 µs/commit
+across two runs. That gap, ~420-620 µs, is transport and driver overhead
+this section's library row does not pay and both MySQL and PostgreSQL do,
+on every statement — the same order of magnitude as `BENCHMARK.md`'s entire
+published PostgreSQL write gap. It is large enough that a transport-matched
+comparison would very likely reverse part of the published write ordering,
+not just narrow it. See `BENCHMARK.md`'s "Against MySQL and PostgreSQL"
+correction and `PERF.md`'s 2026-08-30 section for the full measurement,
+including why it is not this engine's commit-path CPU cost either (`fsync`
+is 88-89% of a containerised commit, matching the host's 97.1%).
+
+### What today's rerun found, and what a fair comparison needs
+
+A same-session rerun of this section's own drivers, done to check whether
+the published table reproduces, did not reproduce it: the ordering between
+MySQL and PostgreSQL flipped and the multiple against both shrank by about a
+third, traced to the Docker volume's own `fsync` cost drifting 1.5-1.8x
+within one sitting (`PERF.md`'s 2026-08-30 section has the numbers and the
+timing). **The recommended fix is methodological, not a bigger sample of the
+same method:** interleave InlaySQL, MySQL and PostgreSQL within one session
+rather than running each to completion in turn, repeat several times, on a
+quiet machine, and publish the median and the spread the same way
+`REPEATS=5 ./bench/repeat.sh` already does for `run.sh`. **`bench/compare.sh`
+has no automated quiet-machine load gate the way `bench/run.sh` does** — no
+`BENCH_MAX_LOAD_PER_CPU` check anywhere in the script — and no repeat
+wrapper either, so today's numbers, published or rerun, are a single
+sequential pass on whatever load the machine happened to be carrying, not a
+gated or repeated measurement.
+
 Both drivers prepare their statements once, outside the timed loop, and bind
 per iteration (MySQL via the connector's binary-protocol prepared cursor,
 PostgreSQL via psycopg's server-side `prepare=True`) — the same "prepare
