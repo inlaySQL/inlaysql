@@ -300,17 +300,17 @@
   </p>
   <div class="figures">
     <div class="figure">
-      <b>901k</b>
+      <b>523k</b>
       <span>point reads per second</span>
-      <em>4.57× SQLite in journal mode, durable</em>
+      <em>3.3× SQLite in journal mode, durable</em>
     </div>
     <div class="figure">
-      <b>13.0×</b>
+      <b>13.7×</b>
       <span>SQLite on concurrent writes</span>
-      <em>1,184 commits/s at 8 writers, 0% aborted</em>
+      <em>1,209 commits/s at 8 writers, 0% aborted</em>
     </div>
     <div class="figure">
-      <b>197 µs</b>
+      <b>198 µs</b>
       <span>hybrid search latency</span>
       <em>vector + BM25 fused in the engine</em>
     </div>
@@ -464,27 +464,27 @@
       <tbody>
         <tr>
           <td>Point read by primary key</td>
-          <td class="num">901,158 ops/s</td>
+          <td class="num">522,562 ops/s</td>
           <td>SQLite, journal (durable)</td>
-          <td class="win">4.57× faster</td>
+          <td class="win">~3.3× faster</td>
         </tr>
         <tr>
           <td>Concurrent writes, 8 writers</td>
-          <td class="num">1,184 commits/s</td>
+          <td class="num">1,209 commits/s</td>
           <td>SQLite, journal</td>
-          <td class="win">13.0× faster</td>
+          <td class="win">13.7× faster</td>
         </tr>
         <tr>
           <td>Vector search, recall@10 1.000</td>
-          <td class="num">88.29 µs</td>
+          <td class="num">78.96 µs</td>
           <td><code>sqlite-vec</code></td>
-          <td class="win">7.56× faster</td>
+          <td class="win">8.46× faster</td>
         </tr>
         <tr>
           <td>Hybrid search (BM25 + vector)</td>
-          <td class="num">197.0 µs</td>
+          <td class="num">198.0 µs</td>
           <td>DuckDB, pgvector</td>
-          <td class="win">60–70× faster</td>
+          <td class="win">56–69× faster</td>
         </tr>
         <tr>
           <td>Durable write, one row per commit (containerised)</td>
@@ -500,15 +500,15 @@
         </tr>
         <tr>
           <td>Secondary-index inner join, 20k × 160k rows</td>
-          <td class="num">3.77 ms</td>
+          <td class="num">4.22 ms</td>
           <td>SQLite</td>
-          <td class="win">7.93× faster</td>
+          <td class="win">7.23× faster</td>
         </tr>
         <tr>
           <td>Indexed range scan, 50 rows</td>
-          <td class="num">12.63 µs</td>
+          <td class="num">14.00 µs</td>
           <td>SQLite, journal</td>
-          <td class="loss">1.67× slower</td>
+          <td class="loss">1.94× slower</td>
         </tr>
       </tbody>
     </table>

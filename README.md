@@ -403,7 +403,7 @@ for a composite key — builds an ordinary ordered B-tree over one or more
 `INTEGER`/`REAL`/`TEXT` columns (AHL-423), living in the same copy-on-write
 tree as the rows, so it gets WAL, crash recovery and MVCC rebase for free. A
 top-level equality or range predicate on an indexed column becomes a range
-probe instead of a full scan — worth 570.26x on point probes and 131.72x on
+probe instead of a full scan — worth 548.71x on point probes and 131.39x on
 range scans over the engine's own unindexed scan (`BENCHMARK.md`) — and `CREATE UNIQUE INDEX` enforces a
 uniqueness constraint at insert time. The same index also answers the inner
 side of a join: `FROM posts JOIN users ON posts.user_id = users.id` probes
@@ -798,18 +798,16 @@ REPEATS=5 ./bench/repeat.sh     # run.sh five times: median plus how far the run
 ```
 
 Every number below is [`BENCHMARK.md`](BENCHMARK.md), regenerated at commit
-`f8385c9` on a developer machine. One developer machine — reproduce it, do not
-trust it. Both halves are new this edition, so every table comes from the same
-commit; they were *not* measured under the same load, though — the SQLite and
-`sqlite-vec` run had an idle machine, and the DuckDB/pgvector/MySQL/PostgreSQL
-run needs Docker and got a machine with eleven unrelated containers on it.
-Because every engine within a run was measured in the same conditions, the
-comparisons within each table remain fair; the absolute figures across the two
-are not comparable, and several moved by more than any code could explain. See
-[`bench/README.md`](bench/README.md) for how each comparison is kept fair:
-matched schema, prepared statements on both sides, matched durability
-(`fullfsync` on macOS, which is what makes these numbers mean anything at
-all), and each engine's own query plan checked rather than assumed.
+`2cb2539` on a developer machine, most of it a median of three runs. One
+developer machine — reproduce it, do not trust it. Not every table below is
+from the same sitting: `BENCHMARK.md`'s own provenance header says exactly
+which tables were regenerated this edition and which are carried forward from
+an earlier commit with their own date stated, and this summary follows that,
+not a single uniform run. See [`bench/README.md`](bench/README.md) for how
+each comparison is kept fair: matched schema, prepared statements on both
+sides, matched durability (`fullfsync` on macOS, which is what makes these
+numbers mean anything at all), and each engine's own query plan checked
+rather than assumed.
 
 ### Against SQLite
 
@@ -820,52 +818,54 @@ harder target.
 
 | Workload | InlaySQL | SQLite, durable | SQLite, fastest |
 | --- | --- | --- | --- |
-| Point read by primary key | **901,158 ops/s**, 688 ns p50 | 205,742 ops/s (**4.57x**) | 1,157,945 ops/s (we lose 1.29x) |
-| Point read, secondary index | **426,091 ops/s**, 2.00 µs p50 | 257,514 ops/s (**1.65x**) | 730,376 ops/s (we lose 1.71x) |
-| Indexed range scan, 50 rows | 74,294 ops/s, 12.63 µs p50 | 124,249 ops/s (we lose 1.67x) | 204,551 ops/s (we lose 2.75x) |
-| Join, PK inner, full scan | 11.47 ms p50 | 9.68 ms p50 (we lose 1.20x) | — |
-| Join, secondary-index inner, full scan | **3.85 ms p50** | 14.85 ms p50 (we win 3.65x) | — |
-| Durable write, one commit each | **240 ops/s**, 4.01 ms p50 | 90 ops/s (**2.66x**) | — |
-| Concurrent durable writers, 8 threads | **768 commits/s**, 0.0% aborted | 86 commits/s (**8.9x**) | — |
+| Point read by primary key | **522,562 ops/s**, 1.38 µs p50 | 160,236 ops/s (**~3.3x**) | 1,118,819 ops/s (we lose 2.14x) |
+| Point read, secondary index | **371,478 ops/s**, 2.25 µs p50 | 245,790 ops/s (**1.51x**) | 619,985 ops/s (we lose 1.67x) |
+| Indexed range scan, 50 rows | 64,250 ops/s, 14.00 µs p50 | 124,662 ops/s (we lose 1.94x) | 182,357 ops/s (we lose 2.84x) |
+| Join, PK inner, full scan | 12.51 ms p50 | 10.70 ms p50 (we lose 1.19x) | — |
+| Join, secondary-index inner, full scan | **4.22 ms p50** | 31.78 ms p50 (we win 7.23x) | — |
+| Durable write, one commit each | **240 ops/s**, 3.97 ms p50 | 90 ops/s (**2.67x**) | — |
+| Concurrent durable writers, 8 threads | **1,209 commits/s**, 0.0% aborted | 88 commits/s (**13.7x**) | — |
 
-A single indexed point probe wins — the index itself is worth 570.26x over the
+A single indexed point probe wins — the index itself is worth 548.71x over the
 engine's own unindexed scan. **Iterating rows is where we lose**: the 50-row
-range scan is now behind both SQLite configurations (1.67x and 2.75x), and the
-`LIMIT 10` form of both join shapes stays 4.7–5.8x behind, which is what pins
-the remaining cost as per-row rather than per-query. This is the top open
+range scan is behind both SQLite configurations (1.94x and 2.84x), and the
+`LIMIT 10` form of both join shapes stays 2.5–3.0x behind (down from 4.7–5.8x
+two editions ago, after two fixes described in `BENCHMARK.md`), which is what
+pins the remaining cost as per-row rather than per-query. This is the top open
 performance target — [`PERF.md`](PERF.md) has the profile, and index selection
 stops at the narrow rule in [What this is not](#what-this-is-not).
 
-The point-read row moved a long way against the previous edition (636,980 ops/s
-at 958 ns) without any code touching that path, while SQLite's two rows moved
-in two different directions on the same machine. Read the ratio against the
-durable configuration, not the absolute figure; `BENCHMARK.md` walks through
-why.
+The point-read row has now been published at 636,980, then 342,747, then
+901,158, and now 522,562 ops/s across four editions, with nothing identified
+in the commit history as touching that path. Read the ratio against the
+durable configuration, not the absolute figure — and read that ratio loosely
+too: the three individual runs behind this edition's median disagreed with
+each other by nearly 2x. `BENCHMARK.md` walks through why.
 
 The point-read win is the page cache (AHL-420): caching decoded pages took
-warm p50 from 6.75 µs to ~1 µs, past SQLite's *durable* configuration above —
-including WAL mode with `synchronous=NORMAL`, the fastest reading
-configuration SQLite has. The cache needs no invalidation protocol because
-the tree is copy-on-write and (until recently) never reused a page id; a free
-list that reuses ids now exists inside the engine (AHL-481), versioning the
-cache the way `crates/inlaysql-core/src/btree/cache.rs` warns it must, but it
-sits behind a handle-level opt-in that nothing in the public API turns on
-yet. The caveat that keeps the point-read row a *warm* number: our *miss*
-path — a `pread` plus a decode — is still dearer than SQLite's, so a cold
-handle warms up more slowly.
+warm p50 from 6.75 µs to roughly 1 µs on a good run, past SQLite's *durable*
+configuration above — including WAL mode with `synchronous=NORMAL`, the
+fastest reading configuration SQLite has, on some runs but not this edition's
+median. The cache needs no invalidation protocol because the tree is
+copy-on-write and (until recently) never reused a page id; a free list that
+reuses ids now exists inside the engine (AHL-481), versioning the cache the
+way `crates/inlaysql-core/src/btree/cache.rs` warns it must, but it sits
+behind a handle-level opt-in that nothing in the public API turns on yet. The
+caveat that keeps the point-read row a *warm* number: our *miss* path — a
+`pread` plus a decode — is still dearer than SQLite's, so a cold handle warms
+up more slowly.
 
 Durable writes win because we pay one `fsync` per commit against the
 journal's several; batching the same workload into one commit per many rows
-reaches 61,025 ops/s at 10.75 µs (**254x**) — a bulk-load number, not the
-transaction one above. Concurrent writers now scale where they used to
-flatten: the reservation gate used to hold ~100% of wall clock re-deriving
-committed state on every commit, so no two commits ever overlapped in the
-sync window; with the gate down to ~0.9 ms (AHL-468), group commit (AHL-461)
-batches most fsyncs and 8 writers do 3.14x the work of one instead of 1.45x.
-Eight is the peak, not the ceiling, though: past it throughput falls (694
-commits/s at 8 writers, 516 at 32) because every writer's whole commit
+reaches 58,320 ops/s at 11.25 µs (**243x**) — a bulk-load number, not the
+transaction one above. Concurrent writers scale well past eight now: the
+adaptive commit-coalesce window (94d96a6) lets 8 writers do 4.96x the work of
+one. Eight is not the peak, though — the fuller sweep in `BENCHMARK.md` finds
+it at 16 writers (1,616 commits/s) — and past the peak throughput falls (1,307
+commits/s at 24 writers, 974 at 32) because every writer's whole commit
 prepare phase, not only its `fsync`, still serializes behind one gate —
-`BENCHMARK.md` has the fuller sweep and `PERF.md` the profile.
+`BENCHMARK.md` has the fuller sweep, including the p99 tail latency, and
+`PERF.md` the profile.
 
 ### Against `sqlite-vec`, DuckDB and pgvector
 
@@ -874,8 +874,8 @@ exhaustive oracle:
 
 | Corpus | recall@10 | InlaySQL p50 | vs `sqlite-vec` |
 | --- | --- | --- | --- |
-| Text-derived embeddings | 1.000 | 88.29 µs | **7.56x faster at 100% of its recall** |
-| Uniform random | 0.922 | 95.29 µs | 6.70x faster at 92.2% of its recall |
+| Text-derived embeddings | 1.000 | 78.96 µs | **8.46x faster at 100% of its recall** |
+| Uniform random | 0.922 | 100.29 µs | 6.66x faster at 92.2% of its recall |
 
 Both corpus shapes are published because only one of them flatters us:
 uniformly random vectors in 384 dimensions have no structure for a graph
@@ -885,9 +885,9 @@ quantisation costs 0.014 recall on the realistic corpus for a 3.96x smaller
 resident vector payload.
 
 Hybrid retrieval (vector + BM25, fused in one SQL statement) at 2,000
-documents, `LIMIT 10`: ingest 14,063 docs/s, vector p50 68.79 µs, **BM25 p50
-47.75 µs**, **hybrid p50 95.17 µs**. BM25 was 347.50 µs and hybrid 453.88 µs
-one commit ago: the full-text index stopped being a map of maps, top-`k`
+documents, `LIMIT 10`: ingest 14,214 docs/s, vector p50 75.67 µs, **BM25 p50
+51.21 µs**, **hybrid p50 102.46 µs**. BM25 was 347.50 µs and hybrid 453.88 µs
+two commits ago: the full-text index stopped being a map of maps, top-`k`
 became a bounded heap instead of scoring and sorting the whole corpus to keep
 ten rows, and a MaxScore walk now skips documents whose entire possible score
 cannot reach the `k`-th best found so far. Scores are unchanged bit for bit and
@@ -901,19 +901,19 @@ for the full methodology. 5,000 documents, dim 128, 100 queries, top-10:
 
 | Engine | recall@10 | vector p50 | hybrid p50 |
 | --- | --- | --- | --- |
-| InlaySQL (HNSW + BM25) | 1.000 | **126.00 µs** | **197.00 µs** |
-| DuckDB (vss HNSW + `fts`) | 0.993 | 3.95 ms | 11.51 ms |
-| Meilisearch (`arroy` ANN + its own ranking) | 0.997 | 1.22 ms | 4.04 ms |
-| pgvector (HNSW + `ts_rank`) | 0.988 | 152.00 µs | 13.64 ms |
+| InlaySQL (HNSW + BM25) | 1.000 | **135.00 µs** | **198.00 µs** |
+| DuckDB (vss HNSW + `fts`) | 0.992 | 3.98 ms | 11.12 ms |
+| Meilisearch (`arroy` ANN + its own ranking) | 0.996 | 1.17 ms | 3.97 ms |
+| pgvector (HNSW + `ts_rank`) | 0.987 | 147.00 µs | 13.40 ms |
 
 **Hybrid is roughly 20x** the nearest baseline now that Meilisearch, a
-dedicated search engine, is in the comparison, and 60–70x DuckDB/pgvector —
+dedicated search engine, is in the comparison, and 56–69x DuckDB/pgvector —
 because it is one statement here and two queries plus client-side rank
 fusion there (Meilisearch's own hybrid mode included: it is deliberately not
 used, so every engine in the table is fused the same way), not a comparison
 of equal work either way, and `bench/README.md` says so. Vector-only stays
-ahead of pgvector: 126 µs against 152 µs, both paying pgvector's socket
-round trip a library in your process does not; Meilisearch's 1.22 ms is
+ahead of pgvector: 135 µs against 147 µs, both paying pgvector's socket
+round trip a library in your process does not; Meilisearch's 1.17 ms is
 doing more per query (its own ranking pipeline runs alongside the ANN
 search), so read that gap as two different products, not a rout.
 
@@ -930,54 +930,59 @@ are in `bench/README.md`, reproduced with `SUITE=vectors ./bench/run.sh`.
 Reads win by a wide margin; sequential writes lose to both. InlaySQL is
 measured twice — on the host with a real `F_FULLFSYNC` barrier, and inside a
 container on the same volume class as the servers, so all three pay the same
-virtualised fsync:
+virtualised fsync. **This table is carried forward from commit `b4798ce`
+(2026-08-30), not regenerated this edition** — `BENCHMARK.md`'s own section
+explains why a fresh single sequential run would be a worse measurement than
+reusing the interleaved, repeated, quiet-machine rerun already done for it:
 
 | Engine | write ops/s | read ops/s |
 | --- | --- | --- |
-| InlaySQL, host (real `F_FULLFSYNC`) | 248.8 | 498,824 |
-| InlaySQL, containerised | 847.2 | **893,526** |
-| MySQL 8 (`innodb_flush_log_at_trx_commit=1`, binlog off) | **1,744.1** | 10,728 |
-| PostgreSQL 17 (`fsync=on`, `synchronous_commit=on`) | 987.0 | 56,589 |
+| InlaySQL, host (real `F_FULLFSYNC`) | 253.2 | 497,000 |
+| InlaySQL, containerised | 849.7 | **678,000** |
+| MySQL 8 (`innodb_flush_log_at_trx_commit=1`, binlog off) | **1,184.2** | 9,200 |
+| PostgreSQL 17 (`fsync=on`, `synchronous_commit=on`) | **1,612.8** | 19,400 |
 
-**Reads: ~83x MySQL and ~15.8x PostgreSQL**, containerised — an in-process
+**Reads: ~74x MySQL and ~35x PostgreSQL**, containerised — an in-process
 library against a socket round trip, an asymmetry that is structural and
-stated rather than hidden. **Writes: we lose to both** — MySQL by 2.06x and
-PostgreSQL by 1.17x. The previous edition had us ahead of PostgreSQL and within
-1.08x of MySQL; our own figure improved (723.1 → 847.2) and both servers
-improved more, in a run where they had eleven unrelated containers for company.
-The ranking is what this run measured; the size of the gap is not to be
-trusted. What is structural: this workload is one commit at a time on one
-connection, so group commit cannot fire by design, and what is left is
-per-commit cost against InnoDB's own redo write.
+stated rather than hidden. **Writes: we lose to both** — PostgreSQL by 1.90x
+and MySQL by 1.39x. `BENCHMARK.md` carries an extensive correction on this
+table: the transport asymmetry above (no socket round trip) is worth roughly
+as much as the entire published PostgreSQL gap on its own, and an interleaved,
+repeated, quiet-machine rerun of the same comparison found closely matching
+multiples (1.81x/1.43x), so read the ranking and the rough size of the gap as
+real, not as an artifact of a busy machine. What is structural regardless:
+this workload is one commit at a time on one connection, so group commit
+cannot fire by design, and what is left is per-commit cost against InnoDB's
+own redo write.
 
 Every row above measures InlaySQL as a *library* against two servers, so the
 reads win partly by paying no socket round trip. **Server to server, over the
-wire, that advantage is smaller and still real** (AHL-495):
+wire, that advantage is smaller and still real** (AHL-489). Also carried
+forward from `BENCHMARK.md` (process-based driver, 2026-08-29, `f8e29e9`) —
 [`inlaysql serve --mysql`](#speaking-mysql-over-the-wire) reached over a
 compose network by `mysql.connector`, against MySQL 8 on the same driver and
-the same transport:
+the same transport, each connection a spawned OS process rather than a Python
+thread so the client's own GIL cannot contaminate the comparison:
 
 | Engine | Connections | write ops/s | read ops/s |
 | --- | --- | --- | --- |
-| InlaySQL, `serve --mysql` | 1 | 690.9 | **26,270.5** |
-| InlaySQL, `serve --mysql` | 8 | 1,240.9 | **17,628.4** |
-| MySQL 8 | 1 | **1,291.0** | 25,488.3 |
-| MySQL 8 | 8 | **7,255.7** | 17,586.1 |
+| InlaySQL, `serve --mysql` | 1 | 556.7 | **9,033.3** |
+| InlaySQL, `serve --mysql` | 8 | 1,255.5 | 6,294.3 |
+| MySQL 8 | 1 | 787.7 | 7,400.6 |
+| MySQL 8 | 8 | **3,092.7** | 7,931.1 |
 
-Reads edge it at one connection (1.03x) and are a dead heat at eight; writes
-lose at one (0.54x) and badly at eight (5.85x), which is thread-per-connection
-against a worker pool. Both read margins were wider in the previous edition
-(1.52x and 1.10x) on a quieter machine, which the Python client pays for as
-much as either server does. The 1-to-8 read drop shown here
-was published with a specific explanation — each connection warming its own
-page cache — that a later investigation could not reproduce or support; see
-`BENCHMARK.md`'s "Server-to-server" section for the correction, the client-side
-GIL-threading confound that most likely explains it instead, and what a shared
-raw-page cache across connections (built during that investigation, real, and
-worth ~18% on the page-miss path) does and does not change about it. The
-numbers in the table are what that run measured and stay; the causal story
-attached to them does not. `bench/README.md` has the full methodology and the
-remaining asymmetries; PostgreSQL has no row because this server speaks only
+Reads edge it at one connection (1.22x) but fall behind at eight (0.79x) —
+and unlike an earlier, thread-based edition of this table, that is not a
+client-side GIL artifact: MySQL's own reads stay flat across the same step
+(7,400.6 → 7,931.1) while InlaySQL's fall in absolute terms (9,033.3 →
+6,294.3), with zero retries on either side. Writes lose at one connection
+(0.71x) and badly at eight (0.41x), which is thread-per-connection against a
+worker pool — MySQL's own write throughput nearly quadruples from one
+connection to eight where InlaySQL's only reaches 2.25x. `BENCHMARK.md`'s
+"Server-to-server" section has the fuller investigation into the read drop,
+including two checks that ruled out `inlaysql-server`'s own concurrency model
+as the more likely cause; `bench/README.md` has the full methodology and the
+remaining asymmetries. PostgreSQL has no row because this server speaks only
 the MySQL wire protocol.
 
 What none of this proves: Docker Desktop's virtual disk was never
@@ -1016,29 +1021,32 @@ below is a surprise to the project, it is the honest state of it:
    See [`PERF.md`](PERF.md) for the numbers and the next, different angle:
    extending the point-read path's already-proven retained-cursor technique
    to the entry-range walk itself, to attack the re-descend cost directly.
-2. ~~**The server's per-connection page cache.**~~ — **investigated, and
-   the diagnosis behind it did not hold up.** The 1-to-8-connection read
-   drop this item used to cite (26,271 → 17,628 in the current run, "each
-   connection warms its own page cache") could not be reproduced on a quiet
-   machine with the same
-   client and driver; what did reproduce, independently, twice: the Python
-   MySQL client's *threaded* concurrency is GIL-bound, and that alone
-   explains a comparable-looking drop with nothing server-side involved. See
-   `BENCHMARK.md`'s "Server-to-server" section for the full correction. A
-   shared raw-page cache across connections was built anyway — real, gated
-   safely against `EngineOptions::page_reuse`, and worth ~18% on the
-   page-miss path specifically — but it does not touch the cited gap,
-   because that gap's own benchmark table already fits in one connection's
-   warm cache. The open item now is a corrected server-to-server number: the
-   benchmark driver needs to measure with processes, not threads, before
-   this line item can be re-scoped honestly.
+2. ~~**The server's per-connection page cache.**~~ — **investigated twice,
+   and the diagnosis behind it did not hold up either time.** The
+   1-to-8-connection read drop this item used to cite (26,271 → 17,628, an
+   even earlier edition) could not be reproduced on a quiet machine with the
+   same client and driver; what did reproduce, independently, twice: the
+   Python MySQL client's *threaded* concurrency is GIL-bound, and that alone
+   explained a comparable-looking drop with nothing server-side involved. A
+   process-based driver now exists (2026-08-29) and closes that question for
+   good — but it finds a real, smaller drop of its own (9,033.3 → 6,294.3
+   reads/s, table above), where MySQL's own reads stay flat across the same
+   step. Two checks ruled out `inlaysql-server`'s thread-per-connection model
+   as the more likely cause (it scales *up* cleanly both on the host and
+   inside the compose network at matching and larger workload shapes); what
+   does reproduce it is running the MySQL driver immediately before the
+   server-to-server one, in this benchmark's own generation order — not
+   root-caused past that. See `BENCHMARK.md`'s "Server-to-server" section and
+   `PLAN.md`'s W5 for what is still open.
 3. ~~**The sequential-commit gap to MySQL.**~~ — as a library the write gap is
-   2.06x containerised (1,744.1 vs 847.2); over the wire it is 1.87x at one
-   connection and 5.85x at eight, thread-per-connection against a worker
-   pool, and group commit cannot fire on a single connection by design. This
-   remains open, and the library gap widened rather than closed between
-   editions — on a run we did not control the machine for. Nothing above
-   changes it.
+   1.39x containerised against MySQL and 1.90x against PostgreSQL; over the
+   wire (server-to-server, process-based) it is 1.41x at one connection and
+   2.46x at eight, thread-per-connection against a worker pool, and group
+   commit cannot fire on a single connection by design. This remains open.
+   `BENCHMARK.md`'s correction on the library figure is worth reading before
+   trusting the size of that gap: the transport asymmetry (no socket round
+   trip) that flatters the library rows is worth roughly as much as the
+   entire published PostgreSQL gap on its own.
 4. ~~**Wiring the free list into the public API.**~~ — **done.** The free
    list and page reuse landed inside the engine (AHL-481); `EngineOptions::page_reuse`
    now reaches it, and `inlaysql vacuum <path>` does whole-file compaction —

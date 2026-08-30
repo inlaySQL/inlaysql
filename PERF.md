@@ -887,7 +887,11 @@ folded back in here — caught while re-profiling for W2 (2026-08-29): a fresh
 secondary-index-inner join at 7.93x faster than journal SQLite (was 3.65x)
 and its `LIMIT` shape at 2.41x slower (was 5.81x) — see `BENCHMARK.md`'s
 Joins section for the regenerated table and what is left in the profile now
-(the same AHL-488/493 allocation cost, still open, not this).
+(the same AHL-488/493 allocation cost, still open, not this). A later
+regeneration (2026-08-30, `2cb2539`, median of three runs, no code change to
+either join path in between) found 7.23x and 2.95x — both within this
+benchmark's own noise band of the figures above, not a further code-driven
+move; `BENCHMARK.md` has the current numbers.
 
 ### The structural fix: stop allocating per row
 
@@ -1236,6 +1240,13 @@ one):**
 | 2 | 394 | 91 | 4.33x |
 | 4 | 615 | 91 | 6.76x |
 | 8 | 1184 | 91 | 13.01x |
+
+**A later regeneration (2026-08-30, `2cb2539`) found 244/304/587/1209 and
+13.7x at 8 writers — no code changed the commit-coalesce path between the two
+sessions, so read the difference as this benchmark's usual run-to-run
+spread, not a further improvement.** `BENCHMARK.md` has the current table;
+this section's own causal argument (the adaptive gather window, measured
+against a reverted fixed-window baseline below) is unaffected either way.
 
 **This also moves the shape this document has published since AHL-497, and
 that section's own framing — "eight writers is the peak" — is now stale and is
@@ -1996,6 +2007,16 @@ the gap between exact and int8 is, if anything, a little worse today than
 (2–5, not idle) is disclosed as the likely source of the spread; call the
 88.29 µs figure provisional rather than wrong, and note the direction (int8
 slower than exact) is not in question either way.
+
+**Settled, 2026-08-30, same commit: the full benchmark regeneration this
+provisional note asked for.** Median of three complete `run.sh` runs
+(`bench/results/20260830T{120941,122626,123414}Z.txt`, load 3.0–4.4/18):
+exact p50 **78.96 µs**, int8 p50 **165.92 µs** — squarely inside the band this
+session already measured (71–97.5 µs / 153–172 µs), and a ratio of 2.10x
+slower, right at "median around 2x" above. `BENCHMARK.md`'s published figure
+is now 78.96 µs, retiring the 88.29 µs figure this note flagged rather than
+silently keeping it. The direction and rough magnitude both held; only the
+precise exact-side number moved, as predicted here.
 
 **Why, traced to the instruction level.** `vector_score` defaults to cosine,
 so a query (kept exact `f32` — see `hnsw.rs:1506-1511`'s own comment on why:
