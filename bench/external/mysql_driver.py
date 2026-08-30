@@ -16,6 +16,31 @@ the binary log disabled (`skip-log-bin`) rather than `sync_binlog=1`:
 InlaySQL has no replication log, so a second fsync per commit for one would
 be measuring a feature neither engine in this comparison uses. See
 `bench/README.md` for the full rationale.
+
+**Commits-per-fsync.** The write phase also brackets `SHOW GLOBAL STATUS`'s
+`Handler_commit` and `Innodb_os_log_fsyncs` and reports their delta ratio —
+the mechanism metric `SCOREBOARD.md` §6 names: how many commits landed
+inside how many hardware `fsync` barriers.
+
+**`Handler_commit`, not `Com_commit` — checked empirically, not assumed.**
+`SCOREBOARD.md` §6 (and the task this driver was built against) named
+`Com_commit` as the numerator. Measured directly against this same
+container: it does not move on an autocommit-implicit statement at all —
+`Com_commit` counts literal `COMMIT` statement text, and nothing here ever
+sends one. `Handler_commit` is the storage-engine-level counter that
+increments once per transaction regardless of whether the commit was
+explicit or autocommit-implicit, confirmed the same way (one `INSERT`
+against a real table moved it by exactly one; a `SHOW GLOBAL STATUS` query,
+touching no InnoDB table, moved neither counter). Using `Com_commit` as
+specified would have silently reported `0/N = 0.0` every time — a wrong
+number that looks like a real one, not a missing one, which is the failure
+mode this repo's own instrumentation rules exist to catch.
+
+At this driver's one connection the ratio is expected to sit near 1.0
+(autocommit, one statement per transaction, nothing concurrent to batch
+with); the number becomes interesting once the same counters are read at
+concurrency in `server_driver.py`, where it says whether InnoDB's group
+commit is actually amortising `fsync`s as writers pile up.
 """
 
 from __future__ import annotations
@@ -34,6 +59,24 @@ DSN = dict(
     password=os.environ.get("MYSQL_PASSWORD", "root"),
     database=os.environ.get("MYSQL_DB", "bench"),
 )
+
+
+def global_status(connection, name: str) -> int:
+    """One `SHOW GLOBAL STATUS` counter, as an int.
+
+    Used to bracket the write phase below for the commits-per-fsync
+    instrument (`SCOREBOARD.md` §6): `Handler_commit` (storage-engine commits,
+    explicit or autocommit-implicit — see the module docstring for why this
+    is the right counter and `Com_commit` is not) and `Innodb_os_log_fsyncs`
+    (redo-log `fsync()` calls InnoDB has issued). Neither counter needs a
+    config change to read; both are exposed by MySQL's default `SHOW GLOBAL
+    STATUS` output.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(f"SHOW GLOBAL STATUS LIKE '{name}'")
+        row = cursor.fetchone()
+        assert row is not None, f"SHOW GLOBAL STATUS has no {name!r}"
+        return int(row[1])
 
 
 def connect():
@@ -74,6 +117,8 @@ def measure(workload: common.OltpWorkload) -> None:
     write_cursor = connection.cursor(prepared=True)
     insert_sql = "INSERT INTO kv (id, body) VALUES (%s, %s)"
     write_timer = common.Timer()
+    commits_before = global_status(connection, "Handler_commit")
+    fsyncs_before = global_status(connection, "Innodb_os_log_fsyncs")
     started = time.perf_counter()
     for identifier, body in workload.rows:
 
@@ -82,8 +127,25 @@ def measure(workload: common.OltpWorkload) -> None:
 
         write_timer.time(run)
     write_elapsed = time.perf_counter() - started
+    commits_after = global_status(connection, "Handler_commit")
+    fsyncs_after = global_status(connection, "Innodb_os_log_fsyncs")
     write_ops_s = len(workload.rows) / write_elapsed
     write_cursor.close()
+
+    # The commits-per-fsync instrument (`SCOREBOARD.md` §6): how many of the
+    # commits just issued landed inside how many redo-log `fsync()` calls.
+    # 1.0 is expected at one connection (nothing to batch with); this number
+    # is the one that matters once a concurrency sweep (`server_driver.py`)
+    # is layered on top, where it separates "InnoDB group commit is
+    # amortising `fsync`s across writers" from "throughput moved but the
+    # mechanism didn't."
+    commits_delta = commits_after - commits_before
+    fsyncs_delta = fsyncs_after - fsyncs_before
+    commit_stats = {
+        "commits": commits_delta,
+        "fsyncs": fsyncs_delta,
+        "commits_per_fsync": commits_delta / fsyncs_delta if fsyncs_delta else 0.0,
+    }
 
     read_cursor = connection.cursor(prepared=True)
     lookup_sql = "SELECT body FROM kv WHERE id = %s"
@@ -114,9 +176,12 @@ def measure(workload: common.OltpWorkload) -> None:
         "client/server over the compose network: every number here includes a round trip "
         "InlaySQL does not pay; autocommit, so every statement is its own durable transaction, "
         "matched to InlaySQL's non-batched write and to the points suite's SQLite "
-        "journal/sync=FULL/fullfsync row — see bench/README.md",
+        "journal/sync=FULL/fullfsync row — see bench/README.md. commit_stats is the delta of "
+        "Handler_commit/Innodb_os_log_fsyncs bracketing the write phase; at one connection expect "
+        "~1.0 (nothing to batch with) — see SCOREBOARD.md §6",
         len(workload.rows),
         len(workload.lookup_keys),
+        commit_stats,
     )
 
 

@@ -692,19 +692,24 @@ all.
 ## Against MySQL and PostgreSQL
 
 **Tuning asymmetry, found auditing this section for `SCOREBOARD.md`
-(2026-08-31), not previously disclosed here:** `compose.yml`'s `postgres`
-service runs `shared_buffers=512MB`, roughly 4x PostgreSQL's own stock
-default; the `mysql` service gets no equivalent bump to
-`innodb_buffer_pool_size`, which sits at MySQL 8's stock 128MB. Likely inert
-for the numbers below — this workload's 20,000 short rows fit either
-engine's *stock* cache, and the commit path is `fsync`-dominated (88-97% of
-commit time) regardless — but it is a real inconsistency a reviewer would
-flag, and it would matter for any future range-scan/join/aggregate row
-against these servers, where a bigger working set could make the comparison
-about the tuning choice rather than the engine. See `bench/README.md`'s new
-"Tuning" subsection (below "The structural asymmetry that cannot be
-removed") for the full note, and `SCOREBOARD.md` §4.3 for the audit this was
-found during.
+(2026-08-31) and fixed the same day:** `compose.yml`'s `postgres` service
+runs `shared_buffers=512MB`, roughly 4x PostgreSQL's own stock default; the
+`mysql` service used to get no equivalent bump to
+`innodb_buffer_pool_size`, which sat at MySQL 8's stock 128MB. `mysql`'s
+command now also carries `--innodb-buffer-pool-size=512M` — the same value,
+and the same multiple of stock, as `postgres`'s `shared_buffers`; durability
+(`innodb_flush_log_at_trx_commit=1`) is untouched. Likely inert for the
+single-row-commit numbers in this section — this workload's 20,000 short
+rows fit either engine's *stock* cache, and the commit path is
+`fsync`-dominated (88-97% of commit time) regardless, consistent with the
+concurrent-commits numbers below moving in ways fully explained by
+connection count and container noise, not a sudden buffer-pool effect — but
+it was a real inconsistency a reviewer would have flagged, and matters going
+forward for any range-scan/join/aggregate row against these servers, where a
+bigger working set could make the comparison about the tuning choice rather
+than the engine. See `bench/README.md`'s "Tuning" subsection (below "The
+structural asymmetry that cannot be removed") for the full note, and
+`SCOREBOARD.md` §4.3 for the audit this was found during.
 
 **Carried forward from `b4798ce` (2026-08-30), not regenerated this
 edition.** This whole section — the table immediately below, its
@@ -1072,6 +1077,162 @@ PostgreSQL has no row here.
 What this still cannot prove: Docker Desktop's virtual disk was never
 independently verified to honour `fsync` as a barrier for *any* of the three
 engines. "Comparable" is not "hardware-durable".
+
+### Server-to-server, extended: 1/4/16 connections, repeated and interleaved, with commits-per-fsync (2026-08-31)
+
+The table above was a single, unrepeated run at 1 and 8 connections.
+`server_driver.py` already supported `SERVER_CONCURRENCY_LEVELS=1,4,16` —
+it had simply never been run and published at those levels, and never
+repeated. This section is that sweep, run properly: 5 repetitions,
+**interleaved by concurrency level rather than target-major** (MySQL then
+InlaySQL at 1 connection, then MySQL then InlaySQL at 4, then at 16 — the
+ordering this document's own "Interleaved, repeated, quiet-machine rerun"
+section above identifies as the fix for this project's worst past
+measurement error, now applied to the server-to-server driver too;
+`server_driver.py`'s `main()` was restructured to loop concurrency levels
+outer and targets inner rather than the reverse). Load-gated manually before
+every repetition (`bench/compare.sh` still has no automated gate — 1-minute
+average 2.1–3.3 of this 18-logical-CPU box's 4.5 ceiling throughout, quiet
+by this document's own standard).
+
+**Also fixed first: the MySQL/PostgreSQL tuning asymmetry** named above —
+`mysql`'s container now runs `--innodb-buffer-pool-size=512M`, matching
+`postgres`'s `shared_buffers=512MB` — before any of the numbers below were
+taken, per the task this session answers.
+
+**Write throughput, median of 5 and the full range:**
+
+| Connections | InlaySQL write ops/s | MySQL write ops/s | Ratio |
+| --- | ---: | ---: | ---: |
+| 1 | 638.7 (590.1–934.6) | 1,363.1 (674.5–1,510.3) | MySQL ahead, ~1.1-2.4x per rep |
+| 4 | 1,075.0 (1,000.5–1,098.5) | 1,512.7 (1,181.2–3,161.8) | MySQL ahead, ~1.1-3.0x per rep |
+| 16 | 1,308.1 (1,242.4–1,377.3) | 6,120.7 (3,824.2–7,356.9) | MySQL ahead, ~3.1-5.4x per rep |
+
+**MySQL wins every repetition at every level (5 of 5 at all three), and the
+loss widens with concurrency — the opposite of the in-process SQLite row's
+shape, and worse than the old 1/8-connection table found.** Read the
+multiples as the ranges above, not to two significant figures: MySQL's own
+run-to-run spread is large (CoV 33%/47%/26% at 1/4/16 — far outside even
+this document's ~20% busy-desktop floor), and the 4-connection numbers in
+particular look bimodal (two repetitions near 3,000-3,160 ops/s, three near
+1,180-1,510) rather than smoothly scattered — a pattern worth a future
+session's attention, most likely Docker/host contention specific to the
+`mysql` container, not chased further here. What is not in doubt, because
+the sign never once flipped across 15 measured (level, repetition) pairs:
+MySQL is faster on writes at every connection count tried, and more so at
+16 than at 1.
+
+**Reads: TIE at every level**, which a glance at medians alone would not
+show. 1 connection: InlaySQL 9,880 vs MySQL 9,078 ops/s (InlaySQL ahead, but
+only 4 of 5 repetitions, not 5 of 5). 4 connections: MySQL 9,278 vs InlaySQL
+8,224 (MySQL ahead 5 of 5, but the per-rep ratio band, 1.01-1.26x, is the
+same order of magnitude as both engines' own 7-9% CoV). 16 connections:
+MySQL 5,896 vs InlaySQL 5,209 (MySQL ahead 4 of 5, InlaySQL's own CoV 21%).
+None of these clears this document's own bar for a real win or loss; read
+all three as parity, not as a small win for either side.
+
+**p99 write latency — the harness gap this document used to name is now
+closed** (`bench/external/common.py`'s `Timer.percentiles()` returns
+`(p50, p95, p99, max)` as of this session, threaded through both the
+single-connection and server-to-server result writers):
+
+| Connections | InlaySQL p99 (median, range) | MySQL p99 (median, range) | Verdict |
+| --- | ---: | ---: | --- |
+| 1 | 3.89ms (2.97–4.87ms) | 2.48ms (1.46–4.18ms) | parity — ranges overlap, sign flips 1 of 5 reps |
+| 4 | 15.59ms (14.32–17.22ms) | 5.68ms (3.25–10.50ms) | InlaySQL worse, ~1.5-4.5x per rep, 5 of 5 |
+| 16 | 37.00ms (32.18–40.53ms) | 5.69ms (3.76–16.97ms) | InlaySQL worse, ~2.4-8.9x per rep, 5 of 5 |
+
+At 4 and 16 connections the two engines' five-repetition ranges do not
+overlap at all — InlaySQL's *lowest* p99 across 5 runs still exceeds MySQL's
+*highest*. This is the sharpest evidence this whole page has for any
+verdict, anywhere, and it says the same thing the write-throughput table
+above says, more starkly: InlaySQL's tail grows with contention where
+MySQL's does not.
+
+**Commits-per-fsync — the mechanism metric, MySQL side, and the two
+counter-naming defects that would have silently reported it as `0.0`.**
+`SHOW GLOBAL STATUS`'s `Handler_commit` and `Innodb_os_log_fsyncs`,
+bracketed around each level's write phase:
+
+| Connections | MySQL commits-per-fsync (median, range) |
+| --- | --- |
+| 1 | 0.98 (0.98–0.99) |
+| 4 | 1.99 (1.96–1.99) |
+| 16 | 7.42 (6.98–7.59) |
+
+Near 1.0 at one connection, as expected (nothing to batch with), then
+climbing close to linearly with connection count: InnoDB's group commit is
+visibly amortising `fsync`s as writers pile up, and it is doing so *while
+MySQL's own throughput measurement above swings 25-47% CoV* — this ratio's
+own CoV is 0.2%/0.7%/3.3%, tighter than this document's quiet-machine
+concurrency floor (3.6%, `PERF.md` §4). That gap between a noisy throughput
+number and a clean mechanism number, on the same runs, is the practical case
+for measuring commits-per-fsync at all, not just this document's assertion
+of one.
+
+**Getting there required fixing two counter mistakes, caught only by
+running the query against a live container rather than trusting the API
+name:**
+
+- **MySQL: the task originally specified `Δ Com_commit`. `Com_commit` does
+  not move at all under this benchmark's autocommit-per-statement writes** —
+  it counts literal `COMMIT` statement text, and nothing here ever sends
+  one. Verified directly: a plain `INSERT` against a real table left
+  `Com_commit` at `0` and moved `Handler_commit` by exactly one.
+  `Handler_commit` — the storage-engine counter that increments on every
+  commit, explicit or autocommit-implicit — is what `mysql_driver.py` and
+  `server_driver.py` now query. Using `Com_commit` as originally specified
+  would have silently reported `commits: 0, fsyncs: N,
+  commits_per_fsync: 0.0` at every level: a wrong number shaped exactly like
+  a real one, not a missing one.
+- **PostgreSQL (wired for the single-connection OLTP row, `postgres_oltp_
+  driver.py`; no server exists to extend this to a concurrency sweep, so it
+  is not in the table above): the counters were right, the timing was not.**
+  PostgreSQL's cumulative statistics system lets a backend batch its own
+  pending updates and flush them opportunistically rather than at every
+  commit. A fast write phase read back `xact_commit`/`wal_sync` deltas of
+  `0/0` immediately afterward even though the rows had genuinely committed
+  — confirmed by re-querying a couple of seconds later and seeing the real
+  values land. Fixed by calling `pg_stat_force_next_flush()` (PG15+,
+  present in the pinned `postgres:17` image) immediately before each read.
+
+**InlaySQL-server's own commits-per-fsync could not be measured — a
+disclosed instrument gap, not a claim its batching is worse.**
+`crates/inlaysql/src/device.rs`'s `CommitCoordinator` only ever prints its
+flush/ticket counters (`INLAYSQL_COMMIT_STATS=1`) on `Drop`, which fires
+when a one-shot process exits normally — the host `--export-oltp` run and
+the containerised `inlaysql-oltp` replay both do this, which is how §"Durable
+writes" above already reports InlaySQL's own commit-batching ratio when it
+is available. It never fires for `inlaysql-server`: a long-running server is
+never dropped by a normal return from `main`, and no signal handler in
+`crates/inlaysql-server` drops the `Database` gracefully on `SIGTERM`
+(confirmed by reading the crate). `SHOW GLOBAL STATUS` on the InlaySQL side
+reports its own `Com_commit`/`Handler_commit` (`docs/server.md`) but nothing
+analogous to `Innodb_os_log_fsyncs` — there is no live counter for its
+`fsync` count to sample at all. The nearest available evidence, harness
+mismatch disclosed rather than hidden: the in-process `WRITER_LEVELS`
+concurrency sweep's own commits-per-fsync figure, already published above
+("Concurrent writers"), was 4.76-6.31x at 8/32 writers — real OS threads,
+one process, no wire protocol in the loop at all. That sits in the same
+order of magnitude as MySQL's 7.42 at 16 connections here. Read that as weak
+evidence that InlaySQL's own commit-batching *mechanism* is roughly
+competitive with InnoDB's group commit when it gets to run, which would
+point this section's throughput and p99 losses at `inlaysql-server`'s
+thread-per-connection design (one OS thread and one `Database` handle per
+connection, no pool — `docs/server.md`'s D2) rather than at the underlying
+commit coordinator being outclassed. **Not confirmed** — the direct
+measurement that would confirm or refute it is exactly the instrument gap
+just described, and closing it (a live status counter for the server's own
+flush/ticket count) is future work, not done this session.
+
+Durability: MySQL `innodb_flush_log_at_trx_commit=1`, binlog off,
+`innodb_buffer_pool_size=512M` (this session's tuning fix); InlaySQL server
+has no separate durability knob, same commit path as every other row on
+this page. Raw per-repetition JSON
+(`results-server-oltp-{mysql,inlaysql-server}.json` per repetition) was not
+retained as committed artifacts — `bench/results/` is git-ignored per this
+repo's convention, the same as the interleaved OLTP rerun's own raw files
+above.
 
 ---
 

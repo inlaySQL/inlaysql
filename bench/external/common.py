@@ -158,12 +158,20 @@ class Timer:
         self.samples.append((time.perf_counter() - started) * 1000.0)
         return result
 
-    def percentiles(self) -> tuple[float, float, float]:
+    def percentiles(self) -> tuple[float, float, float, float]:
+        """p50, p95, p99, max — the same four points and the same
+        nearest-rank formula `crates/inlaysql-bench/src/main.rs`'s own
+        `percentiles()` uses, so a Python-driven row and a Rust-driven row
+        land on directly comparable numbers rather than two engines'
+        latencies being rounded two different ways. p99 was added
+        (`SCOREBOARD.md` §3.10/§6) to close the MySQL/PostgreSQL tail-latency
+        cells the Rust concurrency suite's own p99 already fills for SQLite.
+        """
         if not self.samples:
-            return (0.0, 0.0, 0.0)
+            return (0.0, 0.0, 0.0, 0.0)
         ordered = sorted(self.samples)
         pick = lambda p: ordered[round((len(ordered) - 1) * p)]  # noqa: E731
-        return (pick(0.50), pick(0.95), ordered[-1])
+        return (pick(0.50), pick(0.95), pick(0.99), ordered[-1])
 
 
 def write_result(
@@ -178,8 +186,8 @@ def write_result(
     notes: str,
 ) -> None:
     """Write one engine's numbers in the shape `report.py` merges."""
-    vp50, vp95, vmax = vector_timer.percentiles()
-    hp50, hp95, hmax = hybrid_timer.percentiles()
+    vp50, vp95, vp99, vmax = vector_timer.percentiles()
+    hp50, hp95, hp99, hmax = hybrid_timer.percentiles()
     result = {
         "engine": engine,
         "build_seconds": round(build_seconds, 3),
@@ -187,12 +195,14 @@ def write_result(
             "recall": round(vector_recall, 4),
             "p50_ms": round(vp50, 3),
             "p95_ms": round(vp95, 3),
+            "p99_ms": round(vp99, 3),
             "max_ms": round(vmax, 3),
         },
         "hybrid": {
             "agreement": round(hybrid_agreement, 4),
             "p50_ms": round(hp50, 3),
             "p95_ms": round(hp95, 3),
+            "p99_ms": round(hp99, 3),
             "max_ms": round(hmax, 3),
         },
         "notes": notes,
@@ -215,6 +225,7 @@ def write_oltp_result(
     notes: str,
     rows: int,
     lookups: int,
+    commit_stats: dict | None = None,
 ) -> None:
     """Write one engine's OLTP numbers in the shape `report.py` merges.
 
@@ -231,9 +242,18 @@ def write_oltp_result(
     `read_timer`: summing per-operation samples would drop whatever time the
     loop itself spends between operations, and the Rust harness this is
     matched against times the whole loop the same way.
+
+    `commit_stats`, when given, is `{"commits": int, "fsyncs": int,
+    "commits_per_fsync": float}` — the delta of a server's own commit and
+    `fsync` counters (MySQL's `Com_commit`/`Innodb_os_log_fsyncs`,
+    PostgreSQL's `pg_stat_database.xact_commit`/`pg_stat_wal.wal_sync`)
+    sampled immediately before and after the write phase timed above. See
+    `SCOREBOARD.md` §6: this is the mechanism metric, not just throughput —
+    it is the number that says whether group commit is amortising `fsync`s
+    across concurrent writers or paying one per commit regardless.
     """
-    wp50, wp95, wmax = write_timer.percentiles()
-    rp50, rp95, rmax = read_timer.percentiles()
+    wp50, wp95, wp99, wmax = write_timer.percentiles()
+    rp50, rp95, rp99, rmax = read_timer.percentiles()
     result = {
         "engine": engine,
         "rows": rows,
@@ -242,16 +262,20 @@ def write_oltp_result(
             "ops_s": round(write_ops_s, 1),
             "p50_ms": round(wp50, 3),
             "p95_ms": round(wp95, 3),
+            "p99_ms": round(wp99, 3),
             "max_ms": round(wmax, 3),
         },
         "read": {
             "ops_s": round(read_ops_s, 1),
             "p50_ms": round(rp50, 3),
             "p95_ms": round(rp95, 3),
+            "p99_ms": round(rp99, 3),
             "max_ms": round(rmax, 3),
         },
         "notes": notes,
     }
+    if commit_stats is not None:
+        result["commit_stats"] = commit_stats
     path = os.path.join(directory, f"results-oltp-{slug}.json")
     with open(path, "w") as handle:
         json.dump(result, handle, indent=2)
@@ -280,31 +304,37 @@ def write_server_oltp_result(
     read against each other. See bench/README.md.
 
     `levels` is a list of dicts with `concurrency`, `write_ops_s`,
-    `write_timer`, `write_retries`, `read_ops_s`, `read_timer` — the shape
+    `write_timer`, `write_retries`, `read_ops_s`, `read_timer`, and
+    optionally `commit_stats` (see `write_oltp_result`'s docstring for its
+    shape — the delta commit/`fsync` counters bracketing this level's write
+    phase, where the target exposes them) — the shape
     `server_driver.py::measure_concurrency` returns.
     """
     encoded_levels = []
     for level in levels:
-        wp50, wp95, wmax = level["write_timer"].percentiles()
-        rp50, rp95, rmax = level["read_timer"].percentiles()
-        encoded_levels.append(
-            {
-                "concurrency": level["concurrency"],
-                "write": {
-                    "ops_s": round(level["write_ops_s"], 1),
-                    "p50_ms": round(wp50, 3),
-                    "p95_ms": round(wp95, 3),
-                    "max_ms": round(wmax, 3),
-                },
-                "write_retries": level["write_retries"],
-                "read": {
-                    "ops_s": round(level["read_ops_s"], 1),
-                    "p50_ms": round(rp50, 3),
-                    "p95_ms": round(rp95, 3),
-                    "max_ms": round(rmax, 3),
-                },
-            }
-        )
+        wp50, wp95, wp99, wmax = level["write_timer"].percentiles()
+        rp50, rp95, rp99, rmax = level["read_timer"].percentiles()
+        encoded = {
+            "concurrency": level["concurrency"],
+            "write": {
+                "ops_s": round(level["write_ops_s"], 1),
+                "p50_ms": round(wp50, 3),
+                "p95_ms": round(wp95, 3),
+                "p99_ms": round(wp99, 3),
+                "max_ms": round(wmax, 3),
+            },
+            "write_retries": level["write_retries"],
+            "read": {
+                "ops_s": round(level["read_ops_s"], 1),
+                "p50_ms": round(rp50, 3),
+                "p95_ms": round(rp95, 3),
+                "p99_ms": round(rp99, 3),
+                "max_ms": round(rmax, 3),
+            },
+        }
+        if level.get("commit_stats") is not None:
+            encoded["commit_stats"] = level["commit_stats"]
+        encoded_levels.append(encoded)
     result = {
         "engine": engine,
         "rows": rows,

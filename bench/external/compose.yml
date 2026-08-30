@@ -89,6 +89,15 @@ services:
   # a durability feature neither engine in this comparison uses, not the
   # commit path itself. See bench/README.md.
   #
+  # `innodb-buffer-pool-size=512M` matches the `postgres` service's own
+  # `shared_buffers=512MB` above (both 4x their engine's stock default,
+  # 128MB), found unmatched during `SCOREBOARD.md`'s fairness audit
+  # (2026-08-31): tuning one server's cache and leaving the other at stock,
+  # in the same file, for the same comparison, confounds every MySQL-vs-
+  # PostgreSQL row regardless of whether today's workload is large enough for
+  # the mismatch to show up. See bench/README.md's "Tuning" subsection for
+  # what this is and is not expected to change.
+  #
   # Not tmpfs, for the same reason as postgres above.
   mysql:
     image: mysql:8
@@ -98,6 +107,7 @@ services:
     command: >
       --innodb-flush-log-at-trx-commit=1
       --skip-log-bin
+      --innodb-buffer-pool-size=512M
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"]
       interval: 2s

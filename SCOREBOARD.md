@@ -14,21 +14,29 @@ first attempt to hold every cell of the SQLite/MySQL/PostgreSQL matrix to
 that same discipline, rather than letting an easy comparison in and a hard
 one stay silently absent.
 
-**What this is not.** A benchmark run. Every number quoted below already
-exists in `BENCHMARK.md`, itself the only place a headline figure is allowed
-to originate (`AGENTS.md`). No new measurement was taken to produce this
-document — see the note at the top of the task this file answers: the host
-this was written on is a busy interactive desktop with the A/A floor
-`PERF.md` §4 measured, and a long run on it would be neither trustworthy nor
-likely to finish. Where the honest answer is "nobody has run this
-comparison," the cell says **UNKNOWN**, not a plausible-looking number.
+**What this mostly is not, with one dated exception.** A benchmark run.
+Every number quoted below except the §3.5/§6 MySQL concurrent-commit cells
+already existed in `BENCHMARK.md` before this edition, itself the only place
+a headline figure is normally allowed to originate (`AGENTS.md`). The
+exception: this edition (2026-08-31) *did* run the concurrent-commits-vs-MySQL
+sweep — `SERVER_CONCURRENCY_LEVELS=1,4,16`, 5 repetitions, interleaved per
+concurrency level rather than target-major, load-gated (1-minute average
+2.1-3.3 of a 4.5 ceiling throughout) — because that cell was the task's
+explicit subject and the machine was, on this occasion, quiet enough to
+trust; everything else in this document still follows the "no new
+measurement, cell stays UNKNOWN rather than a plausible number" rule the
+previous edition stated here. Where the honest answer is "nobody has run
+this comparison," the cell still says **UNKNOWN**.
 
-Provenance: every figure below traces to `BENCHMARK.md` as committed at
-`b825f2d` (the commit this document was written against, confirmed clean
-before writing). `BENCHMARK.md`'s own per-section provenance notes (which
-tables regenerated this edition, which are carried forward, and from which
-commit) apply transitively here and are not repeated in full — follow the
-section reference given for each row.
+Provenance: every figure below except the 2026-08-31 concurrent-commits
+update traces to `BENCHMARK.md` as committed at `b825f2d` (the commit this
+document was originally written against, confirmed clean before writing).
+`BENCHMARK.md`'s own per-section provenance notes (which tables regenerated
+this edition, which are carried forward, and from which commit) apply
+transitively here and are not repeated in full — follow the section
+reference given for each row. The concurrent-commits figures trace to
+`BENCHMARK.md`'s own new "Server-to-server, extended" subsection, this same
+edition.
 
 ---
 
@@ -98,18 +106,22 @@ configuration changed.
 | Indexed range scan | LOSS ~2x (durable) / ~2.9x (WAL) | UNKNOWN — no harness | UNKNOWN — no harness |
 | Single-row insert (durable) | WIN ~2.7x | LOSS ~1.4-1.8x (containerised; not floor-bound, §3.3) | LOSS ~1.4-1.8x (containerised; not floor-bound, §3.3) |
 | Batch insert | UNKNOWN — no SQLite-batched comparison published | UNKNOWN — no harness | UNKNOWN — no harness |
-| Concurrent commits, 4/8/16 writers | WIN ~10-17x across 4/8/16 | LOSS @1,8 (~0.71x/~0.41x, single run); UNKNOWN @4,16 | UNKNOWN — no server exists (§3.4) |
+| Concurrent commits, 4/8/16 writers | WIN ~10-17x across 4/8/16 | LOSS @1,4,16 (~1.4-2.4x/~1.1-3.0x/~3.1-5.4x, widening with concurrency, 5 interleaved reps); LOSS @8 not reconfirmed (old single run, pre-tuning-fix, ~0.41x) | UNKNOWN — no server exists (§3.4) |
 | Two-table join | MIXED: WIN one shape (~5-9x), LOSS three shapes (~1.1-3.5x) | UNKNOWN — no harness | UNKNOWN — no harness |
 | Aggregate / `GROUP BY` | UNKNOWN — no harness | UNKNOWN — no harness | UNKNOWN — no harness |
 | Vector search, exact | N/A (stock) / WIN ~8-10x vs `sqlite-vec` ext., iso-recall | N/A — no vector capability | UNKNOWN — not floor-qualified (single run, §3.6) |
 | Vector search, int8 | UNKNOWN — no cross-engine harness | N/A — no vector capability | UNKNOWN — no cross-engine harness |
-| p99 commit latency | LOSS ~7-9x at high writer counts | UNKNOWN — harness doesn't compute p99 (§6) | UNKNOWN — harness doesn't compute p99 (§6) |
+| p99 commit latency | LOSS ~7-9x at high writer counts | TIE @1 (mixed sign, 4/5 reps); LOSS @4,16 (~1.5-4.5x/~2.4-8.9x, widening, 5 interleaved reps) | UNKNOWN — no server exists (§3.4) |
 
-Fourteen UNKNOWN or N/A-for-missing-harness cells out of thirty. That ratio
-is the honest state of "beat SQLite, MySQL and PostgreSQL across the board"
-today: the SQLite column is mostly filled in (and mixed, not a sweep), and
-the MySQL/PostgreSQL columns are mostly empty outside points and one
-concurrency slice.
+Fourteen UNKNOWN or N/A-for-missing-harness cells out of thirty when this
+document was first written; two full cells and one partial one moved off
+that count this session (2026-08-31), once real, repeated MySQL data existed
+for 4 and 16 connections and for p99 commit latency — real numbers, not all
+of them wins, replacing "nobody has run this" where the comparison was
+actually possible to run. That ratio is still the honest state of "beat
+SQLite, MySQL and PostgreSQL across the board" today: the SQLite column is
+mostly filled in (and mixed, not a sweep), and the MySQL/PostgreSQL columns
+are still mostly empty outside points and the concurrency row.
 
 ---
 
@@ -230,20 +242,88 @@ concurrency-suite floor (3.6% core CoV); the 8-writer point is the tightest
 in its own sweep (0.9% spread). Durability: full, both sides, real OS
 threads, one `fsync`/`F_FULLFSYNC` per commit or per coalesced batch.
 
-**MySQL** (`BENCHMARK.md` "Server-to-server"): at 1 connection InlaySQL
-556.7 ops/s vs MySQL 787.7 (**LOSS, ~0.71x**); at 8, InlaySQL 1,255.5 vs
-MySQL 3,092.7 (**LOSS, ~0.41x**, and MySQL's own throughput nearly
-quadruples across the step where InlaySQL's only reaches 2.25x — the gap
-widens with concurrency, the opposite of what the in-process SQLite row
-shows). **4 and 16 connections: UNKNOWN** — `server_driver.py` defaults to
-`SERVER_CONCURRENCY_LEVELS=1,8` and supports an override
-(`SERVER_CONCURRENCY_LEVELS=1,4,16 ./bench/compare.sh`, per `compare.sh`'s
-own usage comment) that has not been run and published. This is also a
-single run with no repeated median — treat the 1x/8x figures above as
-directional, not final, per `BENCHMARK.md`'s own caveat on this table.
-Durability: MySQL `innodb_flush_log_at_trx_commit=1`, binlog off; InlaySQL
+**MySQL, 1/4/16 connections (2026-08-31, `BENCHMARK.md` "Server-to-server,
+extended"): LOSS at every level, widening with concurrency, properly
+repeated this time.** `SERVER_CONCURRENCY_LEVELS=1,4,16`, 5 repetitions,
+**interleaved per concurrency level** (MySQL then InlaySQL at 1 connection,
+then MySQL then InlaySQL at 4, then at 16 — never all-of-one-engine-then-
+all-of-the-other, the ordering `BENCHMARK.md`'s own corrections section
+identifies as this project's worst past measurement error), load-gated
+manually before every repetition (1-minute average 2.1-3.3 of an 18-CPU
+box's 4.5 ceiling throughout — quiet by this repo's own standard). Median
+write throughput and the full 5-repetition range:
+
+| Connections | InlaySQL write ops/s | MySQL write ops/s | Ratio (median) |
+| --- | ---: | ---: | ---: |
+| 1 | 638.7 (590.1-934.6) | 1,363.1 (674.5-1,510.3) | **LOSS, ~2.1x** (~1.1-2.4x per-rep) |
+| 4 | 1,075.0 (1,000.5-1,098.5) | 1,512.7 (1,181.2-3,161.8) | **LOSS, ~1.4x** (~1.1-3.0x per-rep) |
+| 16 | 1,308.1 (1,242.4-1,377.3) | 6,120.7 (3,824.2-7,356.9) | **LOSS, ~4.7x** (~3.1-5.4x per-rep) |
+
+**Read as LOSS, not TIE, despite MySQL's own huge run-to-run spread** (CoV
+33%/47%/26% at 1/4/16 — far outside even this repo's ~20% busy-desktop
+floor, `PERF.md` §4 — most likely Docker/host contention on the MySQL
+container specifically, not measured further here): MySQL's write throughput
+was ahead of InlaySQL's **in all 5 repetitions at all 3 connection counts**,
+the same "consistent sign across repeats" standard `BENCHMARK.md`'s own
+interleaved OLTP rerun uses to call a result real rather than noise. The
+*exact* multiple should be read as the wide ranges above, not to two
+significant figures — MySQL's conc=4 numbers in particular look bimodal
+(two repetitions near 3,000-3,160 ops/s, three near 1,180-1,510) rather than
+tightly scattered around one value, a pattern worth a future session's
+attention rather than smoothed over here. **The loss widens with
+concurrency** (median ratio roughly 2.1x → 1.4x → 4.7x — not monotonic step
+to step given the conc=4 noise just described, but unambiguously worse at 16
+than at 1), the same direction §3.10's p99 finding takes and the opposite of
+what the in-process SQLite row above does.
+
+**Reads: TIE at every level**, not the mild win/loss a median alone would
+suggest. Median read ops/s: InlaySQL 9,880 vs MySQL 9,078 at 1 connection
+(InlaySQL nominally ahead, but only 4 of 5 repetitions agree, not 5 of 5);
+MySQL 9,278 vs InlaySQL 8,224 at 4 (MySQL ahead 5/5, but the ratio band is
+1.01-1.26x against per-engine CoVs of 7-9% — the same order of magnitude as
+the gap); MySQL 5,896 vs InlaySQL 5,209 at 16 (MySQL ahead 4/5, InlaySQL's
+own CoV 21%). None of these three clears the bar §1 sets for a verdict other
+than TIE — the kind of gap a careless read would call a small win or loss in
+either direction, and isn't.
+
+**Commits-per-fsync, MySQL only — see §6 for the full instrument writeup and
+the `Handler_commit`/`Com_commit` defect this session found and fixed**:
+median 0.98 (1 connection) → 1.99 (4) → 7.42 (16), CoV 0.2-3.3% — the
+cleanest, least noisy number this entire sweep produced, and it is the
+mechanism explanation for why MySQL's *throughput* lead widens with
+concurrency: InnoDB's group commit is visibly amortising `fsync`s as writers
+are added. **InlaySQL-server's own ratio could not be measured** — no live
+counter, and the `INLAYSQL_COMMIT_STATS=1` exit-time diagnostic never fires
+for a long-running server (§6) — a genuine instrument gap, not a claim that
+InlaySQL's mechanism is worse. The best available (harness-mismatched)
+comparison point is the in-process `WRITER_LEVELS` figure already published
+(4.76-6.31x at 8/32 writers, real OS threads, no wire protocol) — the same
+order of magnitude as MySQL's 7.42 at 16 connections, weak evidence that
+InlaySQL's own batching mechanism is roughly competitive when it runs, which
+would point the server's throughput and tail-latency loss at
+`inlaysql-server`'s thread-per-connection design rather than at inferior
+`fsync` batching — not confirmed, since the direct measurement this would
+take is exactly the gap that could not be closed this session.
+
+Durability: MySQL `innodb_flush_log_at_trx_commit=1`, binlog off,
+`innodb_buffer_pool_size=512M` (matched to PostgreSQL's `shared_buffers`
+this session — §4.3 — though PostgreSQL has no row in this table); InlaySQL
 server has no separate durability knob — every commit syncs before the
 statement returns, the same path the host/containerised rows measure.
+
+**Superseded by the above, not reconfirmed: the old 1/8-connection table**
+(`BENCHMARK.md` "Server-to-server", single unrepeated run, pre-dating both
+the tuning fix and the interleaved-repeat methodology): 1 connection,
+InlaySQL 556.7 ops/s vs MySQL 787.7 (**LOSS, ~0.71x** as originally
+reported); 8 connections, InlaySQL 1,255.5 vs MySQL 3,092.7 (**LOSS,
+~0.41x**). The 1-connection figure is superseded by the properly-repeated
+row above (which found a similar-direction but larger loss, ~2.1x, on a
+retuned MySQL container); **8 connections was not re-measured this session**
+and its ~0.41x figure should be read with reduced confidence relative to the
+new rows — it predates the `innodb_buffer_pool_size` fix and was never
+repeated, so whether it would still land at ~0.41x under the same
+methodology as the table above is genuinely unknown, not merely
+unconfirmed.
 
 **PostgreSQL: UNKNOWN**, and distinctly so — this is not a missing
 measurement, it is a missing capability on **InlaySQL's** side, not
@@ -342,10 +422,30 @@ writers gathered late in a big cohort sit in its tail; SQLite serialises at
 a file lock instead, so its tail stays flat while its throughput does not
 scale. Durability: same as 3.5.
 
-**MySQL / PostgreSQL: UNKNOWN**, and structurally so rather than just
-unmeasured — `bench/external/common.py`'s `Timer.percentiles()` returns
-only `(p50, p95, max)`; the server-to-server driver never computes a p99 at
-all. This is the exact instrument gap §6 below names as worth fixing first.
+**MySQL (2026-08-31): TIE at 1 connection, LOSS at 4 and 16, widening.**
+`bench/external/common.py`'s `Timer.percentiles()` used to return only
+`(p50, p95, max)` — fixed this session (a fourth return value, `p99`,
+threaded through `write_oltp_result`/`write_server_oltp_result` and
+`report.py`), closing the instrument gap this row used to cite. Measured
+alongside §3.5's throughput sweep, same 5 interleaved repetitions:
+
+| Connections | InlaySQL write p99 (median, range) | MySQL write p99 (median, range) | Verdict |
+| --- | ---: | ---: | --- |
+| 1 | 3.89ms (2.97-4.87ms) | 2.48ms (1.46-4.18ms) | **TIE** — ranges overlap, sign flips 1 of 5 reps |
+| 4 | 15.59ms (14.32-17.22ms) | 5.68ms (3.25-10.50ms) | **LOSS, ~2.7x** (~1.5-4.5x per-rep, 5/5 reps) |
+| 16 | 37.00ms (32.18-40.53ms) | 5.69ms (3.76-16.97ms) | **LOSS, ~6.5x** (~2.4-8.9x per-rep, 5/5 reps) |
+
+At 4 and 16 connections the two engines' ranges do not overlap at all
+(InlaySQL's *minimum* exceeds MySQL's *maximum*), the strongest form of
+evidence this document uses anywhere for a verdict. This is the same story
+§3.5 tells for throughput, sharper: InlaySQL's gather-window design grows the
+cohort riding one `fsync` as contention rises (visible directly in §6's
+commits-per-fsync numbers climbing for *MySQL*, which is the mechanism that
+keeps its own tail flat while InlaySQL's grows), and `inlaysql-server`'s own
+version of that cohort has no live counter to confirm the mechanism directly
+(§6) — only the throughput and latency symptom, not the internal cause, is
+measured here. **PostgreSQL: still UNKNOWN** — no InlaySQL server exists to
+put a `psycopg` client against (§3.4).
 
 ---
 
@@ -402,41 +502,45 @@ gap there (35-74x) is large enough that the WIN verdict in §3.1 does not
 depend on resolving that number, but a reader should not assume the 420-620
 µs figure applies unchanged to a ~1-100 µs read.
 
-### 4.3 Tuning — an asymmetry exists, likely inert for what's published, load-bearing for what isn't
+### 4.3 Tuning — fixed (2026-08-31), not just recommended
 
 `compose.yml`'s `postgres` service is started with `shared_buffers=512MB`
 (line 69) — 4x PostgreSQL's own ~128MB stock default. The `mysql` service
-gets **no equivalent bump**: `--innodb-flush-log-at-trx-commit=1
---skip-log-bin` is the entire command, and `innodb_buffer_pool_size` is left
+used to get **no equivalent bump**: `--innodb-flush-log-at-trx-commit=1
+--skip-log-bin` was the entire command, and `innodb_buffer_pool_size` sat
 at MySQL 8's stock default (128MB). **A reviewer would immediately object to
 this**: PostgreSQL was tuned, MySQL was not, in the same file, for the same
-comparison.
+comparison. This was the first thing this session's task named and fixed
+before taking any new measurement: `mysql`'s command now also carries
+`--innodb-buffer-pool-size=512M` — the same absolute value as `postgres`'s
+`shared_buffers`, and also the same *multiple* of each engine's own stock
+default (both ~4x). Durability is untouched
+(`innodb_flush_log_at_trx_commit=1` still stands): this is a cache-size
+change only. Verified live against the running container:
+`SHOW VARIABLES LIKE 'innodb_buffer_pool_size'` reports `536870912` (512MB)
+post-fix. See `bench/README.md`'s "Tuning" subsection for the full note.
 
-**Direction and likely magnitude on what's currently published: small, and
-favours neither side measurably.** The OLTP workload here is 20,000 rows of
-a `body TEXT` a few dozen bytes wide — comfortably resident in either
-engine's *stock* buffer cache, let alone a bumped one — and every write-path
-analysis in `PERF.md`/`BENCHMARK.md` found the commit path barrier-dominated
-(87.8-97.1% `fsync`, depending on host vs. container), leaving little room
-for a buffer-pool difference to show up in a single-row-commit workload
-regardless. **The same asymmetry would matter a great deal more for the
-currently-UNKNOWN cells** (indexed range scan, join, aggregate) if those
-harnesses are ever built against MySQL/PostgreSQL — a working set that
-doesn't fit a stock 128MB `innodb_buffer_pool_size` but does fit a tuned one
-would make those comparisons about the tuning choice, not the engine, unless
-both sides get matched. **Recommendation: either match `shared_buffers` and
-`innodb_buffer_pool_size` (both to the same multiple of stock, or both left
-at stock) before any range-scan/join/aggregate harness against these
-servers ships, or size the corpus so it exceeds every configuration's buffer
-cache and the mismatch becomes moot.** Also unmatched and worth naming for
-the same future harness, though likely inert today for the same
-barrier-dominance reason: `innodb_flush_method` (left at MySQL's own
-default, not `O_DIRECT`, so MySQL here pays a double-buffered write through
-the OS page cache a tuned deployment would skip — a reviewer's second likely
-objection, and one that, if anything, *disfavours* MySQL slightly, i.e. cuts
-in InlaySQL's favour, the opposite direction from the buffer-pool point
-above); PostgreSQL's `wal_buffers`, `checkpoint_completion_target`,
-`max_wal_size`, and `effective_io_concurrency` (all left stock).
+**Direction and likely magnitude on what was published before this fix:
+small, and favoured neither side measurably** — the OLTP workload here is
+20,000 rows of a `body TEXT` a few dozen bytes wide, comfortably resident in
+either engine's *stock* buffer cache, let alone a bumped one, and every
+write-path analysis in `PERF.md`/`BENCHMARK.md` found the commit path
+barrier-dominated (87.8-97.1% `fsync`), leaving little room for a
+buffer-pool difference to show up in a single-row-commit workload regardless
+— consistent with this session's own new concurrent-commits numbers (§3.5)
+moving in ways fully explained by connection count and container-level
+noise, not by a sudden buffer-pool effect. **The fix matters going forward**
+for any indexed-range-scan, join, or aggregate harness against these
+servers, where a working set that overflows a stock 128MB but fits 512MB
+would have made that comparison about the tuning choice, not the engine —
+that asymmetry is now closed before any such harness exists to be confounded
+by it. Still unmatched, and named for the same reason, because it cuts the
+*other* way (against MySQL, not in its favour, so carries less urgency):
+`innodb_flush_method` is left at MySQL's own default rather than `O_DIRECT`,
+which costs MySQL a double-buffered write through the OS page cache a tuned
+deployment would skip; PostgreSQL's `wal_buffers`,
+`checkpoint_completion_target`, `max_wal_size`, and
+`effective_io_concurrency` (all left stock).
 
 ### 4.4 Structural asymmetry — embedded vs. server, both directions
 
@@ -472,26 +576,34 @@ this disadvantage; every cell that stays a library call (§3.1, §3.2, §3.6,
 
 ## 5. What is missing to fill the scoreboard, ranked by effort
 
-1. **(Cheap, config-only) Extend the existing server-to-server sweep to 4
-   and 16 connections.** `server_driver.py` already supports
-   `SERVER_CONCURRENCY_LEVELS=1,4,16 ./bench/compare.sh` — it has simply
-   never been run and published at those levels. Fills two of §3.5's three
-   UNKNOWN sub-cells with no new code.
-2. **(Cheap, harness change) Add p99 to `bench/external/common.py`'s
-   `Timer.percentiles()`.** It returns `(p50, p95, max)` today; adding a
-   fourth return value and threading it through `write_oltp_result` and
-   `write_server_oltp_result` closes §3.10's MySQL/PostgreSQL UNKNOWN cells
-   the next time `compare.sh` runs. This is the smallest fix with the
-   highest matrix payoff — one field, two call sites, a low-risk `report.py`
-   change to display it.
+1. **DONE (2026-08-31).** ~~(Cheap, config-only) Extend the existing
+   server-to-server sweep to 4 and 16 connections.~~ Run at
+   `SERVER_CONCURRENCY_LEVELS=1,4,16`, 5 interleaved, load-gated repetitions
+   — §3.5 and `BENCHMARK.md`'s "Server-to-server, extended" have the results.
+   Filled both of §3.5's UNKNOWN sub-cells (LOSS at both, widening with
+   concurrency); the old 8-connection point was not re-measured and is
+   flagged reduced-confidence rather than superseded outright.
+2. **DONE (2026-08-31).** ~~(Cheap, harness change) Add p99 to
+   `bench/external/common.py`'s `Timer.percentiles()`.~~ Now returns
+   `(p50, p95, p99, max)`, threaded through `write_result`,
+   `write_oltp_result` and `write_server_oltp_result`, and through the
+   equivalent Rust-side `oltp_result_json` in
+   `crates/inlaysql-bench/src/oltp_export.rs` (which already computed p99
+   and had been discarding it) for schema consistency between the two.
+   `report.py` displays it. Closed §3.10's MySQL sub-cell (TIE @1, LOSS
+   @4/16); PostgreSQL's stays UNKNOWN — no InlaySQL server exists to measure
+   it against (§3.4).
 3. **(Cheap, methodology) Give `bench/compare.sh` a repeat wrapper and load
-   gate**, the way `bench/run.sh`/`bench/repeat.sh` already have. This is
-   recorded as a recommendation in both `PERF.md` and `bench/README.md`
-   already, pending someone watching a CI run confirm it doesn't interact
-   badly with `trust.yml`'s shared-runner tolerances. Without it, §3.8's
-   vector-search UNKNOWN cell (and any future `compare.sh`-sourced cell)
-   cannot become a WIN/LOSS no matter how the raw numbers look — there is no
-   floor to check them against.
+   gate**, the way `bench/run.sh`/`bench/repeat.sh` already have. Still not
+   done generally — this session's own repeated concurrency measurement was
+   driven by hand (a manual `uptime` check and a loop over
+   `server_driver.py` invocations, matching the interleaved OLTP rerun's own
+   precedent), not by a wrapper `compare.sh` itself gained. Recorded in both
+   `PERF.md` and `bench/README.md` already, pending someone watching a CI run
+   confirm it doesn't interact badly with `trust.yml`'s shared-runner
+   tolerances. Without it, §3.8's vector-search UNKNOWN cell (and any future
+   `compare.sh`-sourced cell) cannot become a WIN/LOSS no matter how the raw
+   numbers look — there is no floor to check them against.
 4. **(Medium, new harness) Indexed range scan and two-table join against
    MySQL/PostgreSQL.** Needs a second table in the OLTP schema (or a
    parallel schema) with a secondary index and a joinable foreign key,
@@ -527,51 +639,112 @@ this disadvantage; every cell that stays a library call (§3.1, §3.2, §3.6,
 
 ## 6. The commits-per-fsync instrument
 
-The concurrent-commit cells (§3.5) currently report only throughput —
-commits/s — which lets the easy opponent look like the whole story. SQLite
-serialises writers at a file lock and has no group-commit mechanism at all;
-beating it 13-17x on concurrent throughput is real, but it is also the
-least surprising axis to win on, because SQLite isn't even trying to batch
-`fsync`s. InnoDB and PostgreSQL both have mature group commit and are the
-opponents this axis should actually be judged against, and the mechanism
-metric that makes that judgment meaningful — not just believable, the same
-metric that is what made this project's own 13x figure credible in the
-first place — is **commits landed per `fsync` call**.
+**Wired in and run (2026-08-31), superseding the "not implemented this
+session" note this section used to carry.** The concurrent-commit cells
+(§3.5) used to report only throughput — commits/s — which lets the easy
+opponent look like the whole story. SQLite serialises writers at a file lock
+and has no group-commit mechanism at all; beating it 13-17x on concurrent
+throughput is real, but it is also the least surprising axis to win on,
+because SQLite isn't even trying to batch `fsync`s. InnoDB and PostgreSQL
+both have mature group commit and are the opponents this axis should
+actually be judged against, and the mechanism metric that makes that
+judgment meaningful — not just believable, the same metric that is what made
+this project's own 13x figure credible in the first place — is **commits
+landed per `fsync` call**.
 
-**InlaySQL already prints this.** `crates/inlaysql/src/device.rs:565-573`,
-gated on `INLAYSQL_COMMIT_STATS=1`: on drop, `CommitCoordinator` writes
-`commit-stats: flushes=N tickets=N normal_flushes=N normal_tickets=N` to
-stderr. `normal_tickets / normal_flushes` is exactly commits-per-`fsync`,
-excluding checkpoint-triggered flushes — the ratio `PERF.md`'s "fixed
-8-yield gather window" section used to show the batching ratio was pinned
-near 2.0 before the adaptive-window fix and rose to 4.76-6.31 after it, at 8
-and 32 writers respectively.
+**InlaySQL prints this, but only for a process that exits normally.**
+`crates/inlaysql/src/device.rs:565-573`, gated on `INLAYSQL_COMMIT_STATS=1`:
+on drop, `CommitCoordinator` writes `commit-stats: flushes=N tickets=N
+normal_flushes=N normal_tickets=N` to stderr — `normal_tickets /
+normal_flushes` is commits-per-`fsync`, excluding checkpoint-triggered
+flushes, and it is the ratio `PERF.md`'s "fixed 8-yield gather window"
+section already used to show the in-process batching ratio was pinned near
+2.0 before the adaptive-window fix and rose to 4.76-6.31 after it, at 8 and
+32 writers respectively (real OS threads, one process, `bench/run.sh`'s
+`WRITER_LEVELS` sweep). **That mechanism does not reach `inlaysql-server`**:
+a long-running server is never dropped by a normal return from `main`, and
+no signal handler in `crates/inlaysql-server` drops the `Database`
+gracefully on `SIGTERM` — confirmed by reading the crate, not assumed — so
+the one InlaySQL row this section's own task cares about most (the server,
+§3.5's actual subject) has no live counter to sample and no exit-time
+diagnostic that ever fires. This is a genuine, disclosed instrument gap, not
+a claim that the server's own batching does not exist; see §3.5 below for
+what stands in for it.
 
-**MySQL and PostgreSQL both expose the equivalent, by the same
-before/after-delta method, and neither needs a config change to get it:**
+**MySQL and PostgreSQL both expose the equivalent, and neither needed a
+config change — but one of the two counters this section originally named
+was wrong, caught only by running it against a live container:**
 
-- **MySQL:** `SHOW GLOBAL STATUS LIKE 'Innodb_os_log_fsyncs'` (the count of
-  `fsync()` calls InnoDB has issued against the redo log) against `SHOW
-  GLOBAL STATUS LIKE 'Com_commit'` (the count of `COMMIT` statements
-  executed, which under this benchmark's autocommit setup is one per
-  statement). Sample both counters before and after the timed window;
-  `Δ Com_commit / Δ Innodb_os_log_fsyncs` is InnoDB's commits-per-`fsync`
-  under group commit, the same standard method used to characterise
-  InnoDB group-commit efficiency operationally.
-- **PostgreSQL:** `pg_stat_wal.wal_sync` (PostgreSQL 14+; "number of times
-  WAL files were synced to disk via `issue_xlog_fsync`", present in the
-  `postgres:17` image this repo already pins) against `pg_stat_database.
-  xact_commit` for the `bench` database. `Δ xact_commit / Δ wal_sync` is the
-  matching ratio.
+- **MySQL: `Handler_commit`, not `Com_commit`.** This section previously
+  named `Δ Com_commit / Δ Innodb_os_log_fsyncs`. Measured directly against
+  `bench/external/compose.yml`'s `mysql` service: `Com_commit` counts literal
+  `COMMIT` statement text and does not move at all under this benchmark's
+  autocommit-per-statement writes (verified with a plain `INSERT` against a
+  real table — `Com_commit` stayed at `0`, `Handler_commit` moved by exactly
+  one). Using `Com_commit` as originally specified would have silently
+  reported `commits: 0, fsyncs: N, commits_per_fsync: 0.0` at every
+  concurrency level — a wrong number that looks like a real one, not a
+  missing one, which is worse than the instrument gap above. `Handler_commit`
+  is the storage-engine-level counter that increments on every commit,
+  explicit or autocommit-implicit, and is what `mysql_driver.py` and
+  `server_driver.py` now actually query. `Innodb_os_log_fsyncs` (the count of
+  `fsync()` calls InnoDB has issued against the redo log) was correct as
+  specified.
+- **PostgreSQL: the counters were right, the timing was not.**
+  `Δ pg_stat_database.xact_commit / Δ pg_stat_wal.wal_sync` is the correct
+  pair, but PostgreSQL's cumulative statistics system lets a backend batch
+  its own pending counter updates and flush them opportunistically rather
+  than synchronously at every commit. Measured directly: a fast write phase
+  (a few hundred rows) followed immediately by a read of both counters on the
+  same connection, with no forced flush, read back `commits: 0, fsyncs: 0`
+  even though the rows had genuinely committed — confirmed by re-querying a
+  couple of seconds later and seeing the real values appear.
+  `postgres_oltp_driver.py`'s `xact_commit`/`wal_sync` helpers now call
+  `pg_stat_force_next_flush()` (PG15+, present in the pinned `postgres:17`
+  image) immediately before each read, which fixed it.
 
-**What it would take to wire in:** a small addition to `mysql_driver.py`
-and `postgres_oltp_driver.py`'s connect/measure functions (query the counter
-before and after the timed write loop, same pattern as the existing
-`Timer`), and a corresponding read from `INLAYSQL_COMMIT_STATS`'s stderr
-output in whichever process launches the InlaySQL side (host export or
-containerised replay) — none of this requires a config change to either
-server, since both counters are exposed by default. This is scoped as
-future harness work (§5 item 4-adjacent), not implemented in this session,
-per the task's instruction not to run the full benchmark battery; it is
-recorded here so the next person who touches §3.5 has the exact counters
-named rather than needing to rediscover them.
+Both mistakes have the same shape: a plausible-sounding counter name or a
+plausible-sounding "no config change needed" claim that produced a
+confidently wrong `0.0` instead of an honestly missing measurement, caught
+only by running the query against a live container rather than trusting the
+API name. That is exactly the failure mode this repo's own instrumentation
+rules (`crates/inlaysql-server/src/metrics.rs`'s "every number is
+maintained, or it is not reported") exist to catch, applied here to a
+borrowed counter instead of one this project owns.
+
+**What running it found, at MySQL server-to-server (§3.5), 5 interleaved
+repetitions:**
+
+| Connections | MySQL commits-per-fsync (median, range) |
+| --- | --- |
+| 1 | 0.98 (0.98-0.99) |
+| 4 | 1.99 (1.96-1.99) |
+| 16 | 7.42 (6.98-7.59) |
+
+Near-1.0 at one connection (nothing to batch with, as expected), then
+climbing close to linearly with connection count — InnoDB's group commit is
+visibly amortising `fsync`s as writers are added, exactly the behaviour this
+instrument exists to detect. **It is also, itself, the single most stable
+number this session measured**: CoV 0.2%/0.7%/3.3% at 1/4/16 connections,
+tighter than the *quiet-machine* concurrency floor `PERF.md` §4 established
+(3.6%) even though the wall-clock write-throughput figures gathered
+alongside it in the same repetitions swung 25-47% CoV on this same,
+nominally-quiet machine (see §3.5) — direct evidence for the task's own
+premise that this metric is more robust to machine noise than throughput,
+not just an assertion of it.
+
+InlaySQL-server's own ratio could not be measured (see the instrument-gap
+paragraph above). The closest available evidence is the in-process
+`WRITER_LEVELS` figure already published (4.76-6.31x at 8/32 writers) —
+a different harness (library, real OS threads, no wire protocol, no
+`inlaysql-server` connection-handling in the loop) and not a substitute
+measurement, but the two numbers sit in the same order of magnitude as
+MySQL's 7.42 at 16 connections. Read that as weak, harness-mismatched
+evidence that InlaySQL's own commit-batching *mechanism* is roughly
+competitive with InnoDB's when it gets the chance to run, which — combined
+with §3.5's finding that the server's throughput and tail latency are what
+actually lose, badly — points at `inlaysql-server`'s thread-per-connection
+design (no pool, `docs/server.md`'s D2) as the more likely place this
+project's server-side concurrent-write loss lives, not the underlying
+commit coordinator's batching logic. Not confirmed; the instrument gap above
+is exactly what would need closing to confirm it directly.

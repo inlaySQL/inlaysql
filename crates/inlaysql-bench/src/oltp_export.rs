@@ -283,23 +283,25 @@ fn oltp_result_json(
     read_samples: &[Duration],
     notes: &str,
 ) -> String {
-    let (wp50, wp95, _wp99, wmax) = percentiles(write_samples);
-    let (rp50, rp95, _rp99, rmax) = percentiles(read_samples);
+    let (wp50, wp95, wp99, wmax) = percentiles(write_samples);
+    let (rp50, rp95, rp99, rmax) = percentiles(read_samples);
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
     let ops_s =
         |count: usize, elapsed: Duration| count as f64 / elapsed.as_secs_f64().max(f64::EPSILON);
     format!(
         "{{\n  \"engine\": \"{engine}\",\n  \"rows\": {rows},\n  \"lookups\": {lookups},\n  \
-         \"write\": {{\"ops_s\": {:.1}, \"p50_ms\": {:.3}, \"p95_ms\": {:.3}, \"max_ms\": {:.3}}},\n  \
-         \"read\": {{\"ops_s\": {:.1}, \"p50_ms\": {:.3}, \"p95_ms\": {:.3}, \"max_ms\": {:.3}}},\n  \
+         \"write\": {{\"ops_s\": {:.1}, \"p50_ms\": {:.3}, \"p95_ms\": {:.3}, \"p99_ms\": {:.3}, \"max_ms\": {:.3}}},\n  \
+         \"read\": {{\"ops_s\": {:.1}, \"p50_ms\": {:.3}, \"p95_ms\": {:.3}, \"p99_ms\": {:.3}, \"max_ms\": {:.3}}},\n  \
          \"notes\": \"{notes}\"\n}}\n",
         ops_s(rows, write_elapsed),
         ms(wp50),
         ms(wp95),
+        ms(wp99),
         ms(wmax),
         ops_s(lookups, read_elapsed),
         ms(rp50),
         ms(rp95),
+        ms(rp99),
         ms(rmax),
     )
 }

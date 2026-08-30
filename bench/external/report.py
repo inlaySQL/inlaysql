@@ -88,12 +88,12 @@ def print_oltp(directory: str, results: list[dict]) -> None:
     )
     width = max(64, max(len(result["engine"]) for result in results) + 1)
     header = (
-        f"{'engine':<{width}} {'write ops/s':>11} {'p50':>8} {'p95':>8} | "
-        f"{'read ops/s':>11} {'p50':>8} {'p95':>8}"
+        f"{'engine':<{width}} {'write ops/s':>11} {'p50':>8} {'p95':>8} {'p99':>8} | "
+        f"{'read ops/s':>11} {'p50':>8} {'p95':>8} {'p99':>8}"
     )
     print(
-        f"\n{'':{width}} {'--- write (durable, one row/commit) ---':^30} | "
-        f"{'--- read (point lookup) ---':^30}"
+        f"\n{'':{width}} {'--- write (durable, one row/commit) ---':^38} | "
+        f"{'--- read (point lookup) ---':^38}"
     )
     print(header)
     print("-" * len(header))
@@ -101,10 +101,18 @@ def print_oltp(directory: str, results: list[dict]) -> None:
         write, read = result["write"], result["read"]
         print(
             f"{result['engine']:<{width}} {write['ops_s']:>11.1f} "
-            f"{duration(write['p50_ms']):>9} {duration(write['p95_ms']):>9} | "
+            f"{duration(write['p50_ms']):>9} {duration(write['p95_ms']):>9} "
+            f"{duration(write.get('p99_ms', write['p95_ms'])):>9} | "
             f"{read['ops_s']:>11.1f} {duration(read['p50_ms']):>9} "
-            f"{duration(read['p95_ms']):>9}"
+            f"{duration(read['p95_ms']):>9} "
+            f"{duration(read.get('p99_ms', read['p95_ms'])):>9}"
         )
+        commit_stats = result.get("commit_stats")
+        if commit_stats is not None:
+            print(
+                f"{'':{width}}   commits-per-fsync: {commit_stats['commits']}"
+                f"/{commit_stats['fsyncs']} = {commit_stats['commits_per_fsync']:.2f}"
+            )
 
     print("\nEvery row here is configured for real durability — fsync on every commit — matched")
     print("as closely as each engine allows. See bench/README.md for the exact settings and the")
@@ -153,12 +161,12 @@ def print_server_oltp(directory: str, results: list[dict]) -> None:
     )
     width = max(56, max(len(result["engine"]) for result in results) + 1)
     header = (
-        f"{'engine':<{width}} {'conn':>4} {'write ops/s':>11} {'p50':>8} {'p95':>8} "
-        f"{'retries':>7} | {'read ops/s':>11} {'p50':>8} {'p95':>8}"
+        f"{'engine':<{width}} {'conn':>4} {'write ops/s':>11} {'p50':>8} {'p95':>8} {'p99':>8} "
+        f"{'retries':>7} | {'read ops/s':>11} {'p50':>8} {'p95':>8} {'p99':>8}"
     )
     print(
-        f"\n{'':{width}} {'':4} {'--- write (durable, one row/commit) ---':^30} {'':>7} | "
-        f"{'--- read (point lookup) ---':^30}"
+        f"\n{'':{width}} {'':4} {'--- write (durable, one row/commit) ---':^38} {'':>7} | "
+        f"{'--- read (point lookup) ---':^38}"
     )
     print(header)
     print("-" * len(header))
@@ -168,9 +176,17 @@ def print_server_oltp(directory: str, results: list[dict]) -> None:
             print(
                 f"{result['engine']:<{width}} {level['concurrency']:>4} {write['ops_s']:>11.1f} "
                 f"{duration(write['p50_ms']):>9} {duration(write['p95_ms']):>9} "
+                f"{duration(write.get('p99_ms', write['p95_ms'])):>9} "
                 f"{level['write_retries']:>7} | {read['ops_s']:>11.1f} "
-                f"{duration(read['p50_ms']):>9} {duration(read['p95_ms']):>9}"
+                f"{duration(read['p50_ms']):>9} {duration(read['p95_ms']):>9} "
+                f"{duration(read.get('p99_ms', read['p95_ms'])):>9}"
             )
+            commit_stats = level.get("commit_stats")
+            if commit_stats is not None:
+                print(
+                    f"{'':{width}} {'':4}   commits-per-fsync: {commit_stats['commits']}"
+                    f"/{commit_stats['fsyncs']} = {commit_stats['commits_per_fsync']:.2f}"
+                )
 
     print("\nThis is the row bench/README.md calls the missing apples-to-apples number: InlaySQL")
     print("here is never a library call, it is `inlaysql serve --mysql`, reached over the compose")

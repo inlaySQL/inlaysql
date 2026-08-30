@@ -70,6 +70,28 @@ two engines:
   InlaySQL server to put on the other end of a `psycopg` connection, so the
   PostgreSQL row stays in `postgres_oltp_driver.py`'s table, measured
   in-process-vs-server the way every other InlaySQL-vs-PostgreSQL row is.
+
+**Commits-per-fsync, MySQL side only.** Each level's write phase brackets
+`SHOW GLOBAL STATUS`'s `Handler_commit`/`Innodb_os_log_fsyncs` for the
+`mysql` target — the mechanism metric `SCOREBOARD.md` §6 names, and the one
+that turns a concurrency sweep's throughput numbers into a statement about
+whether group commit is actually amortising `fsync`s as writers are added.
+`Handler_commit`, not `Com_commit` as originally specified: checked
+empirically against this same container, `Com_commit` counts literal
+`COMMIT` statement text and never moves under this driver's
+autocommit-per-statement writes, which would have silently reported
+`0/N = 0.0` at every level — `Handler_commit` is the storage-engine counter
+that increments on every commit, explicit or autocommit-implicit, and is the
+one that actually tracks what this driver does. See `mysql_driver.py`'s
+module docstring for the full check. `inlaysql-server` has no row here:
+`SHOW GLOBAL STATUS` reports its own `Com_commit`/`Handler_commit` but
+nothing analogous to `Innodb_os_log_fsyncs` (its `CommitCoordinator`'s flush
+counters, `crates/inlaysql/src/device.rs`, are only ever printed via
+`INLAYSQL_COMMIT_STATS=1` on process `Drop`, which never runs for a
+long-lived server stopped by `SIGTERM`) — a disclosed instrument gap, not a
+claim that its own batching is absent; see `bench/README.md` for the
+existing evidence of that batching from a different harness (the in-process
+`WRITER_LEVELS` concurrency sweep).
 """
 
 from __future__ import annotations
@@ -161,6 +183,35 @@ def connect(target: dict) -> mysql.connector.MySQLConnection:
             last = error
             time.sleep(1)
     raise RuntimeError(f"{target['slug']} never accepted a connection: {last}")
+
+
+def global_status(target: dict, name: str) -> int:
+    """One `SHOW GLOBAL STATUS` counter, as an int, read over a fresh
+    connection to `target`.
+
+    Only meaningful for the `mysql` target's `Handler_commit`/
+    `Innodb_os_log_fsyncs` pair — the commits-per-fsync instrument
+    (`SCOREBOARD.md` §6; `Handler_commit`, not `Com_commit` — see the module
+    docstring above for why). `inlaysql-server` answers `SHOW GLOBAL STATUS`
+    too (`Com_commit`/`Handler_commit` among the counters it reports,
+    `docs/server.md`) but has no counterpart to `Innodb_os_log_fsyncs`: its `fsync`/batching
+    counters (`crates/inlaysql/src/device.rs`'s `CommitCoordinator`) are only
+    ever printed once, on process `Drop`, gated on `INLAYSQL_COMMIT_STATS=1
+    — which never fires for a long-running server killed by the container
+    runtime's `SIGTERM` (no signal handler drops the `Database` gracefully),
+    so there is no live counter to sample here. That gap is disclosed in
+    `bench/README.md` and `SCOREBOARD.md` rather than substituting a number
+    that was not actually measured.
+    """
+    connection = connect(target)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(f"SHOW GLOBAL STATUS LIKE '{name}'")
+            row = cursor.fetchone()
+            assert row is not None, f"{target['slug']}: SHOW GLOBAL STATUS has no {name!r}"
+            return int(row[1])
+    finally:
+        connection.close()
 
 
 def setup_schema(target: dict) -> None:
@@ -256,6 +307,17 @@ def measure_concurrency(target: dict, workload: common.OltpWorkload, concurrency
     context = multiprocessing.get_context("spawn")
     row_chunks = chunks(workload.rows, concurrency)
     key_chunks = chunks(workload.lookup_keys, concurrency)
+
+    # Commits-per-fsync (`SCOREBOARD.md` §6), MySQL side only — see
+    # `global_status`'s docstring for why `inlaysql-server` has no
+    # counterpart to sample here. Read over a connection outside the worker
+    # pool so it brackets the phase without adding a process to the
+    # concurrency level being measured.
+    commit_stats = None
+    if target["slug"] == "mysql":
+        commits_before = global_status(target, "Handler_commit")
+        fsyncs_before = global_status(target, "Innodb_os_log_fsyncs")
+
     started = time.perf_counter()
     with context.Pool(processes=concurrency) as pool:
         write_results = pool.starmap(
@@ -263,6 +325,18 @@ def measure_concurrency(target: dict, workload: common.OltpWorkload, concurrency
             [(target, chunk) for chunk in row_chunks],
         )
     write_elapsed = time.perf_counter() - started
+
+    if target["slug"] == "mysql":
+        commits_after = global_status(target, "Handler_commit")
+        fsyncs_after = global_status(target, "Innodb_os_log_fsyncs")
+        commits_delta = commits_after - commits_before
+        fsyncs_delta = fsyncs_after - fsyncs_before
+        commit_stats = {
+            "commits": commits_delta,
+            "fsyncs": fsyncs_delta,
+            "commits_per_fsync": commits_delta / fsyncs_delta if fsyncs_delta else 0.0,
+        }
+
     write_ops_s = len(workload.rows) / write_elapsed
     write_timer = common.Timer()
     write_retries = 0
@@ -289,12 +363,18 @@ def measure_concurrency(target: dict, workload: common.OltpWorkload, concurrency
         write_retries=write_retries,
         read_ops_s=read_ops_s,
         read_timer=read_timer,
+        commit_stats=commit_stats,
     )
 
 
-def measure(target: dict, workload: common.OltpWorkload) -> None:
-    levels = [measure_concurrency(target, workload, n) for n in CONCURRENCY_LEVELS]
-
+def publish(target: dict, levels: list[dict], workload: common.OltpWorkload) -> None:
+    """Write one target's already-measured `levels` list in the shape
+    `report.py` merges. Split from the measurement loop in `main()` below so
+    that loop can interleave *which target is measured* at each concurrency
+    level, rather than measuring one target across every level before
+    starting the other — see `main()`'s own comment for why that ordering
+    matters here.
+    """
     notes = (
         "client/server over the compose network, mysql.connector on both sides of this "
         "table — the same client library and code path drives MySQL and InlaySQL here, so "
@@ -304,7 +384,16 @@ def measure(target: dict, workload: common.OltpWorkload) -> None:
         "are disjoint contiguous id/key ranges per connection, not a shared queue. See "
         "bench/README.md's Server-to-server section for the concurrency-model, credential "
         "and TLS asymmetries that remain even so, and for why PostgreSQL has no row in "
-        "this table."
+        "this table. Where present, commit_stats is the delta of MySQL's own "
+        "Handler_commit/Innodb_os_log_fsyncs bracketing that level's write phase (Handler_commit, "
+        "not Com_commit, which never moves under autocommit-implicit writes — see "
+        "mysql_driver.py) — the "
+        "commits-per-fsync instrument, SCOREBOARD.md §6: a ratio rising with concurrency "
+        "says group commit is amortising fsyncs across writers, not just that throughput "
+        "moved. inlaysql-server has no row here: it has no live counter for its own "
+        "fsync/flush count (see global_status's docstring), which is a disclosed instrument "
+        "gap, not a claim that its batching does not exist — see SCOREBOARD.md and "
+        "bench/README.md."
     )
     common.write_server_oltp_result(
         common.CORPUS,
@@ -333,8 +422,26 @@ def main() -> None:
     inserted = {row_id for row_id, _ in rows}
     lookup_keys = [key for key in full.lookup_keys if key in inserted][:SERVER_LOOKUPS]
     workload = common.OltpWorkload(manifest=full.manifest, rows=rows, lookup_keys=lookup_keys)
+
+    # Interleaved by concurrency level, not target-major (MySQL at every
+    # level, then InlaySQL at every level): a same-session drift in the
+    # Docker volume's fsync cost or in whichever container the host happens
+    # to be favouring at that moment lands on both targets' *same* level
+    # this way, instead of piling entirely onto whichever target's turn came
+    # second. `BENCHMARK.md`'s own corrections section is why — a
+    # target-major (there, driver-major) measurement order produced this
+    # project's worst measurement error, traced to exactly this kind of
+    # drift. Each level's results are still whichever target ran the pool of
+    # OS processes for that level; nothing about the concurrency measurement
+    # itself changes, only the order targets take their turn.
+    levels_by_target: dict[str, list[dict]] = {target["slug"]: [] for target in TARGETS}
+    for concurrency in CONCURRENCY_LEVELS:
+        for target in TARGETS:
+            levels_by_target[target["slug"]].append(
+                measure_concurrency(target, workload, concurrency)
+            )
     for target in TARGETS:
-        measure(target, workload)
+        publish(target, levels_by_target[target["slug"]], workload)
 
 
 if __name__ == "__main__":

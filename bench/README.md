@@ -866,36 +866,46 @@ correction and `PERF.md`'s 2026-08-30 section for the full measurement,
 including why it is not this engine's commit-path CPU cost either (`fsync`
 is 88-89% of a containerised commit, matching the host's 97.1%).
 
-### Tuning — not matched, and it should be, before this comparison grows
+### Tuning — now matched
 
-Found auditing `compose.yml` for `SCOREBOARD.md` (2026-08-31), not previously
-written down anywhere: the `postgres` service runs with `shared_buffers=512MB`
-(`compose.yml`), roughly 4x PostgreSQL's own ~128MB stock default. The
-`mysql` service gets no equivalent bump — its command is exactly
+Found auditing `compose.yml` for `SCOREBOARD.md` (2026-08-31): the `postgres`
+service runs with `shared_buffers=512MB` (`compose.yml`), roughly 4x
+PostgreSQL's own ~128MB stock default, while the `mysql` service got no
+equivalent bump — its command was exactly
 `--innodb-flush-log-at-trx-commit=1 --skip-log-bin`, so
-`innodb_buffer_pool_size` sits at MySQL 8's stock 128MB. A reviewer would
+`innodb_buffer_pool_size` sat at MySQL 8's stock 128MB. A reviewer would
 reasonably ask why one server was tuned and the other was not, in the same
 file, for the same comparison.
+
+**Fixed the same day it was found**, not just recommended: `mysql`'s command
+now also carries `--innodb-buffer-pool-size=512M` — the same absolute value
+as `postgres`'s `shared_buffers=512MB`, which is also the same *multiple* of
+each engine's own stock default (both ~128MB, so both are now ~4x stock).
+Matching the multiple rather than picking two independently-reasonable
+numbers is the point: a reader comparing this file against a future one
+should be able to tell "both tuned the same way" from the values alone
+without re-deriving what each engine's stock baseline was. Durability is
+untouched — `innodb-flush-log-at-trx-commit=1` still stands, so this is a
+cache-size change only, not a durability change.
 
 **Likely inert for the numbers published today, for the same reason the
 transport tax above is not this engine's CPU cost:** the OLTP workload is
 20,000 rows of a short `body TEXT`, comfortably resident in either engine's
-*stock* buffer cache, and every write-path profile in this document and
-`PERF.md` found the commit path `fsync`-dominated (88-97% of commit time),
-leaving little room for a buffer-pool difference to move a single-row-commit
-number. **It would matter a great deal if this comparison ever grows to an
-indexed range scan, a join, or an aggregate against these servers** — a
-working set that overflows a stock 128MB `innodb_buffer_pool_size` but fits
-a tuned `shared_buffers` would make that comparison about the tuning choice,
-not the engine. Recommendation, for whoever builds that next comparison: set
-`innodb_buffer_pool_size` to match `shared_buffers`'s multiple of stock (or
-size the corpus past every configuration's cache and make the mismatch
-moot) before publishing. Also unmatched, and named for the same reason:
-`innodb_flush_method` is left at MySQL's own default rather than
-`O_DIRECT` — which, if anything, costs MySQL a double-buffered write through
-the OS page cache a tuned deployment would skip, cutting the other way from
-the buffer-pool point above. Neither item is fixed here; see `SCOREBOARD.md`
-for the fuller fairness audit this was found during.
+*stock* buffer cache, let alone a bumped one, and every write-path profile in
+this document and `PERF.md` found the commit path `fsync`-dominated (88-97%
+of commit time), leaving little room for a buffer-pool difference to move a
+single-row-commit number — so this fix is not expected to move any figure
+already published against these servers. **It matters for any future
+indexed-range-scan, join, or aggregate harness against these servers** — a
+working set that overflows a stock 128MB but fits a tuned 512MB would have
+made that comparison about the tuning choice, not the engine, which is
+exactly the asymmetry this closes before such a harness is ever built. Still
+unmatched, and named for the same reason, because it cuts the *other* way
+(against MySQL, not in its favour, so it does not need the same urgency):
+`innodb_flush_method` is left at MySQL's own default rather than `O_DIRECT`,
+which costs MySQL a double-buffered write through the OS page cache a tuned
+deployment would skip. See `SCOREBOARD.md` §4.3 for the fuller fairness audit
+this was found during.
 
 ### What today's rerun found, and what a fair comparison needs
 
