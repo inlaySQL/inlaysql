@@ -19,7 +19,7 @@ beside wins, because a table that only contains wins is advertising.
 | Tree | source clean (`dirty: no` in both raw outputs) |
 | Machine | Apple Mac17,9, 18 cores, macOS 27.0 (Darwin 27.0.0 arm64) |
 | Toolchain | rustc 1.91.1 (ed61e7d7e 2025-11-07) |
-| Raw output | `bench/results/20260825T103354Z.txt` and `20260825T104132Z.txt` (SQLite, `sqlite-vec`; two runs, median published); `20260825T110513Z-compare.txt` (DuckDB, pgvector, MySQL, PostgreSQL). Retrieval section regenerated 2026-08-29 (Meilisearch added): `20260829T084502Z-compare.txt`. Concurrent-writers section regenerated 2026-08-30 on base commit `63b6cb2` with an adaptive commit-coalesce window applied and uncommitted at capture time (committed immediately after regeneration — see PERF.md), median of three runs each: `20260830T031300Z.txt`/`20260830T032800Z.txt`/`20260830T032900Z.txt` (published 1/2/4/8 sweep) and `20260830T031500Z.txt`/`20260830T032100Z.txt`/`20260830T033600Z.txt` (wide sweep) |
+| Raw output | `bench/results/20260825T103354Z.txt` and `20260825T104132Z.txt` (SQLite, `sqlite-vec`; two runs, median published); `20260825T110513Z-compare.txt` (DuckDB, pgvector, MySQL, PostgreSQL). Retrieval section regenerated 2026-08-29 (Meilisearch added): `20260829T084502Z-compare.txt`. Concurrent-writers section regenerated 2026-08-30 on base commit `63b6cb2` with an adaptive commit-coalesce window applied and uncommitted at capture time (committed immediately after regeneration — see PERF.md), median of three runs each: `20260830T031300Z.txt`/`20260830T032800Z.txt`/`20260830T032900Z.txt` (published 1/2/4/8 sweep) and `20260830T031500Z.txt`/`20260830T032100Z.txt`/`20260830T033600Z.txt` (wide sweep). Tail-latency table and the old-vs-new A/B regenerated 2026-08-30 on `08f5fd4` (which added the percentile columns), `WRITER_LEVELS=1,8,32`, median of three runs each: `bench/results/ab-head-run{1,2,3}-*.txt` (current adaptive window) and `bench/results/ab-pre94d96a6-run{1,2,3}-*.txt` (temporarily reverted to the pre-`94d96a6` fixed 8-yield window for the A/B only; not shipped) |
 
 One developer machine. Reproduce it; do not trust it. Both runs are new this
 edition, so — unlike the previous one — every table below comes from the same
@@ -236,6 +236,64 @@ regression above the new, higher peak: *commit-side* logical group commit
 (one gate holder absorbing other waiting writers' whole transactions into
 one prepare/encode/WAL-append pass, not just one `fsync` covering several
 already-encoded ones), scoped but not started.
+
+### Concurrent writers: the tail the commits/s table hides
+
+`08f5fd4` added per-commit p50/p95/p99/max to `inlaysql-bench --suite
+concurrency`, so this is the first edition that can show what the peak-shape
+sweep above only implies: an average going up while some writers wait much
+longer than the median. `WRITER_LEVELS=1,8,32`, 200 transactions per writer,
+median of three runs each, load 2.7–5.5/18 across the runs (disclosed because
+the 8- and 32-writer figures are the ones sensitive to it):
+
+| Writers | InlaySQL commits/s | p50 | p95 | p99 | max | SQLite commits/s | p50 | p95 | p99 | max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 250 | 3.99 ms | 4.71 ms | 7.88 ms | 8.30 ms | 88 | 11.60 ms | 12.87 ms | 13.17 ms | 13.33 ms |
+| 8 | **1142** | 5.16 ms | 20.26 ms | 34.90 ms | 58.98 ms | 86 | 11.80 ms | 13.24 ms | 17.20 ms | 31.90 ms |
+| 32 | **968** | 24.19 ms | 97.06 ms | **122.13 ms** | 154.96 ms | 85 | 11.71 ms | 13.15 ms | **17.82 ms** | 45.87 ms |
+
+**Published beside the win because it is the same trade: at 32 writers
+InlaySQL does 11.4x SQLite's committed throughput and loses p99 by 6.9x
+against SQLite's own tail**, which stays inside roughly 13–18 ms at every
+writer count measured here because SQLite serializes writers at its file
+lock — the connection that's waiting pays in queueing, not in a longer
+`fsync`. InlaySQL's optimistic design instead lets the gather window grow the
+cohort riding one `fsync` as contention rises, and the writers gathered late
+in a big cohort are the ones sitting in its p99: p50 at 32 writers (24.19 ms)
+is not far past solo (3.99 ms, mostly one `fullfsync`), but p99 (122.13 ms)
+is 5x that p50. This is a real cost of the concurrent-writer design, not
+noise, and it belongs in the table, not a footnote.
+
+**Whether the adaptive gather window (`94d96a6`) is *why*: no — the data says
+the opposite.** Nobody had measured p99 before `08f5fd4` existed, so it was
+an open question whether trading a fixed 8-`yield_now` gather window for an
+adaptive one (up to `COMMIT_COALESCE_MAX_YIELDS` = 16,384, closing on
+`COMMIT_COALESCE_STALL_YIELDS` = 1,500 yields of no progress —
+`crates/inlaysql/src/device.rs`) had bought throughput at the tail's expense.
+Three interleaved A/B pairs (old, new, old, new, old, new — "old" built by
+temporarily setting `COMMIT_COALESCE_MAX_YIELDS` back to `8`, which is
+provably identical to the pre-`94d96a6` fixed loop because
+`COMMIT_COALESCE_STALL_YIELDS`, at 1,500, can never be reached within 8
+iterations), same `WRITER_LEVELS=1,8,32`, median of three runs each
+(`bench/results/ab-pre94d96a6-run{1,2,3}-*.txt`,
+`bench/results/ab-head-run{1,2,3}-*.txt`):
+
+| Writers | old commits/s | old p99 | new (`94d96a6`) commits/s | new p99 | Δ commits/s | Δ p99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 247 | 7.94 ms | 250 | 7.88 ms | +1.2% (noise) | −0.8% (noise) |
+| 8 | 576 | 45.01 ms | 1142 | 34.90 ms | **+98.3%** | **−22.5%** |
+| 32 | 504 | 150.89 ms | 968 | 122.13 ms | **+92.1%** | **−19.1%** |
+
+The adaptive window **roughly doubles throughput and lowers p99** at both 8
+and 32 writers, and the direction was consistent across all three pairs at
+both levels — not a one-off. The tail loss against SQLite above is real and
+stays in the table, but it predates `94d96a6` and was *worse* under the old
+fixed window (150.89 ms p99 at 32 writers, against 122.13 ms now) for barely
+half the throughput. It is a structural cost of gathering more commits behind
+fewer `fsync`s under contention, not something the adaptive window
+introduced — so this edition does not re-tune `COMMIT_COALESCE_MAX_YIELDS` /
+`COMMIT_COALESCE_STALL_YIELDS`. The data does not call for a trade that would
+give back a p99 win already banked, and the shipped constants are unchanged.
 
 ---
 

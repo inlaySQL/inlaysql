@@ -250,6 +250,11 @@ What that says, in order:
 1. **Allocation is still first**, at ~21% even after AHL-462 narrowed it. This
    is the `ValueRef` work above, and the join path is where it now pays most —
    every probed inner row is assembled, cloned into an `ExecRow`, and dropped.
+   **This 21% predates AHL-478/AHL-455 (the `ValueRef` conversion, corrected
+   2026-08-30 in "The structural fix: stop allocating per row" below) and
+   should not be trusted to still localize the cost.** A fresh profile is
+   owed; see that section's correction for what a follow-up audit found is
+   still actually unconverted.
 2. **`PageCache::get` at 13% is the single hottest function**, well above the
    ~9% this file recorded for point reads: a join descends per outer row, so the
    per-hit LRU relink is paid `depth × outer_rows` times. The clock /
@@ -305,6 +310,16 @@ build a cleaner profiling harness first: the post-fix re-profile attempted here
 was contaminated by the benchmark's own setup writes and SQLite's locking in
 the same process, so no post-fix percentages are published above — only
 wall-clock A/B, which is trustworthy.
+
+**Corrected 2026-08-30: both of the above are done.** The executor-level
+`ValueRef` conversion landed (AHL-478/AHL-455) and `crates/inlaysql-bench/src/bin/profile.rs`
+is the cleaner harness this paragraph asked for — it links no SQLite, emits a
+`PHASE_MARKER` so a profiler attaches only after setup, and takes
+`--page-cache-bytes` to force the miss path. See the correction in "The
+structural fix: stop allocating per row" below for the evidence and for what
+a fresh audit found is still actually open — this paragraph's ~21%
+allocation figure predates that fix and should not be read as still pointing
+here.
 
 ### The entry walk, and what is actually left in a join (AHL-479)
 
@@ -696,6 +711,13 @@ count:
 **Allocation is the miss path**, at more than double `pread` in the pure cases
 and still the largest single category in the realistic blended one.
 
+**Corrected 2026-08-30: this 28.4–58.6% range predates the landed `ValueRef`
+conversion (AHL-478/AHL-455)** — the page-decode representation this section
+blames has since changed shape (see the correction in "The structural fix:
+stop allocating per row" below). It is no longer safe to read these
+percentages as still pointing at `page::decode`'s per-cell allocations; a
+fresh profile is owed before anyone acts on this table.
+
 The cause is exact: `btree::page::decode` eagerly materialises a `Vec<Entry>`
 and `Vec<Separator>` for *every* cell on a page — a `Vec<u8>` per key and an
 `Rc<[u8]>` per inline value, around 49 of each for a leaf in this fixture —
@@ -859,19 +881,63 @@ it that matters most for point reads.
   of cloned. A projection containing an expression still clones, because
   expressions are evaluated in item order and would read a column an earlier
   item had moved out.
-- `resolve_value_at` cloning the value out of the cached page — **untouched**.
-  This is the one a real `ValueRef` is for.
+- ~~`resolve_value_at` cloning the value out of the cached page — **untouched**.
+  This is the one a real `ValueRef` is for.~~ — **done (AHL-478/AHL-455,
+  corrected 2026-08-30).** See below.
 
 Two more copies went with them: `aggregate` borrowed its group instead of
 cloning every row into a second `Vec`, and `sort_rows` moves rows through the
 keyed form instead of cloning them twice.
 
-What is left is the invasive part, and it is still the single largest remaining
-win: an internal borrowed `ValueRef<'a>` the executor uses, with owned `Value`
-materialised only at the public API boundary. That turns step 6 from "allocate
-per cell" into "slice into the cached page". `eval.rs`, `engine.rs` and `plan.rs`
-all assume owned values, so it is a change of its own — and now that the
-pipeline is iterators with one owner per row, it is a smaller one than it was.
+~~What is left is the invasive part, and it is still the single largest
+remaining win: an internal borrowed `ValueRef<'a>` the executor uses, with
+owned `Value` materialised only at the public API boundary. That turns step 6
+from "allocate per cell" into "slice into the cached page". `eval.rs`,
+`engine.rs` and `plan.rs` all assume owned values, so it is a change of its
+own — and now that the pipeline is iterators with one owner per row, it is a
+smaller one than it was.~~
+
+**Corrected 2026-08-30: this is built, not still open.** A read-only audit
+(`2d67a23`) verified by `git merge-base --is-ancestor` that all of the
+following are ancestors of `main`'s HEAD, i.e. already shipped, not a plan:
+
+- `ValueRef<'a>` with borrowed `Text(&'a str)`/`Blob(&'a [u8])` —
+  `crates/inlaysql-core/src/value.rs:320-403`.
+- `RowBuf` sharing page bytes via `Rc<[u8]>` instead of copying them —
+  `crates/inlaysql-core/src/row.rs:29-109`. Its own doc comment names this
+  section explicitly: "the whole of the fix for the site `PERF.md` names as
+  'untouched and now largest'".
+- `decode_row_ref_masked`, allocation-free for `Text`/`Blob` cells —
+  `crates/inlaysql-core/src/row.rs:318-331`.
+- `DecodeFilter`, which decodes borrowed and only materialises owned `Value`s
+  for the rows that survive a predicate — `crates/inlaysql-core/src/exec.rs:341-391`.
+- `resolve_value_at` itself — the exact clone this section named as the
+  target — is now a refcount bump (`Rc::clone`) for the inline case, not a
+  byte copy — `crates/inlaysql-core/src/btree/tree.rs:2810-2863`.
+
+This landed as AHL-478/AHL-455. (A separate, page-*view* attempt at a related
+idea, AHL-493, was built, measured and **rejected** — see "The page-view
+attempt, twice, and why it did not land" above — and that section's "not
+merged" framing is still accurate; it is a different change from the one
+corrected here.)
+
+**What a fresh audit found is still actually unconverted — flagged here so
+the next person does not have to re-derive it, and does not act on the stale
+21%/12% (join profile, above) or 28.4–58.6% (AHL-488, above) figures to find
+it, since both predate this fix:**
+
+- `IndexProbe::fetch` (`crates/inlaysql-core/src/exec.rs:663-665`) and its
+  scan fallback (`crates/inlaysql-core/src/exec.rs:677`) still call the
+  fully-owned `decode_row_masked` rather than the borrow-then-filter pattern
+  `DecodeFilter` uses.
+- `JoinInner::append_row_into` (`crates/inlaysql-core/src/exec.rs:468-474`)
+  still deep-copies `Blob`/`Vector` cells (`.cloned()`) once per outer-row
+  pairing, for both the materialised and hash-join branches.
+
+Neither has been profiled since this fix landed. Whoever picks this up next
+should re-run the profile first — the percentages elsewhere in this document
+were all measured against the pre-fix decode path and cannot be trusted to
+still size these two spots correctly.
 
 Cheaper wins, in rough effort order:
 - ~~**`row_key` without allocating**~~ — **done (AHL-422)**. `RowKeyBuf` builds
@@ -1271,6 +1337,33 @@ p99 commit latency is a real gap in what this document can honestly claim.
    writers means both a bigger cohort to gather before the leader's `fsync`
    and a longer queue behind the reservation gate, and both grow the tail
    directly, not just the median.
+
+**Follow-up (2026-08-30): the "genuinely unknown" question above is now
+answered, and "the 2x throughput win did come at a real tail-latency price"
+overstates the causal link — the A/B says the adaptive window is not what the
+tail price was paid for.** Three interleaved A/B pairs (old: temporarily
+`COMMIT_COALESCE_MAX_YIELDS = 8`, provably identical to the pre-`94d96a6`
+fixed loop since `COMMIT_COALESCE_STALL_YIELDS` — 1,500 — can never be
+reached within 8 iterations; new: HEAD, unmodified), same
+`WRITER_LEVELS=1,8,32`, median of three runs each:
+
+| Writers | old p99 (pre-`94d96a6`) | new p99 (adaptive) | old commits/s | new commits/s |
+| --- | --- | --- | --- | --- |
+| 1 | 7.94 ms | 7.88 ms | 247 | 250 |
+| 8 | 45.01 ms | **34.90 ms** | 576 | **1142** |
+| 32 | 150.89 ms | **122.13 ms** | 504 | **968** |
+
+The adaptive window **lowers p99 by 19-23% and roughly doubles throughput at
+both 8 and 32 writers**, consistently across all three pairs — it is strictly
+better on both axes than the fixed 8-yield window it replaced, not a
+throughput-for-tail trade. The real trade this section's table above
+correctly identifies — ~10-11x SQLite's throughput against ~7-9x worse p99 —
+is a structural cost of gathering commits behind fewer `fsync`s under
+contention, and it predates `94d96a6`: the old fixed window paid it too, at
+150.89ms p99 for barely half the throughput. See `BENCHMARK.md`'s "Concurrent
+writers: the tail the commits/s table hides" for the full published numbers.
+`COMMIT_COALESCE_MAX_YIELDS`/`COMMIT_COALESCE_STALL_YIELDS` are unchanged by
+this finding — there is no p99 regression here to trade away.
 
 ### Deferred/checkpointed page durability, measured before being built — Phase 0, and the redesign does not pay (2026-08-30)
 
