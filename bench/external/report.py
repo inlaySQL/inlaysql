@@ -187,6 +187,12 @@ def print_server_oltp(directory: str, results: list[dict]) -> None:
                     f"{'':{width}} {'':4}   commits-per-fsync: {commit_stats['commits']}"
                     f"/{commit_stats['fsyncs']} = {commit_stats['commits_per_fsync']:.2f}"
                 )
+                if "commits_per_fsync_all" in commit_stats:
+                    print(
+                        f"{'':{width}} {'':4}   commits-per-fsync (checkpoint-inclusive): "
+                        f"{commit_stats['commits_all']}/{commit_stats['fsyncs_all']} = "
+                        f"{commit_stats['commits_per_fsync_all']:.2f}"
+                    )
 
     print("\nThis is the row bench/README.md calls the missing apples-to-apples number: InlaySQL")
     print("here is never a library call, it is `inlaysql serve --mysql`, reached over the compose")

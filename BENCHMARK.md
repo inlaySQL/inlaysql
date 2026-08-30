@@ -1225,6 +1225,15 @@ measurement that would confirm or refute it is exactly the instrument gap
 just described, and closing it (a live status counter for the server's own
 flush/ticket count) is future work, not done this session.
 
+**Superseded, same day: the instrument gap is closed and the direct
+measurement is run — see "Server-to-server: InlaySQL's own commits-per-fsync,
+measured directly" below.** It confirms the batching half of the "weak
+evidence" read above and sharpens the diagnosis: InlaySQL's own
+commits-per-fsync ties or beats MySQL's at 1 and 4 connections and trails by
+only ~1.6x at 16, so the thread-per-connection hypothesis should be read as
+being about how *often* the server gets to flush, not how well it batches
+once it does — see below for the number that actually carries the gap.
+
 Durability: MySQL `innodb_flush_log_at_trx_commit=1`, binlog off,
 `innodb_buffer_pool_size=512M` (this session's tuning fix); InlaySQL server
 has no separate durability knob, same commit path as every other row on
@@ -1233,6 +1242,89 @@ this page. Raw per-repetition JSON
 retained as committed artifacts — `bench/results/` is git-ignored per this
 repo's convention, the same as the interleaved OLTP rerun's own raw files
 above.
+
+### Server-to-server: InlaySQL's own commits-per-fsync, measured directly (2026-08-31)
+
+The subsection above named the exact gap this one closes: InlaySQL-server's
+own batching ratio had no live counter to sample, so the concurrency sweep
+could only report MySQL's mechanism number. `SCOREBOARD.md`'s §6 traced
+that to `CommitCoordinator`'s flush/ticket counters printing only on
+process `Drop` (`INLAYSQL_COMMIT_STATS=1`), which never fires for a server
+stopped by `SIGTERM`. That is now fixed —
+`Inlaysql_normal_commit_flushes`/`Inlaysql_normal_commit_tickets` (plus the
+checkpoint-inclusive `Inlaysql_commit_flushes`/`Inlaysql_commit_tickets`)
+are live `SHOW GLOBAL STATUS` variables on a running server — and
+`server_driver.py` now brackets them the same way it brackets MySQL's
+`Handler_commit`/`Innodb_os_log_fsyncs`. This section is that sweep, run
+properly: `SERVER_CONCURRENCY_LEVELS=1,4,16`, 5 repetitions, interleaved per
+concurrency level (same discipline as "Server-to-server, extended" above),
+load-gated (1-minute average 2.3-3.3 of the 18-logical-CPU box's 4.5
+ceiling throughout — quiet).
+
+**Commits-per-fsync, both engines, median and 5-repetition range. InlaySQL's
+own like-for-like pair is `Inlaysql_normal_commit_tickets` /
+`Inlaysql_normal_commit_flushes` — excludes checkpoint-triggered flushes,
+the fair comparison against MySQL's `Handler_commit`/`Innodb_os_log_fsyncs`,
+neither of which counts a checkpoint-analogous event either:**
+
+| Connections | InlaySQL commits-per-fsync | MySQL commits-per-fsync | Ratio (MySQL/InlaySQL, paired per rep) |
+| --- | ---: | ---: | ---: |
+| 1 | 1.00 (1.00–1.00), CoV 0.0% | 0.98 (0.97–0.99), CoV 0.7% | 0.98x (0.97–0.99x) — tied, gap inside floor |
+| 4 | 2.30 (2.16–2.34), CoV 2.8% | 1.99 (1.99–2.00), CoV 0.2% | **0.86x (0.85–0.92x) — InlaySQL ahead, 5/5 reps** |
+| 16 | 4.63 (4.55–4.69), CoV 1.1% | 7.47 (7.34–7.59), CoV 1.2% | **1.61x (1.59–1.62x) — MySQL ahead, 5/5 reps** |
+
+The checkpoint-inclusive pair (`Inlaysql_commit_tickets`/
+`Inlaysql_commit_flushes`) tracks within about 5% of the like-for-like one
+at every level (medians 1.00 / 2.25 / 4.43 at 1/4/16 connections) — the two
+do not diverge materially, so this is reported for completeness rather than
+because it changes anything above.
+
+**Implied `fsync` rate — measured throughput divided by measured
+commits-per-fsync, both sides, median and range:**
+
+| Connections | InlaySQL implied fsync/s | MySQL implied fsync/s | Ratio (MySQL/InlaySQL, paired per rep) |
+| --- | ---: | ---: | ---: |
+| 1 | 660.9 (522.0–736.3), CoV 10.8% | 897.0 (748.0–1561.6), CoV 32.5% | 1.43x (1.16–2.14x) |
+| 4 | 488.8 (478.1–504.1), CoV 1.8% | 1594.4 (695.0–1641.9), CoV 35.4% | **3.21x (1.45–3.37x)** |
+| 16 | 301.7 (260.4–311.4), CoV 6.0% | 843.9 (618.6–945.8), CoV 14.3% | **2.78x (2.10–3.63x)** |
+
+MySQL was ahead on implied fsync rate in all 15 of 15 (level, repetition)
+pairs — the same "sign never flips" standard this document already applies
+to the noisier throughput and p99 numbers above. Multiplying the
+batching-ratio and fsync-rate-ratio medians reproduces the measured
+write-throughput ratio at each level to within rounding (0.98×1.43≈1.40 vs
+this rerun's own measured 1.40x; 0.86×3.21≈2.76 vs 2.77x; 1.61×2.78≈4.48 vs
+4.43x) — the decomposition is internally consistent, not two numbers that
+happen to multiply out.
+
+**The headline: InlaySQL's deficit against MySQL on concurrent writes is
+predominantly a barrier-rate problem, not a batching problem, at every
+connection count tried.** InlaySQL's own commit-batching mechanism ties
+MySQL's at 1 connection and beats it at 4; it only falls behind, by a real
+but modest ~1.6x, at 16. Meanwhile InlaySQL's actual `fsync` cadence *falls*
+as connections are added — from ~661/s at 1 connection to ~302/s at 16,
+roughly halving — while MySQL's holds in a flat, noisy 620-1640/s band over
+the same range. That is the opposite of what a "batching is fine, keep
+adding writers" story would predict: more writers should mean bigger
+cohorts riding a *steady or rising* fsync cadence, not one that collapses.
+This reframes the earlier "our group commit is worse" reading: the commit
+coordinator is not the weak link measured here — something upstream of it
+is throttling how often it gets the chance to run at all. `PERF.md`'s dated
+"Task 2" section runs a bounded diagnosis of why, without implementing a
+fix. This rerun's own write-throughput numbers (medians 660.9/1138.9/1393.7
+ops/s InlaySQL, 882.5/3171.4/6214.3 ops/s MySQL at 1/4/16 connections) sit in
+the same direction and rough order as the "Server-to-server, extended"
+table above (638.7/1075.0/1308.1 vs 1363.1/1512.7/6120.7) without matching
+it exactly — expected noise on an already-disclosed-noisy metric (MySQL's
+own throughput CoV was 25-47% there, 15-35% here), not a contradiction; the
+table above is left as the published headline rather than replaced by a
+second noisy instance of the same measurement.
+
+Durability: identical to "Server-to-server, extended" above — MySQL
+`innodb_flush_log_at_trx_commit=1`, binlog off,
+`innodb_buffer_pool_size=512M`; InlaySQL server has no separate durability
+knob. Raw per-repetition JSON was not retained as a committed artifact, same
+convention as above.
 
 ---
 

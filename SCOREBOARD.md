@@ -26,7 +26,11 @@ explicit subject and the machine was, on this occasion, quiet enough to
 trust; everything else in this document still follows the "no new
 measurement, cell stays UNKNOWN rather than a plausible number" rule the
 previous edition stated here. Where the honest answer is "nobody has run
-this comparison," the cell still says **UNKNOWN**.
+this comparison," the cell still says **UNKNOWN**. A second pass the same
+day, once `Inlaysql_normal_commit_flushes`/`Inlaysql_normal_commit_tickets`
+went live, reran the same sweep with `inlaysql-server`'s own commits-per-
+fsync bracketed alongside MySQL's — §3.5/§6 below carry both passes'
+numbers, not a silent replacement of one by the other.
 
 Provenance: every figure below except the 2026-08-31 concurrent-commits
 update traces to `BENCHMARK.md` as committed at `b825f2d` (the commit this
@@ -304,6 +308,64 @@ would point the server's throughput and tail-latency loss at
 `inlaysql-server`'s thread-per-connection design rather than at inferior
 `fsync` batching — not confirmed, since the direct measurement this would
 take is exactly the gap that could not be closed this session.
+
+**Confirmed, same day, once the instrument gap below was closed: the
+deficit is predominantly barrier rate, not batching.** `server_driver.py`
+now brackets `inlaysql-server`'s own
+`Inlaysql_normal_commit_tickets`/`Inlaysql_normal_commit_flushes` the same
+way it brackets MySQL's `Handler_commit`/`Innodb_os_log_fsyncs`, run at the
+same 1/4/16 connections, 5 repetitions, interleaved per level, load-gated
+(1-minute average 2.3-3.3 of the 4.5 ceiling throughout). InlaySQL's own
+commits-per-fsync: **median 1.00 (1 connection, CoV 0.0%) → 2.30 (4, CoV
+2.8%) → 4.63 (16, CoV 1.1%)** — climbing with concurrency the same way
+MySQL's does, and **at 1 and 4 connections it is tied with or ahead of
+MySQL's own ratio** (MySQL/InlaySQL batching-ratio, paired per repetition:
+median 0.98x at 1 connection — InlaySQL fractionally ahead, gap inside this
+metric's own floor; **0.86x at 4 — InlaySQL ahead in all 5 of 5
+repetitions**, range 0.85-0.92x). Only at 16 connections does MySQL's
+batching pull ahead (median 1.61x, range 1.59-1.62x, 5/5 reps) — real, not
+huge. The checkpoint-inclusive pair
+(`Inlaysql_commit_tickets`/`Inlaysql_commit_flushes`) tracks within ~5% of
+the like-for-like one at every level (1.00 vs 1.00 at 1 connection, exactly;
+2.25 vs 2.30 at 4; 4.43 vs 4.63 at 16) — the two do not diverge materially,
+so checkpoint traffic is not hiding a different story here.
+
+**The implied `fsync` rate (`write ops/s ÷ commits-per-fsync`, both sides)
+is where the gap actually lives.** InlaySQL's own barrier rate *falls* as
+concurrency rises — median 660.9/s (1 connection) → 488.8/s (4) → 301.7/s
+(16), monotonically, CoV 10.8%/1.8%/6.0% — while MySQL's stays in a flat,
+noisy 620-1640/s band across the same three levels (medians 897.0 → 1594.4
+→ 843.9/s, CoV 33-35% at 1 and 4, driven by the same throughput noise
+§3.5 above already discloses). The MySQL/InlaySQL fsync-rate ratio, paired
+per repetition: **median 1.43x (1 connection, range 1.16-2.14x) → 3.21x (4,
+range 1.45-3.37x) → 2.78x (16, range 2.10-3.63x)** — MySQL ahead in all 15
+of 15 (level, repetition) pairs, the same "sign never flips" standard this
+document uses elsewhere to call a noisy-looking gap real. Multiplying the
+batching-ratio and fsync-rate-ratio medians reproduces the write-throughput
+ratio at each level to within rounding (0.98×1.43≈1.40 vs measured 1.40;
+0.86×3.21≈2.76 vs measured 2.77; 1.61×2.78≈4.48 vs measured 4.43) — the
+decomposition is internally consistent, not just two numbers that happen to
+multiply out.
+
+**Verdict: the deficit is barrier rate, not batching, at every connection
+count measured, and it is the larger of the two factors even at 16
+connections where batching also starts to matter.** InlaySQL's
+commit-batching mechanism is not the weak link — it ties or beats InnoDB's
+at low-to-moderate concurrency and only falls behind by ~1.6x at the highest
+level tried, while its `fsync` cadence itself falls by more than half from 1
+to 16 connections instead of holding flat or rising the way MySQL's does.
+This points at *how often the server actually gets to attempt a flush*, not
+*how well it batches once it does* — consistent with, and sharper than, the
+`inlaysql-server` thread-per-connection hypothesis above: see "Task 2" in
+`PERF.md`'s dated section for what was and was not checked to explain it.
+This session's own write-throughput figures for this rerun (medians 660.9 →
+1138.9 → 1393.7 ops/s InlaySQL, 882.5 → 3171.4 → 6214.3 ops/s MySQL) sit in
+the same direction and rough order as the previously published sweep
+(638.7/1075.0/1308.1 vs 1363.1/1512.7/6120.7) but are not identical to it —
+expected run-to-run noise on an already-disclosed-noisy metric (MySQL's own
+throughput CoV was 25-47% in the original sweep, 15-35% in this one), not a
+contradiction; the published headline table above is left as is rather than
+replaced by a second noisy instance of the same measurement.
 
 **A candidate mechanism for the fsync-*rate* gap specifically was tested and
 refuted (2026-08-31), and the instrument gap above is now closed** — see
@@ -774,8 +836,8 @@ project's server-side concurrent-write loss lives, not the underlying
 commit coordinator's batching logic. Not confirmed; the instrument gap above
 is exactly what would need closing to confirm it directly.
 
-**The instrument gap is closed, 2026-08-31 — the confirming measurement is
-still not run.** `inlaysql::FileDevice::commit_stats()`
+**The instrument gap is closed, 2026-08-31 — and so is the confirming
+measurement, same day.** `inlaysql::FileDevice::commit_stats()`
 (`crates/inlaysql/src/device.rs`) is a live snapshot of the same
 `normal_flushes`/`normal_tickets_flushed` counters `INLAYSQL_COMMIT_STATS`
 prints on `Drop`, now readable from a running server too:
@@ -786,9 +848,23 @@ and read on `SHOW GLOBAL STATUS` as `Inlaysql_normal_commit_flushes`/
 `Inlaysql_commit_flushes`/`Inlaysql_commit_tickets`). Tested end-to-end
 (`show_global_status_reports_the_commit_batching_counters`,
 `crates/inlaysql-server/tests/wire.rs`) — a second connection's commits move
-the count, `SESSION`/`GLOBAL` agree since the counter is process-wide. What
-this does *not* do is run the actual `SERVER_CONCURRENCY_LEVELS` sweep
-against these counters alongside MySQL's `Handler_commit`/
-`Innodb_os_log_fsyncs`; that measurement — the one that would turn "weak,
-harness-mismatched evidence" above into a real confirmation or refutal — is
-still owed. See `PLAN.md` item 6 for the same note in planning form.
+the count, `SESSION`/`GLOBAL` agree since the counter is process-wide.
+`server_driver.py` now brackets these counters alongside MySQL's
+`Handler_commit`/`Innodb_os_log_fsyncs`, and the `SERVER_CONCURRENCY_LEVELS`
+sweep this paragraph used to call owed has been run: **"weak,
+harness-mismatched evidence" is now a real confirmation, and it says the
+opposite of what a reader might guess from the throughput loss alone —
+InlaySQL's own commit-batching mechanism ties or beats InnoDB's at 1 and 4
+connections and trails by only ~1.6x at 16, while its `fsync` rate itself
+falls from ~661/s to ~302/s as connections go from 1 to 16 (MySQL's stays in
+a flat 620-1640/s band over the same range).** The thread-per-connection
+design named above is the more likely place the throughput loss lives, and
+this session's numbers sharpen why: not because the coordinator batches
+`fsync`s worse than InnoDB does, but because something upstream of the
+coordinator throttles how often a flush gets attempted at all as writers are
+added, the opposite of the direction batching alone would predict. Full
+numbers and the per-repetition ratio ranges are in §3.5 above; a bounded
+search for *why* the barrier rate itself falls is in `PERF.md`'s dated
+"Task 2" section — diagnosis only, no fix implemented or proposed as
+production-ready. See `PLAN.md` item 6/9 for the same note in planning
+form.

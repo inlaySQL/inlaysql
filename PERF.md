@@ -1872,6 +1872,116 @@ question for it. For the platform this project actually benchmarks on, the
 one `SCOREBOARD.md`'s 4.7x figure was measured on, the answer is unambiguous:
 flat, not sloped, and the redesign would not close this gap.
 
+### Task 2 — the server-to-server barrier-rate gap, diagnosed but not fixed (2026-08-31)
+
+The section above refuted the dirty-bytes explanation for InlaySQL-server's
+lower implied `fsync` rate against MySQL. It left the thread-per-connection
+design (`docs/server.md` D2) as the standing, unconfirmed suspect, backed
+only by a harness-mismatched proxy (the in-process `WRITER_LEVELS` figure).
+That proxy is no longer needed: `SCOREBOARD.md`/`BENCHMARK.md`'s same-day
+follow-up gave `inlaysql-server` a live commits-per-fsync counter
+(`Inlaysql_normal_commit_flushes`/`Inlaysql_normal_commit_tickets`, `SHOW
+GLOBAL STATUS`) and measured it directly at 1/4/16 connections, 5
+interleaved repetitions, load-gated (1-minute average 2.3-3.3/18
+throughout). The result, in one sentence: **InlaySQL's commit-batching
+mechanism ties or beats MySQL's at 1 and 4 connections and trails by only
+~1.6x at 16, while its implied `fsync` rate falls from ~661/s to ~302/s as
+connections go from 1 to 16 — MySQL's stays flat in a noisy 620-1640/s
+band over the same range.** Full tables in `BENCHMARK.md`'s "Server-to-
+server: InlaySQL's own commits-per-fsync, measured directly" section.
+
+This section is the bounded diagnosis the task brief asked for once that
+was known: candidate causes for *why* the barrier rate itself falls, each
+labelled by how it was checked. **No fix is implemented or proposed here —
+diagnosis only**, per the task's explicit instruction.
+
+**Confirmed, by reading the code this session (not merely assumed):**
+
+- **`TCP_NODELAY` is already set** (`stream.set_nodelay(true)?`,
+  `crates/inlaysql-server/src/lib.rs:740`). Nagle's-algorithm-plus-delayed-
+  ACK interaction — the classic cause of a request/response protocol
+  crawling under concurrency — is not available as an explanation; it was
+  checked, not assumed, and ruled out.
+- **No evidence of an extra or duplicated barrier in the server path.** At 1
+  connection, InlaySQL's own commits-per-fsync measured exactly **1.000
+  across all 5 repetitions, CoV 0.0%** — one commit, one `fsync`, every
+  time, the expected result if the server path shares `FileDevice`'s
+  `CommitCoordinator` unmodified with the library path (it does:
+  `crates/inlaysql-server`'s connections each open their own
+  [`Database`](inlaysql::Database) on the same file and share its device,
+  per D2's own doc comment). A doubled barrier per commit would show up
+  here as a ratio of 0.5, not 1.0. It does not.
+- **The adaptive gather window is a pure cooperative spin, not a timer**
+  (`CommitCoordinator::coalesce_normal_commits`,
+  `crates/inlaysql/src/device.rs:534-555`): `std::thread::yield_now()` in a
+  loop, bounded at `COMMIT_COALESCE_MAX_YIELDS` (16,384) total turns and
+  `COMMIT_COALESCE_STALL_YIELDS` (1,500) consecutive no-progress turns
+  before giving up. It has no `sleep`, no condvar, no OS-level wakeup
+  hint — it purely depends on the scheduler handing other, already-
+  reserved commit threads a turn quickly enough for `writes_completed` to
+  advance while this loop polls it. This code is identical between the
+  server and the library path (both go through the same `FileDevice`), so
+  it is not itself a server-specific defect, but its *effectiveness* is a
+  function of how fast *other* threads can reach the point where they
+  publish a ticket — which is where the server and library harnesses
+  genuinely diverge, below.
+- **The two harnesses are structurally different in exactly the way that
+  would matter here.** The in-process `WRITER_LEVELS` sweep
+  (`crates/inlaysql-bench/src/concurrency.rs:244-316`) drives each writer
+  with a tight `std::thread::scope` loop calling `db.execute("INSERT ...")`
+  directly on its own `Database` handle — no socket, no wire-protocol
+  encode/decode, no separate OS process, nothing between one commit
+  returning and the next one starting except a `Vec` push and a loop
+  increment. `server_driver.py`'s server-to-server path instead round-trips
+  each row through: a spawned Python OS process, `mysql.connector`'s own
+  packet encode, a TCP send/recv pair over the compose network,
+  `inlaysql-server`'s wire-protocol parse (`packet`/`protocol`/`shim`
+  modules) and statement dispatch, then the same round trip back. Every one
+  of those steps sits *before* a ticket ever reaches
+  `coalesce_normal_commits`, and every one of them is absent from the
+  in-process harness the "weak evidence" comparison used until this
+  session.
+
+**Plausible, consistent with the measurement, not directly profiled this
+session (bounded effort, per the task):**
+
+- **The likely mechanism**: round-trip cost specific to the server
+  topology (network hop, wire-protocol parsing, and — critically — the
+  scheduling latency of thread-per-connection with sixteen-plus blocking OS
+  threads competing for turns, no pool) paces how fast new commit tickets
+  *arrive* at the coordinator. If arrival rate degrades as more blocking
+  threads are added — more context-switch overhead per useful unit of
+  work, not more useful work — that would produce exactly the observed
+  shape: a batching ratio that still climbs (more requests happen to be
+  in flight when a leader's window opens) while the achieved `fsync` cadence
+  falls (the gaps between one flush completing and the next leader having
+  anything to gather widen). This is the sharper, evidence-backed version
+  of the standing D2 hypothesis — it is no longer "batching might be fine,
+  something else must be wrong," it is "batching *is* fine, the arrival
+  rate upstream of it is not." **Not measured directly**: no
+  socket-wait-time-vs-commit-wait-time breakdown was captured per thread
+  this session; that profiling is the natural next diagnostic step and is
+  explicitly out of this section's bounded scope.
+- **Container network path as a contributing, not sole, factor.** Both
+  engines cross the same `docker compose` bridge network and pay whatever
+  latency OrbStack's virtualised networking adds, so this alone cannot
+  explain an InlaySQL-vs-MySQL *asymmetry* — but MySQL's own connection
+  handling (a bounded worker pool built for exactly this access pattern
+  from the start) plausibly tolerates that added per-request latency
+  structurally better than a cooperative-yield group-commit design tuned
+  and validated primarily against a zero-latency in-process harness.
+  Plausible, not measured; stated as a contributing factor worth a future
+  session's profiling, not as a finding.
+
+**What this changes going forward.** Any future work on this gap should
+target *arrival rate into the commit coordinator* under the server's
+connection model (a pool, batching reads across connections before
+dispatch, or reducing per-statement wire-protocol overhead), not the
+coordinator's own batching logic, which this session's direct measurement
+shows is not the weak link. See `SCOREBOARD.md` §3.5/§6 and `BENCHMARK.md`'s
+new server-to-server commits-per-fsync subsection for the numbers this
+diagnosis is built on.
+
 ### Block-max WAND: built, measured, reverted
 
 `PLAN.md`'s R6 names per-block impact bounds as the next step after MaxScore,

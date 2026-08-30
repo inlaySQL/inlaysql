@@ -71,27 +71,42 @@ two engines:
   PostgreSQL row stays in `postgres_oltp_driver.py`'s table, measured
   in-process-vs-server the way every other InlaySQL-vs-PostgreSQL row is.
 
-**Commits-per-fsync, MySQL side only.** Each level's write phase brackets
-`SHOW GLOBAL STATUS`'s `Handler_commit`/`Innodb_os_log_fsyncs` for the
-`mysql` target — the mechanism metric `SCOREBOARD.md` §6 names, and the one
-that turns a concurrency sweep's throughput numbers into a statement about
-whether group commit is actually amortising `fsync`s as writers are added.
-`Handler_commit`, not `Com_commit` as originally specified: checked
-empirically against this same container, `Com_commit` counts literal
-`COMMIT` statement text and never moves under this driver's
-autocommit-per-statement writes, which would have silently reported
-`0/N = 0.0` at every level — `Handler_commit` is the storage-engine counter
-that increments on every commit, explicit or autocommit-implicit, and is the
-one that actually tracks what this driver does. See `mysql_driver.py`'s
-module docstring for the full check. `inlaysql-server` has no row here:
-`SHOW GLOBAL STATUS` reports its own `Com_commit`/`Handler_commit` but
-nothing analogous to `Innodb_os_log_fsyncs` (its `CommitCoordinator`'s flush
-counters, `crates/inlaysql/src/device.rs`, are only ever printed via
-`INLAYSQL_COMMIT_STATS=1` on process `Drop`, which never runs for a
-long-lived server stopped by `SIGTERM`) — a disclosed instrument gap, not a
-claim that its own batching is absent; see `bench/README.md` for the
-existing evidence of that batching from a different harness (the in-process
-`WRITER_LEVELS` concurrency sweep).
+**Commits-per-fsync, both sides (2026-08-31: the InlaySQL-side instrument
+gap this section used to describe is closed).** Each level's write phase
+brackets `SHOW GLOBAL STATUS` counters for both targets — the mechanism
+metric `SCOREBOARD.md` §6 names, and the one that turns a concurrency
+sweep's throughput numbers into a statement about whether group commit is
+actually amortising `fsync`s as writers are added, rather than just that
+throughput moved.
+
+For `mysql`: `Handler_commit`/`Innodb_os_log_fsyncs`. `Handler_commit`, not
+`Com_commit` as originally specified: checked empirically against this same
+container, `Com_commit` counts literal `COMMIT` statement text and never
+moves under this driver's autocommit-per-statement writes, which would have
+silently reported `0/N = 0.0` at every level — `Handler_commit` is the
+storage-engine counter that increments on every commit, explicit or
+autocommit-implicit, and is the one that actually tracks what this driver
+does. See `mysql_driver.py`'s module docstring for the full check.
+
+For `inlaysql-server`: `Inlaysql_normal_commit_tickets`/
+`Inlaysql_normal_commit_flushes` (excludes checkpoint-triggered flushes —
+the like-for-like pair against MySQL's, since neither MySQL number above
+includes a checkpoint-analogous event either) as `commits`/`fsyncs`/
+`commits_per_fsync`, plus the checkpoint-inclusive
+`Inlaysql_commit_tickets`/`Inlaysql_commit_flushes` reported alongside as
+`commits_all`/`fsyncs_all`/`commits_per_fsync_all` in case the two pairs
+diverge materially. These four counters are a live `SHOW GLOBAL STATUS`
+snapshot of the same `CommitCoordinator` flush/ticket counters
+`INLAYSQL_COMMIT_STATS=1` used to only print on process `Drop` — a mechanism
+that never fired for a long-running server killed by `SIGTERM`
+(`crates/inlaysql-server/src/lib.rs` shares the same keeper handle used for
+the file lock into every connection thread; `crates/inlaysql-server/src/
+metrics.rs` exposes it). This closes the instrument gap this section used to
+describe (`SCOREBOARD.md` §6, `PLAN.md` item 6): before this, the only
+available number for InlaySQL's own batching ratio was the in-process
+`WRITER_LEVELS` sweep, a different harness (library, real OS threads, no
+wire protocol) that could only stand in for, not measure, the server's own
+ratio.
 """
 
 from __future__ import annotations
@@ -189,19 +204,19 @@ def global_status(target: dict, name: str) -> int:
     """One `SHOW GLOBAL STATUS` counter, as an int, read over a fresh
     connection to `target`.
 
-    Only meaningful for the `mysql` target's `Handler_commit`/
-    `Innodb_os_log_fsyncs` pair — the commits-per-fsync instrument
-    (`SCOREBOARD.md` §6; `Handler_commit`, not `Com_commit` — see the module
-    docstring above for why). `inlaysql-server` answers `SHOW GLOBAL STATUS`
-    too (`Com_commit`/`Handler_commit` among the counters it reports,
-    `docs/server.md`) but has no counterpart to `Innodb_os_log_fsyncs`: its `fsync`/batching
-    counters (`crates/inlaysql/src/device.rs`'s `CommitCoordinator`) are only
-    ever printed once, on process `Drop`, gated on `INLAYSQL_COMMIT_STATS=1
-    — which never fires for a long-running server killed by the container
-    runtime's `SIGTERM` (no signal handler drops the `Database` gracefully),
-    so there is no live counter to sample here. That gap is disclosed in
-    `bench/README.md` and `SCOREBOARD.md` rather than substituting a number
-    that was not actually measured.
+    Used for both targets' commits-per-fsync instrument (`SCOREBOARD.md`
+    §6): `mysql`'s `Handler_commit`/`Innodb_os_log_fsyncs` pair
+    (`Handler_commit`, not `Com_commit` — see the module docstring above for
+    why), and `inlaysql-server`'s `Inlaysql_normal_commit_tickets`/
+    `Inlaysql_normal_commit_flushes` (plus the checkpoint-inclusive
+    `Inlaysql_commit_tickets`/`Inlaysql_commit_flushes`) — a live counter as
+    of 2026-08-31 (`crates/inlaysql-server/src/metrics.rs`), where it used to
+    have none: the underlying `CommitCoordinator` flush/ticket counters
+    (`crates/inlaysql/src/device.rs`) used to be printed only once, on
+    process `Drop`, gated on `INLAYSQL_COMMIT_STATS=1` — which never fired
+    for a long-running server killed by the container runtime's `SIGTERM`
+    (no signal handler dropped the `Database` gracefully). That gap is now
+    closed; see the module docstring above.
     """
     connection = connect(target)
     try:
@@ -308,15 +323,36 @@ def measure_concurrency(target: dict, workload: common.OltpWorkload, concurrency
     row_chunks = chunks(workload.rows, concurrency)
     key_chunks = chunks(workload.lookup_keys, concurrency)
 
-    # Commits-per-fsync (`SCOREBOARD.md` §6), MySQL side only — see
-    # `global_status`'s docstring for why `inlaysql-server` has no
-    # counterpart to sample here. Read over a connection outside the worker
-    # pool so it brackets the phase without adding a process to the
-    # concurrency level being measured.
+    # Commits-per-fsync (`SCOREBOARD.md` §6), both targets as of 2026-08-31
+    # — see `global_status`'s docstring and the module docstring above for
+    # which counters back which target, and for the instrument-gap history.
+    # `counter_names` is `(commits, fsyncs)` for the like-for-like ratio;
+    # `counter_names_all`, only present for `inlaysql-server`, is the
+    # checkpoint-inclusive pair reported alongside it. Read over a
+    # connection outside the worker pool so it brackets the phase without
+    # adding a process to the concurrency level being measured.
+    counter_names = {
+        "mysql": ("Handler_commit", "Innodb_os_log_fsyncs"),
+        "inlaysql-server": (
+            "Inlaysql_normal_commit_tickets",
+            "Inlaysql_normal_commit_flushes",
+        ),
+    }.get(target["slug"])
+    counter_names_all = (
+        ("Inlaysql_commit_tickets", "Inlaysql_commit_flushes")
+        if target["slug"] == "inlaysql-server"
+        else None
+    )
+
     commit_stats = None
-    if target["slug"] == "mysql":
-        commits_before = global_status(target, "Handler_commit")
-        fsyncs_before = global_status(target, "Innodb_os_log_fsyncs")
+    if counter_names is not None:
+        commits_name, fsyncs_name = counter_names
+        commits_before = global_status(target, commits_name)
+        fsyncs_before = global_status(target, fsyncs_name)
+        if counter_names_all is not None:
+            commits_all_name, fsyncs_all_name = counter_names_all
+            commits_all_before = global_status(target, commits_all_name)
+            fsyncs_all_before = global_status(target, fsyncs_all_name)
 
     started = time.perf_counter()
     with context.Pool(processes=concurrency) as pool:
@@ -326,9 +362,9 @@ def measure_concurrency(target: dict, workload: common.OltpWorkload, concurrency
         )
     write_elapsed = time.perf_counter() - started
 
-    if target["slug"] == "mysql":
-        commits_after = global_status(target, "Handler_commit")
-        fsyncs_after = global_status(target, "Innodb_os_log_fsyncs")
+    if counter_names is not None:
+        commits_after = global_status(target, commits_name)
+        fsyncs_after = global_status(target, fsyncs_name)
         commits_delta = commits_after - commits_before
         fsyncs_delta = fsyncs_after - fsyncs_before
         commit_stats = {
@@ -336,6 +372,16 @@ def measure_concurrency(target: dict, workload: common.OltpWorkload, concurrency
             "fsyncs": fsyncs_delta,
             "commits_per_fsync": commits_delta / fsyncs_delta if fsyncs_delta else 0.0,
         }
+        if counter_names_all is not None:
+            commits_all_after = global_status(target, commits_all_name)
+            fsyncs_all_after = global_status(target, fsyncs_all_name)
+            commits_all_delta = commits_all_after - commits_all_before
+            fsyncs_all_delta = fsyncs_all_after - fsyncs_all_before
+            commit_stats["commits_all"] = commits_all_delta
+            commit_stats["fsyncs_all"] = fsyncs_all_delta
+            commit_stats["commits_per_fsync_all"] = (
+                commits_all_delta / fsyncs_all_delta if fsyncs_all_delta else 0.0
+            )
 
     write_ops_s = len(workload.rows) / write_elapsed
     write_timer = common.Timer()
@@ -384,16 +430,19 @@ def publish(target: dict, levels: list[dict], workload: common.OltpWorkload) -> 
         "are disjoint contiguous id/key ranges per connection, not a shared queue. See "
         "bench/README.md's Server-to-server section for the concurrency-model, credential "
         "and TLS asymmetries that remain even so, and for why PostgreSQL has no row in "
-        "this table. Where present, commit_stats is the delta of MySQL's own "
-        "Handler_commit/Innodb_os_log_fsyncs bracketing that level's write phase (Handler_commit, "
-        "not Com_commit, which never moves under autocommit-implicit writes — see "
-        "mysql_driver.py) — the "
-        "commits-per-fsync instrument, SCOREBOARD.md §6: a ratio rising with concurrency "
-        "says group commit is amortising fsyncs across writers, not just that throughput "
-        "moved. inlaysql-server has no row here: it has no live counter for its own "
-        "fsync/flush count (see global_status's docstring), which is a disclosed instrument "
-        "gap, not a claim that its batching does not exist — see SCOREBOARD.md and "
-        "bench/README.md."
+        "this table. Where present, commit_stats is the delta of each engine's own commit/"
+        "fsync counters bracketing that level's write phase — the commits-per-fsync "
+        "instrument, SCOREBOARD.md §6: a ratio rising with concurrency says group commit is "
+        "amortising fsyncs across writers, not just that throughput moved. For MySQL: "
+        "Handler_commit/Innodb_os_log_fsyncs (Handler_commit, not Com_commit, which never "
+        "moves under autocommit-implicit writes — see mysql_driver.py). For inlaysql-server "
+        "(live as of 2026-08-31, closing this section's former instrument gap): "
+        "commits/fsyncs/commits_per_fsync are Inlaysql_normal_commit_tickets/"
+        "Inlaysql_normal_commit_flushes (excludes checkpoint-triggered flushes, the "
+        "like-for-like pair against MySQL's); commits_all/fsyncs_all/commits_per_fsync_all "
+        "are the checkpoint-inclusive Inlaysql_commit_tickets/Inlaysql_commit_flushes, "
+        "reported alongside in case the two diverge materially — see global_status's "
+        "docstring and SCOREBOARD.md."
     )
     common.write_server_oltp_result(
         common.CORPUS,
