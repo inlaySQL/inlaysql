@@ -42,6 +42,15 @@ pub struct FileDevice {
     /// why it lives here, as a field, rather than as a local in whichever
     /// function is between the two calls.
     normal_commit_guard: Mutex<Option<NormalCommitGuard>>,
+    /// [`now_nanos`] at the moment this handle acquired the reservation gate
+    /// for the normal commit now in flight — the start of the gate-hold
+    /// segment [`FileDevice::commit_ready`] closes. Zero while no gate-held
+    /// commit is between the two calls.
+    gate_started_ns: AtomicU64,
+    /// Whether the gate acquisition that set [`FileDevice::gate_started_ns`]
+    /// happened while a flush was in flight — the start-state half of the
+    /// racing split, consumed by [`Device::commit_ready`].
+    gate_started_racing: AtomicBool,
     /// Kept only to name the file in an error message — [`FileDevice`] itself
     /// never needs to re-open or re-derive a path.
     path: PathBuf,
@@ -127,6 +136,52 @@ struct CommitCoordinator {
     /// Diagnostic count/sum for leaders entered through `sync_commit`.
     normal_flushes: AtomicU64,
     normal_tickets_flushed: AtomicU64,
+    /// Diagnostic cycle-phase timers, all accumulated nanoseconds read via
+    /// [`now_nanos`]. Together with `flushes` these decompose one full
+    /// coordinator cycle — elect leader, gather a cohort, run the barrier,
+    /// wake the waiters, idle until the next leader — into segments that
+    /// [`FileDevice::commit_stats`] can read while the process is still
+    /// running. Read the counts (`gate_waits`, `follower_waits`, `flushes`)
+    /// alongside each sum to turn it into a per-event mean; each accumulator
+    /// costs one relaxed `fetch_add` per commit cycle, never a per-ticket
+    /// record.
+    gate_wait_ns: AtomicU64,
+    gate_hold_ns: AtomicU64,
+    /// Of `gate_hold_ns`, the time accumulated while a flush was already in
+    /// flight when the holder published its ticket — the "slow write racing a
+    /// concurrent `fsync`" effect, measurable separately because it is the
+    /// segment where a serialized gate can inherit the barrier's cost.
+    gate_hold_racing_ns: AtomicU64,
+    gate_hold_racing_count: AtomicU64,
+    /// Of `gate_hold_ns`, the time accumulated by holds that *acquired the
+    /// gate while a flush was already in flight* — the start-state split the
+    /// end-state `gate_hold_racing_*` above cannot express, because a hold
+    /// slowed by writes racing a barrier often outlives that barrier and
+    /// ends with no flush in progress. This is the segment where the "slow
+    /// write racing a concurrent fsync" cost actually lands.
+    gate_hold_racing_start_ns: AtomicU64,
+    gate_hold_racing_start_count: AtomicU64,
+    gate_waits: AtomicU64,
+    follower_wait_ns: AtomicU64,
+    follower_waits: AtomicU64,
+    /// Time the elected leader spent inside the adaptive gather window before
+    /// capturing its flush target.
+    gather_spin_ns: AtomicU64,
+    /// Total wall time spent inside the barrier itself.
+    fsync_ns: AtomicU64,
+    /// Time spent after the barrier returning — re-locking the flush state
+    /// and waking every follower — before the cycle can be called over.
+    post_ns: AtomicU64,
+    /// Time between one cycle's end and the next leader's election. Whatever
+    /// the segments above do not account for in a cycle shows up here, so a
+    /// cycle's sum (`gather + fsync + post + gap`) is checkable against the
+    /// independently measured cycle time (`elapsed / flushes`) instead of
+    /// being exact by construction.
+    gap_ns: AtomicU64,
+    /// Wall-clock [`now_nanos`] marker left by the last [`LeaderGuard`] drop,
+    /// for the `gap_ns` measurement above. Zero after every cycle end until
+    /// the next leader reads and consumes it.
+    last_cycle_end_ns: AtomicU64,
     /// Held only for its `Drop`: releases the OS lock when the last
     /// `FileDevice` sharing this coordinator goes away. Never read.
     _lock: File,
@@ -195,6 +250,42 @@ pub struct CommitStats {
     /// `normal_tickets_flushed / normal_flushes` is commits landed per
     /// `fsync` — the same ratio `INLAYSQL_COMMIT_STATS` prints on `Drop`.
     pub normal_tickets_flushed: u64,
+    /// Nanoseconds writers spent blocked acquiring the reservation gate,
+    /// with [`CommitStats::gate_waits`] acquisitions.
+    pub gate_wait_ns: u64,
+    /// How many gate acquisitions [`CommitStats::gate_wait_ns`] sums.
+    pub gate_waits: u64,
+    /// Nanoseconds writers spent inside the reservation gate — rebase, WAL
+    /// record encode, the record and dirty-page `pwrite`s — with one
+    /// entry per successful [`Device::commit_ready`]. Conflicted attempts
+    /// release the gate without publishing a ticket, so their in-gate time
+    /// is not counted.
+    pub gate_hold_ns: u64,
+    /// Of [`CommitStats::gate_hold_ns`], the time accumulated while a flush
+    /// was already in flight when the ticket was published, with its own
+    /// count — see the coordinator field's doc comment.
+    pub gate_hold_racing_ns: u64,
+    /// How many [`CommitStats::gate_hold_ns`] entries the racing split covers.
+    pub gate_hold_racing_count: u64,
+    /// Of [`CommitStats::gate_hold_ns`], the time accumulated by holds that
+    /// acquired the gate while a flush was already in flight, with its own
+    /// count — see the coordinator field's doc comment.
+    pub gate_hold_racing_start_ns: u64,
+    /// How many holds the start-state racing split covers.
+    pub gate_hold_racing_start_count: u64,
+    /// Nanoseconds writers spent as flush followers waiting on
+    /// [`CommitCoordinator::flush_done`], with the number of waits.
+    pub follower_wait_ns: u64,
+    /// How many follower waits [`CommitStats::follower_wait_ns`] sums.
+    pub follower_waits: u64,
+    /// Nanoseconds flush leaders spent in the adaptive gather window.
+    pub gather_spin_ns: u64,
+    /// Nanoseconds spent inside the barrier itself, all flushes.
+    pub fsync_ns: u64,
+    /// Nanoseconds spent after the barrier waking followers.
+    pub post_ns: u64,
+    /// Nanoseconds between one cycle's end and the next leader's election.
+    pub gap_ns: u64,
 }
 
 /// [`CommitCoordinator::durability`]'s three legal values, encoded so
@@ -209,6 +300,19 @@ pub struct CommitStats {
 const DURABILITY_UNSET: u8 = 0;
 const DURABILITY_NORMAL: u8 = 1;
 const DURABILITY_FULL: u8 = 2;
+
+/// Monotonic nanoseconds for the commit-cycle timers — a process-start
+/// anchored [`std::time::Instant`], so the values are differences and never
+/// leak a wall clock into anything user-visible. One `clock_gettime` (vDSO)
+/// per segment boundary; a commit cycle reads it at most a handful of times
+/// and stores only per-segment totals, never per-ticket records.
+fn now_nanos() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64
+}
 
 /// The committed state and per-region append positions the reservation gate
 /// would otherwise re-derive from the file, guarded by
@@ -453,12 +557,16 @@ impl CommitCoordinator {
                 // back and re-check. `epoch` distinguishes "this round ended"
                 // from a spurious wakeup or a round that already moved on.
                 let epoch = flush.epoch;
+                let wait_started = now_nanos();
                 while flush.in_progress && flush.epoch == epoch {
                     flush = self
                         .flush_done
                         .wait(flush)
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                 }
+                self.follower_wait_ns
+                    .fetch_add(now_nanos().saturating_sub(wait_started), Ordering::Relaxed);
+                self.follower_waits.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
@@ -466,6 +574,13 @@ impl CommitCoordinator {
             // no second thread can also become leader for this round.
             flush.in_progress = true;
             drop(flush);
+            // Time between the previous cycle's end and this election — the
+            // coordinator-idle segment the four in-cycle segments cannot see.
+            let last_end = self.last_cycle_end_ns.swap(0, Ordering::Relaxed);
+            if last_end != 0 {
+                self.gap_ns
+                    .fetch_add(now_nanos().saturating_sub(last_end), Ordering::Relaxed);
+            }
             // `LeaderGuard` clears `in_progress`, bumps `epoch` and wakes every
             // follower on drop — including on an early return through `?` or
             // an unwind out of `sync` — so a failed or panicking flush can
@@ -479,11 +594,19 @@ impl CommitCoordinator {
             // Our own ticket is always among them, because `writes_completed`
             // already counted it before this function was called.
             if coalesce_normal_commits {
+                let gather_started = now_nanos();
                 self.coalesce_normal_commits();
+                self.gather_spin_ns.fetch_add(
+                    now_nanos().saturating_sub(gather_started),
+                    Ordering::Relaxed,
+                );
             }
             let durable_before = self.durable_upto.load(Ordering::SeqCst);
             let target = self.writes_completed.load(Ordering::SeqCst);
+            let flush_started = now_nanos();
             let result = sync();
+            self.fsync_ns
+                .fetch_add(now_nanos().saturating_sub(flush_started), Ordering::Relaxed);
             if result.is_ok() {
                 self.durable_upto.fetch_max(target, Ordering::SeqCst);
                 let covered = target.saturating_sub(durable_before);
@@ -589,6 +712,20 @@ impl Drop for CommitCoordinator {
                 self.normal_flushes.load(Ordering::Relaxed),
                 self.normal_tickets_flushed.load(Ordering::Relaxed),
             );
+            eprintln!(
+                "commit-stats: ns gate_wait={} gate_hold={} (racing {}) follower_wait={} \
+                 gather_spin={} fsync={} post={} gap={}; waits gate={} follower={}",
+                self.gate_wait_ns.load(Ordering::Relaxed),
+                self.gate_hold_ns.load(Ordering::Relaxed),
+                self.gate_hold_racing_ns.load(Ordering::Relaxed),
+                self.follower_wait_ns.load(Ordering::Relaxed),
+                self.gather_spin_ns.load(Ordering::Relaxed),
+                self.fsync_ns.load(Ordering::Relaxed),
+                self.post_ns.load(Ordering::Relaxed),
+                self.gap_ns.load(Ordering::Relaxed),
+                self.gate_waits.load(Ordering::Relaxed),
+                self.follower_waits.load(Ordering::Relaxed),
+            );
         }
     }
 }
@@ -604,6 +741,7 @@ struct LeaderGuard<'a> {
 
 impl Drop for LeaderGuard<'_> {
     fn drop(&mut self) {
+        let post_started = now_nanos();
         let mut flush = self
             .coordinator
             .flush
@@ -613,6 +751,13 @@ impl Drop for LeaderGuard<'_> {
         flush.epoch = flush.epoch.wrapping_add(1);
         drop(flush);
         self.coordinator.flush_done.notify_all();
+        let ended = now_nanos();
+        self.coordinator
+            .post_ns
+            .fetch_add(ended.saturating_sub(post_started), Ordering::Relaxed);
+        self.coordinator
+            .last_cycle_end_ns
+            .store(ended, Ordering::Relaxed);
     }
 }
 
@@ -767,6 +912,8 @@ impl FileDevice {
             coordinator: Some(coordinator),
             wal_region,
             pending_commit_ticket: AtomicU64::new(0),
+            gate_started_ns: AtomicU64::new(0),
+            gate_started_racing: AtomicBool::new(false),
             normal_commit_guard: Mutex::new(None),
             path: path.to_path_buf(),
         })
@@ -811,6 +958,8 @@ impl FileDevice {
             coordinator: None,
             wal_region: 0,
             pending_commit_ticket: AtomicU64::new(0),
+            gate_started_ns: AtomicU64::new(0),
+            gate_started_racing: AtomicBool::new(false),
             normal_commit_guard: Mutex::new(None),
             path: path.to_path_buf(),
         })
@@ -843,6 +992,23 @@ impl FileDevice {
             tickets_flushed: coordinator.tickets_flushed.load(Ordering::Relaxed),
             normal_flushes: coordinator.normal_flushes.load(Ordering::Relaxed),
             normal_tickets_flushed: coordinator.normal_tickets_flushed.load(Ordering::Relaxed),
+            gate_wait_ns: coordinator.gate_wait_ns.load(Ordering::Relaxed),
+            gate_waits: coordinator.gate_waits.load(Ordering::Relaxed),
+            gate_hold_ns: coordinator.gate_hold_ns.load(Ordering::Relaxed),
+            gate_hold_racing_ns: coordinator.gate_hold_racing_ns.load(Ordering::Relaxed),
+            gate_hold_racing_count: coordinator.gate_hold_racing_count.load(Ordering::Relaxed),
+            gate_hold_racing_start_ns: coordinator
+                .gate_hold_racing_start_ns
+                .load(Ordering::Relaxed),
+            gate_hold_racing_start_count: coordinator
+                .gate_hold_racing_start_count
+                .load(Ordering::Relaxed),
+            follower_wait_ns: coordinator.follower_wait_ns.load(Ordering::Relaxed),
+            follower_waits: coordinator.follower_waits.load(Ordering::Relaxed),
+            gather_spin_ns: coordinator.gather_spin_ns.load(Ordering::Relaxed),
+            fsync_ns: coordinator.fsync_ns.load(Ordering::Relaxed),
+            post_ns: coordinator.post_ns.load(Ordering::Relaxed),
+            gap_ns: coordinator.gap_ns.load(Ordering::Relaxed),
         })
     }
 
@@ -921,6 +1087,7 @@ impl FileDevice {
     /// caller records whether it is a normal commit separately so a flush
     /// leader can ignore checkpoints when deciding whether a cohort exists.
     fn begin_reservation(&self, coordinator: &CommitCoordinator) -> Result<()> {
+        let wait_started = now_nanos();
         let mut reserved = coordinator
             .reserved
             .lock()
@@ -932,6 +1099,10 @@ impl FileDevice {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
         *reserved = true;
+        coordinator
+            .gate_wait_ns
+            .fetch_add(now_nanos().saturating_sub(wait_started), Ordering::Relaxed);
+        coordinator.gate_waits.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1075,6 +1246,36 @@ impl Device for FileDevice {
         let Some(coordinator) = &self.coordinator else {
             unreachable!("a read-only FileDevice cannot publish a commit ticket");
         };
+        // Close this commit's gate-hold segment. A flush already in flight is
+        // recorded separately: gate work done while a barrier runs pays
+        // whatever the platform charges a `pwrite` racing an `fsync`, and that
+        // cost is inherited by every writer queued behind the gate.
+        let started = self.gate_started_ns.swap(0, Ordering::Relaxed);
+        if started != 0 {
+            let held = now_nanos().saturating_sub(started);
+            coordinator.gate_hold_ns.fetch_add(held, Ordering::Relaxed);
+            let racing = coordinator
+                .flush
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .in_progress;
+            if racing {
+                coordinator
+                    .gate_hold_racing_ns
+                    .fetch_add(held, Ordering::Relaxed);
+                coordinator
+                    .gate_hold_racing_count
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if self.gate_started_racing.swap(false, Ordering::Relaxed) {
+                coordinator
+                    .gate_hold_racing_start_ns
+                    .fetch_add(held, Ordering::Relaxed);
+                coordinator
+                    .gate_hold_racing_start_count
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let ticket = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
         self.pending_commit_ticket.store(ticket, Ordering::Release);
     }
@@ -1116,6 +1317,13 @@ impl Device for FileDevice {
         drop(waiter_guard);
         if result.is_ok() {
             coordinator.normal_inflight.fetch_add(1, Ordering::Release);
+            self.gate_started_ns.store(now_nanos(), Ordering::Relaxed);
+            let racing = coordinator
+                .flush
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .in_progress;
+            self.gate_started_racing.store(racing, Ordering::Relaxed);
             *self
                 .normal_commit_guard
                 .lock()
@@ -1424,6 +1632,20 @@ fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator
         tickets_flushed: AtomicU64::new(0),
         normal_flushes: AtomicU64::new(0),
         normal_tickets_flushed: AtomicU64::new(0),
+        gate_wait_ns: AtomicU64::new(0),
+        gate_hold_ns: AtomicU64::new(0),
+        gate_hold_racing_ns: AtomicU64::new(0),
+        gate_hold_racing_count: AtomicU64::new(0),
+        gate_hold_racing_start_ns: AtomicU64::new(0),
+        gate_hold_racing_start_count: AtomicU64::new(0),
+        gate_waits: AtomicU64::new(0),
+        follower_wait_ns: AtomicU64::new(0),
+        follower_waits: AtomicU64::new(0),
+        gather_spin_ns: AtomicU64::new(0),
+        fsync_ns: AtomicU64::new(0),
+        post_ns: AtomicU64::new(0),
+        gap_ns: AtomicU64::new(0),
+        last_cycle_end_ns: AtomicU64::new(0),
         _lock: lock_file,
         readers: Mutex::new(HashMap::new()),
         next_reader_token: AtomicU64::new(1),
@@ -1559,6 +1781,20 @@ mod group_commit_tests {
             tickets_flushed: AtomicU64::new(0),
             normal_flushes: AtomicU64::new(0),
             normal_tickets_flushed: AtomicU64::new(0),
+            gate_wait_ns: AtomicU64::new(0),
+            gate_hold_ns: AtomicU64::new(0),
+            gate_hold_racing_ns: AtomicU64::new(0),
+            gate_hold_racing_count: AtomicU64::new(0),
+            gate_hold_racing_start_ns: AtomicU64::new(0),
+            gate_hold_racing_start_count: AtomicU64::new(0),
+            gate_waits: AtomicU64::new(0),
+            follower_wait_ns: AtomicU64::new(0),
+            follower_waits: AtomicU64::new(0),
+            gather_spin_ns: AtomicU64::new(0),
+            fsync_ns: AtomicU64::new(0),
+            post_ns: AtomicU64::new(0),
+            gap_ns: AtomicU64::new(0),
+            last_cycle_end_ns: AtomicU64::new(0),
             _lock: lock_file,
             readers: Mutex::new(HashMap::new()),
             next_reader_token: AtomicU64::new(1),

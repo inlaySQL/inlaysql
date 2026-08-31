@@ -2368,6 +2368,190 @@ small (a)-shaped detail riding along.**
 
 ---
 
+### Task 3 — the library commit cycle, instrumented (2026-08-31)
+
+Task 2 left the diagnosis at the container boundary: batching ties or beats
+MySQL's at 1 and 4 connections and trails only ~1.6x at 16, so the deficit is
+barrier *rate* (~661 → ~302 fsync/s from 1 to 16 connections), not batching.
+The plan this section executes decomposed the library commit cycle itself —
+no server, no socket — into timed segments to find where the non-fsync time
+lives. Two tasks, reported in order: the static code reading (B), then the
+instrumented run (A). The brief's pre-registered decision tree and
+expectations are restated here before the data, and the branch taken is
+labelled explicitly.
+
+#### Task B — does the coordinator accept tickets while an fsync is in flight?
+
+**Yes — intake is open during flush; but cohort membership is closed before
+the barrier, and the gather window is a gate-drain wait.** Both halves matter,
+and the second half is what makes the cycle serial:
+
+- The reservation gate (`reserved: Mutex<bool>` +
+  `reservation_done: Condvar`, `crates/inlaysql/src/device.rs:74-76`) is held
+  only across a commit's in-gate work: acquired in `begin_reservation`
+  (`device.rs:998-1015`), released in `release_normal_reservation`
+  (`device.rs:707-722`) *before* durability. The fsync is called from
+  `make_durable_with_cohort` with no gate held — `CowBTree::commit` calls
+  `sync_commit` (`crates/inlaysql-core/src/btree/tree.rs:1210`) after
+  `end_normal_commit` (`tree.rs:1154`), and the comment at `tree.rs:1206-1210`
+  states the intent outright: durability is the operation parallel writers are
+  allowed to overlap. So during flush N's barrier, other writers can acquire
+  the gate, write their WAL records and dirty pages, and publish tickets
+  (`Device::commit_ready`, `device.rs:1149-1160`). The write phase *is*
+  pipelined.
+- But a round's coverage set is snapshotted at
+  `target = writes_completed.load()` (`device.rs:560`) strictly *before* the
+  barrier (`device.rs:561`), so a ticket published while flush N is in flight
+  is **not** covered by round N: its writer waits as a follower on
+  `flush_done` (`device.rs:526-537`), then loops back and becomes the leader
+  of round N+1. There is no moment at which a cohort is being gathered while
+  a barrier is in flight — the gather window
+  (`coalesce_normal_commits`, `device.rs:609-630`) only ever runs after a
+  leader is elected and strictly before its own barrier.
+- And the gather window's exit condition is the load-bearing detail the
+  serial-cycle hypothesis needs revising for: it keeps yielding while
+  `normal_inflight > 0 || normal_waiters > 0` (`device.rs:613-617`) — that
+  is, **it waits for the reservation gate to drain** before the leader
+  captures its target. The barrier is therefore positioned after the entire
+  cohort's serialized gate work, not merely after the tickets that existed
+  when the round began.
+
+So the code reading *confirms* the serial-cycle structure (gather → flush →
+gather, never overlapped) but *rejects* the implication that a two-stage
+pipeline is the whole fix: the gather segment's duration is set by how long
+the serialized gate takes to drain, and that same serialized gate is (per A,
+below) the throughput ceiling. Both are reported so the epic scoping can see
+them as one mechanism.
+
+#### Task A — the cycle, decomposed
+
+**Instrumentation.** `CommitCoordinator` grew per-segment nanosecond
+accumulators (`gate_wait_ns`, `gate_hold_ns`, `gate_hold_racing_start_ns/_count`
++ end-state split, `follower_wait_ns`, `gather_spin_ns`, `fsync_ns`, `post_ns`,
+`gap_ns`), each one relaxed `fetch_add` per event — timestamps at segment
+boundaries only, no per-ticket records. They are readable without process
+`Drop` through the existing `FileDevice::commit_stats()` snapshot (the
+`SHOW GLOBAL STATUS` pattern's library-side counterpart; the keeper-handle
+trick `inlaysql-server` uses is reproduced by the harness), and the
+`INLAYSQL_COMMIT_STATS` drop print now includes them. Segment semantics:
+*gather-wait* = gate queue wait + leader gather spin + follower barrier wait
+(reported as three sub-segments, because they are three different mechanisms);
+*WAL-write* = time inside the reservation gate (rebase, record encode, record
++ dirty-page `pwrite`s); *fsync* = the barrier; *post-work* = the leader
+waking followers; *gap* = coordinator idle between one cycle's end and the
+next leader's election.
+
+**Harness.** `cargo run --release -p inlaysql-bench --bin commit_cycle` —
+in-process OS threads (the concurrency suite's shape: one `Database` handle
+per writer, disjoint keys, one-row INSERT transactions), 1/4/16 writers, 5
+repetitions each, the full (level, rep) schedule Fisher-Yates-shuffled with a
+fixed seed so no level is systematically first in wall-clock time, 2000
+transactions per writer per rep, fresh file per rep, stats delta read through
+a still-open keeper handle, and the lost-write verification the concurrency
+suite runs. The database file lives on a named Docker volume
+(`inlaysql-commitcycle-data`), the same volume class the barrier-rate and
+fsync-floor measurements used.
+
+**Expectations stated before the data landed** (session discipline): (i) at
+16 writers, gather-wait would grow with writer count and dominate non-fsync
+time, matching branch 1; (ii) single-writer would put its ~0.4 ms gap in
+gate-hold; (iii) gate-hold would grow with writers because in-gate writes
+race the in-flight barrier (the ~18-23x slowdown documented at
+`device.rs`, macOS-flavoured, unverified on Linux). Prediction (iii) was the
+one I expected to be wrong on this platform; it turned out to be the finding.
+
+**Results.** Three runs of the full schedule on the container
+(18-CPU Docker VM; host load averages 2.7-5.0 over the sitting, disclosed
+because run 1 was the quietest and runs 2-3 visibly slower across *every*
+level — machine drift, not code). Medians per repetition; all values µs
+unless stated. Run 1 / run 2 / run 3:
+
+| Segment (per cycle, µs) | 1 writer | 4 writers | 16 writers |
+| --- | --- | --- | --- |
+| cycle (= 1/fsync-rate) | 1205 / 1531 / 1503 | 2033 / 2338 / 2201 | 3270 / 3451 / 3411 |
+| fsync | 1080 / 1405 / 1359 | 1299 / 1695 / 1546 | 1543 / 1898 / 1853 |
+| gather (leader spin) | 0 / 0 / 0 | 370 / 300 / 305 | 934 / 896 / 892 |
+| post (wake followers) | ~1 | 54-69 | 45-75 |
+| gap (coordinator idle) | 117 / 125 / 144 | 459 / 447 / 418 | 733 / 698 / 691 |
+| WAL-write (gate hold, per commit) | 70 / 79 / 87 | 373 / 414 / 380 | 746 / 812 / 775 |
+| — of which acquired while flush in flight | 0% | 78-81% (388-469 µs) | 96-97% (737-904 µs) |
+| gate queue wait (per commit) | 0 | 562-647 | 8230-9944 |
+| follower barrier wait (per wait) | 0 | 1347-1769 | 2536-2817 |
+| gate busy (commits/s × mean hold) | 5-6% | 44-47% | 88-90% |
+| c/fsync | 1.00 | 2.47-2.93 | 3.69-4.08 |
+| commits/s | 830 / 653 / 665 | 1348 / 1071 / 1204 | 1189 / 1101 / 1144 |
+
+**Consistency checks, both pre-registered:**
+
+- **(i) Segment sum vs measured cycle time.** The gap counter is
+  double-entry bookkeeping for the residual: measured cycle − (fsync + gather
+  + post) should equal gap/flushes. 1 writer: 124-144 vs 117-144 µs — agree
+  to ~0.1%. 16 writers: 605-689 vs 656-733 µs — agree to 1.3-2.6% of cycle.
+  4 writers: 287-370 vs 418-459 µs — the counter exceeds the residual by
+  6.8-13% of cycle, marginally outside the ~5% band. The direction of the
+  discrepancy is explained, not hand-waved: checkpoint flushes ride the same
+  accumulators but not the `normal_flushes` denominator (measured share:
+  flushes/normal_flushes = 1.02 at 1 writer, ~1.035 at 4, ~1.05 at 16), and
+  the first cycle's pre-election time is in `elapsed` but not in the gap
+  counter. Neither effect is large enough to change any interpretation below.
+- **(ii) Derived fsync/s reproduces the earlier measurements.** Run 1
+  (quietest): 830 / 492 / 306 fsync/s at 1/4/16 writers against the
+  targets ~660 / ~490 / ~302 — 4 and 16 reproduce to 0.4% and 1.3%; 1 writer
+  lands *above* the target for the reason the plan's own arithmetic predicts:
+  the ~660 figure was server-derived, and the in-process path removes the
+  wire (~23% at 16 connections per the plan; here the 1-writer gap is
+  660→830, ~25%). Runs 2-3 (visibly busier host) landed 653-665 / 428-457 /
+  271-297 — the same shape with the whole scale shifted by machine drift,
+  which is exactly what the shuffled schedule is there to expose. Checks
+  passed; nothing needed stopping for.
+
+**Decision tree, branch taken: branch 2, with branch 1's antecedent true.**
+Gather-wait *does* dominate non-fsync time and *does* grow with writer count
+(0 → ~300 → ~890 µs) — the branch-1 trigger fires literally. But the
+instrumentation resolves what the gather *is*: at 16 writers the reservation
+gate is 88-90% busy, 96-97% of gate holds are acquired while a barrier is in
+flight, and the mean hold inflates ~10x over solo (79 → 775 µs). The gather
+spin is the leader waiting for that serialized, barrier-slowed gate queue to
+drain — the exit condition requires `normal_inflight == 0`. The system's
+throughput ceiling is the gate, not the barrier: 1/775 µs ≈ 1290 commits/s
+bounds what any batching or pipelining schedule can push through the gate at
+these hold costs, and measured throughput (992-1237 across runs) sits just
+under it. A two-stage/pipelined group commit alone would therefore recover
+at most the gap + gather overlap (~1.6 ms of a 3.4 ms cycle) before slamming
+into the gate ceiling — worthwhile, but strictly second to making the gate
+hold cheaper (moving dirty-page/WAL writes out of the serialized section, or
+shrinking what the gate covers — InnoDB copies a small redo tail under a
+latch and writes pages outside any commit-serializing lock). **Scope the epic
+as both halves; pipelining without gate-work reduction buys ~12%.**
+
+**Single-writer verdict: the one-mechanism-two-cells reading is refuted.**
+In-process single-writer commits land at 1.21-1.53 ms against a bare barrier
+floor the same reps measure at 1.08-1.41 ms (the floor itself drifts with
+host load — see the floor-probe spread) — the library's own overhead above
+the floor is ~0.2 ms and splits into gate-hold (70-116 µs) and the
+inter-cycle gap (117-205 µs), with the gather spin structurally absent (the
+solo emptiness check fires before any yield) and gate busy at 5-6%. The
+published single-writer loss (1.51 ms vs MySQL's 1.11 ms, both server-side)
+is therefore *not* the same mechanism as the 16-writer deficit: at one
+connection the library is essentially at floor, ~0.2 ms of its non-fsync
+time is gate + inter-cycle, and MySQL's own 1.11 ms is plausibly its floor
+too. The remaining single-writer delta lives outside the library (wire +
+per-connection handler), which the brief excluded from this batch's scope;
+it is reported, not chased.
+
+**Believed but not measured, separately marked:** (a) the 10x gate-hold
+inflation is the pwrite-racing-fsync effect plus queueing on the VM's page
+cache, not CPU starvation — 18 CPUs against 16 writer threads + leader says
+the scheduler was not the constraint, but no stall-cycle profile was taken
+inside the hold; (b) the barrier's own growth with writer count (1.08 →
+1.54-1.90 ms) is plausibly the same racing-pwrite effect seen from the
+flusher's side (the floor probe measured barriers with no concurrent
+writes); (c) the first run's single 1329 commits/s outlier at 1 writer
+(fsync 654 µs, below every floor measurement) was kept in the medians and
+flagged rather than discarded.
+
+---
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness
