@@ -757,6 +757,11 @@ pub(crate) struct HashJoinTable {
     inner_key: usize,
     /// The inner table's declared width, what a `LEFT JOIN` pads with.
     width: usize,
+    /// The collating sequence the `ON`'s `=` resolved, which both the bucket
+    /// hash and the candidate comparison have to agree on. A build made under
+    /// one collation cannot answer a probe under another — the bucket layout
+    /// itself differs — so the engine's build cache keys on this too.
+    collation: Collation,
 }
 
 impl HashJoin {
@@ -776,6 +781,7 @@ impl HashJoin {
         mask: ColumnMask,
         inner_key: usize,
         width: usize,
+        collation: Collation,
         interrupt: &Interrupt,
     ) -> Result<Rc<HashJoinTable>> {
         let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -789,7 +795,7 @@ impl HashJoin {
         // the rows in scan order, so each bucket's run stays row-id ascending.
         let mut counts = alloc::vec![0usize; buckets_len];
         for row in &rows {
-            counts[(hash_value(&row[inner_key]) as usize) & mask_bits] += 1;
+            counts[(hash_value(&row[inner_key], collation) as usize) & mask_bits] += 1;
         }
         let mut offsets = Vec::with_capacity(buckets_len + 1);
         let mut running = 0usize;
@@ -806,7 +812,7 @@ impl HashJoin {
         let mut placed: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
         placed.resize_with(rows.len(), Vec::new);
         for row in rows {
-            let bucket = (hash_value(&row[inner_key]) as usize) & mask_bits;
+            let bucket = (hash_value(&row[inner_key], collation) as usize) & mask_bits;
             let slot = counts[bucket];
             placed[slot] = row;
             counts[bucket] = slot + 1;
@@ -817,6 +823,7 @@ impl HashJoin {
             mask: mask_bits,
             inner_key,
             width,
+            collation,
         }))
     }
 
@@ -834,7 +841,7 @@ impl HashJoin {
     fn prepare(&mut self, outer: &[Value]) {
         self.current = match outer.get(self.key) {
             Some(Value::Null) | None => usize::MAX,
-            Some(value) => (hash_value(value) as usize) & self.table.mask,
+            Some(value) => (hash_value(value, self.table.collation) as usize) & self.table.mask,
         };
     }
 
@@ -857,7 +864,7 @@ impl HashJoin {
         self.rows()
             .get(index)
             .and_then(|row| row.get(self.table.inner_key))
-            .is_some_and(|inner| outer != &Value::Null && outer == inner)
+            .is_some_and(|inner| keys_equal(outer, inner, self.table.collation))
     }
 
     /// The outer joined-row ordinal the key is read from. For a single join
@@ -872,7 +879,7 @@ impl HashJoin {
     pub fn prepare_key(&mut self, key: &Value) {
         self.current = match key {
             Value::Null => usize::MAX,
-            value => (hash_value(value) as usize) & self.table.mask,
+            value => (hash_value(value, self.table.collation) as usize) & self.table.mask,
         };
     }
 
@@ -881,7 +888,7 @@ impl HashJoin {
         self.rows()
             .get(index)
             .and_then(|row| row.get(self.table.inner_key))
-            .is_some_and(|inner| key != &Value::Null && key == inner)
+            .is_some_and(|inner| keys_equal(key, inner, self.table.collation))
     }
 }
 
@@ -925,14 +932,42 @@ impl HashJoinTable {
 /// [`HashJoin`] is only built for a same-class, binary-collation key, so this
 /// matches on the value's class and no two keys the `ON`'s equality compares
 /// equal can land in different buckets.
-fn hash_value(value: &Value) -> u64 {
+fn hash_value(value: &Value, collation: Collation) -> u64 {
     match value {
         Value::Integer(integer) => (*integer as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-        Value::Text(text) => fnv1a(text.as_bytes()),
+        // Hash what the collation *compares*, not the stored bytes. Under
+        // `NOCASE`, `'KEY'` and `'key'` are equal, so they have to land in one
+        // bucket or the join would miss the pair entirely — the invariant this
+        // whole structure rests on is "equal ⇒ same bucket". `Collation::fold`
+        // is the same transform the comparison uses and borrows when it is the
+        // identity, so a `BINARY` key still hashes its own bytes with no copy.
+        Value::Text(text) => fnv1a(&collation.fold(text.as_bytes())),
+        // A `BLOB` is compared byte-wise whatever collation the `ON` resolved —
+        // collations apply to text — so it hashes its bytes unfolded.
         Value::Blob(bytes) => fnv1a(bytes),
         // A `NULL`/`REAL`/`VECTOR` key never reaches here: `NULL` is handled
         // before the hash is asked, and the planner refuses those classes.
         Value::Null | Value::Real(_) | Value::Vector(_) => 0,
+    }
+}
+
+/// Whether two join keys are equal under `collation`.
+///
+/// The bucket only narrows candidates; this is what decides a pair, both for
+/// the general path and for the single-equality shortcut that skips
+/// re-evaluating the `ON`. It has to agree with `Collation::fold`'s grouping in
+/// one direction only: folding may put unequal keys in the same bucket (a
+/// collision, or two `RTRIM`-equal texts), and this rejects them. What it must
+/// never do is call two keys unequal that the `ON`'s `=` would call equal.
+fn keys_equal(outer: &Value, inner: &Value, collation: Collation) -> bool {
+    if matches!(outer, Value::Null) || matches!(inner, Value::Null) {
+        return false;
+    }
+    match (outer, inner) {
+        (Value::Text(outer), Value::Text(inner)) if !collation.is_binary() => {
+            collation.fold(outer.as_bytes()) == collation.fold(inner.as_bytes())
+        }
+        _ => outer == inner,
     }
 }
 

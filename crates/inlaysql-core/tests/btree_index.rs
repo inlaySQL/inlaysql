@@ -1971,6 +1971,13 @@ fn an_index_answers_only_the_collation_it_is_keyed_under() {
 
 /// The same rule on the join side (AHL-464): the probe is only built when the
 /// index's collation is the one the `ON` resolved.
+///
+/// Both halves carry a `LIMIT`, which is what makes the probe the plan under
+/// test at all. A join with no `LIMIT` is a full scan, and a full scan now
+/// prefers a hash join for a `NOCASE` key as well as a `BINARY` one — see
+/// [`a_nocase_hash_join_agrees_with_the_probe_and_the_scan`], which is where
+/// that plan's answers are checked. This test is about which *index* a probe
+/// will accept, so it pins the shape that probes.
 #[test]
 fn a_join_probes_only_an_index_keyed_under_the_ons_collation() {
     let (mut engine, probe) = engine();
@@ -1984,7 +1991,7 @@ fn a_join_probes_only_an_index_keyed_under_the_ons_collation() {
     probe.reset();
     rows(
         &mut engine,
-        "SELECT p.id, q.id FROM p JOIN q ON p.nc = q.nc",
+        "SELECT p.id, q.id FROM p JOIN q ON p.nc = q.nc LIMIT 100",
         &[],
     );
     assert_eq!(
@@ -1998,12 +2005,101 @@ fn a_join_probes_only_an_index_keyed_under_the_ons_collation() {
     probe.reset();
     rows(
         &mut engine,
-        "SELECT p.id, q.id FROM p JOIN q ON p.bin = q.nc",
+        "SELECT p.id, q.id FROM p JOIN q ON p.bin = q.nc LIMIT 100",
         &[],
     );
     assert!(
         probe.scans_of("q") > 0,
         "the inner side was probed with an index keyed under another collation"
+    );
+}
+
+/// The hash join's answers under a non-binary collation are the other paths'
+/// answers.
+///
+/// A hash join used to be refused for any collation but `BINARY`, because
+/// hashing the stored bytes puts `'ADA'` and `'ada'` in different buckets and
+/// the join then misses a pair its own `ON` calls equal. It is allowed now
+/// because the hash folds through the collation first, which can only
+/// *over*-group — and this is the test that the folding did not quietly change
+/// an answer, which is the standing rule for every fast path in this codebase:
+/// tie it to the slow one.
+///
+/// The three plans are pinned by shape rather than asserted from `EXPLAIN`:
+/// no index and no `LIMIT` is the hash join, a matching index with a `LIMIT` is
+/// the index probe, and no index with a `LIMIT` is the materialising nested
+/// loop. `COLLATION_SETUP` deliberately carries case variants, `NULL`s and
+/// empty strings, so all three have the same chances to disagree.
+#[test]
+fn a_nocase_hash_join_agrees_with_the_probe_and_the_scan() {
+    const JOIN: &str = "SELECT p.id, q.id FROM p JOIN q ON p.nc = q.nc ORDER BY p.id, q.id";
+
+    let (mut hashed, hash_probe) = engine();
+    let (mut probed, _) = engine();
+    let (mut scanned, _) = engine();
+    for sql in COLLATION_SETUP {
+        run(&mut hashed, sql);
+        run(&mut probed, sql);
+        run(&mut scanned, sql);
+    }
+    run(&mut probed, "CREATE INDEX q_nc ON q (nc) USING BTREE");
+
+    hash_probe.reset();
+    let by_hash = rows(&mut hashed, JOIN, &[]);
+    assert!(
+        hash_probe.scans_of("q") > 0,
+        "the hash join is supposed to build from a scan of the inner side"
+    );
+    let by_probe = rows(&mut probed, &format!("{JOIN} LIMIT 100"), &[]);
+    let by_scan = rows(&mut scanned, &format!("{JOIN} LIMIT 100"), &[]);
+
+    // Case-insensitively equal keys match across the case difference, and the
+    // pairs are exactly the ones the collation says: 'ada'/'ADA'/'ada' in `p`
+    // all meet `q`'s 'ADA', and 'Grace'/'grace' both meet 'grace'. `NULL` never
+    // matches, and `q`'s 'zoe' has no partner.
+    assert_eq!(
+        by_hash,
+        vec![
+            vec!["i:1", "i:1"],
+            vec!["i:2", "i:1"],
+            vec!["i:3", "i:2"],
+            vec!["i:4", "i:2"],
+            vec!["i:7", "i:1"],
+        ],
+        "the hash join's own answer changed"
+    );
+    assert_eq!(
+        by_hash, by_probe,
+        "the hash join and the index probe disagree"
+    );
+    assert_eq!(by_hash, by_scan, "the hash join and the scan disagree");
+}
+
+/// The same tie for `RTRIM`, the other non-binary collation, whose folding
+/// removes bytes rather than changing them.
+#[test]
+fn an_rtrim_hash_join_agrees_with_the_scan() {
+    const JOIN: &str = "SELECT a.id, b.id FROM p a JOIN p b ON a.rt = b.rt ORDER BY a.id, b.id";
+
+    let (mut hashed, _) = engine();
+    let (mut scanned, _) = engine();
+    for sql in COLLATION_SETUP {
+        run(&mut hashed, sql);
+        run(&mut scanned, sql);
+    }
+
+    let by_hash = rows(&mut hashed, JOIN, &[]);
+    let by_scan = rows(&mut scanned, &format!("{JOIN} LIMIT 100"), &[]);
+    assert_eq!(by_hash, by_scan, "the hash join and the scan disagree");
+    // 'a' and 'a  ' are the same key under RTRIM, so rows 1, 2 and 7 are one
+    // group; 'g' and 'G' are not (RTRIM does not fold case).
+    assert!(
+        by_hash.contains(&vec!["i:1".to_string(), "i:2".to_string()]),
+        "'a' and 'a  ' should be equal under RTRIM: {by_hash:?}"
+    );
+    assert!(
+        !by_hash.contains(&vec!["i:3".to_string(), "i:4".to_string()]),
+        "'g' and 'G' are not equal under RTRIM: {by_hash:?}"
     );
 }
 

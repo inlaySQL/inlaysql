@@ -494,6 +494,10 @@ struct CachedHashJoin {
     mask: ColumnMask,
     inner_key: usize,
     width: usize,
+    /// Part of the identity, not a detail: the bucket layout is built from a
+    /// collation-folded hash, so a `NOCASE` build answers a `BINARY` probe with
+    /// the wrong bucket and would silently drop pairs.
+    collation: Collation,
     table: Rc<HashJoinTable>,
 }
 
@@ -505,19 +509,29 @@ impl CachedHashJoin {
         mask: &ColumnMask,
         inner_key: usize,
         width: usize,
+        collation: Collation,
     ) -> bool {
         self.write_version == write_version
             && self.table_name == table_name
             && self.mask == *mask
             && self.inner_key == inner_key
             && self.width == width
+            && self.collation == collation
     }
 }
 
 /// One join access path chosen by the executor and `EXPLAIN` together.
 pub(crate) enum JoinStrategy {
     /// Build the inner table's hash table and probe it with `outer_key`.
-    Hash { outer_key: usize, inner_key: usize },
+    ///
+    /// `collation` is what the `ON`'s `=` resolved: it decides both the bucket
+    /// hash and the candidate comparison, and a build made under one collation
+    /// cannot answer a probe under another.
+    Hash {
+        outer_key: usize,
+        inner_key: usize,
+        collation: Collation,
+    },
     /// Probe the inner primary key or scalar B-tree index per outer row.
     Probe {
         key: usize,
@@ -5939,6 +5953,7 @@ impl Engine {
                             strategy: JoinStrategy::Hash {
                                 outer_key: key.0.outer,
                                 inner_key: key.0.inner,
+                                collation: key.0.collation,
                             },
                             cost: Some(decision),
                         };
@@ -5966,6 +5981,7 @@ impl Engine {
                     strategy: JoinStrategy::Hash {
                         outer_key: key.0.outer,
                         inner_key: key.0.inner,
+                        collation: key.0.collation,
                     },
                     cost: None,
                 };
@@ -6049,9 +6065,15 @@ impl Engine {
             JoinStrategy::Hash {
                 outer_key,
                 inner_key,
+                collation,
             } => {
-                let table =
-                    self.hash_join_table(&inner.name, inner_mask, inner_key, inner.columns.len())?;
+                let table = self.hash_join_table(
+                    &inner.name,
+                    inner_mask,
+                    inner_key,
+                    inner.columns.len(),
+                    collation,
+                )?;
                 Ok(JoinInner::Hash(HashJoin::from_table(table, outer_key)))
             }
             JoinStrategy::Probe {
@@ -6090,12 +6112,20 @@ impl Engine {
         mask: ColumnMask,
         inner_key: usize,
         width: usize,
+        collation: Collation,
     ) -> Result<Rc<HashJoinTable>> {
         let transaction_has_writes = self.in_transaction && !self.pending_changes.is_empty();
         if !transaction_has_writes {
             let cache = self.hash_join_cache.borrow();
             if let Some(cached) = cache.as_ref() {
-                if cached.matches(self.write_version, table_name, &mask, inner_key, width) {
+                if cached.matches(
+                    self.write_version,
+                    table_name,
+                    &mask,
+                    inner_key,
+                    width,
+                    collation,
+                ) {
                     return Ok(Rc::clone(&cached.table));
                 }
             }
@@ -6107,6 +6137,7 @@ impl Engine {
             mask.clone(),
             inner_key,
             width,
+            collation,
             &self.interrupt,
         )?;
         if !transaction_has_writes
@@ -6119,6 +6150,7 @@ impl Engine {
                 mask,
                 inner_key,
                 width,
+                collation,
                 table: Rc::clone(&table),
             }));
         }
@@ -7124,14 +7156,24 @@ pub(crate) struct JoinKey {
 /// The join key a hash join can build on, or `None` when none qualifies.
 ///
 /// A hash join can only be handed a key whose equality it can reproduce with a
-/// hash: the two columns have to share a declared storage class (so equal
+/// hash: the two columns have to share a declared storage class, so equal
 /// values are the same [`Value`] class and hash alike — an `INTEGER` next to a
-/// `REAL` compares as `f64` and would need normalisation the hash does not do)
-/// and the collation has to be binary (a `NOCASE` text key would fold two
-/// byte-unequal texts into one match). A hash that *over*-groups is safe because
-/// candidates still compare their keys (and residual predicates still run),
-/// but one that splits equal keys apart is wrong — which is what both
-/// conditions rule out.
+/// `REAL` compares as `f64` and would need normalisation the hash does not do.
+/// A hash that *over*-groups is safe because candidates still compare their
+/// keys (and residual predicates still run), but one that splits equal keys
+/// apart is wrong, which is what that condition rules out.
+///
+/// **A non-binary collation used to be refused here too, and is not any more.**
+/// The objection was real — hashing the stored bytes of a `NOCASE` key puts
+/// `'KEY'` and `'key'` in different buckets and the join then misses a pair the
+/// `ON` calls equal, which is the "splits equal keys apart" failure. The fix is
+/// to hash what the collation *compares* rather than what the row stores:
+/// `HashJoin` folds the key through [`Collation::fold`] for both the bucket and
+/// the candidate comparison, so equal-under-collation values group together and
+/// the grouping errs only toward over-grouping. Refusing instead cost a
+/// measured ~183x on an unindexed `TEXT COLLATE NOCASE` join (it fell all the
+/// way to `Materialise`), which is the shape a MySQL-compatible server meets by
+/// default, since MySQL's own default collation is case-insensitive.
 pub(crate) fn hash_join_key(
     from: &[FromItem],
     inner_index: usize,
@@ -7142,9 +7184,6 @@ pub(crate) fn hash_join_key(
     let mut keys = Vec::new();
     collect_join_keys(on?, offset_of, inner.columns.len(), &mut keys);
     for key in keys {
-        if key.collation != Collation::Binary {
-            continue;
-        }
         let inner_ty = inner.columns[key.inner].ty;
         if !matches!(
             inner_ty,
