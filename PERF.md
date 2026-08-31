@@ -2552,6 +2552,63 @@ flagged rather than discarded.
 
 ---
 
+### A case-insensitive join was 204x slower than a case-sensitive one (2026-09-01)
+
+Found by probing one join per key type rather than by profiling a known-slow
+shape. `hash_join_key` refused any join key whose `ON` resolved a non-binary
+collation, so `TEXT COLLATE NOCASE` had no hash path *and* — without a matching
+index — no probe path either, and fell all the way to `JoinStrategy::Materialise`,
+the replay-the-inner-side-per-outer-row plan.
+
+The refusal was for a real reason, stated in the function's own doc comment: a
+hash join's load-bearing invariant is "keys the `ON` calls equal hash to the
+same bucket", and hashing the *stored* bytes of `'ADA'` and `'ada'` puts two
+`NOCASE`-equal keys in different buckets, so the join would miss the pair. What
+the comment also says is the way out: "a hash that *over*-groups is safe because
+candidates still compare their keys". Hashing what the collation **compares**
+rather than what the row **stores** can only over-group — `Collation::fold`
+already exists for exactly this and borrows when the transform is the identity,
+so a `BINARY` key still hashes its own bytes with no copy.
+
+Both candidate paths had to fold too, not just the bucket: the general path
+re-evaluates the `ON`, but the single-equality shortcut
+(`hash_key_is_full_on`) compares keys directly and skips it, so a folded bucket
+with an unfolded comparison would have produced the exact false-negative the
+old refusal was preventing. The engine's retained hash-build cache also had to
+take the collation into its identity — the bucket layout is built from the
+folded hash, so a `NOCASE` build answering a `BINARY` probe would silently drop
+pairs.
+
+Measured, interleaved, three repetitions, 2,000 × 2,000 rows, `COUNT(*)` over
+an inner join:
+
+| Shape | Before | After | |
+| --- | ---: | ---: | --- |
+| `TEXT COLLATE NOCASE` | 96.53 ms | **473 µs** | **204x**, 3/3, non-overlapping |
+| `TEXT` binary (control) | 467 µs | 399 µs | unchanged — the control did not regress |
+
+Both sides returned the same 2,000 rows throughout. Correctness is tied down
+three ways rather than asserted: a test that runs the same `NOCASE` join
+through the hash plan, the index-probe plan and the materialising plan and
+requires all three to agree; a second one for `RTRIM`, whose folding removes
+bytes rather than changing them; and the expected pairs checked against a real
+`sqlite3` 3.54 binary, which produces the identical five pairs and the identical
+`RTRIM` grouping. The 20,000-round differential fuzzer against SQLite passes,
+including its `collated_predicates`, `collated_orderings_and_groupings`,
+`inner_joins` and `left_joins` targets.
+
+**Why this shape matters more than its size suggests.** MySQL's own default
+collation is case-insensitive, so an application pointed at `serve --mysql`
+joins on a `NOCASE` key by default — this was the plan the wire-protocol story
+hit first, and it was the worst plan the engine has.
+
+One consequence worth stating: a `NOCASE` join with a matching index used to
+probe that index and now hash-joins instead when the query is a full scan.
+That is the faster plan (the same measurement puts an indexed `NOCASE` probe at
+2.62 ms against the hash join's 473 µs), and the probe is still chosen when a
+`LIMIT` makes the shape non-full-scan. The test that pins the probe's
+index-collation rule now uses a `LIMIT` to keep testing the probe.
+
 ### The `LIMIT`-join overhead, profiled — and why the fix was reverted (2026-08-31)
 
 `BENCHMARK.md`'s two `LIMIT 10` join rows lose 2.4–3.3x to SQLite, and every
