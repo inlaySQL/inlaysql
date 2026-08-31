@@ -167,16 +167,12 @@ jobs:
       # failing the job, because the numbers above are still worth
       # publishing without it.
       #
-      # The gate is off here for the same reason it is off above, and now for
-      # the same script: `compare.sh` gained the quiet-machine gate (it shares
-      # `bench/load_gate.sh` with `run.sh`), so without this override it would
-      # fail on shared-runner baseline load exactly the way AHL-501 already
-      # caught `run.sh` doing. Same reasoning applies unchanged — this job is
-      # a gross-regression canary, and a CI result carrying the override does
-      # not become a published figure.
+      # `compare.sh` now has the quiet-machine gate too — it shares
+      # `bench/load_gate.sh` with `run.sh` — so it needs the job-level override
+      # above for the same reason AHL-501 gave `run.sh`'s: a shared runner's
+      # baseline load would fail the job on runner noise unrelated to any
+      # commit.
       - name: Compare against DuckDB, pgvector and Meilisearch
-        env:
-          BENCH_MAX_LOAD_PER_CPU: "off"
         run: |
           if docker info >/dev/null 2>&1; then
             ./bench/compare.sh

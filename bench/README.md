@@ -18,6 +18,9 @@ WRITER_LEVELS=1,128 SUITE=concurrency ./bench/run.sh
 REPEATS=5 ./bench/repeat.sh         # run.sh five times, report the median and the spread
 REPEATS=5 SUITE=retrieval ./bench/repeat.sh
 
+REPEATS=5 ./bench/repeat-compare.sh # compare.sh five times, median and spread
+COOLDOWN_SECONDS=0 ./bench/repeat-compare.sh   # no pause between repetitions
+
 # The HNSW parameter grid behind the shipped defaults. Not in `all`: it is
 # one graph build per (M, ef_construction) point and takes minutes.
 cargo run --release -p inlaysql-bench -- --suite sweep --docs 20000
@@ -27,10 +30,14 @@ cargo run --release -p inlaysql-bench -- --suite sweep --docs 20000
 bench/ann/.venv/bin/python bench/ann/run.py --dataset glove-25-angular
 ```
 
-`bench/run.sh` refuses to *start* a run when the one-minute load average is
-above `0.25` per logical CPU, because a busy host has moved the concurrency
-rows by more than the code changes being measured. For a deliberate
-under-load experiment only, override it explicitly:
+`bench/run.sh` and `bench/compare.sh` both refuse to *start* a run when the
+one-minute load average is above `0.25` per logical CPU, because a busy host
+has moved the concurrency rows by more than the code changes being measured.
+Both source the same `bench/load_gate.sh`, deliberately: two copies of a gate
+is how one of them silently stops matching the other, and the numbers on both
+sides of a published comparison have to be gated the same way or the gate is
+part of what is being compared. For a deliberate under-load experiment only,
+override it explicitly:
 
 ```sh
 BENCH_MAX_LOAD_PER_CPU=off SUITE=concurrency ./bench/run.sh
@@ -62,9 +69,18 @@ is the documented escape hatch for a deliberate under/over-load measurement.
 The raw result records the observed load (start, and now the full sampled
 range) and the threshold/override, so a later reader can tell whether a run
 passed the quiet-machine gate throughout, not just at the starting gun.
-`bench/compare.sh` has no equivalent gate at all yet — see "Server-to-server"
-below for why porting one needs a real CI run to verify first, and why this
-sampling fix is recommended for it rather than applied.
+
+`bench/compare.sh` has the same gate, with one difference that matters for
+reading its output: it samples only the *measured* phases. That script
+compiles the workspace and builds container images before it measures
+anything, and those phases saturate the machine by design; sampling across
+them would mark every run `CONTAMINATED` for work the script itself was
+doing, which is how a warning stops being read. The sampler therefore starts
+after the containers are up and built — the containerised InlaySQL image is
+now built during setup for exactly this reason, rather than at its `run` step
+between two driver phases — and stops after the last driver. `CONTAMINATED`
+on a compare result means something *else* on the machine disturbed the
+measurement.
 
 Writes a timestamped file to `bench/results/` (git-ignored) containing the
 toolchain, host and commit alongside the numbers, so a result is always
@@ -918,12 +934,19 @@ timing). **The recommended fix is methodological, not a bigger sample of the
 same method:** interleave InlaySQL, MySQL and PostgreSQL within one session
 rather than running each to completion in turn, repeat several times, on a
 quiet machine, and publish the median and the spread the same way
-`REPEATS=5 ./bench/repeat.sh` already does for `run.sh`. **`bench/compare.sh`
-has no automated quiet-machine load gate the way `bench/run.sh` does** — no
-`BENCH_MAX_LOAD_PER_CPU` check anywhere in the script — and no repeat
-wrapper either, so today's numbers, published or rerun, are a single
-sequential pass on whatever load the machine happened to be carrying, not a
-gated or repeated measurement.
+`REPEATS=5 ./bench/repeat.sh` already does for `run.sh`.
+
+**Half of that recommendation is now shipped, and half is not.** `compare.sh`
+has the quiet-machine gate (`bench/load_gate.sh`, shared with `run.sh`), and
+`REPEATS=5 ./bench/repeat-compare.sh` runs it repeatedly and reports the
+median and the spread through the same `bench/summarise.py`. What is *not*
+addressed: interleaving the engines **within** one run. `compare.sh`'s phase
+order is fixed — each engine's driver runs to completion in turn — so the
+repeat wrapper repeats whole passes rather than alternating engines, and the
+`fsync`-cost drift described above happens on a timescale that a single pass
+still straddles. The numbers on this page predate both scripts and are still
+a single ungated sequential pass; they are owed a regeneration, not a
+footnote.
 
 Both drivers prepare their statements once, outside the timed loop, and bind
 per iteration (MySQL via the connector's binary-protocol prepared cursor,

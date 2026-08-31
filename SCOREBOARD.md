@@ -55,8 +55,9 @@ two this project cannot honestly do without:
   concurrency / 7.3% point-reads-quiet / ~20% under desktop load), **and**
   the source table itself treats the gap as real rather than noise (most
   `run.sh`-sourced tables state a run-to-run range explicitly; where a
-  figure comes from `compare.sh`, which has no repeat wrapper and therefore
-  no measured floor of its own, WIN is only used when `BENCHMARK.md`'s own
+  figure comes from `compare.sh` — every such figure on this page predates
+  `bench/repeat-compare.sh` (§5 item 3) and so has no measured floor of its
+  own — WIN is only used when `BENCHMARK.md`'s own
   text says the gap is too large for that table's noise to plausibly
   produce — e.g. the 35-74x read numbers below — never on a raw multiple
   alone).
@@ -810,16 +811,26 @@ this disadvantage; every cell that stays a library call (§3.1, §3.2, §3.6,
    @4/16); PostgreSQL's stays UNKNOWN — no InlaySQL server exists to measure
    it against (§3.4).
 3. **(Cheap, methodology) Give `bench/compare.sh` a repeat wrapper and load
-   gate**, the way `bench/run.sh`/`bench/repeat.sh` already have. Still not
-   done generally — this session's own repeated concurrency measurement was
-   driven by hand (a manual `uptime` check and a loop over
-   `server_driver.py` invocations, matching the interleaved OLTP rerun's own
-   precedent), not by a wrapper `compare.sh` itself gained. Recorded in both
-   `PERF.md` and `bench/README.md` already, pending someone watching a CI run
-   confirm it doesn't interact badly with `trust.yml`'s shared-runner
-   tolerances. Without it, §3.8's vector-search UNKNOWN cell (and any future
-   `compare.sh`-sourced cell) cannot become a WIN/LOSS no matter how the raw
-   numbers look — there is no floor to check them against.
+   gate**, the way `bench/run.sh`/`bench/repeat.sh` already have. **Built,
+   2026-08-31** — `bench/load_gate.sh` is now a module both `run.sh` and
+   `compare.sh` source (one gate, not two copies that drift), and
+   `REPEATS=5 ./bench/repeat-compare.sh` repeats `compare.sh` and reports the
+   median and spread through the same `bench/summarise.py`. `compare.sh`
+   samples only its measured phases, not its own container builds, so
+   `CONTAMINATED` on a compare result means something else on the machine
+   disturbed the run.
+
+   **This does not by itself upgrade a single cell below.** Every
+   `compare.sh`-sourced figure on this page was taken before the tooling
+   existed, as one ungated sequential pass; the instrument now exists and the
+   measurement is still owed. §3.8's vector-search cell and every other
+   `compare.sh`-sourced UNKNOWN stays UNKNOWN until a repeated, gated run
+   supplies the floor to check it against. Two further gaps the wrapper does
+   *not* close, stated so nobody reads more into it: it repeats whole passes
+   rather than interleaving the engines within one pass (`compare.sh`'s phase
+   order is fixed), and nobody has yet watched a CI run confirm the gate does
+   not interact badly with `trust.yml`'s shared-runner tolerances — the
+   original reason this item was recorded rather than done.
 4. **(Medium, new harness) Indexed range scan and two-table join against
    MySQL/PostgreSQL.** Needs a second table in the OLTP schema (or a
    parallel schema) with a secondary index and a joinable foreign key,
