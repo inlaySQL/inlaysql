@@ -38,7 +38,17 @@ current execution order without relying on local conversation history.
 
 ## Next work, in order
 
-1. Run clean, guarded benchmark repeats when the host is quiet:
+1. ~~Run clean, guarded benchmark repeats when the host is quiet~~ — **owed,
+   re-deferred 2026-08-31 with a date: retry on or before 2026-09-07, in the
+   next quiet window.** Three attempts this date, all refused by the quiet
+   machine gate (1-minute load 4-10/18, desktop in active use). A
+   `BENCH_MAX_LOAD_PER_CPU=off` same-sitting variant of both commands *was*
+   run the same day as disclosed under-load data for the new
+   MySQL/PostgreSQL join/range cells (`BENCHMARK.md` "Read shapes and batch
+   insert against MySQL and PostgreSQL", `SCOREBOARD.md` §4.0) — but those
+   are **not** the clean back-tests this item owes and do not close it. The
+   pass criteria are unchanged: clean gate, three runs, spread within the
+   suite's floor.
 
    ```sh
    REPEATS=3 SUITE=joins ROWS=20000 QUERIES=100 LIMIT=20 ./bench/repeat.sh
@@ -48,6 +58,13 @@ current execution order without relying on local conversation history.
    Keep the raw files in `bench/results/`; do not publish a row if the quiet
    machine gate refuses or the repeat spread is too wide. `BENCH_MAX_LOAD_PER_CPU=off`
    is for explicitly labelled diagnostics only.
+
+   Side effect worth knowing before the retry: this session fixed a
+   `bench/run.sh` bug where any `BENCH_MAX_LOAD_PER_CPU=off` run exited 1
+   *after* publishing its results (an `[[ ]] &&` compound in the EXIT trap's
+   cleanup returning 1 under `set -e`), so pre-fix override runs in
+   `bench/results/` may show a spurious failure in their caller's log while
+   the result files themselves are complete.
 
 2. Compare the post-`ANALYZE` join result and `EXPLAIN` paths with SQLite. If
    the clean data confirms the access-path constants, record the result in

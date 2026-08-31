@@ -68,7 +68,13 @@ cleanup_sampler() {
     kill "$SAMPLER_PID" >/dev/null 2>&1 || true
     wait "$SAMPLER_PID" 2>/dev/null || true
   fi
-  [[ -n "$LOAD_SAMPLES" ]] && rm -f "$LOAD_SAMPLES"
+  # An `if`, not a `[[ ]] &&` compound: with `set -e` a failing EXIT trap
+  # replaces the script's own exit status, and this function runs on every
+  # `BENCH_MAX_LOAD_PER_CPU=off` run where `$LOAD_SAMPLES` is legitimately
+  # empty — every such run was exiting 1 after publishing its results.
+  if [[ -n "$LOAD_SAMPLES" ]]; then
+    rm -f "$LOAD_SAMPLES"
+  fi
 }
 trap cleanup_sampler EXIT
 
