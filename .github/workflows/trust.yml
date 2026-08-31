@@ -141,7 +141,20 @@ jobs:
 
       # The same script a reader runs locally. If this job and a laptop
       # disagree, the script is the thing both of them ran.
+      #
+      # The quiet-machine gate is off here, deliberately: a GitHub-hosted
+      # runner is a shared machine whose *baseline* load hovers at
+      # 0.25-0.35/CPU, so the 0.25 gate is a coin flip that fails the job on
+      # runner noise unrelated to any commit (seen 2026-08-31, runs
+      # 33330438181 and 33382170933: "machine load 1.24/4 exceeds
+      # BENCH_MAX_LOAD_PER_CPU=0.25", twice in a row, between two green
+      # runs). run.sh records the override in the result file's `load:` line
+      # either way, and this job is a gross-regression canary — the numbers
+      # BENCHMARK.md publishes come from local, gated runs, so a CI result
+      # carrying the override does not become a published figure.
       - name: Run the benchmark suites
+        env:
+          BENCH_MAX_LOAD_PER_CPU: "off"
         run: ./bench/run.sh
 
       # DuckDB, pgvector and Meilisearch need containers, so this is
