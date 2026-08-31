@@ -107,22 +107,31 @@ configuration changed.
 | Workload | SQLite | MySQL 8 | PostgreSQL 17 |
 | --- | --- | --- | --- |
 | Point read by PK | WIN ~2-4x vs durable config; LOSS ~2x vs WAL/NORMAL | WIN ~74x (structural, §3.1) | WIN ~35x (structural, §3.1) |
-| Indexed range scan | LOSS ~2x (durable) / ~2.9x (WAL) | UNKNOWN — no harness | UNKNOWN — no harness |
+| Indexed range scan | LOSS ~2x (durable) / ~2.9x (WAL) | WIN ~3.7x (§3.2) | WIN ~2.3x (§3.2) |
 | Single-row insert (durable) | WIN ~2.7x | LOSS ~1.4-1.8x (containerised; not floor-bound, §3.3) | LOSS ~1.4-1.8x (containerised; not floor-bound, §3.3) |
-| Batch insert | UNKNOWN — no SQLite-batched comparison published | UNKNOWN — no harness | UNKNOWN — no harness |
+| Batch insert | UNKNOWN — no SQLite-batched comparison published | LOSS ~1.6x (§3.4) | LOSS ~3.1x (§3.4) |
 | Concurrent commits, 4/8/16 writers | WIN ~10-17x across 4/8/16 | LOSS @1,4,16 (~1.4-2.4x/~1.1-3.0x/~3.1-5.4x, widening with concurrency, 5 interleaved reps); LOSS @8 not reconfirmed (old single run, pre-tuning-fix, ~0.41x) | UNKNOWN — no server exists (§3.4) |
-| Two-table join | MIXED: WIN one shape (~5-9x), LOSS three shapes (~1.1-3.5x) | UNKNOWN — no harness | UNKNOWN — no harness |
-| Aggregate / `GROUP BY` | UNKNOWN — no harness | UNKNOWN — no harness | UNKNOWN — no harness |
+| Two-table join | MIXED: WIN one shape (~5-9x), LOSS three shapes (~1.1-3.5x) | MIXED: TIE one shape (~1.2x), WIN three (~2.8-3.6x) (§3.6) | MIXED: LOSS one shape (~1.24x), WIN three (~1.9-2.2x) (§3.6) |
+| Aggregate / `GROUP BY` | UNKNOWN — no harness | LOSS ~3.4x group / ~5.2x scalar (§3.7) | LOSS ~5.1x group / ~6.0x scalar (§3.7) |
 | Vector search, exact | N/A (stock) / WIN ~8-10x vs `sqlite-vec` ext., iso-recall | N/A — no vector capability | UNKNOWN — not floor-qualified (single run, §3.6) |
 | Vector search, int8 | UNKNOWN — no cross-engine harness | N/A — no vector capability | UNKNOWN — no cross-engine harness |
 | p99 commit latency | LOSS ~7-9x at high writer counts | TIE @1 (mixed sign, 4/5 reps); LOSS @4,16 (~1.5-4.5x/~2.4-8.9x, widening, 5 interleaved reps) | UNKNOWN — no server exists (§3.4) |
 
 Fourteen UNKNOWN or N/A-for-missing-harness cells out of thirty when this
-document was first written; two full cells and one partial one moved off
-that count this session (2026-08-31), once real, repeated MySQL data existed
-for 4 and 16 connections and for p99 commit latency — real numbers, not all
-of them wins, replacing "nobody has run this" where the comparison was
-actually possible to run. That ratio is still the honest state of "beat
+document was first written; two full cells and one partial one moved off that
+count on 2026-08-31 (morning), once real, repeated MySQL data existed for 4
+and 16 connections and for p99 commit latency — real numbers, not all of them
+wins, replacing "nobody has run this" where the comparison was actually
+possible to run — and **eight more cells moved the same day (afternoon)**,
+when the read-shape and batch-insert harnesses (`bench/external/read_driver.py`,
+`bench/external/batch_driver.py`, `inlaysql-bench --bin sql_shapes`) filled
+the MySQL/PostgreSQL cells for indexed range scan, two-table join, aggregate
+and batch insert (§3.2, §3.4, §3.6, §3.7). Six UNKNOWN cells remain: the two
+SQLite cells that still have no harness (aggregate, batched insert), the two
+int8 vector cells (explicitly out of scope until the commit path and this
+red-cell survey were done), the exact-vector PostgreSQL cell (still not
+floor-qualified), and the two PostgreSQL cells that require a PG wire server
+that does not exist. That ratio is still the honest state of "beat
 SQLite, MySQL and PostgreSQL across the board" today: the SQLite column is
 mostly filled in (and mixed, not a sweep), and the MySQL/PostgreSQL columns
 are still mostly empty outside points and the concurrency row.
@@ -164,10 +173,22 @@ Both essentially unchanged across editions and consistent in sign across all
 three runs behind the median (9-21% individual spread), so read as real
 losses, not noise. Durability: same as 3.1, read-only.
 
-**MySQL / PostgreSQL**: **UNKNOWN.** The OLTP driver's schema is a bare `kv`
-table (`id`, `body`), no secondary index, no range predicate —
-`mysql_driver.py` and `postgres_oltp_driver.py` only exercise point read/point
-write by primary key. There is no harness that could produce this cell today.
+**MySQL / PostgreSQL** (2026-08-31, `bench/external/read_driver.py`, unix
+socket, 5 shuffled reps — see §4.1's disclosure about this sitting's
+desktop load): the harness rebuilds `SUITE=indexed`'s shape — `users (id,
+email, body)` at 100,000 rows, index built after the rows, 100
+`WHERE email >= ? AND email < ?` queries returning exactly 50 rows, key
+sequence generated with the same seeded xorshift64* the Rust harness uses.
+InlaySQL 49,259 ops/s (same-sitting median of 3, gate-off; the published
+clean median is 64,250) vs MySQL 13,124 ops/s (11,359-13,360, p50 69 µs)
+and PostgreSQL 21,455 ops/s (8,479-23,347, p50 40 µs). **WIN ~3.7x vs
+MySQL, WIN ~2.3x vs PostgreSQL** — both outside the sitting's 20% floor by
+a wide margin, and both would stay WINs even if InlaySQL's own number fell
+to its published-clean self under load (`64,250/13,124 = 4.9x`,
+`64,250/21,455 = 3.0x`). Durability: read-only after setup; MySQL
+`innodb_flush_log_at_trx_commit=1`, PG `synchronous_commit=on`, both
+servers on their named volumes, reached over unix sockets; InlaySQL
+in-process.
 
 ### 3.3 Single-row insert (durable)
 
@@ -220,15 +241,12 @@ volume of the same `local` driver class.
 
 ### 3.4 Batch insert
 
-**All three: UNKNOWN.** `BENCHMARK.md`'s "Durable writes" section quotes
-"~240x" for InlaySQL's batched-vs-unbatched write rate (58,320 ops/s batched
-against 240 ops/s single-row) — **that multiple is InlaySQL against itself,
-not against SQLite.** No SQLite-batched-transaction number is published
-anywhere in the current tables, and no batched/multi-row-insert comparison
-exists against MySQL or PostgreSQL either (`bench/README.md`'s "Scope" note
-explicitly excludes the `points` suite's batched-write row from the
-MySQL/PostgreSQL comparison — "there is no natural equivalent on
-MySQL/PostgreSQL without picking an arbitrary batch size for them too").
+**SQLite: UNKNOWN** — unchanged. `BENCHMARK.md`'s "Durable writes" section
+quotes "~240x" for InlaySQL's batched-vs-unbatched write rate (58,320 ops/s
+batched against 240 ops/s single-row) — **that multiple is InlaySQL against
+itself, not against SQLite.** No SQLite-batched-transaction number is
+published anywhere in the current tables. (The 2026-08-31 afternoon
+harnesses cover MySQL and PostgreSQL only; the brief scoped them that way.)
 **Flagged as a documentation risk, not just a missing measurement**: the
 "~240x" figure sits in a paragraph immediately after several real "vs
 SQLite" ratios, with no explicit "against our own single-row rate" qualifier
@@ -236,6 +254,36 @@ in `README.md`'s prose — a reader skimming could misattribute it as a
 competitive multiple. It isn't one. Recommend the prose in `README.md` and
 `BENCHMARK.md` state the comparison basis explicitly wherever this figure is
 quoted.
+
+**MySQL / PostgreSQL** (2026-08-31, `bench/external/batch_driver.py` vs
+`inlaysql-bench --bin sql_shapes --mode batch`, unix socket, 5 reps, all in
+the same container environment and volume class — see §4.1's disclosure
+about this sitting's desktop load): 100 rows per multi-row INSERT
+statement, autocommitted, 100 statements per rep (10,000 rows per rep),
+explicit ids. Durability aligned: MySQL `innodb_flush_log_at_trx_commit=1`,
+PG `synchronous_commit=on`, InlaySQL `Durability::Full` — one commit, one
+barrier per statement on every engine.
+
+| Engine | rows/s (median, range) | commits/s | c/fsync |
+| --- | --- | --- | --- |
+| InlaySQL | 26,254 (19,111-43,851) | 263 | 1.00 |
+| MySQL 8 | 42,933 (39,543-44,379) | 429 | 0.64 |
+| PostgreSQL 17 | 81,229 (73,881-91,918) | 812 | 1.00 |
+
+**LOSS ~1.6x vs MySQL, LOSS ~3.1x vs PostgreSQL.** InlaySQL's rows/s range
+is wide (1.8x min-to-max) because the host was under desktop load through
+this sitting; even the best rep (43,851) does not reach MySQL's *worst*
+(39,543)+margin, and the c/fsync column — the noise-resistant metric on
+this machine — is stable everywhere: InlaySQL and PostgreSQL at exactly
+1.00 (one commit, one barrier, no batching possible for a single writer),
+MySQL at 0.64 (InnoDB's log layer flushed ~1.5x per commit at this batch
+size, its background flush accounted). commits/s order the same way:
+263 / 429 / 812. A single-writer batch-insert cell cannot be FLOOR-BOUND
+in the concurrent sense, but note the barrier-rate connection to PERF.md
+Task 3: InlaySQL's ~263 commits/s at c/fsync 1.00 is the same ~1.2-1.5 ms
+commit cycle the single-writer segment analysis measured, so this cell's
+deficit is the same mechanism §3.3 names, priced per row instead of per
+commit.
 
 ### 3.5 Concurrent commits at 4/8/16 writers
 
@@ -435,15 +483,73 @@ every combination of the three runs' own spread (10-38%), which is why
 Durability: read-only; both engines built under `journal` + `sync=FULL` +
 `fullfsync`.
 
-**MySQL / PostgreSQL: UNKNOWN.** No join benchmark exists against either
-server — the OLTP drivers' schema is a single `kv` table with no second
-table to join against.
+**MySQL / PostgreSQL** (2026-08-31, `bench/external/read_driver.py`, unix
+socket, 5 shuffled reps — §4.1's desktop-load disclosure applies): the
+harness rebuilds `SUITE=joins`' exact shape — 20,000 users × 8 posts per
+user round-robin (160,000 posts), index on `posts.user_id` built after the
+rows, ANALYZE, all four AHL-464 shapes at `LIMIT 20`, 100 executions per
+rep. Per the pre-fixed join rule, **both FROM orders are reported,
+worst-first**, and the p50 medians are compared:
+
+| Shape | InlaySQL p50 | MySQL 8 p50 | PostgreSQL 17 p50 |
+| --- | --- | --- | --- |
+| PK inner, full join | 13.04 ms | 15.00 ms | **10.49 ms** |
+| Secondary-index inner, full join | 4.77 ms | 15.01 ms | 10.49 ms |
+| PK inner, LIMIT 20 | 14.08 µs | 39.7 µs | 27 µs |
+| Secondary-index inner, LIMIT 20 | 13.38 µs | 48 µs | 29 µs |
+
+Worst-first per opponent: **vs MySQL — TIE** on the PK-inner full join
+(1.15x, inside the sitting's 20% floor), **WIN** the other three shapes
+(2.8-3.6x). **vs PostgreSQL — LOSS ~1.24x** on the PK-inner full join (just
+outside the 20% floor; marked red — this is the shape where PG's planner
+picked the better order), **WIN** the other three (1.9-2.2x). Both
+opponents run both full-join shapes in ~15.0/~10.5 ms regardless of FROM
+order — their planners hash-join either direction, so the iteration-side
+asymmetry that splits InlaySQL's two shapes ~7.9x does not exist for them;
+InlaySQL's index nested-loop join wins the secondary-inner shape big and
+pays for its PK-inner shape against PG. The brief's expected-result rule
+("if PG's planner beats us on multi-join, record it, mark the cell red and
+scope planner epic yes/no as a decision for the human") applies: the PK
+inner full join is that red cell, and the planner-epic decision is left to
+the human.
+
+Methodology note, disclosed: the full-join shapes are timed as
+server-side `SELECT COUNT(*) FROM (<join>) q` wrappers, because a Python
+client fetching 160,000 rows per execution measures mysql-connector's
+per-row cost (the drivers container sat at 100% CPU with the server idle
+before this change), not the engine's join, while the InlaySQL side streams
+rows through a near-zero-cost callback. The wrapper still produces and
+discards every joined row server-side; the LIMIT/50-row/aggregates shapes
+transfer their rows directly. The asymmetry favours InlaySQL — its own
+published number *includes* row streaming — so a LOSS recorded here is
+conservative.
 
 ### 3.7 Aggregate / `GROUP BY`
 
-**All three: UNKNOWN.** No `GROUP BY`/aggregate suite exists anywhere in
-this repo's benchmark harness, against SQLite or the servers. This is a
-complete gap, not a partial one — see §5.
+**SQLite: UNKNOWN** — no aggregate suite exists against SQLite; unchanged
+this session.
+
+**MySQL / PostgreSQL** (2026-08-31, `bench/external/read_driver.py` vs
+`inlaysql-bench --bin sql_shapes --mode agg`, unix socket, 5 shuffled reps
+— §4.1's desktop-load disclosure applies; this shape is defined *here*, no
+Rust suite exists for either side): over `indexed`'s 100,000-row table with
+a 100-bucket column added, two statements, 100 executions per rep.
+
+| Shape | InlaySQL | MySQL 8 | PostgreSQL 17 |
+| --- | --- | --- | --- |
+| `GROUP BY n` (100 groups) | 29/s (26-31) | 98/s (96-104) | 147/s (143-148) |
+| scalar (`COUNT/MIN/MAX`) | 53/s (49-57) | 275/s (245-284) | 317/s (299-328) |
+
+**LOSS across the board: ~3.4x group / ~5.2x scalar vs MySQL, ~5.1x group
+/ ~6.0x scalar vs PostgreSQL** — far outside any floor, consistent in sign
+across every rep. These are engine-side aggregation costs (rows/s of a
+statement that reads 100k rows), and both opponents stream the 1-100 result
+rows over a socket; InlaySQL is in-process. No transport asymmetry can
+explain a 3-6x gap: the engine's grouping pipeline is simply not
+competitive at this shape. Recorded red, and the same planner-epic
+yes/no decision §3.6 leaves to the human should name aggregation
+explicitly — this cell is the single largest multiple against InlaySQL in
+the matrix outside points.
 
 ### 3.8 Vector search, exact
 
@@ -537,6 +643,29 @@ put a `psycopg` client against (§3.4).
 ---
 
 ## 4. Fairness audit
+
+### 4.0 The 2026-08-31 afternoon sitting — desktop load, disclosed and floor-applied
+
+Every cell §3.2, §3.4, §3.6 and §3.7 filled that afternoon was measured with
+`BENCH_MAX_LOAD_PER_CPU=off` — the host was a desktop in active use, 1-minute
+load 4-10 of 18 CPUs for the whole sitting, and the quiet-machine gate
+(§`PERF.md` §4) refused every attempt to run it clean. This is disclosed
+rather than hidden, and handled the way the floor table already handles it:
+**PERF.md §4's desktop-load A/A floor (20.2% CoV) is the floor applied to
+every verdict in those cells**, not the quiet-machine one. Three implications,
+each applied where it mattered:
+
+- No verdict in those cells may be called a WIN inside 20%. The PK-inner
+  full-join TIE vs MySQL (1.15x) is that rule firing.
+- Both sides of each cell were measured in the same sitting, so the load is
+  a common-mode penalty, not a differential one — except where a side's own
+  range shows it hurt more (InlaySQL's batch-insert range is 1.8x wide; its
+  best rep still does not beat MySQL's median, and the c/fsync column is
+  unaffected either way).
+- The clean back-tests these cells would ideally cite (`docs/PLAN.md`'s
+  `REPEATS=3` guarded repeats) remain owed; re-deferred with a date there.
+  Every raw file this sitting produced is in `bench/results/`
+  (`20260831T06*-repeat.txt`, `20260831T06*.txt`).
 
 ### 4.1 Durability alignment — no mismatched barrier found
 
@@ -699,15 +828,26 @@ this disadvantage; every cell that stays a library call (§3.1, §3.2, §3.6,
    tuning before the numbers mean anything. This closes four UNKNOWN cells
    (§3.2, §3.6 x2 columns) at once.
 5. **(Medium, new harness) `GROUP BY`/aggregate suite, all three engines.**
-   Does not exist against anyone today, InlaySQL-vs-SQLite included. Needs
-   a workload design first (row count, cardinality, aggregate shape) before
-   any engine gets measured — this is the one row in the matrix with zero
-   existing infrastructure to extend.
-6. **(Medium, new harness) Batch insert against MySQL/PostgreSQL.**
-   `bench/README.md` already scoped why this needs a deliberate choice
-   (an arbitrary batch size for the servers) rather than reusing the
-   `points` suite's InlaySQL-only batched row — the design decision, not the
-   implementation, is the work here.
+   ~~Does not exist against anyone today~~ — **MySQL and PostgreSQL cells
+   filled 2026-08-31** (§3.7, both LOSS by 3.4-6.0x; the shape is defined in
+   `bench/external/read_driver.py` and measured InlaySQL-side through
+   `inlaysql-bench --bin sql_shapes --mode agg`). **The SQLite cell is the
+   remaining half of this item**: extend `read_driver.py` or add an
+   aggregate suite to `inlaysql-bench` so the row reads "vs SQLite" too.
+   The workload design decision (row count, cardinality, aggregate shape)
+   this item asked for was made on 2026-08-31 — 100k rows, a 100-bucket
+   `n` column, `GROUP BY n` plus a whole-table scalar aggregate — and is
+   now pinned by the published cells above; keep it if the SQLite leg is
+   added.
+6. ~~**(Medium, new harness) Batch insert against MySQL/PostgreSQL.**~~
+   **Done 2026-08-31** (§3.4): `bench/external/batch_driver.py` vs
+   `inlaysql-bench --bin sql_shapes --mode batch`, 100 rows per statement,
+   c/fsync bracketed per rep — LOSS ~1.6x / ~3.1x. The deliberate design
+   choice this item asked for was made and is pinned by the published cell:
+   100 rows/statement because a single InlaySQL commit's WAL record must fit
+   its region format at any batch size, and 100 keeps every engine's commit
+   count (and therefore the c/fsync metric) comparable at 1.00.
+   The SQLite leg was not in scope and remains UNKNOWN.
 7. **(Larger, new capability) Repeated, quiet-machine, transport-matched
    rerun of the single-row-insert comparison** (§3.3's "what is owed" item,
    already scoped in `PERF.md`/`BENCHMARK.md` but not executed at more than

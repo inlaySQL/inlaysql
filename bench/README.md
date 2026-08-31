@@ -1081,6 +1081,43 @@ The first such run (AHL-495) read 1.52x and 1.10x on reads under a load average
 of 5.4; neither run had a controlled machine, and the read margin is inside the
 spread between them. Run `./bench/compare.sh` yourself to reproduce it.
 
+## Read shapes and batch insert: MySQL and PostgreSQL, unix socket (2026-08-31)
+
+```sh
+docker compose -f bench/external/compose.yml up -d postgres mysql drivers
+docker exec inlaysql-bench-drivers-1 \
+  sh -c 'TARGET=mysql REPS=5 python /drivers/read_driver.py'     # range + aggregate + join
+docker exec inlaysql-bench-drivers-1 \
+  sh -c 'TARGET=postgres REPS=5 python /drivers/batch_driver.py' # batch insert + c/fsync
+cargo run --release -p inlaysql-bench --bin sql_shapes           # InlaySQL's side (agg|batch)
+```
+
+`read_driver.py` and `batch_driver.py` fill the MySQL/PostgreSQL scoreboard
+cells for indexed range scan, two-table join, aggregate and batch insert —
+the workloads whose InlaySQL numbers came from `SUITE=indexed`/`SUITE=joins`
+(range, join) and from `sql_shapes` (aggregate, batch: the two shapes that
+had no Rust suite on *any* side, so the shape is defined by these drivers and
+pinned by the published cells). Transport is a shared unix-socket volume
+(`db-sockets` in `compose.yml`) mounted into `mysql`, `postgres` and
+`drivers` — matched transport for both servers, per the scoreboard's
+cell-filling rules.
+
+Method, pre-fixed: REPS repetitions (default 5) with the full `(shape, rep)`
+schedule Fisher-Yates-shuffled from a fixed seed; medians and ranges
+published, never a single run; row counts asserted before anything is timed
+(a shape returning the wrong row count refuses to time rather than timing a
+wrong answer); durability aligned (`innodb_flush_log_at_trx_commit=1`,
+`synchronous_commit=on`, InlaySQL `Durability::Full`). InlaySQL is
+in-process while the servers sit behind a socket — the asymmetry favours
+InlaySQL, so its losses here are conservative. The full-join shapes are
+timed as server-side `COUNT(*)` wrappers because a Python client fetching
+160,000 rows per execution measures mysql-connector's per-row cost, not the
+engine; see `BENCHMARK.md` for the full disclosure.
+
+`sql_shapes` deliberately duplicates none of `indexed`/`joins`' shapes —
+those cells' InlaySQL numbers come from the Rust suites, and this binary
+exists only for aggregate and batch insert so the two sides cannot drift.
+
 ## ann-benchmarks — an external corpus, an external ground truth, an external protocol
 
 Everything above this line is ours. Our harness, our corpus, our oracle, our

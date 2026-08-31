@@ -74,6 +74,11 @@ services:
       retries: 30
     volumes:
       - postgres-oltp-data:/var/lib/postgresql/data
+      # Unix-socket transport for the read-shape and batch-insert harnesses
+      # (`read_driver.py`, `batch_driver.py`): one shared socket volume is
+      # the matched-transport requirement from the scoreboard's
+      # cell-filling rules, applied to both engines instead of one on TCP.
+      - db-sockets:/var/run/postgresql
 
   # MySQL 8, for the other half of the OLTP comparison. Pinned to the major
   # version rather than `latest`, for the same reason as pgvector above: a
@@ -115,6 +120,8 @@ services:
       retries: 60
     volumes:
       - mysql-oltp-data:/var/lib/mysql
+      # The shared unix-socket volume — see the `postgres` service above.
+      - db-sockets:/var/run/mysqld
 
   # InlaySQL, served over its own MySQL wire protocol (`inlaysql serve
   # --mysql`) — the server-to-server row (AHL-489, docs/architecture.md Phase 5.2). Every
@@ -180,6 +187,9 @@ services:
       context: .
     volumes:
       - ${CORPUS_DIR:-../../target/bench-corpus}:/corpus
+      # The engines' unix sockets, mounted from the `mysql` and `postgres`
+      # services above.
+      - db-sockets:/sockets
     environment:
       PG_DSN: postgresql://postgres:postgres@pgvector:5432/postgres
       PG_OLTP_DSN: postgresql://postgres:postgres@postgres:5432/bench
@@ -263,6 +273,11 @@ volumes:
   # filesystem to mean anything.
   postgres-oltp-data:
   mysql-oltp-data:
+  # The unix-socket directory shared by `postgres`, `mysql` and `drivers`:
+  # the matched transport the read-shape/batch harnesses run over. Socket
+  # files vanish with the container, so this volume holds no state worth
+  # keeping and `docker compose down -v` may delete it freely.
+  db-sockets:
   # Where the containerised InlaySQL run's database file lives — the volume
   # `inlaysql-oltp` above fsyncs to, on the same footing as the two above.
   inlaysql-oltp-data:

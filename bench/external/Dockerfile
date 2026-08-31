@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir \
 
 WORKDIR /drivers
 COPY common.py duckdb_driver.py pgvector_driver.py postgres_oltp_driver.py mysql_driver.py \
-     server_driver.py meilisearch_driver.py report.py ./
+     server_driver.py meilisearch_driver.py report.py read_driver.py batch_driver.py ./
 
 # The corpus is mounted, never baked in: the image is the environment and the
 # corpus is the experiment.

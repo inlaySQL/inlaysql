@@ -1328,6 +1328,119 @@ convention as above.
 
 ---
 
+## Read shapes and batch insert against MySQL and PostgreSQL (2026-08-31 afternoon)
+
+Four workloads that previously had **no harness on either side** — indexed
+range scan, two-table join, aggregate/`GROUP BY`, batch insert — measured in
+one sitting against both servers, filling the eight UNKNOWN MySQL/PostgreSQL
+cells `SCOREBOARD.md` carried since it was written. Harnesses (new):
+`bench/external/read_driver.py` (range/aggregate/join, `TARGET=mysql|postgres`),
+`bench/external/batch_driver.py` (batch insert with commits-per-fsync
+bracketing), `inlaysql-bench --bin sql_shapes` (InlaySQL's side for the two
+shapes with no Rust suite); `compose.yml` gained one shared unix-socket
+volume so both engines are reached over the same transport.
+
+**Disclosure, read before the tables: this sitting ran under desktop load.**
+The quiet-machine gate refused every clean attempt (1-minute load 4-10 of 18
+CPUs throughout — the host was in active desktop use), so
+`BENCH_MAX_LOAD_PER_CPU=off` was used deliberately, both sides of every cell
+were measured in the same sitting, and `SCOREBOARD.md` §4.0 applies PERF.md's
+**20.2% desktop-load A/A floor** (not the quiet one) to every verdict. Medians
+of 5 repetitions, `(shape, rep)` schedule Fisher-Yates-shuffled with a fixed
+seed so no shape was systematically first; raw files in `bench/results/`
+(`20260831T06*-repeat.txt` and the `read-*`/`batch-*` outputs quoted below).
+InlaySQL runs in-process; MySQL/PostgreSQL run over unix sockets — an
+asymmetry that favours InlaySQL, so every LOSS recorded here is conservative.
+
+### Indexed range scan — WIN both
+
+`SUITE=indexed`'s shape: `users (id, email, body)`, 100,000 rows, index built
+after the rows, 100 range queries of exactly 50 rows each, the key sequence
+generated with the same seeded xorshift64* the Rust suite uses.
+
+| Engine | ops/s (median, range) | p50 (median) |
+| --- | --- | --- |
+| **InlaySQL** | 49,259 (same-sitting median of 3; published clean median 64,250) | 19.42 µs |
+| PostgreSQL 17 | 21,455 (8,479-23,347) | 40 µs |
+| MySQL 8 | 13,124 (11,359-13,360) | 69 µs |
+
+InlaySQL is ~3.7x MySQL and ~2.3x PostgreSQL on the same-sitting numbers and
+*more* ahead (4.9x/3.0x) on its own published clean median. The published
+loss against SQLite's WAL configuration (~2.9x) stands unchanged — the range
+scan is a shape InlaySQL wins against the servers and loses to SQLite.
+
+### Two-table join — worst-first: vs MySQL TIE/WIN/WIN/WIN, vs PG LOSS/WIN/WIN/WIN
+
+`SUITE=joins`' exact shape at `LIMIT 20`: 20,000 users × 8 round-robin posts,
+index on `posts.user_id` built after the rows, ANALYZE, 100 executions per
+rep, p50 medians compared, both FROM orders reported worst-first per
+`SCOREBOARD.md`'s pre-fixed join rule.
+
+| Shape | InlaySQL p50 | MySQL 8 p50 | PostgreSQL 17 p50 |
+| --- | --- | --- | --- |
+| PK inner, full join | 13.04 ms | 15.00 ms | **10.49 ms** |
+| Secondary-index inner, full join | 4.77 ms | 15.01 ms | 10.49 ms |
+| PK inner, LIMIT 20 | 14.08 µs | 39.7 µs | 27 µs |
+| Secondary-index inner, LIMIT 20 | 13.38 µs | 48 µs | 29 µs |
+
+Both servers hash-join either FROM order in ~15.0/~10.5 ms — the
+iteration-side asymmetry that splits InlaySQL's own two full-join shapes
+(~7.9x, see `PERF.md`) does not exist for them. InlaySQL's index
+nested-loop join wins the secondary-inner shape outright (2.2-3.1x) and both
+LIMIT shapes (1.9-3.6x); the PK-inner full join is a TIE vs MySQL (1.15x,
+inside the 20% floor) and a **LOSS ~1.24x vs PostgreSQL** — the red cell
+where PG's planner picked the better order, recorded as exactly the
+"planner epic: yes/no for the human" decision `SCOREBOARD.md` scopes.
+
+Full-join methodology, disclosed: the full-join shapes are timed as
+server-side `SELECT COUNT(*) FROM (<join>) q` wrappers, because a Python
+client fetching 160,000 rows per execution measures the connector's
+per-row cost (the drivers container sat at 100% CPU with the server idle
+before this change), not the engine's join; the wrapper still produces and
+discards every joined row server-side, and the LIMIT/range/aggregate shapes
+transfer their rows directly. The asymmetry favours InlaySQL — its own
+number includes row streaming — so the PG LOSS above is conservative.
+
+### Aggregate / GROUP BY — LOSS both, the worst multiples in the matrix
+
+A shape defined this session (no Rust suite exists on either side; the
+InlaySQL side runs through `sql_shapes --mode agg`): `indexed`'s 100,000-row
+table with a 100-bucket column added; 100 executions per rep.
+
+| Shape | InlaySQL | MySQL 8 | PostgreSQL 17 |
+| --- | --- | --- | --- |
+| `GROUP BY n` (100 groups) | 29/s (26-31) | 98/s (96-104) | 147/s (143-148) |
+| scalar `COUNT/MIN/MAX` | 53/s (49-57) | 275/s (245-284) | 317/s (299-328) |
+
+**LOSS ~3.4-6.0x, consistent in sign across every rep** — outside any floor
+by a wide margin, and not explicable by transport: both opponents stream
+1-100 result rows over a socket while InlaySQL is in-process. This is the
+engine's grouping/aggregate pipeline, priced honestly for the first time.
+
+### Batch insert — LOSS both
+
+100 rows per multi-row INSERT statement, autocommitted, 100 statements per
+rep (10,000 rows per rep), explicit ids, all three engines in the same
+container environment on the same volume class, durability aligned (MySQL
+`innodb_flush_log_at_trx_commit=1`, PG `synchronous_commit=on`, InlaySQL
+`Durability::Full` — one commit, one barrier per statement everywhere).
+
+| Engine | rows/s (median, range) | commits/s | c/fsync |
+| --- | --- | --- | --- |
+| InlaySQL | 26,254 (19,111-43,851) | 263 | 1.00 |
+| MySQL 8 | 42,933 (39,543-44,379) | 429 | 0.64 |
+| PostgreSQL 17 | 81,229 (73,881-91,918) | 812 | 1.00 |
+
+**LOSS ~1.6x vs MySQL, ~3.1x vs PostgreSQL.** InlaySQL's wide rows/s range
+(1.8x min-to-max) is the desktop load showing up on the slowest side; even
+its best rep (43,851) does not reach MySQL's median, and the
+noise-resistant metric — commits/s, and c/fsync — orders the engines the
+same way. InlaySQL's ~263 commits/s at c/fsync 1.00 is the same ~1.2-1.5 ms
+single-writer commit cycle `PERF.md` Task 3 measured, so this cell prices
+that same mechanism per row rather than per commit.
+
+---
+
 ## What is not measured here
 
 - **No external benchmark for text or hybrid ranking.** Vector search now has
