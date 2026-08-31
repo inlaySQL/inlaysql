@@ -35,6 +35,7 @@ each is closed with evidence. It is a scoreboard, not a claim.
 | 8 | No statement timeout; unbounded materialisation | **closed** — with two loops deliberately not interruptible, named in the entry |
 | 9 | No TLS, one user, no grants | **accounts and privileges closed**, TLS open |
 | 10 | Effectively no observability | **closed** — `EXPLAIN`, `SHOW PROCESSLIST`, `SHOW STATUS` and an opt-in slow-query log; no histograms and no audit log, named in the entry |
+| 11 | Exponential parser backtracking through `IF` (upstream `sqlparser`) | open — found by fuzzing 2026-08-31; see the entry |
 
 Closed means: reproduced first, fixed, and pinned by a test that fails against
 the old code — not "a commit mentions it". Blocker 5 is the one deliberately
@@ -814,9 +815,62 @@ that a non-superuser sees only its own connections
 (`a_non_superuser_sees_only_its_own_connections`) and that every id it was shown
 is one it may `KILL`.
 
----
+### 11. Exponential parser backtracking through `IF` — *reported 2026-08-31, open*
 
-## Major
+CI's `sql_parser` fuzz target found it (Trust run on `92df5c3`, artifact
+`timeout-d89a66c262c26f5839ad03cb4fe903fbfac399e9`): a **74-byte** statement,
+
+```
+IF	0..gg.g.gg.g.gg.g.gg.g.gg.g1g.g.g.gg.g.gg.g.gg.g.gg.g1g.g.g.gg.g.gg.gg.
+```
+
+takes **~30 seconds of CPU** before returning its (uninteresting) parse
+error, on the same input that takes the engine's own suites microseconds.
+Reproduced outside the fuzzer (`inlaysql_core::sql::plan`, release build);
+the time roughly doubles per `g.` pair — exponential, not quadratic — and
+the profile lands entirely in `sqlparser`'s `parse_if_stmt` →
+`parse_conditional_statement_block` → recursive `parse_subexpr`/
+`parse_compound_expr`: each `.identifier` in the chain is a backtracking
+choice the IF-statement path re-explores. This is an upstream `sqlparser`
+0.62 defect, not this repo's parser code.
+
+**Why it is a blocker and not a quirk:** the statement timeout (blocker 8)
+is a cooperative `Interrupt` checked between executor steps — it never
+fires inside `sqlparser::parse_sql`, which runs to completion before any
+execution. `inlaysql serve --mysql` is thread-per-connection, so one
+74-byte statement pins one connection's thread for tens of seconds, and 64
+of them pin every thread the server will ever spawn. Anything that can
+send a query string — the MCP server's own doc comment for this fuzz
+target names a language model as the realistic client — can reach it
+after authenticating.
+
+**The existing pre-parse guard does not catch it, and why:**
+`sql.rs`'s `MAX_NESTING_DEPTH`/`MAX_CHAIN_LENGTH` scan counts operator
+tokens and nesting; `.` is neither, so a 23-dot identifier chain passes
+it. The exponential does not need nesting at all — the 74-byte input has
+zero parentheses past the lexical prefix.
+
+**Candidate fixes, cheapest first** — none executed yet, because a parser
+guard needs its own fuzz/DST validation rather than a drive-by commit:
+
+1. Refuse statement-leading `IF` in the pre-parse scan with the house
+   `Error::Unsupported`: no supported dialect feature begins a statement
+   with `IF` (the `IF()` *function* is mid-expression and unaffected), and
+   MySQL compound `IF..THEN` is not a core feature. Narrow, loud, closes
+   the found path — but it is whack-a-mole until upstream fixes the
+   backtracking, and each new sqlparser statement type re-opens the door.
+2. Extend the pre-parse scan to bound `.`-chains (resetting on non-`.`),
+   the same way `,` resets today: catches the input class, not just the
+   keyword. Needs a fuzz pass of its own to pick the bound.
+3. The real fix is upstream: report to `sqlparser` (a fix likely belongs
+   in `parse_conditional_statement_block`'s re-try structure), then track
+   the upgrade.
+
+Fuzz-artifact provenance is in the Trust run's `fuzz-status` artifact for
+run 33330438181; the Trust workflow will keep failing on this until one of
+the three is done.
+
+---
 
 - **SQL gaps that hit real ORMs and BI tools** — *reported*. `SAVEPOINT`,
   `WITH RECURSIVE` and `RANGE`/`GROUPS` window frames are all supported
