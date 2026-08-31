@@ -4,82 +4,227 @@
     {
       "path": "/services/passport/renew.html",
       "title": "Renew a passport",
-      "body": "Renew your passport online in three steps. Confirm your eligibility: your most recent passport was issued within the last fifteen years and you were over sixteen when it was issued. Complete the renewal form, pay the fee with a card, and post your old passport with the printed checklist. Standard processing takes ten working days; the urgent counter service issues a passport the same day for an additional fee."
+      "body": "Renew your passport online in three steps. Confirm your eligibility: your most recent passport was issued within the last fifteen years and you were over sixteen when it was issued. Complete the renewal form, pay the fee with a card, and post your old passport with the printed checklist.\n\nStandard processing takes ten working days from the day your old passport arrives at the office. If your name has changed since the passport was issued, attach the change-of-name certificate; renewing under a former name is not possible. The urgent counter service issues a passport the same day for an additional fee, and appointments for it open each morning online."
     },
     {
       "path": "/services/passport/first-application.html",
       "title": "Apply for your first passport",
-      "body": "First-time passport applications require an in-person identity check at a passport office. Bring your birth certificate, proof of address, two identical photographs and a guarantor who has known you for at least two years. Appointments open seven days ahead and can be booked online. Children under sixteen need a parent or guardian to apply with them."
+      "body": "First-time passport applications require an in-person identity check at a passport office. Bring your birth certificate, proof of address, two identical photographs and a guarantor who has known you for at least two years.\n\nAppointments open seven days ahead and can be booked online; same-day slots appear most often early in the morning. The identity check itself takes about fifteen minutes, and the passport is posted within two weeks of it. Children under sixteen need a parent or guardian to apply with them, and a child's first passport cannot be posted to an address that is not on the application."
+    },
+    {
+      "path": "/services/passport/lost-or-stolen.html",
+      "title": "Replace a lost or stolen passport",
+      "body": "Report a lost or stolen passport before applying for a replacement. The report cancels the old passport immediately; a passport that is later recovered can never be used again, even to return home. Reporting is free and can be done online or by phone at any hour.\n\nA replacement costs the standard fee plus a lost-document surcharge. You will need the same identity documents as a first application, and the in-person check is required again because the cancelled passport can no longer vouch for you. If the passport was stolen, include the police report number with the application; it is not required, but it speeds up the fraud check that follows every theft."
+    },
+    {
+      "path": "/services/passport/urgent-travel.html",
+      "title": "Urgent travel documents",
+      "body": "If you must travel within days and cannot wait for ordinary processing, the emergency travel desk issues documents for a single journey. It exists for funerals, medical treatment abroad and other urgent compassionate reasons; a cheap fare found at the last minute is not an emergency under the rules.\n\nBring evidence of the travel booking and evidence of the reason. The desk at the central office is open every working morning and does not take appointments; documents are usually issued the same day. An emergency document is valid for one journey and cannot be extended, so check visa requirements of the destination before relying on it."
     },
     {
       "path": "/services/tax/filing.html",
       "title": "File your annual tax return",
-      "body": "The tax year closes on 31 March and returns are due by 30 June. Log in with your tax identification number to file online; employment income and bank interest are pre-filled from reports your employer and bank already submitted. Most refunds are paid within twelve working days of an accepted return. Paper forms are available at any service centre."
+      "body": "The tax year closes on 31 March and returns are due by 30 June. Log in with your tax identification number to file online; employment income and bank interest are pre-filled from reports your employer and bank already submitted. Check the pre-filled figures before accepting them, because a late report from a second employer is the most common reason a refund comes out wrong.\n\nMost refunds are paid within twelve working days of an accepted return, straight to the bank account named in the return. Paper forms are available at any service centre and take up to eight weeks to process. If you miss the deadline, file late anyway: the penalty for a late return is smaller than the penalty for not filing, and it is waived entirely if no tax is owing."
     },
     {
       "path": "/services/tax/child-benefit.html",
       "title": "Claim child benefit",
-      "body": "Child benefit is a quarterly payment for each child under eighteen in your care. Claims are backdated up to three months from the date the claim is received. You will need the child's birth certificate and your bank details. High-income households may repay part of the benefit through the annual tax return; the threshold is published each year with the filing dates."
+      "body": "Child benefit is a quarterly payment for each child under eighteen in your care. Claims are backdated up to three months from the date the claim is received, so a claim lodged the week a child is born covers the birth month.\n\nYou will need the child's birth certificate and your bank details. High-income households may repay part of the benefit through the annual tax return; the threshold is published each year with the filing dates. The claim stays open until you tell the office the child has left your care, and payments stop automatically in the quarter after a child turns eighteen."
+    },
+    {
+      "path": "/services/tax/gst-registration.html",
+      "title": "Register for the goods and services tax",
+      "body": "Businesses with annual turnover above the registration threshold must register for the goods and services tax before they pass it. The threshold and current rate are published on the rates page and change with the annual budget, so check them at registration and at each renewal of your tax number.\n\nRegistration is part of the business portal and issues your GST number immediately. Registered businesses file a short return each quarter listing tax collected and tax paid, and pay the difference. Keeping the invoices that support the tax you paid is the whole record-keeping requirement; a return without supporting invoices can be reopened for six years."
+    },
+    {
+      "path": "/services/tax/payment-plans.html",
+      "title": "Set up a tax payment plan",
+      "body": "If you cannot pay a tax bill in full, apply for a payment plan rather than leaving the debt alone. Interest runs on unpaid tax from the due date, so a plan approved early costs less than a debt discovered months later. Plans are set online: you choose an amount and the system states immediately whether the term it implies is acceptable.\n\nA plan in good standing stops collection action — no deductions from wages, no holds on refunds. Missing two consecutive payments ends the plan, and the remaining balance becomes due at once. If your circumstances change mid-plan, apply to vary it before a payment is missed; variation is nearly always granted once per plan."
     },
     {
       "path": "/services/business/register.html",
       "title": "Register a business",
-      "body": "Register a sole proprietorship or limited company through the online business portal. A limited company needs a registered address, at least one director and a company name that is not already taken; the name check runs during registration. You receive a business registration certificate and tax number within two working days. Trading without registration is an offence under the Business Registration Act."
+      "body": "Register a sole proprietorship or limited company through the online business portal. A limited company needs a registered address, at least one director and a company name that is not already taken; the name check runs during registration and most name rejections are spelling variants of existing companies.\n\nYou receive a business registration certificate and tax number within two working days. Trading without registration is an offence under the Business Registration Act, and the certificate must be displayed at your trading address. Changing the registered address or directors later is a short online notification, not a new registration."
     },
     {
       "path": "/services/business/permits.html",
       "title": "Business permits and licences",
-      "body": "Food premises, private security, passenger transport and sale of alcohol all require sector-specific permits before opening. Each permit page lists the documents to bring, the fee and the statutory decision period. Most permits are valid for two years and renewal reminders are sent by email sixty days before expiry. Applying for a permit does not authorise the activity until the permit is granted."
+      "body": "Food premises, private security, passenger transport and sale of alcohol all require sector-specific permits before opening. Each permit page lists the documents to bring, the fee and the statutory decision period — the period is binding, so an application that is not decided within it is deemed approved.\n\nMost permits are valid for two years and renewal reminders are sent by email sixty days before expiry. Applying for a permit does not authorise the activity until the permit is granted; trading on a pending application is the violation most often fined. Inspections happen before grant for food and alcohol, and unannounced afterwards."
+    },
+    {
+      "path": "/services/business/tenders.html",
+      "title": "Sell to the government: tenders",
+      "body": "Government bodies buy goods and services through published tenders. Every tender above the small-purchase threshold is listed on the procurement portal with its closing date, the evaluation criteria and the award history of similar past tenders, which is the single most useful thing to read before bidding.\n\nRegistration as a supplier takes one working day and is required before bidding. Bids are scored on the published criteria alone; contact with the evaluating body outside the question period disqualifies the bid. Awards are published with the scores of all bidders, so an unsuccessful bid tells you exactly how far off it was."
+    },
+    {
+      "path": "/services/business/employer-obligations.html",
+      "title": "Hiring your first employee",
+      "body": "Employment obligations attach from the first hour of the first shift, not from the first payslip. Register as an employer, check the candidate's right to work, and keep a signed copy of the written terms — hours, pay, notice periods — before the start date.\n\nPay tax deductions each pay period; the thresholds are the same for one employee as for fifty. Workplace injury insurance is arranged through the accident compensation levy, not a separate policy. Keeping the records is the part most often missed: time records and pay records must be retained for six years and produced within ten days if an inspector asks."
     },
     {
       "path": "/services/health/register-gp.html",
       "title": "Register with a doctor",
-      "body": "Register with a general practitioner at the clinic nearest your home address. Registration is free and takes one visit; bring proof of identity and address. Your medical records transfer automatically between clinics within the public system. After hours, call the medical helpline for advice or attend the urgent care centre for conditions that cannot wait until morning."
+      "body": "Register with a general practitioner at the clinic nearest your home address. Registration is free and takes one visit; bring proof of identity and address. Your medical records transfer automatically between clinics within the public system, and the transfer is usually complete within two working days.\n\nYou may register at any clinic, not only the nearest, but home-visit eligibility follows the registered clinic's catchment, not where you actually live. Changing clinics is a new registration, not a transfer request; the records follow automatically. After hours, call the medical helpline for advice or attend the urgent care centre for conditions that cannot wait until morning."
     },
     {
       "path": "/services/health/emergency.html",
       "title": "Emergency services",
-      "body": "Call 112 for police, fire or ambulance in a life-threatening emergency. The line is free from any phone, including those with no credit. Call takers ask for the location first, then what has happened. For non-urgent medical help call the health helpline; for reporting a crime that has already happened, use the online police report or visit a station."
+      "body": "Call 112 for police, fire or ambulance in a life-threatening emergency. The line is free from any phone, including those with no credit and locked phones. Call takers ask for the location first, then what has happened; staying on the line is almost always more useful than hanging up to call someone else.\n\nFor non-urgent medical help call the health helpline, staffed by nurses around the clock. For a crime that has already happened and nobody is in danger, use the online police report or visit a station. Misusing 112 for directions, taxis or weather is an offence, but the operators would far rather take ten wrong calls than miss one right one."
+    },
+    {
+      "path": "/services/health/vaccinations.html",
+      "title": "Vaccination schedules and records",
+      "body": "The childhood schedule is given at registered clinics and recorded in the national immunisation register automatically; you do not report the vaccinations yourself. School enrolment checks the register, so a missing entry is worth fixing before enrolment week rather than during it.\n\nAdult boosters and travel vaccinations are given at clinics and pharmacies, and you can request the recorded ones be added to your register entry. Annual influenza vaccination is free for people over sixty-five, pregnant women and anyone with a listed chronic condition. Your full record is available through the patient portal and prints as a certificate for travel or employment."
+    },
+    {
+      "path": "/services/health/mental-health.html",
+      "title": "Mental health support",
+      "body": "Free short-course counselling is available through the mental health service without a referral; book online or by phone, and sessions can be in person, by video or by phone. A general practitioner referral opens longer-term care, including psychiatric services, at no cost.\n\nIn a crisis, call the mental health crisis line at any hour; it is separate from 112 and staffed by clinicians who can dispatch a mobile team. Emergency departments handle immediate danger, but the crisis line is the faster path when danger is not immediate. Waiting lists for ongoing care vary by region and are published monthly, so you can see the expected wait before choosing where to be referred."
     },
     {
       "path": "/services/housing/rent-assistance.html",
       "title": "Help with rent",
-      "body": "Rent assistance tops up your income when rent takes more than a third of it. The amount depends on household size, income and the local rent table for your area. Apply online with your tenancy agreement and recent payslips; decisions take fifteen working days and payments are backdated to the application date. Students and shared households have separate rules listed on the detail page."
+      "body": "Rent assistance tops up your income when rent takes more than a third of it. The amount depends on household size, income and the local rent table for your area; the tables are updated every April and October, and a change of area can change the amount.\n\nApply online with your tenancy agreement and recent payslips; decisions take fifteen working days and payments are backdated to the application date, not the date rent first became unaffordable, so apply as soon as the gap opens. Students and shared households have separate rules listed on the detail page, and a rent increase must be reported within twenty-eight days or the next payment is suspended pending review."
     },
     {
       "path": "/services/housing/social-housing.html",
       "title": "Apply for social housing",
-      "body": "Social housing is allocated by priority, not first-come-first-served. Points are awarded for overcrowding, medical need, unsanitary conditions and time already waited. One application covers every housing provider in the region. You can update your application and check your queue position online at any time; offers that are declined twice without grounds move you to the back of your band."
+      "body": "Social housing is allocated by priority, not first-come-first-served. Points are awarded for overcrowding, medical need, unsanitary conditions and time already waited. One application covers every housing provider in the region; you list areas you will accept and offers come only from those areas.\n\nYou can update your application and check your queue position online at any time. Offers that are declined twice without grounds move you to the back of your band, so declining an offer to hold out for a preferred suburb is a real cost — read the offer letter's grounds section before refusing. Medical priority claims need the specialist's report, not a general practitioner's letter."
+    },
+    {
+      "path": "/services/housing/tenancy-disputes.html",
+      "title": "Resolve a tenancy dispute",
+      "body": "Most tenancy disputes — deposits, repairs, notice periods — are heard by the tenancy tribunal, and applying costs a small fee that is refunded if you win. Before applying, write to the other party setting out what you want and why; the tribunal expects to see that letter, and a third of applications are settled the week it arrives.\n\nThe tribunal's decisions are enforceable like court orders. Hearings are informal: you speak for yourself, lawyers are allowed but not required, and interpreters are free if booked three days ahead. Evidence is what wins — photographs with dates, the tenancy agreement, receipts and the messages between you and the other side."
+    },
+    {
+      "path": "/services/housing/building-permits.html",
+      "title": "Building and renovation permits",
+      "body": "Structural work, drainage, demolition and anything touching a boundary requires a building permit before work starts. Fences, decks under a metre high and interior redecoration do not; when in doubt, the permitted-work checker on the portal answers in plain language and its answer is binding on the inspector.\n\nPermits are issued by licensed certifiers, not the council itself, so you choose a certifier and shop on price. Inspections happen at set stages, and skipping one means the work may have to be uncovered later. An owner-builder permit lets you supervise your own renovation after a short online course; without it, the person supervising must be a licensed builder."
     },
     {
       "path": "/services/transport/driving-licence.html",
       "title": "Driving licences",
-      "body": "A learner permit is issued from age seventeen after a theory test; book the test online and take identification with you. A full licence follows a practical driving test. Renew a licence up to ninety days before expiry, online or at a service centre, and update your address within fourteen days of moving. Medical conditions affecting driving must be declared when you apply or renew."
+      "body": "A learner permit is issued from age seventeen after a theory test; book the test online and take identification with you. A full licence follows a practical driving test, and the theory result stays valid for two years if the practical is delayed.\n\nRenew a licence up to ninety days before expiry, online or at a service centre, and update your address within fourteen days of moving — an expired licence discovered at a traffic stop is a fine regardless of how recently it lapsed. Medical conditions affecting driving must be declared when you apply or renew; declaring one usually results in a shorter licence term, not a refusal."
     },
     {
       "path": "/services/transport/vehicle-registration.html",
       "title": "Register a vehicle",
-      "body": "Every vehicle driven on public roads must be registered and insured. Registration transfers with ownership: notify the registry within seven days of buying or selling. Annual road tax is paid with the registration renewal and an expired tax disc is enforceable by fine. Electric vehicles pay a reduced rate, listed on the fees page."
+      "body": "Every vehicle driven on public roads must be registered and insured. Registration transfers with ownership: notify the registry within seven days of buying or selling, and until you do, the seller remains liable for the buyer's fines.\n\nAnnual road tax is paid with the registration renewal and an expired tax disc is enforceable by fine. Electric vehicles pay a reduced rate, listed on the fees page. The roadworthiness inspection is due with the renewal from a vehicle's third year; booking the inspection two weeks ahead of renewal leaves time to fix a failure without driving unregistered."
+    },
+    {
+      "path": "/services/transport/public-transport-cards.html",
+      "title": "Public transport passes",
+      "body": "The travel card works on every bus, tram and train in the network; buy it at stations, online, or at any convenience shop displaying the logo. Tapping on and off is required on every service — the inspectors' fine for an untapped card with money on it is the most common complaint the transport authority receives, and the rule is printed on every card reader.\n\nConcession cards halve fares for students, seniors and benefit recipients; the concession is applied to the card, not carried separately. Monthly and yearly passes pay for themselves quickly, and a yearly pass includes the airport line, which single tickets treat as a premium route. Lost cards are blocked and reissued with the remaining balance if the card was registered."
+    },
+    {
+      "path": "/services/transport/road-works.html",
+      "title": "Road works and closures",
+      "body": "Planned closures are published two weeks ahead on the roads map, which is also what the in-car navigation apps licence. Emergency works appear on the same map within minutes and are the reason a route that was clear at breakfast can be closed at noon.\n\nResidents of a street under works receive notice by letter whether or not they subscribe to anything online. Heavy vehicles need a permit for any route the closure map marks as weight-restricted, and the permit system is the same one the utilities use, so a permit is never issued for a street that is about to be dug up."
     },
     {
       "path": "/services/voting/enrol.html",
       "title": "Enrol to vote",
-      "body": "Voting enrolment is open to citizens and permanent residents aged eighteen or over. Enrol online with your identification number, or at any post office. Your electorate is set by your residential address, so re-enrol within thirty days of moving. Enrolment rolls close the day before an election is called; you cannot vote in an electorate you are not enrolled in."
+      "body": "Voting enrolment is open to citizens and permanent residents aged eighteen or over. Enrol online with your identification number, or at any post office. Your electorate is set by your residential address, so re-enrol within thirty days of moving.\n\nEnrolment rolls close the day before an election is called; you cannot vote in an electorate you are not enrolled in. The roll is updated continuously, and checking your entry takes a minute online — a spelling difference between your enrolment and your identification is the most common reason a check at the polling place turns slow."
     },
     {
       "path": "/services/voting/election-day.html",
       "title": "Voting on election day",
-      "body": "Polling places are open from eight in the morning to six in the evening on election day. Bring identification and vote at any polling place in your electorate. If you are overseas, hospitalised or working, advance and postal voting open two weeks early. Results are published progressively from the close of voting, with the final count certified within ten days."
+      "body": "Polling places are open from eight in the morning to six in the evening on election day. Bring identification and vote at any polling place in your electorate; queues are shortest mid-morning and mid-afternoon, and every polling place is wheelchair accessible.\n\nIf you are overseas, hospitalised or working, advance and postal voting open two weeks early; the application for a postal vote closes the Friday before the election. Results are published progressively from the close of voting, with the final count certified within ten days. Voting is compulsory; the fine for not voting is waived if you apply for a postal vote after the close, so the honest mistake is cheap to fix."
+    },
+    {
+      "path": "/services/legal/police-clearance.html",
+      "title": "Police clearance certificates",
+      "body": "A police clearance certificate lists convictions, or states that there are none. Employers, visa offices and adoption agencies are the usual requesters, and many ask for a certificate no older than three months, so do not order it before the requester states its freshness rule.\n\nApply online with identification and your addresses for the past five years. Processing takes five working days, or one working day at the counter for an additional fee. Spent convictions — minor offences after the passage of the spent-convictions period — do not appear, and a certificate showing no convictions is not a promise that none exist; it is a statement about the record the law allows to be disclosed."
+    },
+    {
+      "path": "/services/legal/court-fines.html",
+      "title": "Pay or dispute a fine",
+      "body": "Fines are payable online with the notice number, at any post office, or by the payment plan on the back of the notice. A fine doubles if it is unpaid when the reminder is issued, and unpaid fines past that stage can end in licence suspension, so the cheap time to act is before the reminder, not after.\n\nTo dispute a fine, request a review in writing within twenty-eight days, stating which ground applies: the wrong vehicle, the wrong person, or an error on the notice. Photographs and documents speed the review. A review is free, and requesting one freezes collection until it is decided — but the fine itself is payable in the meantime if the plan schedule says so."
+    },
+    {
+      "path": "/services/legal/marriage.html",
+      "title": "Getting married",
+      "body": "A marriage requires a licence, a ceremony and two witnesses. The licence application is joint, filed online at least three full days before the ceremony, and it is valid for six months — the three-day wait is the part couples most often discover at the last minute.\n\nThe ceremony may be civil, at a registry office or an approved venue, or religious, conducted by a registered celebrant of your faith. Either way the paperwork is the same form, signed by the couple, the celebrant and both witnesses, and the marriage is registered automatically; certified copies for name-change and visa purposes are ordered from the registrar afterwards."
+    },
+    {
+      "path": "/services/legal/birth-certificates.html",
+      "title": "Birth, death and name-change certificates",
+      "body": "The registrar issues certificates for events registered in this jurisdiction. Births must be registered within thirty days, and the hospital gives you the form; the certificate is ordered separately, which is the step new parents most often miss before applying for the child's other documents.\n\nDeaths are registered by the funeral director, and the certificate is ordered by whoever needs it — banks, insurers and estates each want an original, not a photocopy. Name changes are registered applications, advertised in the gazette, and produce a certificate that all agencies must accept. Every certificate is available in a standard or an extended form, and the extended form shows the parents' details where the standard one does not."
+    },
+    {
+      "path": "/services/family/parental-leave.html",
+      "title": "Parental leave and pay",
+      "body": "Employees with twelve months of service are entitled to up to eighteen months of unpaid parental leave, and the first twenty-six weeks are paid at the statutory rate by the parental leave scheme, not by the employer. The employer's role is to hold the job and administer the paperwork; the payment comes from the fund.\n\nLeave is shared between parents, and the weeks can be taken in up to three blocks. Give the employer ten weeks' written notice before the start, and confirm the return date in writing — a return assumed and not confirmed is the dispute the employment tribunal sees most from new parents. Job protection covers the whole leave period, and the position must be held except for genuine redundancy."
+    },
+    {
+      "path": "/services/family/school-enrolment.html",
+      "title": "Enrol a child in school",
+      "body": "Children start school in the year they turn five, and enrolment for the following September opens the previous November. Every child is guaranteed a place at their catchment school; places at other schools are allocated by distance after catchment applications are satisfied, which is why the second preference is worth choosing seriously.\n\nEnrolment needs the birth certificate, proof of address and the immunisation register entry. Mid-year moves are processed within ten school days, and a child in temporary housing is enrolled immediately at the nearest school with the paperwork to follow. School transport is free beyond the walking distance published for each age group."
+    },
+    {
+      "path": "/services/family/childcare-subsidy.html",
+      "title": "Childcare subsidy",
+      "body": "The childcare subsidy pays a percentage of approved childcare costs, set by household income, for children up to school age. The subsidy is paid to the provider and appears on your invoice, so the amount you pay is the gap, not the full fee followed by a reimbursement.\n\nApply online with both parents' income details; the rate is assessed quarterly and moves automatically with income, so a pay rise does not require a new claim. Approved care includes registered childminders as well as centres. Absence days are subsidised up to a limit per year, which exists to stop providers billing for children who never attend."
+    },
+    {
+      "path": "/services/seniors/pension.html",
+      "title": "The state pension",
+      "body": "The state pension is paid from age sixty-seven to everyone with ten years of contributions, and the full amount requires thirty-five years. You can check your contribution record online; gaps from years working abroad or caring full-time can often be filled by voluntary contributions, and the calculator tells you whether filling a gap pays for itself.\n\nClaim four months before you reach pension age — claims cannot be backdated more than three months, and the pension is not automatic. It is paid fortnightly into any bank account, worldwide, and the annual uprating is announced with the budget. Working past pension age does not reduce the pension; it defers it, and deferral adds to the weekly amount."
+    },
+    {
+      "path": "/services/seniors/seniors-card.html",
+      "title": "The seniors card",
+      "body": "The seniors card is free from age sixty-five and gives discounts on public transport, utilities and thousands of listed businesses. Apply online with identification; the card arrives within two weeks and the digital version in the app works the same day the application is approved.\n\nThe transport half-fare is the benefit most used and the one that requires the physical card on some operators, so carry it even if you prefer the app. Business listings are voluntary, which is why a shop that gave the discount last year may not this year — the online directory is the authoritative list, and reporting a business that stopped honouring the card is what keeps it accurate."
+    },
+    {
+      "path": "/services/community/libraries.html",
+      "title": "Libraries and digital access",
+      "body": "Library membership is free for any resident and unlocks lending at every branch, the digital newspaper archive, and the e-book platform — the digital collections need no branch visit and no return date, since licences expire on their own.\n\nEvery branch offers free computer and internet access, printing at a small per-page cost, and staff help for anything from printing a boarding pass to a first video call. The mobile library serves villages without a branch on a published weekly round. Meeting rooms are bookable by community groups at no charge; the booking system is the same one the branches use for their own events, so what you see is what is free."
+    },
+    {
+      "path": "/services/community/parks-and-recreation.html",
+      "title": "Parks, sports facilities and recreation",
+      "body": "Regional parks are open every day and free to enter; the visitor centres at the four largest publish seasonal walks, and the guided walks are free but bookable, because the parking is finite even when the park is not.\n\nCouncil sports grounds, swimming pools and the athletics track are bookable online at published hourly rates, with community rates for clubs and free off-peak swimming for school children. Fitness equipment in parks is unsupervised and used at your own risk. Organised events — fun runs, open days, the summer film series — are listed on one calendar, and any event expecting more than two hundred people needs an events permit, not a park booking alone."
+    },
+    {
+      "path": "/services/community/volunteering.html",
+      "title": "Volunteering",
+      "body": "The volunteer registry lists opportunities with government bodies and accredited community organisations: emergency response, hospital support, literacy tutoring, conservation, and the visitor schemes in public institutions. Registration takes minutes and the references checks are handled by the organisations, not by you paying for a certificate first.\n\nVolunteering does not affect benefit payments as long as the role is genuinely voluntary and the hours remain compatible with job search obligations — the rule of thumb published by the employment service is that volunteering must never be a condition of a benefit, nor a reason to refuse one. Expenses are reimbursable and do not count as income."
+    },
+    {
+      "path": "/services/community/public-holidays.html",
+      "title": "Public holidays",
+      "body": "There are twelve public holidays a year, published for the following year each October. When a holiday falls on a weekend, the following Monday is the holiday — but not if that Monday is already a holiday, in which case Tuesday is, a chain the calendar page resolves for you five years ahead.\n\nShops may open on public holidays but public services run holiday timetables: libraries close, pools open limited hours, and public transport runs a Sunday frequency. Employment rules for holiday work — time-and-a-half and a day in lieu — are on the employment page, and the pay is the same whether the business is private or government-owned."
+    },
+    {
+      "path": "/services/consumer/refunds.html",
+      "title": "Refunds, repairs and your rights",
+      "body": "Goods must be of acceptable quality and fit for purpose; when they are not, you choose between repair, replacement or refund, and the choice is yours, not the shop's. A posted sign saying no refunds is unenforceable and reporting it is a two-minute form that the consumer protection office acts on.\n\nThe remedy depends on how quickly the fault appears: a fault within a short period makes refund or replacement automatic; later faults are repaired first. Keep receipts or any proof of purchase — a bank statement line naming the shop has been accepted. Services carry the same guarantee: a repair that fails within the guarantee period must be redone at no charge, and quotes given before work must be honoured within ten percent."
+    },
+    {
+      "path": "/services/consumer/scams.html",
+      "title": "Report a scam",
+      "body": "Report scams to the consumer protection office even when you lost nothing; reports are what let the bank networks block an account the same day. If money has already been sent, call your bank first — the recall window is hours, not days — then file the report with everything you have: numbers, messages, the account the money went to.\n\nThe patterns worth knowing: pressure to act now, payment by gift card or cryptocurrency, and any contact claiming to be from a government agency demanding immediate payment. No government body takes payment by gift card, and no tax debt is collected by phone with arrest threatened. The scam alert page publishes current campaigns weekly, and subscribing to it is free."
     },
     {
       "path": "/about/contact.html",
       "title": "Contact us",
-      "body": "Service centres are open Monday to Friday, nine to five, and Saturday mornings in the city centre. The general helpline answers within three minutes on weekdays. Written enquiries are answered within ten working days; include your reference number if you have one. Complaints about a service go to the feedback line first and can be escalated to the Ombudsman afterwards."
+      "body": "Service centres are open Monday to Friday, nine to five, and Saturday mornings in the city centre. The general helpline answers within three minutes on weekdays; the quietest hours are 9 to 10 in the morning, and Tuesday is the quietest day.\n\nWritten enquiries are answered within ten working days; include your reference number if you have one, and one topic per message — a message covering three topics becomes three cases, each starting from the date the last one was answered. Complaints about a service go to the feedback line first and can be escalated to the Ombudsman afterwards; the Ombudsman expects you to have tried the ordinary route, which is why the feedback line exists."
     },
     {
       "path": "/about/accessibility.html",
       "title": "Accessibility statement",
-      "body": "This portal aims to meet the government accessibility standard: every service is operable by keyboard, screen readers are supported, and colour is never the only way information is conveyed. Documents published before the standard took effect are being converted on request. If any page blocks you from completing a service, report it through the contact page and staff will complete the transaction with you."
+      "body": "This portal aims to meet the government accessibility standard: every service is operable by keyboard, screen readers are supported, and colour is never the only way information is conveyed. Documents published before the standard took effect are being converted on request, and the request line is the same one staffed for the general helpline.\n\nIf any page blocks you from completing a service, report it through the contact page and staff will complete the transaction with you while the page is fixed. Fixes are published monthly in the accessibility changelog. Sign language interpretation for in-person appointments is free with three working days' notice, and every service centre has at least one hearing loop at the main counter."
+    },
+    {
+      "path": "/about/open-data.html",
+      "title": "Open data and statistics",
+      "body": "Non-personal datasets are published free of charge under an open licence: population statistics, transport ridership, air quality readings, spending over the publication threshold, and the geographic datasets that underlie every map on this portal. Datasets are published with their schema and update schedule, and an API serves the popular ones.\n\nRequests for a dataset that exists but is not yet published are made through the open-data request form; the office must respond within twenty working days with the dataset or a reason grounded in privacy or security. Statistics that could identify a person are aggregated before publication, and the aggregation rules are published with the data so analysts know exactly what was done."
+    },
+    {
+      "path": "/about/careers.html",
+      "title": "Working for the public service",
+      "body": "Public service vacancies are published on one board, covering every department and every region, with salary bands attached — the band is not negotiable, which candidates from the private sector find disorienting and which exists to make every vacancy comparable.\n\nApplications are by statement of claims against the published criteria, not a general CV; the criteria are the interview. Citizenship or permanent residence is required for ongoing roles, and security-cleared roles state the clearance level, which can take months to obtain after an offer. Temporary and casual roles are listed on the same board and are the most common first step into an ongoing position."
     }
   ]
 }

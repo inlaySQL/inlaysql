@@ -59,6 +59,23 @@ CORPUS_DIR=${CORPUS_DIR:-"$ROOT/target/bench-corpus"}
 RESULTS="$ROOT/bench/results"
 COMPOSE=("docker" "compose" "-f" "$ROOT/bench/external/compose.yml")
 
+# The same quiet-machine gate `bench/run.sh` uses, on the script that produces
+# every MySQL, PostgreSQL, pgvector and DuckDB row we publish. Its absence here
+# is why PERF.md, bench/README.md and SCOREBOARD.md all record that no
+# `compare.sh` figure can earn a WIN/LOSS verdict — a comparison taken while
+# something else owned the CPU measures the machine, and this script's numbers
+# decide who is faster than whom.
+#
+# Note the phase boundaries below: this script compiles the workspace and
+# builds container images before it measures anything, and those phases
+# saturate the machine on purpose. The sampler starts after them, so
+# CONTAMINATED means the *measurement* was disturbed rather than "compare.sh
+# built something", which is the only reading of the word that stays useful.
+# shellcheck source=bench/load_gate.sh
+. "$ROOT/bench/load_gate.sh"
+
+load_gate_preflight
+
 if ! docker info >/dev/null 2>&1; then
   echo "docker is not running: this comparison needs it. The suites in" >&2
   echo "./bench/run.sh do not, and cover InlaySQL vs SQLite and sqlite-vec." >&2
@@ -81,6 +98,7 @@ cargo run --release --quiet --manifest-path "$ROOT/Cargo.toml" -p inlaysql-bench
 # container it left behind (this script failing between `run` starting it and
 # `--rm` removing it) would survive an otherwise-clean `down`.
 cleanup() {
+  load_gate_cleanup
   CORPUS_DIR="$CORPUS_DIR" "${COMPOSE[@]}" --profile oltp-container down --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -98,6 +116,17 @@ export INLAYSQL_SERVER_TARGET_VOLUME="inlaysql-bench-server-target-$(printf '%s'
 
 echo "==> starting containers"
 "${COMPOSE[@]}" up -d --build --wait
+
+# Built here rather than at its `run` below, which sits between two measured
+# phases: a container build is minutes of saturated CPU, and building it
+# mid-measurement would put a compile inside the sampled window and flag every
+# run CONTAMINATED by its own doing.
+echo "==> building the containerised InlaySQL OLTP image"
+"${COMPOSE[@]}" --profile oltp-container build inlaysql-oltp
+
+# Everything above this line is setup — compiles and image builds, saturating
+# by design. Everything below is measurement, and is watched.
+load_gate_start_sampler
 
 echo "==> DuckDB"
 "${COMPOSE[@]}" exec -T drivers python duckdb_driver.py
@@ -118,7 +147,10 @@ echo "==> InlaySQL vs MySQL, server-to-server (MySQL wire, matched durability)"
 "${COMPOSE[@]}" exec -T drivers python server_driver.py
 
 echo "==> InlaySQL, containerised (same volume class as MySQL/PostgreSQL)"
-"${COMPOSE[@]}" --profile oltp-container run --rm --build -T inlaysql-oltp
+# No `--build`: the image was built during setup, before the sampler started.
+"${COMPOSE[@]}" --profile oltp-container run --rm -T inlaysql-oltp
+
+load_gate_stop_sampler
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUTPUT="$RESULTS/$STAMP-compare.txt"
@@ -129,8 +161,10 @@ OUTPUT="$RESULTS/$STAMP-compare.txt"
   echo "rustc:  $(rustc --version)"
   echo "host:   $(uname -srm)"
   echo "docker: $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)"
+  load_gate_start_line
   echo
   "${COMPOSE[@]}" exec -T drivers python report.py
+  load_gate_summary
 } | tee "$OUTPUT"
 
 echo "written to ${OUTPUT#"$ROOT"/}"

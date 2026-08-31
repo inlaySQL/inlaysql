@@ -73,6 +73,7 @@ above is exactly these files.
   re-upload, which for a static site is the normal publishing step anyway.
 - **The embedder is a stand-in.** Point 3 above is the one real decision a
   deployment makes.
-- **Corpus size.** The demo ships 16 pages. A few thousand pages with
+- **Corpus size.** The demo ships 45 pages (~160 KiB gzipped for the whole
+  database — the file is mostly sparse pages). A few thousand pages with
   `VECTOR(384)` is a few MB compressed — fine as an asset, but measure with
   your own corpus before promising anything.

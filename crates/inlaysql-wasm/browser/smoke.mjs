@@ -145,6 +145,17 @@ try {
   const semantic = await page.locator("#results").textContent();
   check("semantic-only search also ranks", /passport/i.test(semantic), semantic);
 
+  // A result opens the page itself — there is no server to navigate to, so
+  // the page is rendered from the very row the search ranked.
+  await page.locator("#results li").first().click();
+  await page.waitForFunction(() => document.getElementById("page-view").classList.contains("open"));
+  const pageView = await page.locator("#page-view").textContent();
+  check("a result opens the page view", /passport/i.test(pageView), pageView);
+  check("the page view holds the full text", pageView.length > 400, pageView.length);
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => !document.getElementById("page-view").classList.contains("open"));
+  check("escape returns to the results", (await page.locator("#results li").count()) > 0);
+
   check("nothing threw along the way", problems.length === 0, problems.join(" | "));
 } finally {
   await browser.close();

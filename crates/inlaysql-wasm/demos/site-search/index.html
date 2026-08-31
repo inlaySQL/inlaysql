@@ -19,6 +19,7 @@
     --accent: #12437a;
     --accent-ink: #ffffff;
     --good: #1a7f4f;
+    --warn: #8a5a00;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
     --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
@@ -33,7 +34,7 @@
     -webkit-font-smoothing: antialiased;
   }
 
-  code { font-family: var(--mono); font-size: .85em; }
+  code { font-family: var(--mono); font-size: .85em; background: var(--paper-dim); padding: .1em .35em; border-radius: 4px; }
 
   .wrap { max-width: 46rem; margin: 0 auto; padding: 0 1.25rem; }
 
@@ -99,10 +100,15 @@
     border-radius: 8px;
     padding: 1rem 1.25rem;
     margin-bottom: .75rem;
+    cursor: pointer;
+    transition: border-color .12s, box-shadow .12s;
   }
+  #results li:hover { border-color: var(--accent); box-shadow: 0 1px 4px rgba(18, 67, 122, .12); }
+  #results li:focus-visible { outline: 2px solid var(--accent); }
   #results h2 {
     margin: 0 0 .15rem;
     font-size: 1.05rem;
+    color: var(--accent);
   }
   #results .path {
     font-family: var(--mono);
@@ -118,22 +124,75 @@
     color: var(--ink-dim);
   }
 
-  details {
-    margin-top: 2rem;
+  /* ---- the page view ---- */
+
+  /* Clicking a result opens the page itself, rendered from the same row the
+     search ranked — the demo has no server to fetch a real one from. */
+  #page-view {
+    position: fixed;
+    inset: 0;
+    background: var(--paper-dim);
+    overflow-y: auto;
+    display: none;
+  }
+  #page-view.open { display: block; }
+  #page-view .inner {
+    max-width: 46rem;
+    margin: 0 auto;
+    padding: 1.5rem 1.25rem 3rem;
+  }
+  #page-view .crumb {
+    font-family: var(--mono);
+    font-size: .8rem;
+    color: var(--good);
+    margin: 0 0 .25rem;
+  }
+  #page-view h2 { margin: 0 0 1rem; font-size: 1.5rem; letter-spacing: -.01em; }
+  #page-view p { margin: 0 0 1rem; }
+  #page-view .back {
+    border-radius: 6px;
+    background: var(--paper);
+    color: var(--accent);
+    margin-bottom: 1.5rem;
+  }
+
+  /* ---- how it works ---- */
+
+  .how { margin-top: 3rem; }
+  .how h2 {
+    font-size: 1.3rem;
+    letter-spacing: -.01em;
+    border-bottom: 2px solid var(--accent);
+    padding-bottom: .4rem;
+  }
+  .how section {
     background: var(--paper);
     border: 1px solid var(--line);
     border-radius: 8px;
-    padding: .75rem 1.25rem;
-    font-size: .9rem;
+    padding: 1.1rem 1.4rem;
+    margin: 1rem 0;
   }
-  summary { cursor: pointer; color: var(--accent); font-weight: 500; }
-  pre {
-    background: var(--paper-dim);
-    padding: .75rem 1rem;
+  .how h3 { margin: 0 0 .4rem; font-size: 1rem; }
+  .how p { margin: .4rem 0; font-size: .92rem; color: var(--ink-dim); }
+  .how pre {
+    background: #101820;
+    color: #d7e2ee;
+    padding: .85rem 1.1rem;
     border-radius: 6px;
     overflow-x: auto;
-    font-size: .8rem;
-    line-height: 1.5;
+    font-size: .78rem;
+    line-height: 1.55;
+    margin: .75rem 0;
+  }
+  .how .tag {
+    display: inline-block;
+    font: 600 .72rem/1 var(--mono);
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 999px;
+    padding: .25rem .6rem;
+    margin-bottom: .5rem;
+    background: #eef3f9;
   }
 
   footer {
@@ -168,26 +227,92 @@
   <p id="status">loading the search engine…</p>
   <ol id="results"></ol>
 
-  <details>
-    <summary>What this is actually running</summary>
-    <p>
-      A real InlaySQL database file (<code>site.inlay</code>, built once at
-      deploy time) is fetched as a static asset, like an image. The WASM module
-      (~660 KiB gzipped) opens it and runs this statement per search:
-    </p>
-    <pre id="sql"></pre>
-    <p>
-      No backend, no search API, no third-party request — the ranking happens
-      in this tab. Swap <code>pages.json</code> for your site's own page list,
-      optionally replace the stand-in embedder with your model's vectors, and
-      rebuild. See the
-      <a href="https://github.com/inlaysql/inlaysql/tree/main/crates/inlaysql-wasm/demos/site-search">demo README</a>.
-    </p>
-  </details>
+  <!-- Clicking a result opens the page, rendered from the very row the
+       search ranked. There is no server to fetch a real one from. -->
+  <div id="page-view" role="dialog" aria-modal="true" aria-label="Page view">
+    <div class="inner">
+      <button class="back" id="back" type="button">← back to results</button>
+      <p class="crumb" id="pv-path"></p>
+      <h2 id="pv-title"></h2>
+      <div id="pv-body"></div>
+    </div>
+  </div>
+
+  <div class="how">
+    <h2>How this search works</h2>
+
+    <section>
+      <span class="tag">step 1 · build time</span>
+      <h3>The index is built once, natively, when the site deploys</h3>
+      <p>
+        Every page's text is turned into a vector and inserted into a real
+        InlaySQL database — the same file format the native build writes. This
+        demo runs that as a <code>cargo run</code> at deploy time; your build
+        would run it from your CMS export or sitemap.
+      </p>
+      <pre>CREATE TABLE pages (
+    id INTEGER PRIMARY KEY,
+    path TEXT, title TEXT, body TEXT,
+    embedding VECTOR(384)          -- one vector per page
+);
+CREATE INDEX pages_body      ON pages (body);      -- full-text (BM25)
+CREATE INDEX pages_embedding ON pages (embedding); -- vectors (HNSW)
+
+INSERT INTO pages (path, title, body, embedding)
+VALUES (?, ?, ?, ?);                -- vector computed from `body`</pre>
+      <p>
+        The finished database is checkpointed so the file carries both indexes,
+        then shipped as a static asset — <code>site.inlay</code>, fetched like
+        an image. That is the whole "backend": a file on a web server.
+      </p>
+    </section>
+
+    <section>
+      <span class="tag">step 2 · at search time, in this tab</span>
+      <h3>Your query becomes a vector too</h3>
+      <p>
+        When you search, the query text goes through the same embedding
+        function that built the index, so query and pages live in the same
+        vector space. This demo uses the engine's stand-in embedder — it
+        buckets character trigrams, so it matches pages that <em>spell</em>
+        alike. A real site swaps in its own model's vectors at step 1 and the
+        same model for queries here; everything else stays identical.
+      </p>
+    </section>
+
+    <section>
+      <span class="tag">step 3 · one SQL statement</span>
+      <h3>The ranking mode you picked changes one function call</h3>
+      <p>
+        <code>bm25_score(body, ?)</code> — keyword relevance, the classic
+        search-engine score over the full-text index. Finds exact words:
+        "renew", "passport".
+      </p>
+      <p>
+        <code>vector_score(embedding, ?)</code> — semantic similarity against
+        your query's vector, using the HNSW approximate-nearest-neighbour
+        index. Finds pages about the same <em>topic</em> even when no query
+        word appears: "help with rent" finds rent assistance.
+      </p>
+      <p>
+        <code>fuse(vector_score(…), bm25_score(…))</code> — hybrid: both
+        scores are computed and combined with reciprocal rank fusion, which
+        merges the two rankings rather than the two raw numbers, so a page
+        that does well on either gets pulled up.
+      </p>
+      <pre id="sql"></pre>
+      <p>
+        That statement runs inside the WASM module in this tab against the
+        database fetched at load — every keystroke-to-result hop is local. No
+        search API exists to attack, log, rate-limit or take down.
+      </p>
+    </section>
+  </div>
 
   <footer>
     InlaySQL demo — one static file, hybrid BM25 + vector search, zero servers.
-    <a href="../../">Back to the main demo</a>.
+    <a href="../../">Back to the main demo</a> ·
+    <a href="https://github.com/inlaySQL/inlaysql/tree/main/crates/inlaysql-wasm/demos/site-search">demo source and README</a>
   </footer>
 </main>
 
@@ -233,6 +358,38 @@
     return body.length > 180 ? body.slice(0, 177) + "…" : body;
   }
 
+  // The page view. Rows are cached as the search returns them, so opening a
+  // result never re-queries — though re-querying would work, since the whole
+  // database is already in this tab.
+  const pages = new Map();
+
+  function showPage(path) {
+    const page = pages.get(path);
+    if (!page) return;
+    document.getElementById("pv-path").textContent = path;
+    document.getElementById("pv-title").textContent = page.title;
+    const body = document.getElementById("pv-body");
+    body.innerHTML = "";
+    for (const paragraph of page.body.split(/\n\n+/)) {
+      const p = document.createElement("p");
+      p.textContent = paragraph;
+      body.append(p);
+    }
+    document.getElementById("page-view").classList.add("open");
+    document.getElementById("page-view").scrollTop = 0;
+    history.replaceState(null, "", `?page=${encodeURIComponent(path)}`);
+  }
+
+  function hidePage() {
+    document.getElementById("page-view").classList.remove("open");
+    history.replaceState(null, "", `?q=${encodeURIComponent(qEl.value)}&mode=${modeEl.value}`);
+  }
+
+  document.getElementById("back").addEventListener("click", hidePage);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") hidePage();
+  });
+
   function search(query) {
     const mode = modeEl.value;
     const { sql, params } = statementFor(mode);
@@ -249,7 +406,11 @@
 
     resultsEl.innerHTML = "";
     for (const [path, title, body, score] of found.rows) {
+      pages.set(path, { title, body });
       const li = document.createElement("li");
+      li.tabIndex = 0;
+      li.setAttribute("role", "link");
+      li.setAttribute("aria-label", `Open page: ${title}`);
       const h2 = document.createElement("h2");
       h2.textContent = title;
       const p = document.createElement("p");
@@ -262,6 +423,11 @@
       sc.className = "score";
       sc.textContent = Number(score).toFixed(4);
       li.append(h2, p, s, sc);
+      const open = () => showPage(path);
+      li.addEventListener("click", open);
+      li.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") open();
+      });
       resultsEl.append(li);
     }
     if (found.rows.length === 0) {
@@ -297,14 +463,16 @@
       `${count} pages indexed — this search made no request to any server`;
     statusEl.classList.remove("error");
 
-    // A ?q= link opens with results already shown, so a help article can link
-    // straight to "search results for renewing a passport".
+    // A ?q= link opens with results already shown, and ?page= opens a page
+    // itself — both arrive the way a real site's deep links would.
     const params = new URLSearchParams(location.search);
     const initial = params.get("q");
     if (initial) {
       qEl.value = initial;
       if (params.get("mode")) modeEl.value = params.get("mode");
       search(initial);
+      const target = params.get("page");
+      if (target && pages.has(target)) showPage(target);
     }
   } catch (error) {
     statusEl.textContent = `error: ${error}`;
