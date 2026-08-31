@@ -2552,6 +2552,82 @@ flagged rather than discarded.
 
 ---
 
+### The `LIMIT`-join overhead, profiled — and why the fix was reverted (2026-08-31)
+
+`BENCHMARK.md`'s two `LIMIT 10` join rows lose 2.4–3.3x to SQLite, and every
+edition of the plan carried them as "unexplained, unprofiled". Profiled here
+with `bin/profile.rs --suite joins-limit` (which already existed for exactly
+this and had never been run), release binary, `sample` over the query phase,
+24,481 samples.
+
+**Where the time goes.** By leaf symbol: `_platform_memmove` **21.4%**,
+`PageCache::get` 13.9%, `_platform_memcmp` 10.2%, allocator 14.6%. Attributing
+`memmove` to its callers is the finding: **20.1% of total engine time is
+`memmove` beneath `CowBTree::walk_raw_row_values`** — 12.2% inside
+`FileDevice::read` and 7.9% in `Rc::copy_from_slice` — on queries that return
+ten rows.
+
+**Why.** The raw leaf scan reads a leaf's bytes and never caches them. It says
+so, deliberately (`tree.rs`, the `KIND_LEAF` arm): "Leaves are deliberately not
+inserted — they were never decoded into a `Node` here, and decoding one purely
+to cache it would give back the allocation this scan exists to avoid." The
+consequence is that a *repeated prepared statement* re-`pread`s and re-copies
+the same pages on every execution, forever. Not a capacity effect: raising the
+page cache 8 MiB → 256 MiB (32x, well past the working set) moved the shares by
+less than a point (memmove 21.4% → 20.7%).
+
+**The fix works, and it is not shippable as written.** Caching the leaf —
+decoding it once into `Node::Leaf` and inserting through the existing
+`cache_committed`, so D4's carve-outs all still apply — measured, interleaved,
+3 repetitions each:
+
+| Shape | Before | Leaf caching | Verdict |
+| --- | --- | --- | --- |
+| `joins-limit` (both `LIMIT 10` shapes) | 86,006 ops/s | **121,424** | **1.42x**, 3/3, non-overlapping |
+| `joins` (full shapes dominate) | 52–53 ops/s | **47** | **~10% regression**, 3/3 |
+| `points` | 1.77–1.79M ops/s | 1.76–1.85M | flat |
+| `indexed-range` | 67.1–68.3k ops/s | 66.6–67.1k | flat |
+
+The regression is the mirror image of the win: a sweep reads every leaf once,
+reuses none, and pays the per-cell `entries` decode (AHL-488's cost) for
+thousands of pages that then evict each other. Three admission rules were tried
+to separate the two cases, all measured interleaved:
+
+1. **Cache the leaf the walk stops on** (`out.len() >= bounds.limit`) — flat,
+   88,014 vs 85,057 ops/s, inside the noise floor. The pages actually re-read
+   belong to an *index probe*, which asks for every row matching its key rather
+   than a bounded count, so this excluded exactly the pages worth keeping.
+2. **Cache while the walk is still short** (`out.len() < 256`) — kept the win
+   (1.45x) but kept the regression too (48/47 vs 52/53). A batched scan starts
+   every batch with an empty `out`, so the window never closes on a sweep.
+3. **Admit on the second miss** (2Q-style, 512-entry window) — kept the win
+   (1.44x) and *halved* the regression (50/48/50 vs 54/51/53, ~5.7%, still 3/3).
+   Mechanism for the residue: a batch boundary falling inside a leaf makes the
+   next batch re-read the page the last one finished on, which is itself a
+   second touch. Requiring a third touch was built and measured, but that run's
+   own control side spanned 37–53 ops/s — the measurement had fallen apart
+   (well past `PERF.md` §4's floor), so it decides nothing.
+
+**Reverted, deliberately.** A 1.4x win on one published losing row bought with
+a ~6–10% regression on another published losing row is not a trade this project
+takes, and the standing rule is that a fast path may not regress the slow path.
+What is banked is the diagnosis, the size of the prize, and three rules that do
+not work. The next attempt should make *insertion* cheap rather than admission
+clever — the decode is the cost, and the scan already holds the page bytes it
+would cache, so a cache that could hold an undecoded leaf (a `Node::RawLeaf`
+variant, or bytes beside the node) would pay neither the decode nor the second
+copy. That is a broader change to the `Node` enum and its match sites, which is
+why it was not attempted at the end of a session rather than the start.
+
+**Methodological note, recorded because it nearly published a wrong number.**
+The first version of this measurement compared a "before" run to an "after" run
+taken about thirty minutes apart and reported 1.31x. Re-measured interleaved in
+one sitting, the same "before" binary produced 85–89k ops/s where it had
+produced 68k — the machine, not the code. Every figure above is interleaved,
+same sitting, control side re-measured in every repetition. `bench/repeat.sh`
+exists for exactly this reason and `bin/profile.rs` has no equivalent; a
+harness that interleaves A/B binaries would have caught it automatically.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness
