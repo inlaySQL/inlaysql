@@ -57,30 +57,41 @@
   nav .wrap {
     display: flex;
     align-items: center;
-    gap: 1.5rem;
-    height: 3.5rem;
+    gap: 1rem;
+    height: 3.25rem;
   }
   .brand {
-    font: 600 .95rem/1 var(--mono);
+    font: 600 .85rem/1 var(--mono);
     color: var(--ink);
     display: flex;
     align-items: center;
-    gap: .55rem;
+    gap: .5rem;
     white-space: nowrap;
   }
   .brand .dot {
-    width: .65rem; height: .65rem;
+    width: .6rem; height: .6rem;
     border-radius: 50%;
     background: linear-gradient(120deg, var(--accent), var(--accent-warm));
   }
-  nav .links { display: flex; gap: .25rem; overflow-x: auto; }
+  nav .links {
+    display: flex;
+    gap: .125rem;
+    /* The links scroll rather than wrap on a narrow window, but a scrollbar
+       strip across a navbar reads as broken — the edges fade instead. */
+    overflow-x: auto;
+    scrollbar-width: none;
+    flex: 1;
+    min-width: 0;
+    mask-image: linear-gradient(90deg, #000 94%, transparent);
+  }
+  nav .links::-webkit-scrollbar { display: none; }
   nav .links button {
-    font: 500 .85rem/1 var(--sans);
+    font: 500 .82rem/1 var(--sans);
     color: var(--ink-dim);
     background: none;
     border: 0;
     border-radius: 6px;
-    padding: .55rem .8rem;
+    padding: .5rem .65rem;
     cursor: pointer;
     white-space: nowrap;
   }
@@ -331,24 +342,34 @@
     margin-top: 4.5rem;
     border-top: 1px solid var(--line);
     background: var(--bg-raised);
+    font-size: .88rem;
   }
   footer .cols {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
-    gap: 2rem;
-    padding: 2.5rem 0 2rem;
+    grid-template-columns: 1.4fr 1fr 1fr 1fr;
+    gap: 2.5rem;
+    padding: 2.25rem 0 2rem;
+  }
+  @media (max-width: 52rem) { footer .cols { grid-template-columns: 1fr 1fr; } }
+  footer .about p { color: var(--ink-faint); margin: 0; max-width: 20rem; }
+  .dot-brand {
+    display: inline-block;
+    width: .6rem; height: .6rem;
+    border-radius: 50%;
+    background: linear-gradient(120deg, var(--accent), var(--accent-warm));
   }
   footer h4 {
-    font: 600 .78rem/1 var(--mono);
+    font: 600 .72rem/1 var(--mono);
     letter-spacing: .08em;
     text-transform: uppercase;
     color: var(--ink-faint);
-    margin: 0 0 .9rem;
+    margin: .2rem 0 .8rem;
   }
   footer ul { list-style: none; margin: 0; padding: 0; }
-  footer li { margin: 0 0 .5rem; }
-  footer li button {
-    font: .88rem/1.4 var(--sans);
+  footer li { margin: 0 0 .45rem; }
+  footer li button,
+  footer li a {
+    font: .85rem/1.5 var(--sans);
     color: var(--ink-dim);
     background: none;
     border: 0;
@@ -356,13 +377,14 @@
     cursor: pointer;
     text-align: left;
   }
-  footer li button:hover { color: var(--accent); }
+  footer li button:hover, footer li a:hover { color: var(--accent); text-decoration: none; }
   footer .fine {
     border-top: 1px solid var(--line);
-    padding: 1.25rem 0 2rem;
+    padding: 1rem 0 1.5rem;
     color: var(--ink-faint);
-    font-size: .82rem;
+    font-size: .8rem;
   }
+  footer .fine a { color: var(--ink-dim); }
 </style>
 </head>
 <body>
@@ -509,6 +531,14 @@ VALUES (?, ?, ?, ?);                -- vector computed from `body`</pre>
 <footer>
   <div class="wrap">
     <div class="cols">
+      <div class="about">
+        <h4><span style="display:inline-flex;align-items:center;gap:.45rem;"><span class="dot-brand" aria-hidden="true"></span>Example Government Portal</span></h4>
+        <p>
+          A fictional portal demonstrating site search by InlaySQL — one
+          static database file, hybrid BM25 + vector ranking, zero servers.
+          Every link on this page runs a real query.
+        </p>
+      </div>
       <div>
         <h4>Popular services</h4>
         <ul>
@@ -528,19 +558,18 @@ VALUES (?, ?, ?, ?);                -- vector computed from `body`</pre>
         </ul>
       </div>
       <div>
-        <h4>About this demo</h4>
+        <h4>About</h4>
         <ul>
           <li><button data-q="contact opening hours">Contact us</button></li>
           <li><button data-q="accessibility">Accessibility statement</button></li>
-          <li><a href="https://github.com/inlaySQL/inlaysql/tree/main/crates/inlaysql-wasm/demos/site-search">Demo source and README</a></li>
-          <li><a href="https://github.com/inlaySQL/inlaysql">The engine: InlaySQL on GitHub</a></li>
+          <li><a href="https://github.com/inlaySQL/inlaysql/tree/main/crates/inlaysql-wasm/demos/site-search">Demo source</a></li>
+          <li><a href="https://github.com/inlaySQL/inlaysql">The engine on GitHub</a></li>
         </ul>
       </div>
     </div>
     <div class="fine">
-      A fictional portal demonstrating InlaySQL's WASM build — one static
-      database file, hybrid BM25 + vector search, zero servers. The real demo
-      of the engine lives <a href="../../">here</a>.
+      Search runs entirely in your browser via the InlaySQL WASM build — the
+      real demo of the engine lives <a href="../../">here</a>.
     </div>
   </div>
 </footer>
@@ -670,6 +699,27 @@ VALUES (?, ?, ?, ?);                -- vector computed from `body`</pre>
 
   document.getElementById("form").addEventListener("submit", (event) => {
     event.preventDefault();
+    const query = qEl.value.trim();
+    if (query && db) search(query);
+  });
+
+  // Live search. The database is already in this tab and a ranking pass costs
+  // single-digit milliseconds, so the button is a habit, not a requirement —
+  // results re-rank as you type, and picking a mode re-ranks what is shown.
+  let keystrokes;
+  qEl.addEventListener("input", () => {
+    clearTimeout(keystrokes);
+    const query = qEl.value.trim();
+    if (!query) {
+      resultsEl.innerHTML = "";
+      history.replaceState(null, "", location.pathname);
+      return;
+    }
+    keystrokes = setTimeout(() => {
+      if (db) search(query);
+    }, 120);
+  });
+  modeEl.addEventListener("change", () => {
     const query = qEl.value.trim();
     if (query && db) search(query);
   });
