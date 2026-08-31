@@ -282,6 +282,7 @@
     <div class="cta">
       <a class="btn primary" href="https://github.com/inlaySQL/inlaysql">View on GitHub</a>
       <a class="btn" href="#demo">Try it in your browser</a>
+      <a class="btn" href="demo/playground/">SQL playground</a>
       <a class="btn" href="demo/site-search/">Site-search demo</a>
       <a class="btn" href="https://github.com/inlaySQL/inlaysql/blob/main/BENCHMARK.md">Benchmarks</a>
     </div>
@@ -511,6 +512,30 @@
           <td>SQLite, journal</td>
           <td class="loss">~2× slower</td>
         </tr>
+        <tr>
+          <td>Indexed range scan, 50 rows</td>
+          <td class="num">49,259 ops/s</td>
+          <td>MySQL 8, PostgreSQL 17</td>
+          <td class="win">~2-4× faster</td>
+        </tr>
+        <tr>
+          <td><code>GROUP BY</code>, 100 groups over 100k rows</td>
+          <td class="num">29/s</td>
+          <td>PostgreSQL 17 (147/s), MySQL 8 (98/s)</td>
+          <td class="loss">~3-5× slower</td>
+        </tr>
+        <tr>
+          <td>Batch insert, 100 rows per statement</td>
+          <td class="num">26,254 rows/s</td>
+          <td>PostgreSQL 17 (81,229 rows/s)</td>
+          <td class="loss">~3× slower</td>
+        </tr>
+        <tr>
+          <td>Server writes over MySQL wire, 16 connections</td>
+          <td class="num">1,308.1 ops/s</td>
+          <td>MySQL 8 (6,120.7 ops/s)</td>
+          <td class="loss">~3-5× slower</td>
+        </tr>
       </tbody>
     </table>
     <p class="note">
@@ -547,12 +572,27 @@
         loudly rather than guessing.
       </li>
       <li>
-        <strong>Joins and range scans are slower than SQLite.</strong> Measured,
-        published above, and the current top priority.
+        <strong>Row iteration loses to SQLite.</strong> Range scans and the
+        PK-ordered full join are slower than SQLite; the secondary-index join
+        and both <code>LIMIT</code> shapes are faster, and against MySQL and
+        PostgreSQL the range scan wins outright. Measured, published above,
+        and the current top priority. The cause of the <code>LIMIT</code>-shape
+        gap is now profiled: the raw leaf scan re-reads and re-copies the same
+        page on every execution rather than caching it.
       </li>
       <li>
-        <strong>No cost-based join planner.</strong> Joins run in the order
-        they are written; index selection is a small set of rules that pay.
+        <strong><code>GROUP BY</code> and aggregates are the worst shape we
+        measure.</strong> Three to five times slower than MySQL and PostgreSQL,
+        consistent in sign across every repetition, and not explained by
+        transport. This is what the batch execution path exists to fix, and it
+        is not built.
+      </li>
+      <li>
+        <strong>Joins are ordered as written.</strong> <code>ANALYZE</code>
+        collects row counts and leading-key cardinalities, and index selection
+        and hash-versus-probe are costed from them — but nothing reorders a
+        join, so which table drives it is whichever one you wrote first. On our
+        own benchmark that single choice is worth about 8×.
       </li>
       <li>
         <strong>The MySQL server is localhost-plaintext for now.</strong> No

@@ -1016,6 +1016,29 @@ as the more likely cause; `bench/README.md` has the full methodology and the
 remaining asymmetries. PostgreSQL has no row because this server speaks only
 the MySQL wire protocol.
 
+**Read shapes and batch insert (2026-08-31).** Four workloads that had no
+harness on either side until now — and they do not all go our way:
+
+| Shape | InlaySQL | MySQL 8 | PostgreSQL 17 |
+| --- | --- | --- | --- |
+| Indexed range scan, 50 rows | **49,259 ops/s** | 13,124 ops/s (**~3.7x**) | 21,455 ops/s (**~2.3x**) |
+| Join, secondary-index inner, full | **4.77 ms** p50 | 15.01 ms (**~3.1x**) | 10.49 ms (**~2.2x**) |
+| Join, PK inner, full | 13.04 ms p50 | 15.00 ms (tie) | 10.49 ms (we lose ~1.24x) |
+| `GROUP BY n`, 100 groups | 29/s | 98/s (we lose ~3.4x) | 147/s (we lose ~5.0x) |
+| Batch insert, 100 rows/statement | 26,254 rows/s | 42,933 rows/s (we lose ~1.6x) | 81,229 rows/s (we lose ~3.1x) |
+
+The range scan we lose to SQLite is a shape we *win* against both servers, so
+"our row iteration is slow" is a statement about SQLite specifically, not
+about every engine. **The aggregate row is the worst multiple we publish
+against anyone**: 3.4-6.0x slower than both, consistent in sign across every
+repetition, and not a transport artifact — both opponents stream their result
+rows over a socket while InlaySQL is in-process. That is the tuple-at-a-time
+executor priced honestly, and the batch execution path that would fix it is
+scoped but unbuilt. This sitting ran under deliberate desktop load with the
+quiet-machine gate overridden (it refused every clean attempt), both sides of
+every cell measured in the same sitting, and `SCOREBOARD.md` applies the wider
+20.2% desktop-load noise floor to every verdict above.
+
 What none of this proves: Docker Desktop's virtual disk was never
 independently verified to honour `fsync` as a barrier for any of the engines
 measured in a container. Also not measured anywhere here: sustained or

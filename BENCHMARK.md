@@ -61,6 +61,23 @@ explicitly carried-forward section whose own commit and date are stated where
 it appears, per table, so a reader can always tell which build produced which
 number.
 
+**Tooling correction, 2026-08-31 — every `compare.sh`-sourced table below is
+now owed a regeneration.** Several sections on this page disclose, correctly
+for the numbers they carry, that `bench/compare.sh` had no quiet-machine load
+gate and no repeat wrapper, so its figures are a single ungated pass where the
+`run.sh` tables are gated medians of three. **Both now exist**:
+`bench/load_gate.sh` is shared by `run.sh` and `compare.sh` (same gate, same
+mid-run sampling, same `CONTAMINATED` marking — `compare.sh` watches only its
+measured phases, not its own container builds), and
+`REPEATS=5 ./bench/repeat-compare.sh` reports a median and spread through the
+same `bench/summarise.py`. Nothing on this page has been re-measured with them
+yet, so every such table still reads exactly as it did — a single run, stated
+as such. The instrument existing does not change the number; it changes what
+the *next* edition of these tables owes, which is a gated, repeated one. What
+is still not addressed: interleaving the engines *within* one pass
+(`compare.sh`'s phase order is fixed), which is the half of the recommendation
+`bench/README.md` still carries.
+
 **This edition's spread is wider than the last one it could compare against —
 and the first-published comparison overstated by how much.** The main
 `run.sh` suite (points/indexed/joins/vectors/concurrency/retrieval), median of
@@ -647,8 +664,9 @@ and are not implemented.
 One corpus, one set of queries, one exhaustive ground truth, each engine asked
 for its own query plan so an unindexed row cannot masquerade as an indexed one.
 5,000 documents, dim 128. Regenerated 2026-08-30 via `./bench/compare.sh`,
-single run (this table has no repeat wrapper the way `bench/run.sh` does —
-see `bench/README.md`), host load 1.1–1.9/18 throughout, four unrelated
+single run — no repeat wrapper existed for this table when it was measured;
+one does now (`bench/repeat-compare.sh`, 2026-08-31), and this table has not
+been re-measured with it — host load 1.1–1.9/18 throughout, four unrelated
 Docker containers present and idle for the session's whole duration
 (`hkjc-citywide-redis`, `hkjc-citywide-db`, `linkmonitor-app-1`,
 `estate-ops-postgres` — none touched during the run). Raw output:
@@ -665,8 +683,9 @@ Docker containers present and idle for the session's whole duration
 
 **Hybrid is roughly 20x** the nearest baseline (3.97 ms, Meilisearch,
 essentially unchanged from the previous edition's ~20x) and **roughly
-55-70x** DuckDB/pgvector (was ~60-70x). This table is a single run with no
-repeat wrapper (see the floor note at the top of this file) — it has no
+55-70x** DuckDB/pgvector (was ~60-70x). This table is a single run, measured
+before a repeat wrapper for it existed (see the tooling correction at the top
+of this file) — it has no
 internal spread to measure at all, which makes it *less* trustworthy to two
 significant figures than the gated `run.sh` tables above, not more; read the
 edition-to-edition move here as unmeasured rather than as a real narrowing.
@@ -862,8 +881,8 @@ reading of what the volume's barrier cost at that moment, the instrument
 repeated 5 times. `ROWS=20000 LOOKUPS=5000` — unchanged from the published
 table above.
 
-**Load, disclosed.** `bench/compare.sh` has no load gate (see the
-recommendation below), so the gate was manual, matching `bench/run.sh`'s
+**Load, disclosed.** `bench/compare.sh` had no load gate when this ran (it has
+one since 2026-08-31), so the gate was manual, matching `bench/run.sh`'s
 `BENCH_MAX_LOAD_PER_CPU=0.25` rule (18 logical CPUs → keep the 1-minute
 average well under ~4.5): checked before every repetition, waiting and
 rechecking rather than running and caveating. Two repetitions were caught
@@ -992,8 +1011,9 @@ row pays a socket round trip.
 process, not a Python thread, so `mysql.connector`'s GIL — confirmed below to
 have contaminated every earlier edition of this table — cannot be in this
 run's numbers. Checked quiet beforehand (host load ~3/18 logical CPUs);
-`bench/compare.sh` has no automated load gate the way `bench/run.sh` does, so
-this is a disclosed manual check, not an enforced one.
+`bench/compare.sh` had no automated load gate the way `bench/run.sh` does when
+this ran, so this is a disclosed manual check, not an enforced one; the gate
+landed 2026-08-31 and would enforce it on a re-measurement.
 
 | Engine | Connections | write ops/s | read ops/s |
 | --- | --- | --- | --- |
@@ -1511,13 +1531,16 @@ that same mechanism per row rather than per commit.
   comparison overstated it. Read every ratio in this document as approximate
   rather than exact — the point-reads section above is the extreme case,
   where the individual runs' own ratios against journal-mode SQLite ranged
-  from 2.05x to 3.80x. `bench/compare.sh` still has no repeat wrapper
-  (`bench/README.md` says so) **and, unlike `bench/run.sh`, still samples
-  load only once before the run rather than throughout it** — `bench/run.sh`
-  now does the latter (see `bench/README.md`'s "How many times to run it"),
-  and porting that fix to `compare.sh` is recorded there as a recommendation
-  pending a CI run to verify it doesn't interact badly with `trust.yml`'s
-  shared-runner tolerances. So the DuckDB/pgvector/Meilisearch table and the
+  from 2.05x to 3.80x. `bench/compare.sh` carried none of the gated
+  machinery when the tables below were measured — no repeat wrapper, and load
+  sampled once before the run rather than throughout it. **Both landed
+  2026-08-31** (`bench/load_gate.sh`, shared with `run.sh`, and
+  `bench/repeat-compare.sh`), and the `trust.yml` question that had this
+  recorded as a recommendation rather than a change is answered: the gate did
+  fail the shared-runner benchmarks job on its baseline load (run
+  33396108404), and the override is now job-level so both entrances agree.
+  None of the tables below have been re-measured with any of it. So the
+  DuckDB/pgvector/Meilisearch table and the
   carried-forward MySQL/PostgreSQL section remain single runs or, for the
   interleaved rerun, a 5-repetition median done specifically for that
   comparison — not a `REPEATS=N` sweep. Pinning the machine state itself is
