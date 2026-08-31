@@ -132,6 +132,13 @@ jobs:
     name: benchmarks
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # The override is job-level, not step-level, on purpose: it is not only
+    # "Run the benchmark suites" that gates — the compare step below invokes
+    # bench/run.sh through bench/compare.sh, and a step-level env would not
+    # reach it. A shared runner idles above 0.25/CPU (AHL-501), so both
+    # entrances need the same answer.
+    env:
+      BENCH_MAX_LOAD_PER_CPU: "off"
     steps:
       - uses: actions/checkout@v5
 
@@ -153,15 +160,23 @@ jobs:
       # BENCHMARK.md publishes come from local, gated runs, so a CI result
       # carrying the override does not become a published figure.
       - name: Run the benchmark suites
-        env:
-          BENCH_MAX_LOAD_PER_CPU: "off"
         run: ./bench/run.sh
 
       # DuckDB, pgvector and Meilisearch need containers, so this is
       # best-effort: a runner without Docker reports that rather than
       # failing the job, because the numbers above are still worth
       # publishing without it.
+      #
+      # The gate is off here for the same reason it is off above, and now for
+      # the same script: `compare.sh` gained the quiet-machine gate (it shares
+      # `bench/load_gate.sh` with `run.sh`), so without this override it would
+      # fail on shared-runner baseline load exactly the way AHL-501 already
+      # caught `run.sh` doing. Same reasoning applies unchanged — this job is
+      # a gross-regression canary, and a CI result carrying the override does
+      # not become a published figure.
       - name: Compare against DuckDB, pgvector and Meilisearch
+        env:
+          BENCH_MAX_LOAD_PER_CPU: "off"
         run: |
           if docker info >/dev/null 2>&1; then
             ./bench/compare.sh
