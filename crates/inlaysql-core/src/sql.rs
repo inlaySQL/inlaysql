@@ -87,6 +87,81 @@ const MAX_NESTING_DEPTH: usize = 16;
 /// commas, which do not chain.
 const MAX_CHAIN_LENGTH: usize = 512;
 
+/// How many dot-separated parts one unparenthesised identifier/expression
+/// chain may have (`a.b.c` is two dots).
+///
+/// The coverage-guided fuzzer found (Trust runs 33330438181 and
+/// 33375871306, AHL-500) that `sqlparser`'s IF-statement path backtracks
+/// *exponentially* across a chain of dot-separated identifiers — a 74-byte
+/// `IF 0..gg.g.gg...` statement cost ~30 seconds of CPU before returning
+/// its parse error, with the time roughly doubling per `g.` pair. The
+/// statement timeout never fires inside the parser, so on the server this
+/// is one thread pinned per malicious statement, 64 of which is the whole
+/// connection cap. `sqlparser` 0.62 has no per-dot recursion protection
+/// this crate can inherit (`default-features = false` drops
+/// `recursive-protection`; see [`MAX_NESTING_DEPTH`]'s doc comment for the
+/// same trade), so the chain is bounded here instead, one linear pass
+/// before the parser ever sees the text.
+///
+/// The bound resets on any other token, the way `,` resets
+/// [`MAX_CHAIN_LENGTH`]: real SQL chains `schema.table.column` (two dots),
+/// and nothing legitimate chains twenty-three. A float literal costs one
+/// dot; `a..b` costs two — both far inside the bound.
+const MAX_DOT_CHAIN: usize = 8;
+
+/// Refuse a statement that *begins* with the bare word `IF`.
+///
+/// No supported statement does — the only IF shapes here are
+/// `IFNULL`/`NULLIF`, the `IF NOT EXISTS`/`IF EXISTS` compound keywords are
+/// always mid-statement, and MySQL's compound `IF..THEN` is not a core
+/// feature — while `sqlparser`'s leading-IF path is the one place its
+/// backtracking goes exponential (AHL-500: 74 bytes, ~30 seconds of CPU, and
+/// the statement timeout never fires inside a parser). Refusing the
+/// statement-leading word is the loud version of "we do not have this
+/// clause" and closes the whole IF statement family; mid-statement `IF`
+/// (`CREATE TABLE IF NOT EXISTS`, a hypothetical `x IF y`) still reaches the
+/// parser, and `ifnull`/`if_stock` never were the keyword.
+///
+/// Comment-aware, because `/* */ IF 0..gg...` is the same statement to
+/// `sqlparser` and the same 30 seconds to the attacker.
+fn check_leading_if(sql: &str) -> Result<()> {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' | b'\n' | b'\x0b' | b'\x0c' => i += 1,
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                if sql[start..i].eq_ignore_ascii_case("IF") {
+                    return Err(Error::Unsupported(
+                        "IF statements are not supported (the bare word IF does not name a \
+                         function here — use IFNULL or CASE)"
+                            .to_string(),
+                    ));
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
 /// Reject a statement whose parentheses nest deeper than [`MAX_NESTING_DEPTH`].
 ///
 /// # Why this is here and not in the parser
@@ -108,6 +183,7 @@ const MAX_CHAIN_LENGTH: usize = 512;
 /// the depth is bounded here instead: one linear pass, no allocation, before
 /// the parser ever sees the text.
 fn check_nesting(sql: &str) -> Result<()> {
+    check_leading_if(sql)?;
     let mut depth = 0usize;
     // Parens inside a literal are text, not structure. Tracking quotes keeps
     // `SELECT '((('` working.
@@ -117,6 +193,10 @@ fn check_nesting(sql: &str) -> Result<()> {
     // with each other, and a nested `(...)` starts its own chain. Fixed size,
     // because `depth` is already bounded above — no allocation in this pass.
     let mut chain = [0usize; MAX_NESTING_DEPTH + 1];
+    // Dot chains get the same per-depth treatment — see [`MAX_DOT_CHAIN`] for
+    // why a `.` is the one token that still reaches an exponential in
+    // `sqlparser`'s backtracking.
+    let mut dots = [0usize; MAX_NESTING_DEPTH + 1];
 
     let bytes = sql.as_bytes();
     let mut i = 0;
@@ -142,6 +222,7 @@ fn check_nesting(sql: &str) -> Result<()> {
                     )));
                 }
                 chain[depth] = 0;
+                dots[depth] = 0;
             }
             b')' => depth = depth.saturating_sub(1),
             // A comma ends one expression and starts the next, so the chain
@@ -163,6 +244,28 @@ fn check_nesting(sql: &str) -> Result<()> {
                 b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'<' | b'>' | b'|' | b'&' | b'~' | b'!'
             )
         };
+        // A `.` extends the current dot chain, and so do the identifier
+        // characters between the dots — the fuzzer's inputs were
+        // `g.g.g.g...`, one whitespace-delimited run of dot-separated
+        // identifiers, so counting consecutive dots alone would see one dot
+        // at a time. Anything else (whitespace, operators, commas, parens,
+        // quotes) ends the chain. A float literal costs one dot and
+        // `schema.table.column` two — both far inside the bound; the runs
+        // this exists for were 23 dots and climbing (AHL-500).
+        if byte == b'.' {
+            dots[depth] += 1;
+            if dots[depth] > MAX_DOT_CHAIN {
+                return Err(Error::Unsupported(alloc::format!(
+                    "expression chains more than {MAX_DOT_CHAIN} dot-separated parts"
+                )));
+            }
+            i += 1;
+            continue;
+        }
+        if !(byte.is_ascii_alphanumeric() || byte == b'_') {
+            dots[depth] = 0;
+        }
+
         if is_operator(byte) {
             if i == 0 || !is_operator(bytes[i - 1]) {
                 chain[depth] += 1;

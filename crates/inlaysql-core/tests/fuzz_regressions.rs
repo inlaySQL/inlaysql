@@ -371,3 +371,133 @@ fn reasonable_chains_still_parse() {
         );
     }
 }
+
+// ---------------------------------------------------------------- AHL-500
+//
+// The `Trust` workflow's `sql_parser` target found the same crash twice on
+// different inputs (runs 33330438181 and 33375871306): `sqlparser` 0.62's
+// IF-statement path backtracks *exponentially* across a chain of
+// dot-separated identifiers. 74 bytes cost ~30 seconds of CPU before
+// returning a parse error, the statement timeout never fires inside the
+// parser, and `inlaysql serve --mysql` is thread-per-connection — so this
+// was a one-connection denial of service, not a slow query. Both inputs are
+// vendored below, byte for byte, because a crash that has been fixed but not
+// pinned comes back.
+
+/// Both fuzzer-found inputs must return an error *fast* — microseconds, not
+/// the ~30s one of them measured before the guard. The dot-chain bound is
+/// what actually fires for both (each chains far past [`MAX_DOT_CHAIN`]); the
+/// assertion is on the property, not on which guard fires, so a future
+/// re-balance between the two guards cannot silently un-pin this test.
+#[test]
+fn the_if_dot_chain_fuzzer_crashes_are_refused_without_stalling() {
+    for name in [
+        "sql_parser-if-dot-chain-74b.txt",
+        "sql_parser-if-dot-chain-2.txt",
+    ] {
+        let sql = String::from_utf8_lossy(&fixture(name)).into_owned();
+        assert!(sql.contains("if") || sql.contains("IF"), "{name} changed");
+        let start = std::time::Instant::now();
+        let error = inlaysql_core::sql::plan(&sql, &[], &Catalog::new())
+            .expect_err("{name}: a dot-chain past the bound was accepted");
+        assert!(
+            matches!(error, inlaysql_core::Error::Unsupported(_)),
+            "{name}: expected a loud refusal, got {error:?}"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(100),
+            "{name}: refusal took {:?} — the exponential is back",
+            start.elapsed()
+        );
+    }
+}
+
+/// A statement *beginning* with the bare word `IF` is refused by the
+/// pre-parse scan — no supported statement does, no scalar function is
+/// spelled `IF` (only `IFNULL` and `NULLIF`), and MySQL's compound
+/// `IF..THEN` is not a core feature, while `sqlparser`'s leading-IF path is
+/// the one place its backtracking goes exponential. The refusal names the
+/// clause — the house rule is refuse loudly, never accept and ignore.
+/// Comment-padded variants are the same statement and get the same refusal.
+#[test]
+fn a_statement_leading_if_is_refused_by_the_pre_parse_scan() {
+    let catalog = Catalog::new();
+    for sql in [
+        "IF 1 THEN SELECT 1",
+        "if:Kanything",
+        "/* sneaky */ IF 0..gg.g.gg.g.gg.g.gg.g1g.g.g.gg.g.gg.",
+        "-- sneaky\nIF 0..gg.g.gg.g.gg.g.gg.g1g.g.g.gg.g.gg.",
+    ] {
+        let error = inlaysql_core::sql::plan(sql, &[], &catalog)
+            .expect_err("a statement-leading IF was accepted");
+        assert!(
+            matches!(error, inlaysql_core::Error::Unsupported(ref m) if m.contains("IF")),
+            "{sql}: expected an IF refusal, got {error:?}"
+        );
+    }
+
+    // Mid-statement `IF` is the compound keywords' home (`CREATE TABLE IF
+    // NOT EXISTS`, `DROP TABLE IF EXISTS`) and must still reach the parser;
+    // the fuzzer's exponential only exists for statement-leading IF.
+    let mut engine = inlaysql_core::mem::engine().expect("in-memory engine");
+    engine
+        .execute("CREATE TABLE if_t (a INTEGER)", &[])
+        .expect("create table");
+    engine
+        .execute("CREATE TABLE IF NOT EXISTS if_t (a INTEGER)", &[])
+        .expect("CREATE TABLE IF NOT EXISTS must keep working");
+    engine
+        .execute("DROP TABLE IF EXISTS if_t", &[])
+        .expect("DROP TABLE IF EXISTS must keep working");
+    engine
+        .execute("DROP TABLE IF EXISTS if_t", &[])
+        .expect("a second IF EXISTS drop must stay a no-op, not an error");
+
+    // And the neighbours that must keep working do: `IFNULL` is a real
+    // function here, `ifnull`/`NULLIF` are the same function by its other
+    // spellings, and words that merely contain `if` are identifiers.
+    let mut engine = inlaysql_core::mem::engine().expect("in-memory engine");
+    for sql in [
+        "SELECT ifnull(NULL, 7)",
+        "SELECT nullif(3, 4)",
+        "SELECT 1 AS if_stock",
+    ] {
+        engine
+            .execute(sql, &[])
+            .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+    }
+}
+
+/// The dot-chain bound generalises past the IF shape: any statement whose
+/// identifiers chain past [`MAX_DOT_CHAIN`] is refused, while everything
+/// legitimate — floats, `schema.table.column`, a dot inside a string — still
+/// parses.
+#[test]
+fn dot_chains_are_bounded_and_dots_outside_chains_are_not() {
+    let catalog = Catalog::new();
+    // Past the bound: refused.
+    let chained = format!("SELECT t.{}c", "a.".repeat(9));
+    match inlaysql_core::sql::plan(&chained, &[], &catalog) {
+        Err(inlaysql_core::Error::Unsupported(m)) => {
+            assert!(m.contains("dot"), "unexpected refusal: {m}");
+        }
+        other => panic!("a nine-part dot chain was accepted: {other:?}"),
+    }
+    // Inside the bound: accepted by the pre-scan (this is the
+    // `schema.table.column` shape, which the fuzzer's inputs exaggerated by
+    // an order of magnitude). It may still fail later — there is no FROM
+    // clause here — but the failure must come from the binder, not the
+    // dot-chain refusal.
+    let short = "SELECT t.a.b.c.d.e.f.g.h";
+    match inlaysql_core::sql::plan(short, &[], &catalog) {
+        Err(inlaysql_core::Error::Unsupported(m)) if m.contains("dot") => {
+            panic!("a bounded dot chain hit the pre-scan refusal: {m}");
+        }
+        _ => {}
+    }
+    // Floats are one dot each; strings are opaque.
+    let mut engine = inlaysql_core::mem::engine().expect("in-memory engine");
+    engine
+        .execute("SELECT 1.5, 0.25, 'a.b.c.d.e.f.g.h.i.j.k'", &[])
+        .expect("floats and a dotted string literal were refused");
+}

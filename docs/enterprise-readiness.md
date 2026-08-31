@@ -35,7 +35,7 @@ each is closed with evidence. It is a scoreboard, not a claim.
 | 8 | No statement timeout; unbounded materialisation | **closed** — with two loops deliberately not interruptible, named in the entry |
 | 9 | No TLS, one user, no grants | **accounts and privileges closed**, TLS open |
 | 10 | Effectively no observability | **closed** — `EXPLAIN`, `SHOW PROCESSLIST`, `SHOW STATUS` and an opt-in slow-query log; no histograms and no audit log, named in the entry |
-| 11 | Exponential parser backtracking through `IF` (upstream `sqlparser`) | open — found by fuzzing 2026-08-31; see the entry |
+| 11 | Exponential parser backtracking through `IF` (upstream `sqlparser`) | **closed** — refused at the pre-parse scan, both fuzz inputs pinned as tests; see the entry |
 
 Closed means: reproduced first, fixed, and pinned by a test that fails against
 the old code — not "a commit mentions it". Blocker 5 is the one deliberately
@@ -815,7 +815,7 @@ that a non-superuser sees only its own connections
 (`a_non_superuser_sees_only_its_own_connections`) and that every id it was shown
 is one it may `KILL`.
 
-### 11. Exponential parser backtracking through `IF` — *reported 2026-08-31, open*
+### 11. Exponential parser backtracking through `IF` — *found by fuzzing, fixed and pinned the same day (2026-08-31)*
 
 CI's `sql_parser` fuzz target found it (Trust run on `92df5c3`, artifact
 `timeout-d89a66c262c26f5839ad03cb4fe903fbfac399e9`): a **74-byte** statement,
@@ -850,25 +850,40 @@ tokens and nesting; `.` is neither, so a 23-dot identifier chain passes
 it. The exponential does not need nesting at all — the 74-byte input has
 zero parentheses past the lexical prefix.
 
-**Candidate fixes, cheapest first** — none executed yet, because a parser
-guard needs its own fuzz/DST validation rather than a drive-by commit:
+**Fixed, 2026-08-31 — two guards in `check_nesting`'s linear pre-parse scan
+(`crates/inlaysql-core/src/sql.rs`), both options 1 and 2 from the list
+below:**
 
-1. Refuse statement-leading `IF` in the pre-parse scan with the house
-   `Error::Unsupported`: no supported dialect feature begins a statement
-   with `IF` (the `IF()` *function* is mid-expression and unaffected), and
-   MySQL compound `IF..THEN` is not a core feature. Narrow, loud, closes
-   the found path — but it is whack-a-mole until upstream fixes the
-   backtracking, and each new sqlparser statement type re-opens the door.
-2. Extend the pre-parse scan to bound `.`-chains (resetting on non-`.`),
-   the same way `,` resets today: catches the input class, not just the
-   keyword. Needs a fuzz pass of its own to pick the bound.
-3. The real fix is upstream: report to `sqlparser` (a fix likely belongs
-   in `parse_conditional_statement_block`'s re-try structure), then track
-   the upgrade.
+1. `check_leading_if` refuses a statement that *begins* with the bare word
+   `IF`, comment-aware, with the house `Error::Unsupported`. Mid-statement
+   `IF` is untouched — `CREATE TABLE IF NOT EXISTS` and `DROP TABLE IF
+   EXISTS` keep working, pinned by test — and `ifnull`/`if_stock` were never
+   the keyword. This is the precise refusal of the clause this engine does
+   not have.
+2. `MAX_DOT_CHAIN = 8` bounds dot-separated identifier *chains* — a chain is
+   a whitespace-delimited run of `a.b.c...` parts, which is the shape the
+   fuzzer's inputs were (`g.g.g.g...`, 23 parts and climbing), not
+   consecutive dots. `schema.table.column` costs two, a float literal one;
+   both pinned as still-parsing by test.
+
+Measured on the 74-byte artifact: ~30 s → **~101 µs**, refusal message
+naming the clause. The growth curve is flat: 12/24/48/96 `g.` pairs all
+refuse in ≤1.2 µs, where the unguarded parser doubled per pair. Both fuzzer
+artifacts are vendored byte-for-byte in
+`crates/inlaysql-core/tests/fuzz-regressions/` and pinned by
+`fuzz_regressions.rs` (fast-refusal property, IF-refusal message, and the
+legitimate-neighbours-still-parse side), per this file's "closed means
+pinned by a test that fails against the old code" rule — the old code
+spends ~30 s on the first of those tests, which is the failure.
+
+**Still owed upstream:** the backtracking itself is `sqlparser` 0.62's
+(`parse_conditional_statement_block` re-tries the whole conditional block
+per dot-identifier choice). The guards make that unreachable from SQL text
+this engine accepts; report upstream and track the upgrade so the refusal
+can eventually be lifted for the non-pathological mid-statement shapes.
 
 Fuzz-artifact provenance is in the Trust run's `fuzz-status` artifact for
-run 33330438181; the Trust workflow will keep failing on this until one of
-the three is done.
+runs 33330438181 and 33375871306.
 
 ---
 
