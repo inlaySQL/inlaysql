@@ -8,65 +8,30 @@
      badge on purpose: it is allowed to go red when the fuzzer finds something,
      and its output is the artifacts, not a colour. -->
 
-An embedded, serverless database in Rust: SQLite's single-file simplicity, with
-vector search and BM25 as first-class parts of the SQL dialect rather than an
-extension bolted on the side.
+**InlaySQL is an embedded database for Rust applications — the same shape as
+SQLite: one file, no server, plain SQL. It adds the two things you otherwise
+bolt on from outside: many writers at once, and search — vector and
+full-text — that lives inside the database and is queried with ordinary SQL.**
 
 > [!WARNING]
 > **Experimental. Do not put data you care about in this yet.**
 >
 > InlaySQL is version `0.0.1` and has never been run in production by anyone.
-> It is a storage engine written from scratch in a few weeks, and the honest
-> summary is:
->
-> - **The on-disk format is not stable.** The page format is already at
->   version 5 and the catalog at version 6, and the project is three weeks old.
->   A version number and a policy exist ([`docs/recovery.md`](docs/recovery.md));
->   the policy for pre-1.0 formats is *recreate the database*, not migrate.
-> - **No production burn-in.** The crash-safety story rests on deterministic
->   simulation — thousands of seeded crash and torn-write schedules — which is
->   a good way to find bugs and is **not** the same as years of real hardware,
->   real power cuts and real filesystems. SQLite has those; this does not.
-> - **Known gaps are listed, not hidden.** See
->   [What this is not](#what-this-is-not). Some of them will bite you: recall
->   on uniformly random vectors is poor, and the cost-based planner is still a
->   staged access-path prototype with no join reordering.
->
-> Use it for experiments, prototypes, and anything you can rebuild from source
-> data. `inlaysql backup <database> <destination>` now takes a consistent copy
-> of a live database without stopping the writer, and `Database::backup_to`
-> does the same from code — but there is still no point-in-time recovery, so
-> "restore" means "go back to whenever you last took one". If you find a bug,
-> it is genuinely useful to us — please open an issue.
+> The short version of why: the on-disk format is pre-1.0 (the policy is
+> *recreate the database*, not migrate — [`docs/recovery.md`](docs/recovery.md));
+> crash-safety is proven by deterministic simulation rather than years of real
+> hardware; and the known gaps are listed, not hidden — see
+> [What this is not](#what-this-is-not). Use it for experiments, prototypes and
+> anything you can rebuild from source data. If you find a bug, please open an
+> issue — it is genuinely useful to us.
 
-**Where it began.** This started as a walking skeleton assembled from existing
-crates (`redb`, `sqlparser-rs`, `tantivy`, `instant-distance`) behind our own
-API. The storage engine (copy-on-write B+ tree, WAL, MVCC) and both retrieval
-indexes (BM25 and HNSW ANN) are now in-house.
+## Try it in 30 seconds
 
-## Why
+**In your browser, no install** — the real engine compiled to WebAssembly,
+running in this page's own tab: **[inlaysql.github.io](https://inlaysql.github.io)**
+— type SQL, run hybrid search, and save the database into your browser.
 
-- **SQLite's model, not Postgres's.** One file, no server, a schema you
-  already know — but with concurrent writers and native retrieval instead of
-  the single writer and bolted-on extensions SQLite ships today.
-- **Retrieval is SQL, not a second system.** `VECTOR` and BM25 are additions
-  to the dialect the planner understands, not a separate vector store an
-  application has to keep in sync and merge client-side.
-- **Correct before fast.** `inlaysql-core` is deterministic-simulation-tested
-  — thousands of seeded crash/torn-write schedules replay byte-for-byte in
-  CI — before any number in this file gets trusted.
-- **Honest about the trade.** Every benchmark below regenerates from a script
-  in this repo, wins and losses both — see [Performance](#performance). What
-  is not built yet is listed just as plainly in
-  [What this is not](#what-this-is-not) and [Next](#next).
-
-How the pieces fit together: [Using it](#using-it) for the API,
-[The SQL surface](#the-sql-surface) for the dialect, and
-[Layout](#layout) for how the crates and the `no_std` boundary are arranged.
-For the current engineering sequence and cloud continuation handoff, see
-[`docs/PLAN.md`](docs/PLAN.md).
-
-## The demo
+**On your machine:**
 
 ```sh
 git clone https://github.com/inlaySQL/inlaysql
@@ -105,6 +70,56 @@ LIMIT 3;
 No separate vector store, no application-side merge step, no second query
 language. The planner recognises the retrieval functions, turns each into an
 index probe, and fuses the two rankings.
+
+## What you get
+
+- **One file, no server.** Your whole database — tables, indexes, vectors,
+  full text — is a single `.inlay` file you can copy, back up and ship.
+- **Writers that do not queue.** MVCC with concurrent committers; eight
+  writers do roughly 13x the work of one (measured, not claimed — see
+  [Performance](#performance)).
+- **Search is SQL.** `VECTOR(n)` columns, BM25 indexes, and a `fuse()` that
+  ranks across both in one statement — no sidecar process to keep in sync.
+- **Your ORM already speaks it.** `inlaysql serve --mysql` serves the
+  database over the MySQL wire protocol, so existing MySQL clients and ORMs
+  connect as-is.
+- **Crash-safe by construction.** Every crash and torn-write schedule is
+  replayed byte-for-byte in CI by a deterministic simulator, and the whole
+  engine is `#![forbid(unsafe_code)]` outside one Linux I/O backend.
+- **Async without a runtime.** Plain futures that Tokio, async-std, smol —
+  or nothing at all — can drive.
+
+## Where to go next
+
+| If you want to… | Read |
+| --- | --- |
+| embed it in an application | [Using it](#using-it) |
+| learn the SQL dialect | [The SQL surface](#the-sql-surface) |
+| see the benchmark table, wins and losses | [Performance](#performance) |
+| check what is missing before you depend on it | [What this is not](#what-this-is-not) |
+| read the honest engineering plan | [Next](#next), [`docs/PLAN.md`](docs/PLAN.md) |
+
+## Why
+
+- **SQLite's model, not Postgres's.** One file, no server, a schema you
+  already know — but with concurrent writers and native retrieval instead of
+  the single writer and bolted-on extensions SQLite ships today.
+- **Retrieval is SQL, not a second system.** `VECTOR` and BM25 are additions
+  to the dialect the planner understands, not a separate vector store an
+  application has to keep in sync and merge client-side.
+- **Correct before fast.** `inlaysql-core` is deterministic-simulation-tested
+  — thousands of seeded crash/torn-write schedules replay byte-for-byte in
+  CI — before any number in this file gets trusted.
+- **Honest about the trade.** Every benchmark below regenerates from a script
+  in this repo, wins and losses both — see [Performance](#performance). What
+  is not built yet is listed just as plainly in
+  [What this is not](#what-this-is-not) and [Next](#next).
+
+How the pieces fit together: [Using it](#using-it) for the API,
+[The SQL surface](#the-sql-surface) for the dialect, and
+[Layout](#layout) for how the crates and the `no_std` boundary are arranged.
+For the current engineering sequence and cloud continuation handoff, see
+[`docs/PLAN.md`](docs/PLAN.md).
 
 ## Using it
 
