@@ -46,6 +46,16 @@ DROP = re.compile(r"^\s*(?:date|commit|dirty|rustc|host|docker|load|written to)\
 # double-counts the metric and makes an otherwise valid summary fail.
 PROSE = re.compile(r"^\s*===|^\s*\(|^InlaySQL is ")
 
+# A rule between a table's header and its rows, or the `|` that divides one
+# group of columns from another. Neither carries a number, so both used to be
+# mistaken for the table header — and since the rule sits *below* the real
+# header, every row under a ruled table got its columns named `col1`, `col2`
+# and so on. That is most of `bench/compare.sh`'s output, whose tables are
+# ruled where `bench/run.sh`'s are not, so the naming was worst exactly where
+# the reader most needs to know whether a swinging figure is a `max` (expected)
+# or a `p50` (the measurement falling apart).
+SEPARATOR = re.compile(r"^[-=|+_\s]+$")
+
 # `bench/run.sh` samples machine load throughout a run, not just before it
 # starts, and marks the result file with this word, prominently, when a
 # sample exceeded the configured threshold mid-run. It lives on a `load:`
@@ -120,17 +130,31 @@ def split(line: str) -> tuple[str, list[tuple[float, str]], list[tuple[int, int]
     return " ".join(shape), values, spans
 
 
-def columns(header: str, count: int) -> list[str]:
+def columns(header: str, spans: list[tuple[int, int]]) -> list[str]:
     """Name each value in a row from the table header sitting above it.
 
-    A table header is the line before the rows with no numbers in it, and its
-    trailing words are the column names — `engine ops/s p50 p95 max` over four
-    values means the fourth value is a `max`. Getting this right is most of the
-    point: a row's `max` is one unlucky sample and is *expected* to swing,
-    where the same swing in its `p50` is the measurement falling apart.
+    Getting this right is most of the point: a row's `max` is one unlucky
+    sample and is *expected* to swing, where the same swing in its `p50` is the
+    measurement falling apart.
+
+    Names are matched by *position*, not word order: every table these scripts
+    print is right-aligned, so a value's right edge lines up with the right
+    edge of the header word above it, and the header word whose edge is nearest
+    is that value's name. Word order alone cannot do this. It breaks on a
+    two-word column name (`write ops/s` above one value) by shifting every
+    subsequent name one place left, and it breaks on `|`-divided column groups
+    by counting the divider as a name — both of which are how `compare.sh`
+    prints, and a *wrong* name is worse than no name, because the whole reason
+    to print it is to tell the reader which swings matter.
     """
-    words = header.split()
-    return words[-count:] if len(words) >= count else [f"col{index + 1}" for index in range(count)]
+    words = [
+        (match.group(), match.end())
+        for match in re.finditer(r"\S+", header)
+        if not SEPARATOR.match(match.group())
+    ]
+    if not words:
+        return [f"col{index + 1}" for index in range(len(spans))]
+    return [min(words, key=lambda word: abs(word[1] - end))[0] for _, end in spans]
 
 
 def parse(path: str) -> list[Line | str]:
@@ -147,8 +171,11 @@ def parse(path: str) -> list[Line | str]:
                 continue
             shape, values, spans = split(line)
             if not values:
-                # No numbers: this is a table header, or prose between tables.
-                header = line
+                # No numbers: a table header, prose between tables, or the rule
+                # under a header. A rule is not a header, and letting it become
+                # one throws away the names of every column below it.
+                if not SEPARATOR.match(line):
+                    header = line
                 out.append(line)
                 continue
             out.append(Line(text=line, shape=shape, values=values, spans=spans, header=header))
@@ -240,7 +267,7 @@ def main(paths: list[str]) -> int:
 
     slots: list[list[Slot]] = []
     for index, line in enumerate(reference):
-        names = columns(line.header, len(line.values))
+        names = columns(line.header, line.spans)
         row = []
         for column, (_, unit) in enumerate(line.values):
             row.append(

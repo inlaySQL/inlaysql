@@ -44,6 +44,60 @@ class ParseTests(unittest.TestCase):
             self.assertEqual(len(summarise.measured(summarise.parse(str(faster)))), 2)
 
 
+class ColumnNamingTests(unittest.TestCase):
+    """A metric's column name is what tells the reader whether a wide spread is
+    expected (`max`, one unlucky sample) or is the measurement falling apart
+    (`p50`). `bench/compare.sh`'s tables — the ones deciding whether we beat
+    MySQL, PostgreSQL, pgvector or DuckDB — are ruled under their headers and
+    divided into groups by `|`, and both of those used to defeat the naming.
+    """
+
+    # The OLTP table `bench/compare.sh` prints, trimmed to two rows: a ruled
+    # header, `|`-divided column groups, and two-word column names on either
+    # side of the divider.
+    OLTP = (
+        "engine                    write ops/s      p50      p95 |  read ops/s      p50      p95\n"
+        "---------------------------------------------------------------------------------------\n"
+        "InlaySQL                        278.8   3.82ms   4.74ms |    812408.1   1.00us   4.00us\n"
+        "MySQL 8                        1598.8 572.00us 789.00us |     10594.5  95.00us 103.00us\n"
+    )
+
+    def _first_row_columns(self, text: str) -> list[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "run.txt")
+            path.write_text(text, encoding="utf-8")
+            row = summarise.measured(summarise.parse(str(path)))[0]
+            return summarise.columns(row.header, row.spans)
+
+    def test_a_rule_under_the_header_is_not_mistaken_for_the_header(self) -> None:
+        # Before: the `-----` line had no numbers, so it became the header, and
+        # every value under it was named col1..colN.
+        self.assertNotIn("col1", self._first_row_columns(self.OLTP))
+
+    def test_columns_are_named_across_a_group_divider(self) -> None:
+        # Word order would count `|` as a name and shift everything after it;
+        # two-word names (`write ops/s`) would shift everything after them too.
+        self.assertEqual(
+            self._first_row_columns(self.OLTP),
+            ["ops/s", "p50", "p95", "ops/s", "p50", "p95"],
+        )
+
+    def test_an_unruled_table_still_names_its_columns(self) -> None:
+        # `bench/run.sh`'s own tables have no rule and no divider. They were
+        # named correctly before this change and have to stay that way.
+        unruled = (
+            "engine                   ops/s      p50      p95      p99      max\n"
+            "InlaySQL                   250   3.91ms   4.66ms   7.98ms  12.76ms\n"
+        )
+        self.assertEqual(
+            self._first_row_columns(unruled),
+            ["ops/s", "p50", "p95", "p99", "max"],
+        )
+
+    def test_a_table_with_no_header_at_all_falls_back_to_positions(self) -> None:
+        self.assertEqual(self._first_row_columns("InlaySQL 250 3.91ms\n"), ["col1", "col2"])
+
+
 class ContaminationTests(unittest.TestCase):
     """`bench/run.sh` now samples load throughout a run and marks the result
     file CONTAMINATED, on a `load:` line, when a sample exceeded the gate
