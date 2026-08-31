@@ -360,7 +360,10 @@
         const { rewritten, params } = preprocess(statement);
         const bound = params.length ? JSON.stringify(params) : undefined;
         const result = JSON.parse(db.execute(rewritten, bound));
-        if (result.kind === "rows") {
+        // The module returns { kind: "ddl" | "written" } for non-queries, but
+        // row sets as { columns, rows } with no kind — the presence of
+        // `columns` is what says "this was a SELECT".
+        if (result.columns) {
           block.append(renderTable(result));
         } else if (result.kind === "written") {
           block.classList.add("ok");

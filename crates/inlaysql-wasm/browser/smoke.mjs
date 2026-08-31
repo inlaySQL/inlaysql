@@ -173,6 +173,14 @@ try {
   const ddl = await page.locator("#out .block").first().textContent();
   check("the playground created a table", /schema changed/.test(ddl), ddl);
 
+  // Lesson 2 ends in a SELECT: a row set arrives without a `kind`, and a
+  // regression here once rendered it as "schema changed" instead of a table.
+  await page.click("#lesson-2");
+  await page.click("#run");
+  await page.waitForFunction(() => document.querySelectorAll("#out table").length > 0);
+  const books = await page.locator("#out table").textContent();
+  check("a SELECT renders as a table of rows", /Dune|Neuromancer/.test(books), books);
+
   await page.click("#lesson-5"); // vectors, from scratch in a fresh table
   await page.click("#run");
   await page.waitForFunction(() => document.querySelectorAll("#out .block").length > 0);
