@@ -3,116 +3,240 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Site search — InlaySQL demo</title>
-<meta name="description" content="Full-text and vector search for a static website, running entirely in the browser. No backend, no API, no third-party request.">
+<title>Example Government Portal — site search by InlaySQL</title>
+<meta name="description" content="A government portal whose search runs entirely in the browser: full-text and vector ranking from one static file, no backend, no API.">
 
 <style>
-  /* Self-contained on purpose: this page demonstrates search for a site that
-     must not make a third-party request, so a font CDN or a CSS framework
-     here would undercut the whole point. */
+  /* The visual language is the engine's own demo site (www/index.html):
+     same palette, same type scale — a demo of the product should look like
+     the product. Self-contained still: no fonts, no CDNs, no third-party
+     request of any kind, which is the point the page is making. */
   :root {
-    --ink: #14202e;
-    --ink-dim: #4a5a6a;
-    --line: #d5dce3;
-    --paper: #ffffff;
-    --paper-dim: #f2f5f8;
-    --accent: #12437a;
-    --accent-ink: #ffffff;
-    --good: #1a7f4f;
-    --warn: #8a5a00;
+    --bg: #08080b;
+    --bg-raised: #101015;
+    --line: #23232c;
+    --ink: #e8e8ee;
+    --ink-dim: #9a9aab;
+    --ink-faint: #6b6b7b;
+    --accent: #a78bfa;
+    --accent-warm: #f0abfc;
+    --good: #6ee7b7;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
     --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   }
 
   * { box-sizing: border-box; }
 
+  html { scroll-behavior: smooth; }
+
   body {
     margin: 0;
-    background: var(--paper-dim);
+    background: var(--bg);
     color: var(--ink);
-    font: 16px/1.6 var(--sans);
+    font: 16px/1.65 var(--sans);
     -webkit-font-smoothing: antialiased;
   }
 
-  code { font-family: var(--mono); font-size: .85em; background: var(--paper-dim); padding: .1em .35em; border-radius: 4px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
 
-  .wrap { max-width: 46rem; margin: 0 auto; padding: 0 1.25rem; }
+  code { font-family: var(--mono); font-size: .85em; }
 
-  header.masthead {
-    background: var(--accent);
-    color: var(--accent-ink);
-    padding: 2rem 0 2.25rem;
+  .wrap { max-width: 62rem; margin: 0 auto; padding: 0 1.5rem; }
+
+  /* ---- nav ---- */
+
+  nav {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: rgba(8, 8, 11, .88);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line);
   }
-  header.masthead h1 {
-    margin: 0 0 .25rem;
-    font-size: 1.6rem;
-    letter-spacing: -.01em;
+  nav .wrap {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    height: 3.5rem;
   }
-  header.masthead p { margin: 0; opacity: .85; }
+  .brand {
+    font: 600 .95rem/1 var(--mono);
+    color: var(--ink);
+    display: flex;
+    align-items: center;
+    gap: .55rem;
+    white-space: nowrap;
+  }
+  .brand .dot {
+    width: .65rem; height: .65rem;
+    border-radius: 50%;
+    background: linear-gradient(120deg, var(--accent), var(--accent-warm));
+  }
+  nav .links { display: flex; gap: .25rem; overflow-x: auto; }
+  nav .links button {
+    font: 500 .85rem/1 var(--sans);
+    color: var(--ink-dim);
+    background: none;
+    border: 0;
+    border-radius: 6px;
+    padding: .55rem .8rem;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  nav .links button:hover { color: var(--ink); background: var(--bg-raised); }
+  nav .links button:focus-visible { outline: 2px solid var(--accent); }
+  nav .badge {
+    margin-left: auto;
+    font: 500 .72rem/1 var(--mono);
+    color: var(--accent);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: .4rem .7rem;
+    background: var(--bg-raised);
+    white-space: nowrap;
+  }
+  @media (max-width: 44rem) { nav .badge { display: none; } }
+
+  /* ---- hero ---- */
+
+  header.hero { position: relative; padding: 4.5rem 0 3rem; text-align: center; overflow: hidden; }
+  header.hero::before {
+    content: "";
+    position: absolute;
+    inset: -40% 0 auto 50%;
+    width: 60rem; height: 32rem;
+    transform: translateX(-50%);
+    background: radial-gradient(closest-side, rgba(167, 139, 250, .14), transparent 70%);
+    pointer-events: none;
+  }
+  header.hero > * { position: relative; }
+
+  .eyebrow {
+    display: inline-block;
+    font: 500 .78rem/1 var(--mono);
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: .5rem .9rem;
+    margin-bottom: 1.5rem;
+    background: var(--bg-raised);
+  }
+
+  h1 {
+    font-size: clamp(2rem, 5vw, 3.1rem);
+    line-height: 1.1;
+    letter-spacing: -.03em;
+    font-weight: 700;
+    margin: 0 0 1rem;
+  }
+  h1 .grad {
+    background: linear-gradient(100deg, var(--accent), var(--accent-warm));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .lede {
+    font-size: 1.1rem;
+    color: var(--ink-dim);
+    max-width: 38rem;
+    margin: 0 auto 2rem;
+  }
 
   /* ---- the search box ---- */
 
   form {
     display: flex;
     gap: .5rem;
-    margin: 2rem 0 .5rem;
+    max-width: 40rem;
+    margin: 0 auto .75rem;
     flex-wrap: wrap;
+    justify-content: center;
   }
   #q {
-    flex: 1 1 16rem;
+    flex: 1 1 14rem;
     font: 1rem/1.4 var(--sans);
-    padding: .65rem .9rem;
+    padding: .75rem 1rem;
     border: 1px solid var(--line);
-    border-radius: 6px 0 0 6px;
+    border-radius: 8px 0 0 8px;
     color: var(--ink);
-    background: var(--paper);
+    background: var(--bg-raised);
   }
+  #q::placeholder { color: var(--ink-faint); }
   #q:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   #mode {
-    font: .95rem/1.4 var(--sans);
-    padding: .65rem .6rem;
+    font: .9rem/1.4 var(--sans);
+    padding: .75rem .6rem;
     border: 1px solid var(--line);
     border-left: 0;
     border-radius: 0;
-    background: var(--paper);
-    color: var(--ink);
+    background: var(--bg-raised);
+    color: var(--ink-dim);
   }
-  button {
+  button.cta {
     font: 500 .95rem/1 var(--sans);
-    padding: .7rem 1.3rem;
-    border: 1px solid var(--accent);
-    border-radius: 0 6px 6px 0;
-    background: var(--accent);
-    color: var(--accent-ink);
+    padding: .8rem 1.4rem;
+    border: 1px solid transparent;
+    border-radius: 0 8px 8px 0;
+    background: linear-gradient(100deg, var(--accent), var(--accent-warm));
+    color: #17121f;
+    font-weight: 600;
     cursor: pointer;
   }
-  button:hover { filter: brightness(1.1); }
+  button.cta:hover { filter: brightness(1.08); }
 
-  #status { color: var(--ink-dim); font-size: .9rem; margin: .4rem 0 0; }
-  #status.error { color: #a3282d; }
+  #status { color: var(--ink-faint); font-size: .85rem; margin: .25rem 0 0; font-family: var(--mono); }
+  #status.error { color: #f87171; }
+
+  .chips {
+    display: flex;
+    gap: .5rem;
+    flex-wrap: wrap;
+    justify-content: center;
+    margin-top: 1.25rem;
+  }
+  .chips .label { font: 500 .8rem/1 var(--mono); color: var(--ink-faint); align-self: center; }
+  .chips button {
+    font: 500 .8rem/1 var(--sans);
+    color: var(--ink-dim);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--bg-raised);
+    padding: .5rem .9rem;
+    cursor: pointer;
+  }
+  .chips button:hover { color: var(--ink); border-color: var(--accent); }
 
   /* ---- results ---- */
 
-  #results { list-style: none; margin: 1.5rem 0 0; padding: 0; }
+  #results {
+    list-style: none;
+    margin: 2.5rem 0 0;
+    padding: 0;
+    text-align: left;
+  }
   #results li {
-    background: var(--paper);
+    background: var(--bg-raised);
     border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 1rem 1.25rem;
+    border-radius: 10px;
+    padding: 1.1rem 1.4rem;
     margin-bottom: .75rem;
     cursor: pointer;
     transition: border-color .12s, box-shadow .12s;
   }
-  #results li:hover { border-color: var(--accent); box-shadow: 0 1px 4px rgba(18, 67, 122, .12); }
+  #results li:hover { border-color: var(--accent); box-shadow: 0 2px 12px rgba(167, 139, 250, .08); }
   #results li:focus-visible { outline: 2px solid var(--accent); }
   #results h2 {
-    margin: 0 0 .15rem;
+    margin: 0 0 .2rem;
     font-size: 1.05rem;
     color: var(--accent);
   }
   #results .path {
     font-family: var(--mono);
-    font-size: .8rem;
+    font-size: .78rem;
     color: var(--good);
     margin: 0 0 .5rem;
   }
@@ -120,8 +244,8 @@
   #results .score {
     float: right;
     font-family: var(--mono);
-    font-size: .78rem;
-    color: var(--ink-dim);
+    font-size: .75rem;
+    color: var(--ink-faint);
   }
 
   /* ---- the page view ---- */
@@ -131,101 +255,167 @@
   #page-view {
     position: fixed;
     inset: 0;
-    background: var(--paper-dim);
+    z-index: 30;
+    background: var(--bg);
     overflow-y: auto;
     display: none;
   }
   #page-view.open { display: block; }
-  #page-view .inner {
-    max-width: 46rem;
-    margin: 0 auto;
-    padding: 1.5rem 1.25rem 3rem;
-  }
+  #page-view .inner { max-width: 46rem; margin: 0 auto; padding: 2rem 1.5rem 4rem; }
   #page-view .crumb {
     font-family: var(--mono);
     font-size: .8rem;
     color: var(--good);
-    margin: 0 0 .25rem;
+    margin: 0 0 .5rem;
   }
-  #page-view h2 { margin: 0 0 1rem; font-size: 1.5rem; letter-spacing: -.01em; }
-  #page-view p { margin: 0 0 1rem; }
+  #page-view h2 { margin: 0 0 1.5rem; font-size: 1.7rem; letter-spacing: -.02em; }
+  #page-view p { margin: 0 0 1.1rem; color: var(--ink-dim); }
+  #page-view p:first-of-type { color: var(--ink); }
   #page-view .back {
-    border-radius: 6px;
-    background: var(--paper);
-    color: var(--accent);
+    font: 500 .85rem/1 var(--sans);
+    border-radius: 8px;
+    background: var(--bg-raised);
+    border: 1px solid var(--line);
+    color: var(--ink-dim);
+    padding: .6rem 1rem;
     margin-bottom: 1.5rem;
+    cursor: pointer;
   }
+  #page-view .back:hover { color: var(--ink); border-color: var(--accent); }
 
   /* ---- how it works ---- */
 
-  .how { margin-top: 3rem; }
-  .how h2 {
-    font-size: 1.3rem;
-    letter-spacing: -.01em;
-    border-bottom: 2px solid var(--accent);
-    padding-bottom: .4rem;
+  .how { margin-top: 4.5rem; }
+  .how > h2 {
+    font-size: 1.5rem;
+    letter-spacing: -.02em;
+    text-align: center;
+    margin: 0 0 .5rem;
   }
+  .how > .sub { text-align: center; color: var(--ink-dim); margin: 0 auto 2rem; max-width: 34rem; font-size: .95rem; }
   .how section {
-    background: var(--paper);
+    background: var(--bg-raised);
     border: 1px solid var(--line);
-    border-radius: 8px;
-    padding: 1.1rem 1.4rem;
+    border-radius: 12px;
+    padding: 1.4rem 1.6rem;
     margin: 1rem 0;
   }
-  .how h3 { margin: 0 0 .4rem; font-size: 1rem; }
-  .how p { margin: .4rem 0; font-size: .92rem; color: var(--ink-dim); }
+  .how h3 { margin: 0 0 .5rem; font-size: 1.02rem; }
+  .how p { margin: .5rem 0; font-size: .92rem; color: var(--ink-dim); }
   .how pre {
-    background: #101820;
+    background: #0b0b10;
+    border: 1px solid var(--line);
     color: #d7e2ee;
-    padding: .85rem 1.1rem;
-    border-radius: 6px;
+    padding: .9rem 1.1rem;
+    border-radius: 8px;
     overflow-x: auto;
     font-size: .78rem;
     line-height: 1.55;
-    margin: .75rem 0;
+    margin: .85rem 0;
   }
   .how .tag {
     display: inline-block;
-    font: 600 .72rem/1 var(--mono);
+    font: 600 .7rem/1 var(--mono);
+    letter-spacing: .06em;
+    text-transform: uppercase;
     color: var(--accent);
-    border: 1px solid var(--accent);
+    border: 1px solid rgba(167, 139, 250, .35);
     border-radius: 999px;
-    padding: .25rem .6rem;
-    margin-bottom: .5rem;
-    background: #eef3f9;
+    padding: .3rem .65rem;
+    margin-bottom: .6rem;
+    background: rgba(167, 139, 250, .08);
   }
+  .how .fn { color: var(--accent-warm); font-family: var(--mono); font-size: .85em; }
 
   footer {
-    margin: 3rem 0 2rem;
-    padding-top: 1.25rem;
+    margin-top: 4.5rem;
     border-top: 1px solid var(--line);
-    color: var(--ink-dim);
-    font-size: .85rem;
+    background: var(--bg-raised);
   }
-  footer a { color: var(--accent); }
+  footer .cols {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+    gap: 2rem;
+    padding: 2.5rem 0 2rem;
+  }
+  footer h4 {
+    font: 600 .78rem/1 var(--mono);
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    margin: 0 0 .9rem;
+  }
+  footer ul { list-style: none; margin: 0; padding: 0; }
+  footer li { margin: 0 0 .5rem; }
+  footer li button {
+    font: .88rem/1.4 var(--sans);
+    color: var(--ink-dim);
+    background: none;
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+    text-align: left;
+  }
+  footer li button:hover { color: var(--accent); }
+  footer .fine {
+    border-top: 1px solid var(--line);
+    padding: 1.25rem 0 2rem;
+    color: var(--ink-faint);
+    font-size: .82rem;
+  }
 </style>
 </head>
 <body>
 
-<header class="masthead">
+<nav aria-label="Site">
   <div class="wrap">
-    <h1>Example Government Portal</h1>
-    <p>Site search — running entirely in your browser</p>
+    <span class="brand"><span class="dot" aria-hidden="true"></span>Example Government Portal</span>
+    <div class="links" role="group" aria-label="Popular sections">
+      <button data-q="passport">Passports</button>
+      <button data-q="tax return">Money &amp; tax</button>
+      <button data-q="rent housing">Housing</button>
+      <button data-q="driving licence">Transport</button>
+      <button data-q="birth certificate">Certificates</button>
+      <button data-q="contact opening hours">Contact</button>
+    </div>
+    <span class="badge">search by InlaySQL</span>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="eyebrow">Static site · no backend · search runs in your tab</span>
+    <h1>Find the service<br>you <span class="grad">actually need</span></h1>
+    <p class="lede">
+      Every service, certificate and payment of the portal — searchable by
+      keyword, by meaning, or both at once. The ranking happens on this page:
+      there is no search server.
+    </p>
+
+    <form id="form" autocomplete="off">
+      <input id="q" type="search" placeholder='Try "renew a passport" or "help with rent"' aria-label="Search the site">
+      <select id="mode" aria-label="Ranking mode">
+        <option value="hybrid" selected>hybrid</option>
+        <option value="keyword">keyword</option>
+        <option value="semantic">semantic</option>
+      </select>
+      <button id="search" class="cta" type="submit">Search</button>
+    </form>
+    <p id="status">loading the search engine…</p>
+
+    <div class="chips" role="group" aria-label="Popular searches">
+      <span class="label">popular:</span>
+      <button data-q="renew a passport">renew a passport</button>
+      <button data-q="help with rent">help with rent</button>
+      <button data-q="dispute a fine">dispute a fine</button>
+      <button data-q="getting married">getting married</button>
+      <button data-q="report a scam">report a scam</button>
+    </div>
   </div>
 </header>
 
 <main class="wrap">
-  <form id="form" autocomplete="off">
-    <input id="q" type="search" placeholder='Try "renew a passport" or "help with rent"' aria-label="Search the site">
-    <select id="mode" aria-label="Ranking mode">
-      <option value="hybrid" selected>hybrid</option>
-      <option value="keyword">keyword</option>
-      <option value="semantic">semantic</option>
-    </select>
-    <button id="search" type="submit">Search</button>
-  </form>
-  <p id="status">loading the search engine…</p>
-  <ol id="results"></ol>
+  <ol id="results" aria-live="polite"></ol>
 
   <!-- Clicking a result opens the page, rendered from the very row the
        search ranked. There is no server to fetch a real one from. -->
@@ -240,6 +430,11 @@
 
   <div class="how">
     <h2>How this search works</h2>
+    <p class="sub">
+      Three steps, all visible in this page's source. The same engine that
+      ranks these results ships as a ~660 KiB module and opens a real database
+      file fetched like an image.
+    </p>
 
     <section>
       <span class="tag">step 1 · build time</span>
@@ -284,21 +479,22 @@ VALUES (?, ?, ?, ?);                -- vector computed from `body`</pre>
       <span class="tag">step 3 · one SQL statement</span>
       <h3>The ranking mode you picked changes one function call</h3>
       <p>
-        <code>bm25_score(body, ?)</code> — keyword relevance, the classic
-        search-engine score over the full-text index. Finds exact words:
-        "renew", "passport".
+        <span class="fn">bm25_score(body, ?)</span> — keyword relevance, the
+        classic search-engine score over the full-text index. Finds exact
+        words: "renew", "passport".
       </p>
       <p>
-        <code>vector_score(embedding, ?)</code> — semantic similarity against
-        your query's vector, using the HNSW approximate-nearest-neighbour
-        index. Finds pages about the same <em>topic</em> even when no query
-        word appears: "help with rent" finds rent assistance.
+        <span class="fn">vector_score(embedding, ?)</span> — semantic
+        similarity against your query's vector, using the HNSW
+        approximate-nearest-neighbour index. Finds pages about the same
+        <em>topic</em> even when no query word appears: "help with rent" finds
+        rent assistance.
       </p>
       <p>
-        <code>fuse(vector_score(…), bm25_score(…))</code> — hybrid: both
-        scores are computed and combined with reciprocal rank fusion, which
-        merges the two rankings rather than the two raw numbers, so a page
-        that does well on either gets pulled up.
+        <span class="fn">fuse(vector_score(…), bm25_score(…))</span> — hybrid:
+        both scores are computed and combined with reciprocal rank fusion,
+        which merges the two rankings rather than the two raw numbers, so a
+        page that does well on either gets pulled up.
       </p>
       <pre id="sql"></pre>
       <p>
@@ -308,13 +504,46 @@ VALUES (?, ?, ?, ?);                -- vector computed from `body`</pre>
       </p>
     </section>
   </div>
-
-  <footer>
-    InlaySQL demo — one static file, hybrid BM25 + vector search, zero servers.
-    <a href="../../">Back to the main demo</a> ·
-    <a href="https://github.com/inlaySQL/inlaysql/tree/main/crates/inlaysql-wasm/demos/site-search">demo source and README</a>
-  </footer>
 </main>
+
+<footer>
+  <div class="wrap">
+    <div class="cols">
+      <div>
+        <h4>Popular services</h4>
+        <ul>
+          <li><button data-q="renew a passport">Renew a passport</button></li>
+          <li><button data-q="file tax return">File your tax return</button></li>
+          <li><button data-q="social housing apply">Apply for social housing</button></li>
+          <li><button data-q="enrol to vote">Enrol to vote</button></li>
+        </ul>
+      </div>
+      <div>
+        <h4>Payments &amp; records</h4>
+        <ul>
+          <li><button data-q="pay fine">Pay or dispute a fine</button></li>
+          <li><button data-q="certificate">Order a certificate</button></li>
+          <li><button data-q="payment plan">Set up a payment plan</button></li>
+          <li><button data-q="pension">The state pension</button></li>
+        </ul>
+      </div>
+      <div>
+        <h4>About this demo</h4>
+        <ul>
+          <li><button data-q="contact opening hours">Contact us</button></li>
+          <li><button data-q="accessibility">Accessibility statement</button></li>
+          <li><a href="https://github.com/inlaySQL/inlaysql/tree/main/crates/inlaysql-wasm/demos/site-search">Demo source and README</a></li>
+          <li><a href="https://github.com/inlaySQL/inlaysql">The engine: InlaySQL on GitHub</a></li>
+        </ul>
+      </div>
+    </div>
+    <div class="fine">
+      A fictional portal demonstrating InlaySQL's WASM build — one static
+      database file, hybrid BM25 + vector search, zero servers. The real demo
+      of the engine lives <a href="../../">here</a>.
+    </div>
+  </div>
+</footer>
 
 <script type="module">
   // Relative on purpose: the page is served at /demo/site-search/ under the
@@ -436,6 +665,7 @@ VALUES (?, ?, ?, ?);                -- vector computed from `body`</pre>
       resultsEl.append(li);
     }
     history.replaceState(null, "", `?q=${encodeURIComponent(query)}&mode=${mode}`);
+    resultsEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
 
   document.getElementById("form").addEventListener("submit", (event) => {
@@ -443,6 +673,17 @@ VALUES (?, ?, ?, ?);                -- vector computed from `body`</pre>
     const query = qEl.value.trim();
     if (query && db) search(query);
   });
+
+  // The nav, the chips and the footer service lists are all search triggers:
+  // this demo has no routing and no pages to link to, so "navigation" is a
+  // canned query — which is honest for a site whose pages are rows.
+  for (const trigger of document.querySelectorAll("[data-q]")) {
+    trigger.addEventListener("click", () => {
+      qEl.value = trigger.dataset.q;
+      resultsEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      if (db) search(trigger.dataset.q);
+    });
+  }
 
   try {
     await init();
