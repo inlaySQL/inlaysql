@@ -453,19 +453,20 @@
   <div class="how">
     <h2>How this search works</h2>
     <p class="sub">
-      Three steps, all visible in this page's source. The same engine that
-      ranks these results ships as a ~660 KiB module and opens a real database
-      file fetched like an image.
+      The four statements behind it — create, insert, search, and change —
+      with the code this demo actually runs. It is ordinary SQL over a real
+      database file; the WASM module that executes it here is ~660 KiB
+      gzipped.
     </p>
 
     <section>
-      <span class="tag">step 1 · build time</span>
-      <h3>The index is built once, natively, when the site deploys</h3>
+      <span class="tag">step 1 · create the database</span>
+      <h3>One table, one vector column, two indexes</h3>
       <p>
-        Every page's text is turned into a vector and inserted into a real
-        InlaySQL database — the same file format the native build writes. This
-        demo runs that as a <code>cargo run</code> at deploy time; your build
-        would run it from your CMS export or sitemap.
+        A page is a row. The <code>VECTOR(384)</code> column holds each page's
+        embedding, and the two indexes are what make retrieval fast: one for
+        keyword ranking, one for nearest-vector lookup. Everything below is
+        the engine's own dialect — SQLite's SQL plus vectors.
       </p>
       <pre>CREATE TABLE pages (
     id INTEGER PRIMARY KEY,
@@ -473,33 +474,52 @@
     embedding VECTOR(384)          -- one vector per page
 );
 CREATE INDEX pages_body      ON pages (body);      -- full-text (BM25)
-CREATE INDEX pages_embedding ON pages (embedding); -- vectors (HNSW)
-
-INSERT INTO pages (path, title, body, embedding)
-VALUES (?, ?, ?, ?);                -- vector computed from `body`</pre>
+CREATE INDEX pages_embedding ON pages (embedding); -- vectors (HNSW)</pre>
       <p>
-        The finished database is checkpointed so the file carries both indexes,
-        then shipped as a static asset — <code>site.inlay</code>, fetched like
-        an image. That is the whole "backend": a file on a web server.
+        In the browser this is one call: <code>db.execute(sql)</code>. At
+        build time the same statements run through the native Rust database —
+        that is how <code>site.inlay</code> was written.
       </p>
     </section>
 
     <section>
-      <span class="tag">step 2 · at search time, in this tab</span>
-      <h3>Your query becomes a vector too</h3>
+      <span class="tag">step 2 · insert the pages</span>
+      <h3>Each page's text becomes a vector on the way in</h3>
       <p>
-        When you search, the query text goes through the same embedding
-        function that built the index, so query and pages live in the same
-        vector space. This demo uses the engine's stand-in embedder — it
-        buckets character trigrams, so it matches pages that <em>spell</em>
-        alike. A real site swaps in its own model's vectors at step 1 and the
-        same model for queries here; everything else stays identical.
+        Parameters are bound as a JSON array — a nested array of numbers is a
+        vector. The embedder here is the engine's stand-in (character
+        trigrams, so it matches pages that <em>spell</em> alike); a real site
+        puts its own model's output here instead, and the rest is unchanged.
+      </p>
+      <pre>// one page, as this demo's build script runs it for all 45
+db.execute(
+  "INSERT INTO pages (path, title, body, embedding) VALUES (?, ?, ?, ?)",
+  JSON.stringify([
+    "/services/passport/renew.html",
+    "Renew a passport",
+    body,                              // the page's full text
+    Array.from(embed(body, dim)),      // ← the vector
+  ]),
+);
+
+// write the retrieval indexes into the file itself, then ship it
+const bytes = db.export();           // checkpointed: BM25 + HNSW inside</pre>
+      <p>
+        The exported bytes <em>are</em> the deployment: <code>site.inlay</code>
+        is fetched like an image and opened with
+        <code>Database.open(bytes)</code>. That is the whole "backend" — a
+        file on a web server.
       </p>
     </section>
 
     <section>
-      <span class="tag">step 3 · one SQL statement</span>
-      <h3>The ranking mode you picked changes one function call</h3>
+      <span class="tag">step 3 · search</span>
+      <h3>The query becomes a vector, then one statement ranks everything</h3>
+      <p>
+        Your query text goes through the same embedder that built the index,
+        so query and pages live in the same vector space. Then the ranking
+        mode you picked changes one function call:
+      </p>
       <p>
         <span class="fn">bm25_score(body, ?)</span> — keyword relevance, the
         classic search-engine score over the full-text index. Finds exact
@@ -523,6 +543,37 @@ VALUES (?, ?, ?, ?);                -- vector computed from `body`</pre>
         That statement runs inside the WASM module in this tab against the
         database fetched at load — every keystroke-to-result hop is local. No
         search API exists to attack, log, rate-limit or take down.
+      </p>
+    </section>
+
+    <section>
+      <span class="tag">step 4 · change it — it is a real database</span>
+      <h3>Update, delete, and ship the result</h3>
+      <p>
+        Nothing above is a snapshot trick: this is a mutable database. When a
+        page's content changes, update the row and its vector; when a page
+        disappears, delete it. The indexes maintain themselves incrementally —
+        no rebuild.
+      </p>
+      <pre>// a page's content changed — re-embed it, update the row
+db.execute(
+  "UPDATE pages SET body = ?, embedding = ? WHERE path = ?",
+  JSON.stringify([
+    newBody,
+    Array.from(embed(newBody, dim)),
+    "/services/passport/renew.html",
+  ]),
+);
+
+// a page was removed
+db.execute("DELETE FROM pages WHERE path = ?", JSON.stringify([path]));
+
+// persist: export() checkpoints first, so the bytes carry fresh indexes
+const updated = db.export();         // upload these bytes, done</pre>
+      <p>
+        For a static site this maps directly onto publishing: content changed?
+        Update the rows, export, upload. No index rebuild, no downtime, no
+        cache invalidation beyond the one file.
       </p>
     </section>
   </div>
@@ -562,6 +613,7 @@ VALUES (?, ?, ?, ?);                -- vector computed from `body`</pre>
         <ul>
           <li><button data-q="contact opening hours">Contact us</button></li>
           <li><button data-q="accessibility">Accessibility statement</button></li>
+          <li><a href="../playground/">SQL playground — try it yourself</a></li>
           <li><a href="https://github.com/inlaySQL/inlaysql/tree/main/crates/inlaysql-wasm/demos/site-search">Demo source</a></li>
           <li><a href="https://github.com/inlaySQL/inlaysql">The engine on GitHub</a></li>
         </ul>

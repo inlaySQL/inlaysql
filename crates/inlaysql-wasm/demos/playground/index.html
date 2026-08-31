@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL playground — InlaySQL demo</title>
+<meta name="description" content="Learn the engine by running it: a guided tutorial and a free SQL console against a real InlaySQL database, entirely in your browser.">
+
+<style>
+  /* Same visual language as the other demos — same palette, no CDNs. The
+     database is created empty in the tab and every lesson's statements really
+     run against it; nothing here is canned output. */
+  :root {
+    --bg: #08080b;
+    --bg-raised: #101015;
+    --line: #23232c;
+    --ink: #e8e8ee;
+    --ink-dim: #9a9aab;
+    --ink-faint: #6b6b7b;
+    --accent: #a78bfa;
+    --accent-warm: #f0abfc;
+    --good: #6ee7b7;
+    --bad: #f87171;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 16px/1.65 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { font-family: var(--mono); font-size: .85em; background: var(--bg-raised); padding: .1em .35em; border-radius: 4px; }
+
+  nav {
+    position: sticky; top: 0; z-index: 20;
+    background: rgba(8, 8, 11, .88);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line);
+  }
+  nav .wrap {
+    max-width: 66rem; margin: 0 auto; padding: 0 1.5rem;
+    display: flex; align-items: center; gap: 1rem; height: 3.25rem;
+  }
+  .brand {
+    font: 600 .85rem/1 var(--mono);
+    display: flex; align-items: center; gap: .5rem;
+    white-space: nowrap;
+  }
+  .brand .dot {
+    width: .6rem; height: .6rem; border-radius: 50%;
+    background: linear-gradient(120deg, var(--accent), var(--accent-warm));
+  }
+  nav .links { margin-left: auto; display: flex; gap: .25rem; }
+  nav .links a {
+    font: 500 .82rem/1 var(--sans);
+    color: var(--ink-dim);
+    padding: .5rem .65rem;
+    border-radius: 6px;
+    white-space: nowrap;
+  }
+  nav .links a:hover { color: var(--ink); background: var(--bg-raised); text-decoration: none; }
+
+  header.hero { padding: 2.5rem 0 1.5rem; text-align: center; }
+  header.hero h1 {
+    font-size: clamp(1.7rem, 4vw, 2.4rem);
+    letter-spacing: -.02em; margin: 0 0 .75rem;
+  }
+  header.hero h1 .grad {
+    background: linear-gradient(100deg, var(--accent), var(--accent-warm));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  header.hero p { color: var(--ink-dim); max-width: 36rem; margin: 0 auto; font-size: .95rem; }
+
+  .layout {
+    max-width: 66rem; margin: 0 auto; padding: 1.5rem 1.5rem 3rem;
+    display: grid; grid-template-columns: 14rem 1fr; gap: 1.5rem;
+  }
+  @media (max-width: 48rem) { .layout { grid-template-columns: 1fr; } }
+
+  /* ---- lesson list ---- */
+
+  .lessons {
+    background: var(--bg-raised);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: .75rem;
+    align-self: start;
+    position: sticky;
+    top: 4.25rem;
+  }
+  @media (max-width: 48rem) { .lessons { position: static; } }
+  .lessons h2 {
+    font: 600 .72rem/1 var(--mono);
+    letter-spacing: .08em; text-transform: uppercase;
+    color: var(--ink-faint); margin: .4rem .5rem .75rem;
+  }
+  .lessons button {
+    display: block; width: 100%; text-align: left;
+    font: 500 .85rem/1.3 var(--sans);
+    color: var(--ink-dim);
+    background: none; border: 0; border-radius: 8px;
+    padding: .55rem .65rem; cursor: pointer;
+  }
+  .lessons button:hover { color: var(--ink); background: rgba(167, 139, 250, .08); }
+  .lessons button.active { color: var(--ink); background: rgba(167, 139, 250, .16); }
+  .lessons button .n {
+    font: 600 .72rem/1 var(--mono);
+    color: var(--accent); margin-right: .5rem;
+  }
+
+  /* ---- the lesson ---- */
+
+  .stage { min-width: 0; }
+  .stage .step-head { display: flex; align-items: baseline; gap: .75rem; flex-wrap: wrap; }
+  .stage h2 { font-size: 1.25rem; letter-spacing: -.01em; margin: 0; }
+  .stage .prose { color: var(--ink-dim); font-size: .92rem; margin: .6rem 0 1.1rem; }
+  .stage .prose p { margin: .4rem 0; }
+
+  .editor {
+    width: 100%;
+    min-height: 11rem;
+    resize: vertical;
+    background: #0b0b10;
+    color: #d7e2ee;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    font: .84rem/1.55 var(--mono);
+    padding: .9rem 1.1rem;
+    white-space: pre;
+  }
+  .editor:focus { outline: none; border-color: var(--accent); }
+
+  .controls { display: flex; gap: .6rem; align-items: center; margin: .75rem 0 0; flex-wrap: wrap; }
+  .run {
+    font: 600 .9rem/1 var(--sans);
+    padding: .65rem 1.4rem;
+    border: 0; border-radius: 8px;
+    background: linear-gradient(100deg, var(--accent), var(--accent-warm));
+    color: #17121f;
+    cursor: pointer;
+  }
+  .run:hover { filter: brightness(1.08); }
+  .ghost {
+    font: 500 .85rem/1 var(--sans);
+    padding: .65rem 1rem;
+    border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg-raised);
+    color: var(--ink-dim);
+    cursor: pointer;
+  }
+  .ghost:hover { color: var(--ink); border-color: var(--accent); }
+  .hint { font: 500 .75rem/1 var(--mono); color: var(--ink-faint); }
+
+  #out { margin-top: 1.25rem; }
+  .block { margin-bottom: 1rem; }
+  .block .stmt {
+    font: .78rem/1.5 var(--mono);
+    color: var(--ink-faint);
+    margin: 0 0 .35rem;
+    overflow-x: auto;
+  }
+  .block.ok { color: var(--good); font: 500 .85rem/1.4 var(--mono); }
+  .block.err {
+    color: var(--bad);
+    font: 500 .85rem/1.4 var(--mono);
+    border: 1px solid rgba(248, 113, 113, .3);
+    border-radius: 8px;
+    background: rgba(248, 113, 113, .06);
+    padding: .6rem .8rem;
+  }
+  table {
+    border-collapse: collapse;
+    font: .8rem/1.5 var(--mono);
+    max-width: 100%;
+    display: block;
+    overflow-x: auto;
+  }
+  th, td {
+    text-align: left;
+    border: 1px solid var(--line);
+    padding: .35rem .7rem;
+    white-space: nowrap;
+  }
+  th { color: var(--ink-faint); font-weight: 500; background: var(--bg-raised); }
+  td { color: var(--ink-dim); }
+  td.num { color: var(--good); }
+
+  footer {
+    border-top: 1px solid var(--line);
+    padding: 1.5rem 0 2.5rem;
+    color: var(--ink-faint);
+    font-size: .84rem;
+  }
+  footer .wrap { max-width: 66rem; margin: 0 auto; padding: 0 1.5rem; }
+  footer a { color: var(--ink-dim); }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <span class="brand"><span class="dot" aria-hidden="true"></span>InlaySQL Playground</span>
+    <div class="links">
+      <a href="../../">Main demo</a>
+      <a href="../site-search/">Site-search demo</a>
+      <a href="https://github.com/inlaySQL/inlaysql">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap" style="max-width:66rem;margin:0 auto;padding:0 1.5rem;">
+    <h1>Learn the engine <span class="grad">by running it</span></h1>
+    <p>
+      Seven lessons and a free console against a real InlaySQL database,
+      created empty in this tab. Every result is the engine's own output —
+      edit any statement and make it your own.
+    </p>
+  </div>
+</header>
+
+<div class="layout">
+  <aside class="lessons" aria-label="Lessons">
+    <h2>Lessons</h2>
+    <div id="lesson-list"></div>
+  </aside>
+
+  <div class="stage">
+    <div class="step-head">
+      <h2 id="title"></h2>
+      <span class="hint" id="pg-status">loading the engine…</span>
+    </div>
+    <div class="prose" id="prose"></div>
+    <textarea id="editor" class="editor" spellcheck="false" aria-label="SQL editor"></textarea>
+    <div class="controls">
+      <button class="run" id="run">Run</button>
+      <button class="ghost" id="reset">Reset database</button>
+      <button class="ghost" id="restore">Restore lesson SQL</button>
+      <span class="hint">Ctrl/⌘ + Enter runs</span>
+    </div>
+    <div id="out"></div>
+  </div>
+</div>
+
+<footer>
+  <div class="wrap">
+    The engine in this tab is the ~660 KiB WASM build — the same one the
+    <a href="../site-search/">site-search demo</a> uses for real ranking.
+    Errors are shown verbatim on purpose: the engine refuses what it cannot
+    honour rather than pretending.
+    <a href="https://github.com/inlaySQL/inlaysql/tree/main/crates/inlaysql-wasm/demos/playground">Demo source</a>
+  </div>
+</footer>
+
+<script type="module">
+  // Relative like the other demos: two levels up is the shared module, so the
+  // playground and the other demos can never drift onto different engines.
+  import init, { Database, embed } from "../../pkg/inlaysql_wasm.js";
+
+  const DIM = 8; // a tutorial does not need 384 dimensions — 8 keeps the output readable
+
+  // The lessons. `sql` is the starter text; `prose` explains; everything runs
+  // as written, so a lesson can be bent until it breaks — which is also
+  // teaching.
+  const LESSONS = [
+    {
+      title: "Create a table",
+      prose: `<p>The dialect is SQLite's, extended with <code>VECTOR(n)</code>. Every statement here changes real state in a real database file — it just happens to live in this tab.</p>`,
+      sql: `CREATE TABLE books (\n  id INTEGER PRIMARY KEY,\n  title TEXT,\n  year INTEGER\n);`,
+    },
+    {
+      title: "Insert rows",
+      prose: `<p>Placeholders (<code>?</code>) bind parameters, exactly like any SQL database — the playground binds nothing here, so literals are fine. The <code>SELECT</code> after the inserts proves they landed.</p>`,
+      sql: `INSERT INTO books (title, year) VALUES ('Dune', 1965);\nINSERT INTO books (title, year) VALUES ('The Left Hand of Darkness', 1969);\nINSERT INTO books (title, year) VALUES ('Neuromancer', 1984);\n\nSELECT * FROM books;`,
+    },
+    {
+      title: "Read it back",
+      prose: `<p>Ordinary SQL: <code>WHERE</code>, <code>ORDER BY</code>, <code>LIMIT</code>. Try changing the predicate — the engine answers from the rows you inserted in the last lesson.</p>`,
+      sql: `SELECT * FROM books WHERE year < 1970 ORDER BY year;\n\nSELECT title FROM books ORDER BY title LIMIT 2;`,
+    },
+    {
+      title: "Change and remove",
+      prose: `<p>Nothing is a snapshot trick — this is a mutable database. Update, delete, and read back. Run this lesson twice if you like; the second run is where you find out what <code>UPDATE</code> leaves behind.</p>`,
+      sql: `UPDATE books SET year = 1985 WHERE title = 'Neuromancer';\n\nDELETE FROM books WHERE title = 'Dune';\n\nSELECT * FROM books;`,
+    },
+    {
+      title: "Vectors: meaning, not keywords",
+      prose: `<p><code>embed('…')</code> is a playground helper: it embeds the text (here with 8-dimension trigram vectors, the engine's stand-in) and binds the vector as a parameter. The last statement asks for pages <em>about</em> replacing a passport — note which rows win, and that none of them contains the word "replace".</p>`,
+      sql: `CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT, embedding VECTOR(8));\n\nINSERT INTO docs (body, embedding) VALUES ('how to renew a passport', embed('how to renew a passport'));\nINSERT INTO docs (body, embedding) VALUES ('filing your annual tax return', embed('filing your annual tax return'));\nINSERT INTO docs (body, embedding) VALUES ('renew a driving licence', embed('renew a driving licence'));\n\nCREATE INDEX docs_embedding ON docs (embedding);\n\nSELECT body, vector_score(embedding, embed('replace my passport')) AS score\nFROM docs ORDER BY score DESC;`,
+    },
+    {
+      title: "Full text: BM25",
+      prose: `<p>The full-text index ranks keyword relevance. A word that appears in no row scores 0 everywhere; a word in every row barely discriminates. Try <code>'licence'</code>, then <code>'the'</code>.</p>`,
+      sql: `CREATE INDEX docs_body ON docs (body);\n\nSELECT body, bm25_score(body, 'passport') AS score\nFROM docs ORDER BY score DESC;\n\nSELECT body, bm25_score(body, 'driving licence') AS score\nFROM docs ORDER BY score DESC;`,
+    },
+    {
+      title: "Hybrid: both rankings, one number",
+      prose: `<p><code>fuse</code> combines the two scores with reciprocal rank fusion — it merges the <em>rankings</em>, not the raw numbers, so a page doing well on either side is pulled up. This is the query the site-search demo runs for every keystroke.</p>`,
+      sql: `SELECT body,\n       fuse(vector_score(embedding, embed('renew my passport')),\n            bm25_score(body, 'passport')) AS score\nFROM docs ORDER BY score DESC;`,
+    },
+    {
+      title: "Free playground",
+      prose: `<p>Anything goes: more tables, joins, aggregates, transactions. Two helpers worth knowing — <code>embed('text')</code> binds a vector parameter, and the engine reports every error verbatim instead of guessing. The database persists in this tab until you reset it.</p>`,
+      sql: `SELECT * FROM books;\n\nSELECT * FROM docs;`,
+    },
+  ];
+
+  const els = {
+    status: document.getElementById("pg-status"),
+    list: document.getElementById("lesson-list"),
+    title: document.getElementById("title"),
+    prose: document.getElementById("prose"),
+    editor: document.getElementById("editor"),
+    run: document.getElementById("run"),
+    reset: document.getElementById("reset"),
+    restore: document.getElementById("restore"),
+    out: document.getElementById("out"),
+  };
+
+  let db;
+  let current = 0;
+  let ready = false;
+
+  // `embed('…')` in lesson SQL is a placeholder for a vector parameter: the
+  // helper computes the embedding here and binds it, so lessons can talk about
+  // vectors without a 384-number literal. Real applications bind their model's
+  // output the same way — as a parameter, never as SQL text.
+  function preprocess(sql) {
+    const params = [];
+    const rewritten = sql.replace(/embed\(\s*'((?:[^'\\]|\\.)*)'\s*\)/g, (_, text) => {
+      params.push(Array.from(embed(text.replace(/\\'/g, "'"), DIM)));
+      return "?";
+    });
+    return { rewritten, params };
+  }
+
+  // One call per statement. The playground splits on semicolons — tutorial SQL
+  // has no semicolons inside strings, and the free console is documented as
+  // statement-per-semicolon too. Each statement is preprocessed and bound on
+  // its own: the engine refuses parameters for a statement with no
+  // placeholders, and it is right to.
+  function runSql(sql) {
+    const statements = sql.split(";").map((s) => s.trim()).filter(Boolean);
+    els.out.innerHTML = "";
+    for (const statement of statements) {
+      const block = document.createElement("div");
+      block.className = "block";
+      const shown = document.createElement("p");
+      shown.className = "stmt";
+      shown.textContent = statement + ";";
+      block.append(shown);
+      try {
+        const { rewritten, params } = preprocess(statement);
+        const bound = params.length ? JSON.stringify(params) : undefined;
+        const result = JSON.parse(db.execute(rewritten, bound));
+        if (result.kind === "rows") {
+          block.append(renderTable(result));
+        } else if (result.kind === "written") {
+          block.classList.add("ok");
+          block.append(document.createTextNode(`✔ ${result.rows} row${result.rows === 1 ? "" : "s"} written`));
+        } else {
+          block.classList.add("ok");
+          block.append(document.createTextNode("✔ schema changed"));
+        }
+      } catch (error) {
+        block.classList.add("err");
+        block.append(document.createTextNode(String(error)));
+      }
+      els.out.append(block);
+    }
+  }
+
+  function renderTable(result) {
+    const table = document.createElement("table");
+    const head = table.insertRow();
+    for (const column of result.columns) {
+      const th = document.createElement("th");
+      th.textContent = column;
+      head.append(th);
+    }
+    for (const row of result.rows) {
+      const tr = table.insertRow();
+      for (const value of row) {
+        const td = tr.insertCell();
+        if (typeof value === "number") {
+          td.className = "num";
+          td.textContent = Number.isInteger(value) ? value : value.toFixed(4);
+        } else {
+          td.textContent = value;
+        }
+      }
+    }
+    return table;
+  }
+
+  function show(index) {
+    current = index;
+    const lesson = LESSONS[index];
+    els.title.textContent = lesson.title;
+    els.prose.innerHTML = lesson.prose;
+    els.editor.value = lesson.sql;
+    els.out.innerHTML = "";
+    for (const [i, button] of document.querySelectorAll("#lesson-list button").entries()) {
+      button.classList.toggle("active", i === index);
+    }
+  }
+
+  for (const [index, lesson] of LESSONS.entries()) {
+    const button = document.createElement("button");
+    button.id = `lesson-${index + 1}`;
+    button.innerHTML = `<span class="n">${String(index + 1).padStart(2, "0")}</span>${lesson.title}`;
+    button.addEventListener("click", () => show(index));
+    els.list.append(button);
+  }
+
+  els.run.addEventListener("click", () => {
+    if (ready) runSql(els.editor.value);
+  });
+  els.editor.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      event.preventDefault();
+      els.run.click();
+    }
+  });
+  els.restore.addEventListener("click", () => {
+    els.editor.value = LESSONS[current].sql;
+    els.out.innerHTML = "";
+  });
+  els.reset.addEventListener("click", () => {
+    db = new Database();
+    els.out.innerHTML = "";
+    show(current);
+  });
+
+  try {
+    await init();
+    db = new Database(); // an empty database: the lessons create everything
+    ready = true;
+    els.status.textContent = `${LESSONS.length} lessons · database ready`;
+    show(0);
+  } catch (error) {
+    els.status.textContent = `error: ${error}`;
+  }
+</script>
+</body>
+</html>

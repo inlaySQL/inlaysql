@@ -156,6 +156,30 @@ try {
   await page.waitForFunction(() => !document.getElementById("page-view").classList.contains("open"));
   check("escape returns to the results", (await page.locator("#results li").count()) > 0);
 
+  // ---- the playground ----
+  //
+  // Lessons run real statements against a database created empty in the tab,
+  // so "the tutorial works" means "the engine accepted every step" — checked
+  // by running the first lesson and the vector one, which between them cover
+  // DDL, DML, and a retrieval score.
+  await page.goto(`${base}demo/playground/`, { waitUntil: "networkidle" });
+  await page.waitForFunction(
+    () => document.getElementById("pg-status").textContent.includes("ready"),
+    { timeout: 60_000 },
+  );
+
+  await page.click("#run"); // lesson 1: CREATE TABLE
+  await page.waitForFunction(() => document.querySelectorAll("#out .block").length > 0);
+  const ddl = await page.locator("#out .block").first().textContent();
+  check("the playground created a table", /schema changed/.test(ddl), ddl);
+
+  await page.click("#lesson-5"); // vectors, from scratch in a fresh table
+  await page.click("#run");
+  await page.waitForFunction(() => document.querySelectorAll("#out .block").length > 0);
+  const blocks = await page.locator("#out .block").allTextContents();
+  check("the vector lesson runs end to end", blocks.some((b) => /rows written|schema changed/.test(b)), blocks.join(" | "));
+  check("the vector lesson ranks without errors", !blocks.some((b) => b.includes("Error")), blocks.join(" | "));
+
   check("nothing threw along the way", problems.length === 0, problems.join(" | "));
 } finally {
   await browser.close();

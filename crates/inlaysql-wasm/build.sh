@@ -45,6 +45,12 @@ cargo run --manifest-path "$ROOT/Cargo.toml" -q -p inlaysql-wasm --example site_
 cp "$ROOT/crates/inlaysql-wasm/demos/site-search/index.html" "$DEMO_OUT/index.html"
 cp "$ROOT/crates/inlaysql-wasm/demos/site-search/site.inlay" "$DEMO_OUT/site.inlay"
 
+# The playground has no fixture to build — it starts from an empty database
+# and the lessons create everything — so staging is a copy.
+DEMO_PG="$ROOT/crates/inlaysql-wasm/www/demo/playground"
+mkdir -p "$DEMO_PG"
+cp "$ROOT/crates/inlaysql-wasm/demos/playground/index.html" "$DEMO_PG/index.html"
+
 # Size is a first-class number for a module that ships over the network, so it
 # is printed rather than left for someone to check.
 raw=$(wc -c < "$OUT/inlaysql_wasm_bg.wasm")

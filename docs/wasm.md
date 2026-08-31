@@ -90,6 +90,12 @@ the site's pages is fetched as a static asset and queried in the visitor's
 browser; there is no search API to attack, log or take down, which is the
 deployment shape a government or compliance-bound static site needs.
 
+The second is **[playground](../crates/inlaysql-wasm/demos/playground/README.md)** —
+a guided tutorial and free SQL console at `/demo/playground/`, against a
+database created empty in the tab. Where site-search shows the engine
+answering, the playground shows it *working*: DDL, DML, vectors, BM25 and
+hybrid fusion, every statement editable and every error verbatim.
+
 ## The edge worker
 
 ```sh
