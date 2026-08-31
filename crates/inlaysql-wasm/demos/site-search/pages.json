@@ -1,0 +1,85 @@
+{
+  "dim": 384,
+  "pages": [
+    {
+      "path": "/services/passport/renew.html",
+      "title": "Renew a passport",
+      "body": "Renew your passport online in three steps. Confirm your eligibility: your most recent passport was issued within the last fifteen years and you were over sixteen when it was issued. Complete the renewal form, pay the fee with a card, and post your old passport with the printed checklist. Standard processing takes ten working days; the urgent counter service issues a passport the same day for an additional fee."
+    },
+    {
+      "path": "/services/passport/first-application.html",
+      "title": "Apply for your first passport",
+      "body": "First-time passport applications require an in-person identity check at a passport office. Bring your birth certificate, proof of address, two identical photographs and a guarantor who has known you for at least two years. Appointments open seven days ahead and can be booked online. Children under sixteen need a parent or guardian to apply with them."
+    },
+    {
+      "path": "/services/tax/filing.html",
+      "title": "File your annual tax return",
+      "body": "The tax year closes on 31 March and returns are due by 30 June. Log in with your tax identification number to file online; employment income and bank interest are pre-filled from reports your employer and bank already submitted. Most refunds are paid within twelve working days of an accepted return. Paper forms are available at any service centre."
+    },
+    {
+      "path": "/services/tax/child-benefit.html",
+      "title": "Claim child benefit",
+      "body": "Child benefit is a quarterly payment for each child under eighteen in your care. Claims are backdated up to three months from the date the claim is received. You will need the child's birth certificate and your bank details. High-income households may repay part of the benefit through the annual tax return; the threshold is published each year with the filing dates."
+    },
+    {
+      "path": "/services/business/register.html",
+      "title": "Register a business",
+      "body": "Register a sole proprietorship or limited company through the online business portal. A limited company needs a registered address, at least one director and a company name that is not already taken; the name check runs during registration. You receive a business registration certificate and tax number within two working days. Trading without registration is an offence under the Business Registration Act."
+    },
+    {
+      "path": "/services/business/permits.html",
+      "title": "Business permits and licences",
+      "body": "Food premises, private security, passenger transport and sale of alcohol all require sector-specific permits before opening. Each permit page lists the documents to bring, the fee and the statutory decision period. Most permits are valid for two years and renewal reminders are sent by email sixty days before expiry. Applying for a permit does not authorise the activity until the permit is granted."
+    },
+    {
+      "path": "/services/health/register-gp.html",
+      "title": "Register with a doctor",
+      "body": "Register with a general practitioner at the clinic nearest your home address. Registration is free and takes one visit; bring proof of identity and address. Your medical records transfer automatically between clinics within the public system. After hours, call the medical helpline for advice or attend the urgent care centre for conditions that cannot wait until morning."
+    },
+    {
+      "path": "/services/health/emergency.html",
+      "title": "Emergency services",
+      "body": "Call 112 for police, fire or ambulance in a life-threatening emergency. The line is free from any phone, including those with no credit. Call takers ask for the location first, then what has happened. For non-urgent medical help call the health helpline; for reporting a crime that has already happened, use the online police report or visit a station."
+    },
+    {
+      "path": "/services/housing/rent-assistance.html",
+      "title": "Help with rent",
+      "body": "Rent assistance tops up your income when rent takes more than a third of it. The amount depends on household size, income and the local rent table for your area. Apply online with your tenancy agreement and recent payslips; decisions take fifteen working days and payments are backdated to the application date. Students and shared households have separate rules listed on the detail page."
+    },
+    {
+      "path": "/services/housing/social-housing.html",
+      "title": "Apply for social housing",
+      "body": "Social housing is allocated by priority, not first-come-first-served. Points are awarded for overcrowding, medical need, unsanitary conditions and time already waited. One application covers every housing provider in the region. You can update your application and check your queue position online at any time; offers that are declined twice without grounds move you to the back of your band."
+    },
+    {
+      "path": "/services/transport/driving-licence.html",
+      "title": "Driving licences",
+      "body": "A learner permit is issued from age seventeen after a theory test; book the test online and take identification with you. A full licence follows a practical driving test. Renew a licence up to ninety days before expiry, online or at a service centre, and update your address within fourteen days of moving. Medical conditions affecting driving must be declared when you apply or renew."
+    },
+    {
+      "path": "/services/transport/vehicle-registration.html",
+      "title": "Register a vehicle",
+      "body": "Every vehicle driven on public roads must be registered and insured. Registration transfers with ownership: notify the registry within seven days of buying or selling. Annual road tax is paid with the registration renewal and an expired tax disc is enforceable by fine. Electric vehicles pay a reduced rate, listed on the fees page."
+    },
+    {
+      "path": "/services/voting/enrol.html",
+      "title": "Enrol to vote",
+      "body": "Voting enrolment is open to citizens and permanent residents aged eighteen or over. Enrol online with your identification number, or at any post office. Your electorate is set by your residential address, so re-enrol within thirty days of moving. Enrolment rolls close the day before an election is called; you cannot vote in an electorate you are not enrolled in."
+    },
+    {
+      "path": "/services/voting/election-day.html",
+      "title": "Voting on election day",
+      "body": "Polling places are open from eight in the morning to six in the evening on election day. Bring identification and vote at any polling place in your electorate. If you are overseas, hospitalised or working, advance and postal voting open two weeks early. Results are published progressively from the close of voting, with the final count certified within ten days."
+    },
+    {
+      "path": "/about/contact.html",
+      "title": "Contact us",
+      "body": "Service centres are open Monday to Friday, nine to five, and Saturday mornings in the city centre. The general helpline answers within three minutes on weekdays. Written enquiries are answered within ten working days; include your reference number if you have one. Complaints about a service go to the feedback line first and can be escalated to the Ombudsman afterwards."
+    },
+    {
+      "path": "/about/accessibility.html",
+      "title": "Accessibility statement",
+      "body": "This portal aims to meet the government accessibility standard: every service is operable by keyboard, screen readers are supported, and colour is never the only way information is conveyed. Documents published before the standard took effect are being converted on request. If any page blocks you from completing a service, report it through the contact page and staff will complete the transaction with you."
+    }
+  ]
+}

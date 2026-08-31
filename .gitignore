@@ -21,6 +21,9 @@ fuzz/status
 # wasm-bindgen output
 crates/inlaysql-wasm/www/pkg
 
+# the demos build.sh stages into www/ from demos/ — generated, like pkg
+crates/inlaysql-wasm/www/demo
+
 # npm dependencies for the browser and edge smoke tests
 node_modules/
 .claude/worktrees/

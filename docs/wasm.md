@@ -76,6 +76,20 @@ the page has loaded. It also saves to and loads from OPFS.
 pull request. It is a separate directory on purpose: `www/` is published to
 Pages verbatim and a `node_modules/` has no business being deployed.
 
+### The demos directory
+
+`www/` also carries `demo/`, staged there by `build.sh` from the demo sources
+in `crates/inlaysql-wasm/demos/`. Each demo there is a worked answer to "who
+is this for", built on the same build-once-natively / ship-as-an-asset pattern
+the edge worker uses, and driven by the same browser smoke test.
+
+The first is **[site-search](../crates/inlaysql-wasm/demos/site-search/README.md)** —
+full-text plus vector search for a website with no backend at all, published at
+`/demo/site-search/` on the Pages site. A database built at deploy time from
+the site's pages is fetched as a static asset and queried in the visitor's
+browser; there is no search API to attack, log or take down, which is the
+deployment shape a government or compliance-bound static site needs.
+
 ## The edge worker
 
 ```sh

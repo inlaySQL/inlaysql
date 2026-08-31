@@ -46,7 +46,10 @@ function check(what, condition, detail) {
 // a real origin, and `application/wasm` has to be the actual content type.
 const server = createServer(async (request, response) => {
   const path = new URL(request.url, "http://localhost").pathname;
-  const file = join(ROOT, normalize(path === "/" ? "/index.html" : path));
+  // Directory URLs get their index page, as a host would — Pages serves
+  // /demo/site-search/ that way and the demo must not depend on a .html link.
+  const rel = path.endsWith("/") ? `${path}index.html` : path;
+  const file = join(ROOT, normalize(rel));
   if (!file.startsWith(ROOT)) {
     response.writeHead(403).end();
     return;
@@ -111,6 +114,36 @@ try {
   );
   const afterReload = await page.locator("#results").textContent();
   check("the reopened database still ranks", /\[\d+\]/.test(afterReload), afterReload);
+
+  // ---- the static-site demo ----
+  //
+  // Same module, second story: a search box on a website with no backend.
+  // The Pages URL is /demo/site-search/, and it is driven here through the
+  // directory URL for the same reason Pages would serve it that way.
+  await page.goto(`${base}demo/site-search/`, { waitUntil: "networkidle" });
+  await page.waitForFunction(
+    () => !document.getElementById("status").textContent.startsWith("loading"),
+    { timeout: 60_000 },
+  );
+  const indexed = await page.locator("#status").textContent();
+  check("the site-search index opened", /pages indexed/.test(indexed), indexed);
+
+  // Hybrid is the default mode: one statement, both retrievers.
+  await page.fill("#q", "renew a passport");
+  await page.click("#search");
+  await page.waitForFunction(() => document.querySelectorAll("#results li").length > 0);
+  const hybrid = await page.locator("#results").textContent();
+  check("hybrid search ranks the passport page first", /renew a passport/i.test(hybrid), hybrid);
+  check("results carry their source paths", /\/services\/passport\/renew\.html/.test(hybrid), hybrid);
+
+  // The mode toggle is the claim that ranking is just SQL.
+  await page.selectOption("#mode", "semantic");
+  await page.click("#search");
+  await page.waitForFunction(
+    () => document.getElementById("sql").textContent.includes("vector_score"),
+  );
+  const semantic = await page.locator("#results").textContent();
+  check("semantic-only search also ranks", /passport/i.test(semantic), semantic);
 
   check("nothing threw along the way", problems.length === 0, problems.join(" | "));
 } finally {

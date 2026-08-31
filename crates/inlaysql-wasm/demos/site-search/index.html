@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Site search — InlaySQL demo</title>
+<meta name="description" content="Full-text and vector search for a static website, running entirely in the browser. No backend, no API, no third-party request.">
+
+<style>
+  /* Self-contained on purpose: this page demonstrates search for a site that
+     must not make a third-party request, so a font CDN or a CSS framework
+     here would undercut the whole point. */
+  :root {
+    --ink: #14202e;
+    --ink-dim: #4a5a6a;
+    --line: #d5dce3;
+    --paper: #ffffff;
+    --paper-dim: #f2f5f8;
+    --accent: #12437a;
+    --accent-ink: #ffffff;
+    --good: #1a7f4f;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--paper-dim);
+    color: var(--ink);
+    font: 16px/1.6 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  code { font-family: var(--mono); font-size: .85em; }
+
+  .wrap { max-width: 46rem; margin: 0 auto; padding: 0 1.25rem; }
+
+  header.masthead {
+    background: var(--accent);
+    color: var(--accent-ink);
+    padding: 2rem 0 2.25rem;
+  }
+  header.masthead h1 {
+    margin: 0 0 .25rem;
+    font-size: 1.6rem;
+    letter-spacing: -.01em;
+  }
+  header.masthead p { margin: 0; opacity: .85; }
+
+  /* ---- the search box ---- */
+
+  form {
+    display: flex;
+    gap: .5rem;
+    margin: 2rem 0 .5rem;
+    flex-wrap: wrap;
+  }
+  #q {
+    flex: 1 1 16rem;
+    font: 1rem/1.4 var(--sans);
+    padding: .65rem .9rem;
+    border: 1px solid var(--line);
+    border-radius: 6px 0 0 6px;
+    color: var(--ink);
+    background: var(--paper);
+  }
+  #q:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  #mode {
+    font: .95rem/1.4 var(--sans);
+    padding: .65rem .6rem;
+    border: 1px solid var(--line);
+    border-left: 0;
+    border-radius: 0;
+    background: var(--paper);
+    color: var(--ink);
+  }
+  button {
+    font: 500 .95rem/1 var(--sans);
+    padding: .7rem 1.3rem;
+    border: 1px solid var(--accent);
+    border-radius: 0 6px 6px 0;
+    background: var(--accent);
+    color: var(--accent-ink);
+    cursor: pointer;
+  }
+  button:hover { filter: brightness(1.1); }
+
+  #status { color: var(--ink-dim); font-size: .9rem; margin: .4rem 0 0; }
+  #status.error { color: #a3282d; }
+
+  /* ---- results ---- */
+
+  #results { list-style: none; margin: 1.5rem 0 0; padding: 0; }
+  #results li {
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin-bottom: .75rem;
+  }
+  #results h2 {
+    margin: 0 0 .15rem;
+    font-size: 1.05rem;
+  }
+  #results .path {
+    font-family: var(--mono);
+    font-size: .8rem;
+    color: var(--good);
+    margin: 0 0 .5rem;
+  }
+  #results .snippet { margin: 0; color: var(--ink-dim); font-size: .92rem; }
+  #results .score {
+    float: right;
+    font-family: var(--mono);
+    font-size: .78rem;
+    color: var(--ink-dim);
+  }
+
+  details {
+    margin-top: 2rem;
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: .75rem 1.25rem;
+    font-size: .9rem;
+  }
+  summary { cursor: pointer; color: var(--accent); font-weight: 500; }
+  pre {
+    background: var(--paper-dim);
+    padding: .75rem 1rem;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-size: .8rem;
+    line-height: 1.5;
+  }
+
+  footer {
+    margin: 3rem 0 2rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--line);
+    color: var(--ink-dim);
+    font-size: .85rem;
+  }
+  footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap">
+    <h1>Example Government Portal</h1>
+    <p>Site search — running entirely in your browser</p>
+  </div>
+</header>
+
+<main class="wrap">
+  <form id="form" autocomplete="off">
+    <input id="q" type="search" placeholder='Try "renew a passport" or "help with rent"' aria-label="Search the site">
+    <select id="mode" aria-label="Ranking mode">
+      <option value="hybrid" selected>hybrid</option>
+      <option value="keyword">keyword</option>
+      <option value="semantic">semantic</option>
+    </select>
+    <button id="search" type="submit">Search</button>
+  </form>
+  <p id="status">loading the search engine…</p>
+  <ol id="results"></ol>
+
+  <details>
+    <summary>What this is actually running</summary>
+    <p>
+      A real InlaySQL database file (<code>site.inlay</code>, built once at
+      deploy time) is fetched as a static asset, like an image. The WASM module
+      (~660 KiB gzipped) opens it and runs this statement per search:
+    </p>
+    <pre id="sql"></pre>
+    <p>
+      No backend, no search API, no third-party request — the ranking happens
+      in this tab. Swap <code>pages.json</code> for your site's own page list,
+      optionally replace the stand-in embedder with your model's vectors, and
+      rebuild. See the
+      <a href="https://github.com/inlaysql/inlaysql/tree/main/crates/inlaysql-wasm/demos/site-search">demo README</a>.
+    </p>
+  </details>
+
+  <footer>
+    InlaySQL demo — one static file, hybrid BM25 + vector search, zero servers.
+    <a href="../../">Back to the main demo</a>.
+  </footer>
+</main>
+
+<script type="module">
+  // Relative on purpose: the page is served at /demo/site-search/ under the
+  // Pages root, so the module two levels up is the same one the main demo
+  // loads. No copy, no version skew between the two demos.
+  import init, { Database, embed } from "../../pkg/inlaysql_wasm.js";
+
+  const statusEl = document.getElementById("status");
+  const resultsEl = document.getElementById("results");
+  const sqlEl = document.getElementById("sql");
+  const qEl = document.getElementById("q");
+  const modeEl = document.getElementById("mode");
+
+  const LIMIT = 8;
+
+  let db, dim, count;
+
+  // One statement per mode — the point of the toggle is that ranking is just
+  // SQL, not a product tier.
+  function statementFor(mode) {
+    switch (mode) {
+      case "keyword":
+        return {
+          sql: "SELECT path, title, body, bm25_score(body, ?1) AS score\nFROM pages ORDER BY score DESC LIMIT " + LIMIT,
+          params: (q) => [q],
+        };
+      case "semantic":
+        return {
+          sql: "SELECT path, title, body, vector_score(embedding, ?1) AS score\nFROM pages ORDER BY score DESC LIMIT " + LIMIT,
+          params: (q) => [Array.from(embed(q, dim))],
+        };
+      default:
+        return {
+          sql: "SELECT path, title, body,\n       fuse(vector_score(embedding, ?1), bm25_score(body, ?2)) AS score\nFROM pages ORDER BY score DESC LIMIT " + LIMIT,
+          params: (q) => [Array.from(embed(q, dim)), q],
+        };
+    }
+  }
+
+  function snippet(body) {
+    return body.length > 180 ? body.slice(0, 177) + "…" : body;
+  }
+
+  function search(query) {
+    const mode = modeEl.value;
+    const { sql, params } = statementFor(mode);
+    sqlEl.textContent = sql;
+
+    let found;
+    try {
+      found = JSON.parse(db.query(sql, JSON.stringify(params(query))));
+    } catch (error) {
+      statusEl.textContent = `error: ${error}`;
+      statusEl.classList.add("error");
+      return;
+    }
+
+    resultsEl.innerHTML = "";
+    for (const [path, title, body, score] of found.rows) {
+      const li = document.createElement("li");
+      const h2 = document.createElement("h2");
+      h2.textContent = title;
+      const p = document.createElement("p");
+      p.className = "path";
+      p.textContent = path;
+      const s = document.createElement("p");
+      s.className = "snippet";
+      s.textContent = snippet(body);
+      const sc = document.createElement("span");
+      sc.className = "score";
+      sc.textContent = Number(score).toFixed(4);
+      li.append(h2, p, s, sc);
+      resultsEl.append(li);
+    }
+    if (found.rows.length === 0) {
+      const li = document.createElement("li");
+      li.textContent = `Nothing matched "${query}".`;
+      resultsEl.append(li);
+    }
+    history.replaceState(null, "", `?q=${encodeURIComponent(query)}&mode=${mode}`);
+  }
+
+  document.getElementById("form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const query = qEl.value.trim();
+    if (query && db) search(query);
+  });
+
+  try {
+    await init();
+    // The database is fetched like any other static asset. Opening it parses
+    // a header and a catalog, not the corpus.
+    const bytes = new Uint8Array(await (await fetch("site.inlay")).arrayBuffer());
+    db = Database.open(bytes);
+
+    // The vector width is read from the shipped schema rather than hard-coded,
+    // so the corpus can change dimension without touching this page.
+    const columns = JSON.parse(db.schema()).tables.find((t) => t.table === "pages")?.columns ?? [];
+    const vector = columns.find((column) => column.type.startsWith("VECTOR("));
+    if (!vector) throw new Error("the shipped database has no VECTOR column");
+    dim = Number(vector.type.slice("VECTOR(".length, -1));
+    count = JSON.parse(db.query("SELECT COUNT(*) FROM pages")).rows[0][0];
+
+    statusEl.textContent =
+      `${count} pages indexed — this search made no request to any server`;
+    statusEl.classList.remove("error");
+
+    // A ?q= link opens with results already shown, so a help article can link
+    // straight to "search results for renewing a passport".
+    const params = new URLSearchParams(location.search);
+    const initial = params.get("q");
+    if (initial) {
+      qEl.value = initial;
+      if (params.get("mode")) modeEl.value = params.get("mode");
+      search(initial);
+    }
+  } catch (error) {
+    statusEl.textContent = `error: ${error}`;
+    statusEl.classList.add("error");
+  }
+</script>
+</body>
+</html>
