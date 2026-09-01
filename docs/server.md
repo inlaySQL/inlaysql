@@ -58,6 +58,41 @@ that is a second authentication system, and nothing asks for it yet. And a
 certificate is read once at startup: rotating one means restarting the server.
 The startup banner states which of the three postures is in force.
 
+**What TLS unlocked: `--strong-passwords`.** An account's stored verifier is
+normally what the MySQL plugins define — `SHA1(SHA1(pw))` or
+`SHA256(SHA256(pw))`, unsalted and two fast hashes deep — because the wire
+protocol's challenge-response is computed *from* it. The consequence is stated
+plainly elsewhere in this file: a stolen database file is a stolen password
+list. The alternative needs the cleartext password, which needs an encrypted
+link, which this server did not have until now.
+
+With `--strong-passwords` (which requires `--tls-cert`), an account created or
+rotated from then on stores salted PBKDF2-HMAC-SHA256 — 210,000 rounds, a
+16-byte random salt — and stores *no* scramble verifier beside it, since one
+left there would be a complete bypass of the other. Three consequences, none
+of them hidden:
+
+* Such an account can only log in over TLS. It cannot answer the fast
+  scramble, so the client must complete full authentication, and this server
+  only allows that over an encrypted link.
+* Every login pays the derivation, roughly a tenth of a second. There is no
+  in-memory cache of a successful authentication, so it is per login rather
+  than per account.
+* The stored form is `$I$…`, not MySQL's `$A$005$…`. It is PBKDF2, not
+  SHA-256-crypt, and claiming MySQL's spelling for something that is not
+  MySQL's digest would mislead exactly the person who went looking.
+
+The default is unchanged: without the flag, accounts store what they always
+did, and every existing account keeps what it has until its password is set
+again.
+
+**Full authentication now requires TLS where TLS is offered.** A client that
+declines the fast scramble is asking to send its password in the clear. On a
+server with a certificate that is refused, naming TLS. On a server with no
+certificate it is still accepted — the operator has accepted a plaintext
+posture, everything already crosses in the clear, and refusing would protect
+nobody while breaking a client with no better option.
+
 **It binds `127.0.0.1` by default.** Reaching the network takes an explicit
 `--bind`, and doing so prints a warning that names the risk. A database server
 that defaults to every interface is a liability.

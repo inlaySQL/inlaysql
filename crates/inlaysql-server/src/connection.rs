@@ -54,6 +54,10 @@ struct Prepared {
 /// One client connection.
 pub struct Connection<S: Read + Write + crate::tls::Upgradable> {
     stream: Stream<S>,
+    /// How a `CREATE USER`/`ALTER USER` on this connection stores its
+    /// password. Server policy, fixed at startup — see
+    /// [`crate::acl::PasswordPolicy`].
+    password_policy: crate::acl::PasswordPolicy,
     /// The server's TLS certificate, when one was configured. `None` is the
     /// default and means this connection is plaintext and says so in its
     /// greeting — see [`crate::tls`].
@@ -107,10 +111,12 @@ impl<S: Read + Write + crate::tls::Upgradable> Connection<S> {
         server_counters: Arc<Metrics>,
         keeper: Arc<FileDevice>,
         tls: Option<crate::tls::TlsConfig>,
+        password_policy: crate::acl::PasswordPolicy,
     ) -> Self {
         Self {
             stream: Stream::new(read_half, write_half),
             tls,
+            password_policy,
             db,
             session: Session::new(Arc::clone(&control), "", None, limits),
             statements: HashMap::new(),
@@ -395,6 +401,57 @@ impl<S: Read + Write + crate::tls::Upgradable> Connection<S> {
                 self.stream.flush()?;
             }
             return Ok(Some((ok, true)));
+        }
+
+        // Full authentication means the client sends its password in the
+        // clear, so it may only happen inside TLS. Before this server could
+        // encrypt anything the exposure was theoretical — the whole connection
+        // was already readable, so a cleartext password revealed nothing an
+        // observer could not take off the wire anyway — and it was accepted on
+        // that basis. It is not theoretical now: with `--tls-cert` there is a
+        // link that does not leak, and asking for the password over one that
+        // does would be handing it to an observer this server could have shut
+        // out.
+        // Refused only when there was a safe way to do it and the client did
+        // not take it. On a server with no certificate this stays permitted:
+        // the operator has accepted a plaintext posture, every statement and
+        // result already crosses in the clear, and refusing would protect
+        // nobody while breaking a client that has no better option available
+        // to it. The moment a certificate exists, that reasoning stops
+        // applying — there *is* a link that does not leak.
+        //
+        // A strong account never reaches the permitted branch: it cannot be
+        // checked without the cleartext, so `Server::bind` refuses
+        // `--strong-passwords` without a certificate rather than creating
+        // accounts that could never log in.
+        // A strong account is refused on an unencrypted link whatever this
+        // server offers. The check above is about policy — a safe option
+        // existed and was not taken — but this one is about the account
+        // itself: its verifier can only be checked against a cleartext
+        // password, so allowing it here would send that password in the clear.
+        // Reachable even though `Server::bind` refuses `--strong-passwords`
+        // without a certificate, because a database carrying strong accounts
+        // can be served later by a process started without either flag.
+        if !self.stream.is_encrypted() && account.requires_tls() {
+            self.fail(&MysqlError::new(
+                1045,
+                "28000",
+                "Access denied: this account's password is stored in a form that can only be \
+                 checked over TLS. Serve this database with --tls-cert and --tls-key, and \
+                 connect with --ssl-mode=REQUIRED.",
+            ))?;
+            return Ok(None);
+        }
+
+        if !self.stream.is_encrypted() && self.tls.is_some() {
+            self.fail(&MysqlError::new(
+                1045,
+                "28000",
+                "Access denied: full authentication sends the password in the clear, and this \
+                 server offers TLS, so it is only allowed over an encrypted connection. \
+                 Reconnect with --ssl-mode=REQUIRED (or your client's equivalent).",
+            ))?;
+            return Ok(None);
         }
 
         // No fast-authentication attempt (an empty response, or one of any
@@ -809,7 +866,13 @@ impl<S: Read + Write + crate::tls::Upgradable> Connection<S> {
                 // `REVOKE` that did not happen, after the client was told it
                 // had.
                 self.commit()?;
-                match acl::execute(&mut self.db, &self.session, &self.bootstrap, &statement)? {
+                match acl::execute(
+                    &mut self.db,
+                    &self.session,
+                    &self.bootstrap,
+                    &statement,
+                    self.password_policy,
+                )? {
                     acl::Effect::Done => Ok(Answer::ok()),
                     acl::Effect::Rows(rows) => Ok(Answer::Rows {
                         rows: *rows,

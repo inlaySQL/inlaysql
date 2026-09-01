@@ -284,6 +284,7 @@ version = "0.0.1"
 dependencies = [
  "inlaysql",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pemfile",
 ]

@@ -16,6 +16,7 @@ rust-version.workspace = true
 inlaysql = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+ring = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

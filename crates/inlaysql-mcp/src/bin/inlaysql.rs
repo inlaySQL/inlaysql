@@ -56,6 +56,13 @@ SERVE --mysql OPTIONS:
                        advertises CLIENT_SSL and upgrades when a client asks.
                        Both or neither. Without them the wire is plaintext,
                        which is the default and is stated at startup.
+    --strong-passwords Store passwords as salted PBKDF2 instead of the MySQL
+                       plugins' unsalted two-hash verifiers, so a stolen
+                       database file is not a stolen password list. Applies to
+                       accounts created or rotated from here on. Needs
+                       --tls-cert: a strong account cannot answer the fast
+                       scramble, so it authenticates only over TLS, and pays a
+                       PBKDF2 derivation on every login.
     --tls-required     Refuse any login that did not upgrade to TLS. Needs
                        --tls-cert/--tls-key. Without this a certificate only
                        makes TLS *available*, and a client that does not ask
@@ -293,6 +300,7 @@ fn serve_mysql(args: &[String]) -> Result<(), String> {
                 )
             }
             "--tls-required" => options.tls_required = true,
+            "--strong-passwords" => options.strong_passwords = true,
             "--user" => {
                 options.user = rest
                     .next()

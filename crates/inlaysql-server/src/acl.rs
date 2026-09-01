@@ -332,10 +332,31 @@ impl Account {
     }
 
     /// Check the cleartext password a full authentication sends.
+    ///
+    /// Dispatches on what is actually stored rather than on what the caller
+    /// expects: a strong verifier is checked with PBKDF2 and a scramble
+    /// verifier by hashing, and neither can be checked by the other's routine.
+    /// A caller that reached here without an encrypted connection has already
+    /// been refused — see `Account::requires_tls`.
     pub fn verify_caching_sha2_cleartext(&self, payload: &[u8]) -> bool {
-        self.sha2
-            .as_deref()
-            .is_some_and(|verifier| auth::verify_caching_sha2_cleartext(verifier, payload))
+        self.sha2.as_deref().is_some_and(|verifier| {
+            if auth::is_strong(verifier) {
+                auth::verify_strong_cleartext(verifier, payload)
+            } else {
+                auth::verify_caching_sha2_cleartext(verifier, payload)
+            }
+        })
+    }
+
+    /// Whether this account can only authenticate over an encrypted link.
+    ///
+    /// True exactly when its stored verifier is the salted, iterated form: no
+    /// scramble can be computed from one, so the only way to check it is
+    /// against a cleartext password, and a cleartext password may not cross an
+    /// unencrypted connection. The login path turns this into a refusal that
+    /// says so, rather than a password failure that does not.
+    pub fn requires_tls(&self) -> bool {
+        self.sha2.as_deref().is_some_and(auth::is_strong)
     }
 
     /// An account that exists only to be refused: the stand-in used when a
@@ -465,6 +486,7 @@ pub fn install(
     user: &str,
     password: &str,
     reset: bool,
+    policy: PasswordPolicy,
 ) -> Result<Installed, MysqlError> {
     if db.catalog().table(USER_TABLE).is_none() {
         // Nothing to reset, and nothing worth creating in order to reset it:
@@ -480,10 +502,10 @@ pub fn install(
 
     let superuser = Privileges::ALL.with(Privileges::GRANT_OPTION);
     if stored_account(db, user)?.is_some() {
-        set_password(db, user, password, None)?;
+        set_password(db, user, password, None, policy)?;
         set_global(db, user, superuser)?;
     } else {
-        insert_account(db, user, password, None, superuser)?;
+        insert_account(db, user, password, None, superuser, policy)?;
     }
     Ok(Installed::Reset {
         user: user.to_string(),
@@ -674,8 +696,9 @@ fn insert_account(
     password: &str,
     plugin: Option<&str>,
     global: Privileges,
+    policy: PasswordPolicy,
 ) -> Result<(), MysqlError> {
-    let (native, sha2) = verifiers(password, plugin);
+    let (native, sha2) = verifiers(password, plugin, policy);
     run_sql(
         db,
         &format!(
@@ -696,8 +719,9 @@ fn set_password(
     name: &str,
     password: &str,
     plugin: Option<&str>,
+    policy: PasswordPolicy,
 ) -> Result<(), MysqlError> {
-    let (native, sha2) = verifiers(password, plugin);
+    let (native, sha2) = verifiers(password, plugin, policy);
     run_sql(
         db,
         &format!("UPDATE {USER_TABLE} SET native_auth = ?, sha2_auth = ? WHERE name = ?"),
@@ -758,7 +782,21 @@ fn set_table_grant(
 /// `None` for the plugin means both, which is what keeps every client that
 /// worked before an account existed working after one does — see the module
 /// docs for the cost of that default and how to opt out of it.
-fn verifiers(password: &str, plugin: Option<&str>) -> (Option<String>, Option<String>) {
+fn verifiers(
+    password: &str,
+    plugin: Option<&str>,
+    policy: PasswordPolicy,
+) -> (Option<String>, Option<String>) {
+    // A strong account stores one thing and it answers no scramble: keeping a
+    // native verifier beside it would leave the weak form on disk as a
+    // complete bypass of the strong one, which is worse than not offering the
+    // strong one at all. An explicit `IDENTIFIED WITH mysql_native_password`
+    // still wins, because that is an operator saying, in as many words, that
+    // this account must work with a client that speaks only the old plugin —
+    // and a silent downgrade of an explicit request is its own bug.
+    if policy == PasswordPolicy::Strong && plugin != Some(auth::NATIVE_PASSWORD) {
+        return (None, Some(auth::strong_verifier(password)));
+    }
     match plugin {
         Some(auth::NATIVE_PASSWORD) => (Some(auth::native_verifier(password)), None),
         Some(auth::CACHING_SHA2_PASSWORD) => (None, Some(auth::sha2_verifier(password))),
@@ -767,6 +805,24 @@ fn verifiers(password: &str, plugin: Option<&str>) -> (Option<String>, Option<St
             Some(auth::sha2_verifier(password)),
         ),
     }
+}
+
+/// How a password is stored when an account is created or rotated.
+///
+/// This is a *server* policy rather than a per-account one: an operator
+/// decides once whether this database's accounts are the fast-scramble kind
+/// every MySQL client can log into over any link, or the salted, iterated kind
+/// that survives the file being stolen and needs TLS to log in at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PasswordPolicy {
+    /// Unsalted, two fast hashes deep, per the plugins' own definitions. The
+    /// default, because it is what every existing account already is and what
+    /// every client can complete without an encrypted connection.
+    #[default]
+    Scramble,
+    /// Salted PBKDF2. Cannot answer a scramble, so a client must complete full
+    /// authentication, which this server only allows over TLS.
+    Strong,
 }
 
 // ------------------------------------------------------------ SQL plumbing
@@ -1757,6 +1813,7 @@ pub fn execute(
     session: &Session,
     bootstrap: &Bootstrap,
     statement: &AclStatement,
+    policy: PasswordPolicy,
 ) -> Result<Effect, MysqlError> {
     // Every statement below except `SHOW GRANTS` writes, and a write is what
     // moves this database from "the flags are the credential" to "the file
@@ -1787,6 +1844,7 @@ pub fn execute(
                     &user.password,
                     user.plugin,
                     Privileges::NONE,
+                    policy,
                 )?;
             }
             Ok(Effect::Done)
@@ -1829,7 +1887,7 @@ pub fn execute(
                         format!("Operation ALTER USER failed for '{}'@'%'", user.name),
                     ));
                 }
-                set_password(db, &user.name, &user.password, user.plugin)?;
+                set_password(db, &user.name, &user.password, user.plugin, policy)?;
             }
             Ok(Effect::Done)
         }
@@ -2087,7 +2145,7 @@ mod tests {
             panic!("expected CREATE USER");
         };
         assert_eq!(users[0].plugin, Some(auth::NATIVE_PASSWORD));
-        let (native, sha2) = verifiers("x", users[0].plugin);
+        let (native, sha2) = verifiers("x", users[0].plugin, PasswordPolicy::Scramble);
         assert!(native.is_some() && sha2.is_none());
 
         let error = refused("CREATE USER 'app' IDENTIFIED WITH sha256_password BY 'x'");
@@ -2096,7 +2154,7 @@ mod tests {
 
     #[test]
     fn the_default_is_both_verifiers_so_no_client_stops_working() {
-        let (native, sha2) = verifiers("hunter2", None);
+        let (native, sha2) = verifiers("hunter2", None, PasswordPolicy::Scramble);
         assert!(native.is_some());
         assert!(sha2.is_some());
         assert_ne!(native.unwrap(), "hunter2");

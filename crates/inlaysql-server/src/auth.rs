@@ -44,10 +44,15 @@
 //! What still needs handling is a client that does not attempt the fast
 //! scramble — an empty first response, asking the server what to do. This
 //! server answers `perform_full_authentication` and accepts the cleartext
-//! password the client sends next, which is a widening of exposure only on
-//! paper: v1 is documented plaintext-localhost (`docs/server.md`), so a
-//! cleartext password crossing an already-plaintext connection reveals
-//! nothing a network observer could not already read directly off the wire.
+//! password the client sends next — **but only over TLS, or on a server that
+//! has no certificate at all.** The original reasoning was that a cleartext
+//! password crossing an already-plaintext connection reveals nothing an
+//! observer could not read off the wire anyway, which held while every
+//! connection was plaintext. Once `--tls-cert` exists that stops being true
+//! for a server that offers it, so `connection.rs` refuses the exchange there
+//! and names TLS in the refusal. A server with no certificate keeps the old
+//! behaviour: refusing would protect nobody and break a client with no better
+//! option.
 //! **A hash-only store did not cost this path**, which was the open question
 //! when the store was designed: hashing what the client just sent and
 //! comparing digests is the same check the fast path makes, so nothing had to
@@ -408,10 +413,10 @@ pub fn sha256(message: &[u8]) -> [u8; 32] {
 /// **This is deliberately not MySQL's own `$A$005$...` spelling**, which is a
 /// salted, 5000-round SHA-256-crypt digest. That form is only usable on
 /// MySQL's *full*-authentication path, where the client has already sent the
-/// cleartext password — over TLS, or after an RSA exchange. This server has
-/// neither, so storing it would mean every connection completing full
-/// authentication over a plaintext link, which is strictly worse than what is
-/// here. What is stored instead is exactly the value real MySQL keeps in its
+/// cleartext password — over TLS, or after an RSA exchange. When this was
+/// written the server had neither. It has TLS now, and [`strong_verifier`] is
+/// the salted, iterated option that unlocked; this function remains what a
+/// scramble-answering account stores, which is still the default. What is stored instead is exactly the value real MySQL keeps in its
 /// in-memory *cache* (the "caching" the plugin is named for), which is what
 /// the fast scramble is checked against — see [`verify_caching_sha2`], and
 /// `docs/server.md` for the whole argument.
@@ -482,6 +487,128 @@ pub fn verify_caching_sha2_cleartext(verifier: &str, payload: &[u8]) -> bool {
     };
     let cleartext = payload.strip_suffix(&[0u8]).unwrap_or(payload);
     constant_time_eq(&sha256(&sha256(cleartext)), &stage2)
+}
+
+// ------------------------------------------- strong at-rest verifiers
+
+/// The prefix marking a verifier as the salted, iterated form rather than the
+/// two-fast-hashes form the wire protocol's scramble needs.
+///
+/// Deliberately **not** MySQL's `$A$`. That spelling means a specific
+/// SHA-256-crypt variant, and this is PBKDF2-HMAC-SHA256; a stored value that
+/// claimed to be MySQL's while being something else would mislead exactly the
+/// person who went looking. `$I$` is this engine's own, and nothing else reads
+/// it.
+pub const STRONG_PREFIX: &str = "$I$";
+
+/// PBKDF2 iterations. OWASP's 2023 guidance for PBKDF2-HMAC-SHA256.
+///
+/// The cost is real and lands on the login path: roughly a tenth of a second
+/// per authentication, paid on **every** login of a strong account rather than
+/// once, because this server keeps no in-memory cache of a successful
+/// authentication the way MySQL's `caching_` prefix refers to. That is the
+/// trade the operator opts into with `--strong-passwords`, and it is stated in
+/// `docs/server.md` next to the flag rather than discovered under load.
+const STRONG_ROUNDS: u32 = 210_000;
+
+/// Salt bytes. 16 is what PBKDF2's own guidance asks for; the salt is stored
+/// beside the digest because a salt is not a secret, it is a defence against
+/// one table of precomputed answers covering every account at once.
+const STRONG_SALT_LEN: usize = 16;
+
+/// A freshly salted, iterated verifier for `password`.
+///
+/// # Why this exists at all
+///
+/// The two verifiers this module's challenge-response needs — `SHA1(SHA1(pw))`
+/// and `SHA256(SHA256(pw))` — are fixed by the plugins' own definitions:
+/// unsalted, two fast hashes deep. They have to be, because the scramble is
+/// computed *from* them. `acl`'s module docs state the consequence plainly: a
+/// stolen database file is a stolen password list against an offline attack.
+///
+/// That was accepted because the alternative needed the cleartext password,
+/// which needed an encrypted link, which this server did not have. **It has
+/// one now** (`--tls-cert`, 2026-09-01), so the alternative is available: store
+/// something no scramble can be computed from, require the client to complete
+/// full authentication over TLS, and derive from what it sends.
+///
+/// An account stored this way therefore *cannot* answer the fast scramble, and
+/// cannot log in over an unencrypted connection at all. Both are consequences,
+/// not defects, and the login path says so rather than failing obscurely.
+pub fn strong_verifier(password: &str) -> String {
+    let mut salt = [0u8; STRONG_SALT_LEN];
+    fill_random(&mut salt);
+    let digest = strong_digest(password.as_bytes(), &salt);
+    format!(
+        "{STRONG_PREFIX}{STRONG_ROUNDS}${}${}",
+        hex(&salt),
+        hex(&digest)
+    )
+}
+
+/// Whether `verifier` is the salted, iterated form.
+pub fn is_strong(verifier: &str) -> bool {
+    verifier.starts_with(STRONG_PREFIX)
+}
+
+/// Whether `payload` — the cleartext a client sends after
+/// `perform_full_authentication` — is the password behind a strong `verifier`.
+///
+/// Returns `false` for a verifier that is not the strong form, so a caller that
+/// reaches here with the wrong kind refuses the login rather than falling
+/// through to something weaker.
+pub fn verify_strong_cleartext(verifier: &str, payload: &[u8]) -> bool {
+    let Some((rounds, salt, expected)) = parse_strong(verifier) else {
+        return false;
+    };
+    let cleartext = payload.strip_suffix(&[0u8]).unwrap_or(payload);
+    let Ok(rounds) = std::num::NonZeroU32::new(rounds).ok_or(()) else {
+        return false;
+    };
+    ring::pbkdf2::verify(
+        ring::pbkdf2::PBKDF2_HMAC_SHA256,
+        rounds,
+        &salt,
+        cleartext,
+        &expected,
+    )
+    .is_ok()
+}
+
+/// `(rounds, salt, digest)` from a stored strong verifier.
+///
+/// Both lengths are fixed rather than parsed freely: a verifier whose salt or
+/// digest decoded to fewer bytes than it should would still verify, against a
+/// correspondingly shorter derivation.
+fn parse_strong(verifier: &str) -> Option<(u32, [u8; STRONG_SALT_LEN], [u8; 32])> {
+    let rest = verifier.strip_prefix(STRONG_PREFIX)?;
+    let mut parts = rest.split('$');
+    let rounds: u32 = parts.next()?.parse().ok()?;
+    let salt = unhex::<STRONG_SALT_LEN>(parts.next()?)?;
+    let digest = unhex::<32>(parts.next()?)?;
+    if parts.next().is_some() || rounds == 0 {
+        return None;
+    }
+    Some((rounds, salt, digest))
+}
+
+fn strong_digest(password: &[u8], salt: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    ring::pbkdf2::derive(
+        ring::pbkdf2::PBKDF2_HMAC_SHA256,
+        std::num::NonZeroU32::new(STRONG_ROUNDS).expect("STRONG_ROUNDS is not zero"),
+        salt,
+        password,
+        &mut out,
+    );
+    out
+}
+
+fn fill_random(out: &mut [u8]) {
+    use ring::rand::SecureRandom;
+    ring::rand::SystemRandom::new()
+        .fill(out)
+        .expect("the system random source must be readable to create an account");
 }
 
 // ------------------------------------------------------------------- hex
@@ -691,6 +818,55 @@ mod tests {
         }
         assert!(!verify_caching_sha2("", &challenge, &[0u8; 32]));
         assert!(!verify_caching_sha2_cleartext("", b"hunter2"));
+    }
+
+    /// The strong verifier round-trips, is salted, and refuses everything else.
+    #[test]
+    fn a_strong_verifier_accepts_its_password_and_nothing_else() {
+        let verifier = strong_verifier("hunter2");
+        assert!(is_strong(&verifier), "{verifier}");
+        assert!(verify_strong_cleartext(&verifier, b"hunter2"));
+        // The protocol NUL-terminates the cleartext; the terminator is framing,
+        // not part of the secret.
+        assert!(verify_strong_cleartext(&verifier, b"hunter2\0"));
+        assert!(!verify_strong_cleartext(&verifier, b"hunter3"));
+        assert!(!verify_strong_cleartext(&verifier, b""));
+        assert!(!verify_strong_cleartext(&verifier, b"hunter2 "));
+
+        // Salted: the same password twice must not produce the same stored
+        // value, or one precomputed table covers every account at once.
+        assert_ne!(verifier, strong_verifier("hunter2"));
+
+        // An empty password is a password, not a bypass.
+        let empty = strong_verifier("");
+        assert!(verify_strong_cleartext(&empty, b""));
+        assert!(!verify_strong_cleartext(&empty, b"hunter2"));
+    }
+
+    /// A malformed or wrong-kind verifier refuses rather than falling through
+    /// to something weaker.
+    #[test]
+    fn a_verifier_that_is_not_the_strong_form_never_verifies_as_one() {
+        // The fast-scramble verifier is not a strong one.
+        let fast = sha2_verifier("hunter2");
+        assert!(!is_strong(&fast));
+        assert!(!verify_strong_cleartext(&fast, b"hunter2"));
+
+        for broken in [
+            "$I$",
+            "$I$0$aa$bb",
+            "$I$210000$$",
+            "$I$210000$zz$zz",
+            // Truncated salt and digest: decoding these leniently would let a
+            // short stored value verify against a short derivation.
+            "$I$210000$00$00",
+            "",
+        ] {
+            assert!(
+                !verify_strong_cleartext(broken, b"hunter2"),
+                "{broken} verified"
+            );
+        }
     }
 
     // -------------------------------------------------------------- SHA-256

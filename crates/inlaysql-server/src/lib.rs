@@ -366,6 +366,16 @@ pub struct ServerOptions {
     /// in the clear" a property of the server rather than a hope about its
     /// clients; without it a certificate only makes TLS *available*.
     pub tls_required: bool,
+    /// Store passwords as salted, iterated PBKDF2 rather than the plugins'
+    /// own unsalted two-hash verifiers.
+    ///
+    /// Applies to accounts created or rotated from here on; existing accounts
+    /// keep what they have until their password is set again. The trade is
+    /// stated rather than implied: a strong account survives the database file
+    /// being stolen, and in exchange it cannot answer the fast scramble, so it
+    /// can only log in over TLS and pays a PBKDF2 derivation on every login.
+    /// [`ServerOptions::tls_cert`] is therefore required with it.
+    pub strong_passwords: bool,
     /// Log a line to stderr for every statement that runs longer than this
     /// many milliseconds. `0` (the default) is off.
     ///
@@ -431,6 +441,7 @@ impl Default for ServerOptions {
             tls_cert: None,
             tls_key: None,
             tls_required: false,
+            strong_passwords: false,
             slow_query_log_ms: 0,
             // Holding statement text is a policy change about user data, so it
             // is asked for and never inherited. See the field's doc.
@@ -470,6 +481,8 @@ pub struct Server {
     bootstrap: acl::Bootstrap,
     /// The certificate every connection offers, when one was configured.
     tls: Option<tls::TlsConfig>,
+    /// How this server stores a password an account statement sets.
+    password_policy: acl::PasswordPolicy,
 }
 
 impl Server {
@@ -504,6 +517,7 @@ impl Server {
             &options.user,
             &options.password,
             options.reset_superuser,
+            password_policy(options),
         )
         .map_err(|error| {
             io::Error::other(format!(
@@ -517,6 +531,17 @@ impl Server {
         // the life of the process — the same trap `run`'s `FileDevice` keeper
         // exists to avoid.
         drop(db);
+
+        // A strong account cannot answer the fast scramble, so it must complete
+        // full authentication, which this server only allows over TLS. Without
+        // a certificate the flag would create accounts that can never log in —
+        // refuse at startup rather than at every client's first attempt.
+        if options.strong_passwords && options.tls_cert.is_none() {
+            return Err(io::Error::other(
+                "--strong-passwords needs --tls-cert and --tls-key: a strong account can only \
+                 authenticate over TLS, so without a certificate it could never log in",
+            ));
+        }
 
         // Loaded before the listener opens, so a bad certificate is a startup
         // failure rather than something every client discovers separately. A
@@ -553,6 +578,7 @@ impl Server {
             listener,
             path,
             tls: tls_config,
+            password_policy: password_policy(options),
             notices: notices_for(&installed),
             bootstrap: acl::Bootstrap::new(&options.user, &options.password),
             // The clamped cap, not the requested one: a session reports what
@@ -721,6 +747,7 @@ impl Server {
             let counters_for_thread = counters.clone();
             let keeper_for_thread = keeper.clone();
             let tls_for_thread = self.tls.clone();
+            let policy_for_thread = self.password_policy;
             let spawned = std::thread::Builder::new()
                 .name(format!("inlaysql-conn-{id}"))
                 .spawn(move || {
@@ -730,6 +757,7 @@ impl Server {
                         stream,
                         &path,
                         tls_for_thread,
+                        policy_for_thread,
                         control,
                         limits,
                         engine,
@@ -783,6 +811,7 @@ fn serve_connection(
     stream: TcpStream,
     path: &Path,
     tls_config: Option<tls::TlsConfig>,
+    password_policy: acl::PasswordPolicy,
     control: Arc<Control>,
     limits: session::Limits,
     engine: EngineOptions,
@@ -848,6 +877,7 @@ fn serve_connection(
         counters,
         keeper,
         tls_config,
+        password_policy,
     )
     .serve();
     // A socket timeout arrives as a bare `WouldBlock`/`TimedOut` from whatever
@@ -954,6 +984,15 @@ fn notices_for(installed: &acl::Installed) -> Vec<String> {
         }
     }
     out
+}
+
+/// The password policy `options` asks for.
+fn password_policy(options: &ServerOptions) -> acl::PasswordPolicy {
+    if options.strong_passwords {
+        acl::PasswordPolicy::Strong
+    } else {
+        acl::PasswordPolicy::Scramble
+    }
 }
 
 /// Write the warning the CLI prints, so the text lives beside the behaviour it

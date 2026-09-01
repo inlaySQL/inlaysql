@@ -194,6 +194,69 @@ fn greeting_capabilities(packet: &[u8]) -> u32 {
     lower | (upper << 16)
 }
 
+/// Negotiate TLS and log in inside the tunnel, the way a real client does.
+///
+/// Returns the encrypted client, or the server's error packet. Shared by the
+/// tests below so each one asserts its own point rather than re-deriving the
+/// handshake.
+fn tls_login(
+    addr: SocketAddr,
+    user: &str,
+    password: &str,
+) -> Result<Client<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>, Vec<u8>> {
+    let tcp = TcpStream::connect(addr).expect("tcp connect");
+    tcp.set_nodelay(true).ok();
+    let mut plain = Client {
+        stream: tcp,
+        sequence: 0,
+    };
+    let greeting = plain.read_packet().expect("greeting");
+    assert_eq!(
+        greeting_capabilities(&greeting) & CLIENT_SSL,
+        CLIENT_SSL,
+        "the server must advertise CLIENT_SSL for this to be possible"
+    );
+    plain
+        .write_packet(&Client::<TcpStream>::login_payload(user, true))
+        .expect("ssl request");
+
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
+        .with_no_client_auth();
+    let session = rustls::ClientConnection::new(
+        Arc::new(config),
+        rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+    )
+    .expect("client session");
+    let mut secure = Client {
+        stream: rustls::StreamOwned::new(session, plain.stream),
+        sequence: plain.sequence,
+    };
+
+    // Empty auth response: declines the fast scramble and asks for full
+    // authentication, which is the only way a strong verifier can be checked.
+    let mut payload = Client::<TcpStream>::login_payload(user, false);
+    payload.truncate(payload.len() - b"mysql_native_password\0".len());
+    payload.extend_from_slice(b"caching_sha2_password\0");
+    secure.write_packet(&payload).expect("login");
+
+    loop {
+        let reply = secure.read_packet().expect("login reply");
+        match reply.first() {
+            Some(&0xff) => return Err(reply),
+            // AuthMoreData: the server is driving full authentication.
+            Some(&0x01) => {
+                // The cleartext password, NUL-terminated per the protocol.
+                let mut payload = password.as_bytes().to_vec();
+                payload.push(0);
+                secure.write_packet(&payload).expect("cleartext password");
+            }
+            _ => return Ok(secure),
+        }
+    }
+}
+
 /// A client that negotiates TLS and then logs in inside the tunnel.
 ///
 /// This is the whole sequence the feature exists for, and every step is
@@ -364,6 +427,181 @@ fn the_default_server_is_still_plaintext_and_still_serves() {
         .expect("login");
     let reply = plain.read_packet().expect("reply");
     assert_ne!(reply.first(), Some(&0xff), "plaintext login was refused");
+}
+
+/// A strong (PBKDF2) account is created, logs in over TLS, and the weak
+/// verifier is not left behind beside it as a bypass.
+///
+/// The bootstrap `--user`/`--password` credential is deliberately not part of
+/// this: on a database with no accounts those flags *are* the credential and
+/// never reach the store, so a real `CREATE USER` is what exercises the
+/// policy.
+#[test]
+fn a_strong_account_authenticates_over_tls() {
+    let fixture = Fixture::new("strongacct");
+    let (cert, key) = fixture.certificate();
+    let addr = start(&fixture, |options| {
+        options.tls_cert = Some(cert.clone());
+        options.tls_key = Some(key.clone());
+        options.strong_passwords = true;
+    });
+
+    let mut root = tls_login(addr, "root", "").expect("the bootstrap account must log in");
+    let reply = root.query_ok("CREATE USER app IDENTIFIED BY 'hunter2'");
+    assert_ne!(reply.first(), Some(&0xff), "CREATE USER failed: {reply:?}");
+
+    // The account logs in over TLS, through full authentication — the only
+    // path that can check a verifier no scramble can be computed from.
+    let mut app =
+        tls_login(addr, "app", "hunter2").expect("a strong account must authenticate over TLS");
+    let reply = app.query_ok("SELECT 1");
+    assert_ne!(reply.first(), Some(&0xff), "a statement failed: {reply:?}");
+
+    // The wrong password is refused, which is what makes the line above mean
+    // something.
+    assert!(
+        tls_login(addr, "app", "hunter3").is_err(),
+        "a strong account accepted the wrong password"
+    );
+
+    // And the weak verifier is genuinely absent rather than merely unused.
+    // Asserted behaviourally, because the account table is deliberately
+    // unreadable through SQL.
+    //
+    // The probe account has an *empty* password for one reason: the native
+    // token for an empty password is itself empty, which this test client can
+    // send without implementing SHA-1. Against a server that stored a native
+    // verifier it would match and the login would succeed; with the strong
+    // policy there is no native verifier to match. A non-empty password would
+    // not discriminate — the login would fail either way, for the wrong
+    // reason, and the test would prove nothing. Verified by mutation.
+    let reply = root.query_ok("CREATE USER probe IDENTIFIED BY ''");
+    assert_ne!(
+        reply.first(),
+        Some(&0xff),
+        "CREATE USER probe failed: {reply:?}"
+    );
+
+    let tcp = TcpStream::connect(addr).expect("tcp connect");
+    let mut plain = Client {
+        stream: tcp,
+        sequence: 0,
+    };
+    let _greeting = plain.read_packet().expect("greeting");
+    plain
+        .write_packet(&Client::<TcpStream>::login_payload("probe", false))
+        .expect("plaintext native login");
+    let reply = plain.read_packet().expect("reply");
+    // Not an OK packet. The server answers an auth-switch request (0xfe) here
+    // rather than an error, because the account has no native verifier to
+    // check against and asks the client to use the other plugin — which it
+    // could not do if a native verifier had been stored.
+    assert_ne!(
+        reply.first(),
+        Some(&0x00),
+        "a strong account accepted a plaintext scramble login, so a weak verifier \
+         was left on disk beside the strong one"
+    );
+}
+
+/// A strong account is refused on a plaintext link even by a server with no
+/// certificate at all.
+///
+/// `Server::bind` refuses `--strong-passwords` without a certificate, so this
+/// combination cannot be *created* — but it can be *served*: the database is a
+/// file, and a later process can open it with neither flag. The account's
+/// password could then only be checked by having it sent in the clear, which
+/// is exactly what must not happen.
+#[test]
+fn a_strong_account_is_refused_on_a_server_with_no_certificate() {
+    let fixture = Fixture::new("strongnotls");
+    let (cert, key) = fixture.certificate();
+
+    // First sitting: TLS and the strong policy, to create the account.
+    let addr = start(&fixture, |options| {
+        options.tls_cert = Some(cert.clone());
+        options.tls_key = Some(key.clone());
+        options.strong_passwords = true;
+    });
+    let mut root = tls_login(addr, "root", "").expect("bootstrap login");
+    let reply = root.query_ok("CREATE USER strong IDENTIFIED BY ''");
+    assert_ne!(reply.first(), Some(&0xff), "CREATE USER failed: {reply:?}");
+    drop(root);
+
+    // Second sitting: the same file, served with neither flag.
+    let plain_addr = start(&fixture, |_| {});
+    let tcp = TcpStream::connect(plain_addr).expect("tcp connect");
+    let mut plain = Client {
+        stream: tcp,
+        sequence: 0,
+    };
+    let _greeting = plain.read_packet().expect("greeting");
+    let mut payload = Client::<TcpStream>::login_payload("strong", false);
+    payload.truncate(payload.len() - b"mysql_native_password\0".len());
+    payload.extend_from_slice(b"caching_sha2_password\0");
+    plain.write_packet(&payload).expect("login");
+    let reply = plain.read_packet().expect("reply");
+    assert_eq!(
+        reply.first(),
+        Some(&0xff),
+        "a strong account authenticated over an unencrypted connection"
+    );
+}
+
+/// Full authentication is refused on an unencrypted connection when the server
+/// offers TLS — the password would cross in the clear with a safe link
+/// available.
+#[test]
+fn full_authentication_in_the_clear_is_refused_when_tls_is_offered() {
+    let fixture = Fixture::new("cleartext");
+    let (cert, key) = fixture.certificate();
+    let addr = start(&fixture, |options| {
+        options.tls_cert = Some(cert.clone());
+        options.tls_key = Some(key.clone());
+    });
+
+    let tcp = TcpStream::connect(addr).expect("tcp connect");
+    let mut plain = Client {
+        stream: tcp,
+        sequence: 0,
+    };
+    let _greeting = plain.read_packet().expect("greeting");
+    // An empty auth response declines the fast scramble, which is what asks
+    // the server for full authentication.
+    let mut payload = Client::<TcpStream>::login_payload("root", false);
+    // Rewrite the plugin so the server routes this through caching_sha2.
+    payload.truncate(payload.len() - b"mysql_native_password\0".len());
+    payload.extend_from_slice(b"caching_sha2_password\0");
+    plain.write_packet(&payload).expect("login");
+    let reply = plain.read_packet().expect("reply");
+    assert_eq!(
+        reply.first(),
+        Some(&0xff),
+        "a cleartext full authentication was accepted on an unencrypted link"
+    );
+}
+
+/// `--strong-passwords` without a certificate must not start: such an account
+/// could never authenticate, because it can only be checked against a
+/// cleartext password and that needs an encrypted link.
+#[test]
+fn strong_passwords_without_a_certificate_refuses_to_start() {
+    let fixture = Fixture::new("strongnocert");
+    let options = ServerOptions {
+        bind: "127.0.0.1".to_string(),
+        port: 0,
+        user: "root".to_string(),
+        password: String::new(),
+        strong_passwords: true,
+        ..ServerOptions::default()
+    };
+    let error = Server::bind(fixture.database(), &options)
+        .err()
+        .expect("bind must refuse");
+    assert!(
+        error.to_string().contains("--tls-cert"),
+        "the refusal should say what is missing: {error}"
+    );
 }
 
 /// A server told to require TLS without a certificate must not start.
