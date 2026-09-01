@@ -7380,8 +7380,11 @@ fn mysql_match_against_translates_to_the_native_bm25_probe() {
     let server = TestServer::start("match-against");
     let mut client = server.client();
     client.ok_query("CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, body TEXT)");
+    // MySQL's rule, which the engine shares: a MATCH over a column list needs
+    // a full-text index over exactly that list, so the two-column query here
+    // gets a two-column index and not two single-column ones.
     client.ok_query("CREATE INDEX docs_body ON docs (body)");
-    client.ok_query("CREATE INDEX docs_title ON docs (title)");
+    client.ok_query("CREATE FULLTEXT INDEX docs_title_body ON docs (title, body)");
     client.ok_query(
         "INSERT INTO docs (id, title, body) VALUES \
          (1, 'alpha', 'alpha alpha alpha'), (2, 'beta', 'beta beta beta'), \
@@ -7409,9 +7412,7 @@ fn mysql_match_against_translates_to_the_native_bm25_probe() {
 
     // WHERE + MATCH composes: the predicate is pushed into the retriever.
     let filtered = client
-        .ok_query(
-            "SELECT id FROM docs WHERE id < 3 AND MATCH (body) AGAINST ('alpha')",
-        )
+        .ok_query("SELECT id FROM docs WHERE id < 3 AND MATCH (body) AGAINST ('alpha')")
         .rows();
     assert_eq!(filtered.column("id"), vec!["1"]);
 
@@ -7438,7 +7439,10 @@ fn mysql_match_against_translates_to_the_native_bm25_probe() {
     let statement = client
         .prepare("SELECT id FROM docs WHERE MATCH (body) AGAINST (?)")
         .expect("prepare a MATCH ... AGAINST (?)");
-    assert_eq!(statement.param_count, 1, "the rewrite must not move ordinals");
+    assert_eq!(
+        statement.param_count, 1,
+        "the rewrite must not move ordinals"
+    );
     let executed = client
         .execute(&statement, &[Param::Str("alpha".to_string())])
         .expect("execute the prepared full-text search");
@@ -7446,16 +7450,20 @@ fn mysql_match_against_translates_to_the_native_bm25_probe() {
 
     // The modes whose semantics the BM25 index does not implement are
     // refused with their names in the message, never accepted and ignored.
-    let (_, boolean) = client.query_until_error(
-        "SELECT id FROM docs WHERE MATCH (body) AGAINST ('+alpha -beta' IN BOOLEAN MODE)",
-    );
+    // The refusals happen before any row, so `query`'s error path carries them.
+    let boolean = client
+        .query("SELECT id FROM docs WHERE MATCH (body) AGAINST ('+alpha -beta' IN BOOLEAN MODE)")
+        .expect_err("BOOLEAN MODE was accepted");
     assert_eq!(boolean.code, 1235, "{boolean:?}");
     assert!(boolean.message.contains("BOOLEAN MODE"), "{boolean:?}");
-    let (_, expansion) = client.query_until_error(
-        "SELECT id FROM docs WHERE MATCH (body) AGAINST ('alpha' WITH QUERY EXPANSION)",
-    );
+    let expansion = client
+        .query("SELECT id FROM docs WHERE MATCH (body) AGAINST ('alpha' WITH QUERY EXPANSION)")
+        .expect_err("QUERY EXPANSION was accepted");
     assert_eq!(expansion.code, 1235, "{expansion:?}");
-    assert!(expansion.message.contains("QUERY EXPANSION"), "{expansion:?}");
+    assert!(
+        expansion.message.contains("QUERY EXPANSION"),
+        "{expansion:?}"
+    );
 
     client.quit();
 }

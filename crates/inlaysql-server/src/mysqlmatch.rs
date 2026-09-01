@@ -65,17 +65,13 @@ pub fn rewrite(sql: &str) -> Result<String, MysqlError> {
             let word: String = chars[start..i].iter().collect();
             let qualified = previous == '.' || previous == '@' || previous == '$';
 
-            if word.eq_ignore_ascii_case("match")
-                && !qualified
-                && next_non_space_is(&chars, i, '(')
+            if word.eq_ignore_ascii_case("match") && !qualified && next_non_space_is(&chars, i, '(')
             {
                 // The column list: everything inside the parentheses,
                 // verbatim — backticks, whitespace and all.
                 let open = next_non_space(&chars, i);
                 let Some(close) = matching_paren(&chars, open) else {
-                    return Err(MysqlError::parse(
-                        "MATCH is missing its closing ')'",
-                    ));
+                    return Err(MysqlError::parse("MATCH is missing its closing ')'"));
                 };
                 let columns: String = chars[open + 1..close].iter().collect();
 
@@ -93,18 +89,13 @@ pub fn rewrite(sql: &str) -> Result<String, MysqlError> {
 
                 let arg_open = next_non_space(&chars, against.end);
                 if chars.get(arg_open) != Some(&'(') {
-                    return Err(MysqlError::parse(
-                        "AGAINST must be followed by '('",
-                    ));
+                    return Err(MysqlError::parse("AGAINST must be followed by '('"));
                 }
                 let Some(arg_close) = matching_paren(&chars, arg_open) else {
-                    return Err(MysqlError::parse(
-                        "AGAINST is missing its closing ')'",
-                    ));
+                    return Err(MysqlError::parse("AGAINST is missing its closing ')'"));
                 };
 
-                let (query, mode_end) =
-                    read_against_argument(&chars, arg_open + 1, arg_close)?;
+                let (query, mode_end) = read_against_argument(&chars, arg_open + 1, arg_close)?;
 
                 out.push_str("bm25_score(");
                 out.push_str(columns.trim());
@@ -176,9 +167,7 @@ fn finish_against(
 
     let word = read_word(chars, i);
     if !word.word.eq_ignore_ascii_case("in") && !word.word.eq_ignore_ascii_case("with") {
-        return Err(MysqlError::parse(
-            "unexpected token inside AGAINST ()",
-        ));
+        return Err(MysqlError::parse("unexpected token inside AGAINST ()"));
     }
 
     let rest: String = chars[i..close].iter().collect();
@@ -385,8 +374,10 @@ mod tests {
 
     #[test]
     fn boolean_mode_is_refused_by_name() {
-        let error = rewrite("SELECT id FROM docs WHERE MATCH (body) AGAINST ('+rust -php' IN BOOLEAN MODE)")
-            .expect_err("boolean mode was accepted");
+        let error = rewrite(
+            "SELECT id FROM docs WHERE MATCH (body) AGAINST ('+rust -php' IN BOOLEAN MODE)",
+        )
+        .expect_err("boolean mode was accepted");
         assert_eq!(error.code, 1235);
         assert!(error.message.contains("BOOLEAN MODE"), "{error:?}");
     }
@@ -423,10 +414,7 @@ mod tests {
             "INSERT INTO notes VALUES ('MATCH (body) AGAINST (\\'x\\')')"
         );
         // A qualified or prefixed name is not the clause.
-        assert_eq!(
-            rewritten("SELECT t.match FROM t"),
-            "SELECT t.match FROM t"
-        );
+        assert_eq!(rewritten("SELECT t.match FROM t"), "SELECT t.match FROM t");
         // No MATCH anywhere: byte-for-byte unchanged.
         let untouched = "SELECT id FROM docs WHERE id = 3";
         assert_eq!(rewritten(untouched), untouched);

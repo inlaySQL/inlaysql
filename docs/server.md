@@ -862,6 +862,29 @@ every column of every table back will conclude that it does. So a filter the
 shim cannot evaluate is an error naming the filter, never an ignored filter and
 never an empty result standing in for "I did not understand".
 
+### Full-text search: `MATCH ... AGAINST`, translated to the native BM25 probe
+
+MySQL's full-text spelling is accepted and translated, because the engine's
+own `bm25_score` was designed against it (multi-column probes, plan-time
+literal queries, positional `?` binds, higher-is-better relevance):
+
+| MySQL | The engine runs |
+| --- | --- |
+| `WHERE MATCH (body) AGAINST ('rust database')` | a BM25 index probe over `body` for the terms `rust database` — rows with no matching term are not returned, exactly as MySQL's natural-language mode behaves |
+| `SELECT id, MATCH (body) AGAINST (?) AS relevance FROM docs ORDER BY relevance DESC` | the same probe with the score projected — the relevance column is `bm25_score`'s own score |
+| `WHERE id < 3 AND MATCH (body) AGAINST (?)` | the probe drives the rows; the remaining predicate filters inside the walk |
+| `MATCH (title, body) AGAINST (?)` | one combined probe over both columns — which needs a full-text index over that same column list, as MySQL requires too |
+| `CREATE FULLTEXT INDEX i ON t (a, b)` / `ALTER TABLE t ADD FULLTEXT INDEX i (a, b)` | `CREATE INDEX i ON t (a, b) USING FULLTEXT` — the engine's spelling for the combined BM25 index |
+| `AGAINST ('x' IN NATURAL LANGUAGE MODE)` | the default mode, spelled out — accepted and dropped, because natural-language mode is what the probe does |
+
+**Refused**, each with `1235` naming the mode: `IN BOOLEAN MODE` (its
+operators change *which rows match*, and the BM25 index has no boolean
+surface) and `WITH QUERY EXPANSION` in both its spellings (a two-round
+retrieval that is not implemented). A retrieval expression nested inside a
+larger WHERE predicate — `MATCH (...) > 0.5`, `NOT MATCH (...)` — is also
+refused by name: it cannot drive the probe and has no scalar meaning. Alias
+the score in the projection and filter on that column's ordering instead.
+
 ### D2 — thread-per-connection, one handle each
 
 `std::net::TcpListener`, one OS thread per connection, and each thread opens
@@ -1483,7 +1506,7 @@ reproduce it. Each fails with `1235` and a message naming the clause:
 | `AUTO_INCREMENT` on a column that is not an `INTEGER PRIMARY KEY` | There is no counter for an ordinary column. Accepting it would give a column that silently stays `NULL`. |
 | `ON UPDATE CURRENT_TIMESTAMP` (and `NOW()`, `LOCALTIME`, `SYSDATE`) | InlaySQL never writes a column the statement did not name. The value would silently stop tracking the row's last update. A foreign key's `ON UPDATE CASCADE` is a different clause and is left alone. |
 | `ZEROFILL` | It promises every value comes back padded to the display width. This server returns the number as stored. |
-| `KEY x (a)` / `INDEX x (a)` / `UNIQUE KEY x (a)` / `FULLTEXT KEY` inside `CREATE TABLE` | The engine would create no index, so the table would come back missing the index it declared. (It also mis-parses today, giving an error about a column type that does not exist.) |
+| `KEY x (a)` / `INDEX x (a)` / `UNIQUE KEY x (a)` / `FULLTEXT KEY` inside `CREATE TABLE` | The engine would create no index, so the table would come back missing the index it declared. Create the index after the table instead — `CREATE FULLTEXT INDEX` and `ALTER TABLE ... ADD FULLTEXT INDEX` are translated (below). |
 | `USING BTREE` / `USING HASH` on `CREATE INDEX` | The engine picks the index kind from the column's type — BM25 for `TEXT`, HNSW for `VECTOR` — and has no B-tree or hash index on a scalar column. Dropping the hint would build a different index from the one asked for. |
 | Any table option not in the list above (`PARTITION BY`, `COMMENT`, `TABLESPACE`, …) | Guessing is how a table nobody asked for gets built. A tail that begins in the *engine's* dialect instead — `STRICT`, `WITHOUT ROWID`, `AS SELECT` — is not MySQL's and is passed straight through, because the engine has a better answer for it than a MySQL translator could invent. |
 

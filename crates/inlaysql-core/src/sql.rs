@@ -15,6 +15,7 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use sqlparser::ast::BinaryOperator;
 use sqlparser::ast::{
     Cte, Distinct, DuplicateTreatment, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
     GroupByExpr, Ident, JoinConstraint, JoinOperator, LimitClause, NamedWindowDefinition,
@@ -23,7 +24,6 @@ use sqlparser::ast::{
     SetQuantifier, Statement, TableAliasColumnDef, TableFactor, TableObject, UnaryOperator,
     Value as AstValue, WindowSpec, WindowType, With,
 };
-use sqlparser::ast::BinaryOperator;
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
 
@@ -3129,9 +3129,10 @@ fn plan_select_body<'p>(
                     "a query may contain only one retrieval expression".to_string(),
                 ));
             }
-            WhereScore::One { expr, rest } => {
-                let resolved_score = resolve_score_expr(expr, &scope, binder)?
+            WhereScore::One(one) => {
+                let resolved_score = resolve_score_expr(one.expr, &scope, binder)?
                     .expect("the splitter only lifts retrieval functions");
+                let rest = one.rest;
                 score = Some(resolved_score);
                 where_handled = true;
                 if let Some(rest) = rest {
@@ -6588,8 +6589,6 @@ fn resolve_scalar_function(
     })
 }
 
-/// Recognise a retrieval expression, or return `None` for ordinary expressions.
-
 /// What a WHERE clause contributed to a retrieval query: either nothing
 /// (`WHERE id > 3` and friends, the ordinary filter path), exactly one
 /// conjunct that is a retrieval expression — the `WHERE MATCH (cols) AGAINST
@@ -6597,18 +6596,22 @@ fn resolve_scalar_function(
 /// or more than one, which no query may carry.
 enum WhereScore<'a> {
     None,
-    One {
-        expr: &'a Expr,
-        rest: Option<Expr>,
-    },
+    One(Box<WhereScoreOne<'a>>),
     Multiple,
+}
+
+/// The payload of [`WhereScore::One`], boxed to keep the enum small: the
+/// retrieval expression, and whatever conjunction is left for the filter.
+struct WhereScoreOne<'a> {
+    expr: &'a Expr,
+    rest: Option<Expr>,
 }
 
 /// Split a WHERE clause into its top-level conjunction and classify it. An
 /// `AND` tree is flattened — `a AND (b AND c)` is the same conjunction as its
 /// flat spelling, so parentheses cannot hide a retrieval expression from the
 /// query or smuggle in a second one.
-fn split_where_score(selection: &Expr) -> Result<WhereScore> {
+fn split_where_score<'a>(selection: &'a Expr) -> Result<WhereScore<'a>> {
     let mut conjuncts = Vec::new();
     collect_conjuncts(selection, &mut conjuncts);
     let mut scores = Vec::new();
@@ -6642,10 +6645,10 @@ fn split_where_score(selection: &Expr) -> Result<WhereScore> {
                     op: BinaryOperator::And,
                     right: Box::new(right),
                 });
-            Ok(WhereScore::One {
+            Ok(WhereScore::One(Box::new(WhereScoreOne {
                 expr: scores[0],
                 rest,
-            })
+            })))
         }
         _ => Ok(WhereScore::Multiple),
     }
@@ -6705,6 +6708,7 @@ fn where_contains_score(expr: &Expr) -> bool {
     }
 }
 
+/// Recognise a retrieval expression, or return `None` for ordinary expressions.
 fn resolve_score_expr(
     expr: &Expr,
     scope: &Scope,

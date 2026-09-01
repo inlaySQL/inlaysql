@@ -1060,6 +1060,29 @@ fn create_index(
     tokens: &[Token],
     dropped: &mut Vec<Dropped>,
 ) -> Result<Option<String>, MysqlError> {
+    // MySQL spells a combined full-text index `CREATE FULLTEXT INDEX`, and
+    // the engine's spelling for the same thing is `CREATE INDEX ... USING
+    // FULLTEXT` — so the adjective is translated, not dropped: dropping it
+    // would build a B-tree where the statement asked for BM25, the quiet
+    // kind of wrong this crate refuses to be. (`SPATIAL` has no engine
+    // equivalent at all and is refused by name rather than left to a
+    // confusing parse error.)
+    // `tokens[0]` is the `CREATE` itself; the adjective — when there is one
+    // — is the next token.
+    let mut fulltext = false;
+    if tokens.get(1).is_some_and(|t| t.is("FULLTEXT")) {
+        fulltext = true;
+    } else if tokens.get(1).is_some_and(|t| t.is("SPATIAL")) {
+        return Err(MysqlError::unsupported(
+            "`CREATE SPATIAL INDEX` is not supported: there is no spatial index here",
+        ));
+    }
+    let tokens: &[Token] = if fulltext {
+        &[&tokens[..1], &tokens[2..]].concat()
+    } else {
+        tokens
+    };
+
     let mut depth = 0i32;
     for (i, token) in tokens.iter().enumerate() {
         match token.punct() {
@@ -1077,7 +1100,20 @@ fn create_index(
             )));
         }
     }
-    Ok(strip_online_ddl_specs(tokens, dropped).map(|t| render(&t)))
+    // `strip_online_ddl_specs` answers `None` for a statement it had no
+    // business reshaping, and `translate` treats that as "the client's own
+    // bytes" — so the USING FULLTEXT suffix has to be applied on both of its
+    // branches when this is a FULLTEXT index, or the adjective would be
+    // dropped on exactly the statements that asked for it.
+    if fulltext {
+        let rendered = match strip_online_ddl_specs(tokens, dropped) {
+            Some(t) => render(&t),
+            None => render(tokens),
+        };
+        Ok(Some(format!("{rendered} USING FULLTEXT")))
+    } else {
+        Ok(strip_online_ddl_specs(tokens, dropped).map(|t| render(&t)))
+    }
 }
 
 // --------------------------------------------------------- ALTER TABLE
@@ -1088,10 +1124,12 @@ fn create_index(
 /// TABLE` — core already knows `ADD COLUMN`, `RENAME COLUMN`, `DROP COLUMN`
 /// and `RENAME TO`, and refuses anything else in its own words.
 enum AlterOp {
-    /// `ADD [CONSTRAINT [symbol]] {INDEX|KEY|UNIQUE [INDEX|KEY]} [name] (cols)`.
+    /// `ADD [CONSTRAINT [symbol]] {INDEX|KEY|UNIQUE [INDEX|KEY]} [name] (cols)`,
+    /// or the same shape under `ADD FULLTEXT [INDEX|KEY]`.
     AddIndex {
         name: Option<String>,
         unique: bool,
+        fulltext: bool,
         columns: Vec<String>,
     },
     /// `ADD [CONSTRAINT [symbol]] FOREIGN KEY ...`, in any of its spellings.
@@ -1100,6 +1138,8 @@ enum AlterOp {
     DropIndex { name: String },
     /// `RENAME {INDEX|KEY} a TO b`.
     RenameIndex { from: String, to: String },
+    /// Understood, and refused by name rather than passed to the engine.
+    Refuse(String),
     /// Not one of the shapes above.
     Other,
 }
@@ -1138,8 +1178,18 @@ fn parse_alter_operation(op: &[Token]) -> AlterOp {
         if unique {
             i += 1;
         }
+        let fulltext = op.get(i).is_some_and(|t| t.is("FULLTEXT"));
+        if fulltext {
+            i += 1;
+        }
+        if op.get(i).is_some_and(|t| t.is("SPATIAL")) {
+            return AlterOp::Refuse(format!(
+                "`{}` is not supported: there is no spatial index here",
+                render(op)
+            ));
+        }
         let has_index_keyword = op.get(i).is_some_and(|t| t.is("INDEX") || t.is("KEY"));
-        if !unique && !has_index_keyword {
+        if !unique && !fulltext && !has_index_keyword {
             // `ADD` something that is not an index, a unique constraint or a
             // foreign key — `ADD COLUMN`, most often. Core's business.
             return AlterOp::Other;
@@ -1157,6 +1207,7 @@ fn parse_alter_operation(op: &[Token]) -> AlterOp {
         return AlterOp::AddIndex {
             name,
             unique,
+            fulltext,
             columns,
         };
     }
@@ -1276,6 +1327,7 @@ fn alter_table(
             AlterOp::AddIndex {
                 name,
                 unique,
+                fulltext,
                 columns,
             } => {
                 rewrote_an_operation = true;
@@ -1287,16 +1339,25 @@ fn alter_table(
                 }
                 let name = name.unwrap_or_else(|| synthesize_index_name(&columns, &existing_names));
                 existing_names.push(name.clone());
-                let keyword = if unique { "UNIQUE INDEX" } else { "INDEX" };
+                let mut keyword = if unique { "UNIQUE INDEX" } else { "INDEX" };
+                if fulltext {
+                    // The engine's spelling for the combined BM25 index
+                    // MySQL's `ADD FULLTEXT INDEX` asks for; see
+                    // `create_index` for why this is a translation and not a
+                    // dropped adjective.
+                    keyword = "INDEX";
+                }
+                let using = if fulltext { " USING FULLTEXT" } else { "" };
                 let column_list = columns
                     .iter()
                     .map(|c| format!("`{c}`"))
                     .collect::<Vec<_>>()
                     .join(", ");
                 statements.push(format!(
-                    "CREATE {keyword} `{name}` ON {table_name} ({column_list})"
+                    "CREATE {keyword} `{name}` ON {table_name} ({column_list}){using}"
                 ));
             }
+            AlterOp::Refuse(message) => return Err(MysqlError::unsupported(message.clone())),
             AlterOp::AddForeignKey => {
                 rewrote_an_operation = true;
                 dropped.push(Dropped::new(
@@ -3116,6 +3177,70 @@ mod tests {
                 "insert into users (id, email, name) values (?, ?, ?) ON CONFLICT DO UPDATE SET \
                  email = excluded.email, name = excluded.name"
             ]
+        );
+    }
+}
+#[cfg(test)]
+mod fulltext_ddl_tests {
+    use super::*;
+
+    fn one(sql: &str, catalog: &Catalog) -> String {
+        translate(sql, catalog)
+            .unwrap_or_else(|e| panic!("{sql} was refused: {e}"))
+            .statements[0]
+            .clone()
+    }
+
+    #[test]
+    fn create_fulltext_index_translates_to_using_fulltext() {
+        assert_eq!(
+            one(
+                "CREATE FULLTEXT INDEX docs_title_body ON docs (title, body)",
+                &Catalog::new()
+            ),
+            "CREATE INDEX docs_title_body ON docs (title, body) USING FULLTEXT"
+        );
+    }
+
+    #[test]
+    fn plain_create_index_is_byte_for_byte_unchanged() {
+        assert_eq!(
+            one("CREATE INDEX docs_body ON docs (body)", &Catalog::new()),
+            "CREATE INDEX docs_body ON docs (body)"
+        );
+    }
+
+    #[test]
+    fn create_spatial_index_is_refused_by_name() {
+        let error = translate("CREATE SPATIAL INDEX i ON t (g)", &Catalog::new())
+            .expect_err("spatial index was accepted");
+        assert_eq!(error.code, 1235, "{error:?}");
+        assert!(error.message.contains("SPATIAL"), "{error:?}");
+    }
+
+    #[test]
+    fn alter_add_fulltext_index_translates_to_using_fulltext() {
+        let mut catalog = Catalog::new();
+        catalog
+            .create_table(inlaysql::Table {
+                primary_key: vec!["id".into()],
+                name: "docs".into(),
+                columns: vec![
+                    inlaysql::Column::primary_key("id", inlaysql::DataType::Integer),
+                    inlaysql::Column::new("title", inlaysql::DataType::Text),
+                    inlaysql::Column::new("body", inlaysql::DataType::Text),
+                ],
+                without_rowid: false,
+                temporary: false,
+                strict: false,
+            })
+            .unwrap();
+        assert_eq!(
+            one(
+                "ALTER TABLE docs ADD FULLTEXT INDEX docs_title_body (title, body)",
+                &catalog
+            ),
+            "CREATE INDEX `docs_title_body` ON docs (`title`, `body`) USING FULLTEXT"
         );
     }
 }
