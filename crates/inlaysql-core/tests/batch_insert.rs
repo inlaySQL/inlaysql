@@ -1,11 +1,13 @@
 //! A multi-row `INSERT` writes exactly what the same rows written one
 //! statement at a time write.
 //!
-//! The write path resolves per *statement* what it used to resolve per row:
-//! the table's index declarations. That is only safe because nothing can
-//! change them between two rows of one statement, and the way it would fail
-//! is not a compile error — a batch would maintain a set it resolved too
-//! early, or carry state from a row that was rejected into the row after it.
+//! The write path resolves per *statement* what it used to resolve per row —
+//! the table's index declarations, and the column-type list the row encoder
+//! reads. That is only safe because nothing can change either between two
+//! rows of one statement, and the way it would fail is not a compile error: a
+//! batch would maintain a set it resolved too early, encode against a stale
+//! type list, or carry state from a row that was rejected into the row after
+//! it.
 //!
 //! So every test here is a *comparison*, not an assertion about one engine.
 //! Two engines get the same schema and the same rows; one takes them in a
@@ -539,4 +541,82 @@ fn a_multi_row_update_and_delete_match_one_statement_per_row() {
 
     assert_eq!(observed(&mut batched), observed(&mut single));
     assert!(observed(&mut batched)[0].1.len() < ROWS);
+}
+
+// ------------------------------------------------------------- THE ENCODING
+
+/// The row encoder is handed its column-type list once per statement now, and
+/// it encodes into a buffer the statement reuses. One column type —
+/// `VECTOR(n, INT8)` — is the only thing that list changes, so it is the one
+/// a batch has to be checked against: a stale list would store the exact
+/// layout where the quantized one belongs, and a buffer that was not cleared
+/// would leave the previous row's tail behind every short row.
+#[test]
+fn a_batch_into_a_quantized_vector_column_encodes_what_one_row_at_a_time_does() {
+    let schema = |engine: &mut Engine| {
+        run(
+            engine,
+            "CREATE TABLE q (id INTEGER PRIMARY KEY, embedding VECTOR(4, INT8), note TEXT)",
+        );
+    };
+    let corpus = corpus(ROWS);
+    // Deliberately ragged: the encoded length swings row to row, so a buffer
+    // carrying its previous contents shows up as a longer row rather than as
+    // nothing at all.
+    let note = |row: &Row| -> Value {
+        Value::Text(
+            match row.id % 3 {
+                0 => String::new(),
+                1 => row.slug.clone(),
+                _ => row.body.repeat(4),
+            }
+            .into(),
+        )
+    };
+
+    let mut batched = mem::engine().expect("open in-memory engine");
+    schema(&mut batched);
+    let mut sql = String::from("INSERT INTO q (id, embedding, note) VALUES ");
+    let mut params = Vec::with_capacity(corpus.len() * 3);
+    for (i, row) in corpus.iter().enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str("(?, ?, ?)");
+        params.push(Value::Integer(row.id));
+        params.push(Value::Vector(row.embedding.clone()));
+        params.push(note(row));
+    }
+    batched.execute(&sql, &params).expect("batch insert");
+
+    let mut single = mem::engine().expect("open in-memory engine");
+    schema(&mut single);
+    for row in &corpus {
+        single
+            .execute(
+                "INSERT INTO q (id, embedding, note) VALUES (?, ?, ?)",
+                &[
+                    Value::Integer(row.id),
+                    Value::Vector(row.embedding.clone()),
+                    note(row),
+                ],
+            )
+            .expect("insert");
+    }
+
+    let stored = rows(&mut batched, "SELECT * FROM q ORDER BY id", &[]);
+    assert_eq!(stored.len(), ROWS);
+    assert_eq!(
+        stored,
+        rows(&mut single, "SELECT * FROM q ORDER BY id", &[])
+    );
+
+    // Quantization is lossy, so this is not the corpus back — but the loss is
+    // the same on both sides, and every row still has to decode to four
+    // dimensions and to the note it was given. Without this a silently empty
+    // encoding would satisfy the comparison above.
+    for (row, decoded) in corpus.iter().zip(&stored) {
+        assert_eq!(decoded[1].matches(',').count(), 3, "row {}", row.id);
+        assert_eq!(decoded[2], render(&note(row)), "row {}", row.id);
+    }
 }

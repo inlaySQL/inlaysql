@@ -158,17 +158,26 @@ pub fn encode_row(values: &[Value]) -> Vec<u8> {
 /// `VECTOR(n, INT8)` column gets the new tag and payload.
 pub(crate) fn encode_typed_row(values: &[Value], types: &[DataType]) -> Vec<u8> {
     let mut out = Vec::new();
-    put_u32(&mut out, values.len() as u32);
+    encode_typed_row_into(&mut out, values, types);
+    out
+}
+
+/// [`encode_typed_row`] into a buffer the caller owns, so a statement writing
+/// many rows can keep one allocation instead of growing a fresh `Vec` from
+/// empty for every row. `out` is cleared first; its capacity is what the
+/// caller is reusing.
+pub(crate) fn encode_typed_row_into(out: &mut Vec<u8>, values: &[Value], types: &[DataType]) {
+    out.clear();
+    put_u32(out, values.len() as u32);
     for (ordinal, value) in values.iter().enumerate() {
         if matches!(types.get(ordinal), Some(DataType::QuantizedVector(_))) {
             if let Value::Vector(vector) = value {
-                encode_q8_vector(&mut out, vector);
+                encode_q8_vector(out, vector);
                 continue;
             }
         }
-        encode_value(&mut out, value);
+        encode_value(out, value);
     }
-    out
 }
 
 fn encode_q8_vector(out: &mut Vec<u8>, vector: &[f32]) {

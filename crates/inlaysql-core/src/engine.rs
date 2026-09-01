@@ -47,7 +47,8 @@ use crate::plan::{
 };
 use crate::planner::{self, JoinDecision, JoinPath, PlannerStats, STATS_META_KEY};
 use crate::row::{
-    decode_row, decode_row_masked, decode_value_at, encode_typed_row, ColumnMask, RowBuf,
+    decode_row, decode_row_masked, decode_value_at, encode_typed_row, encode_typed_row_into,
+    ColumnMask, RowBuf,
 };
 use crate::shared::SharedStorage;
 use crate::sql::{self, TableRules};
@@ -3894,6 +3895,12 @@ impl Engine {
         // above is a clone taken once: no DDL can interleave with the loop
         // below, so the set every row writes into is the set resolved here.
         let indexes = RowIndexes::resolve(&self.catalog, &table.name);
+        // Likewise the column types the row encoder reads, and the buffer it
+        // encodes into — one allocation for the statement rather than one
+        // grown from empty per row. `encoded` is only ever read back on the
+        // line that fills it.
+        let types = column_types(&table);
+        let mut encoded: Vec<u8> = Vec::new();
 
         let mut written = 0usize;
         let mut returned: Vec<Vec<Value>> = Vec::new();
@@ -3999,8 +4006,8 @@ impl Engine {
                 }
             }
 
-            self.storage
-                .put_row(&table.name, id, &encode_table_row(&table, &row))?;
+            encode_typed_row_into(&mut encoded, &row, &types);
+            self.storage.put_row(&table.name, id, &encoded)?;
             // Only after the row is in the transaction, and only when the key
             // came from the counter: a caller reading this back is asking what
             // key it did not supply, and a row that failed to be written has no
@@ -7109,9 +7116,19 @@ fn bind_embedding(
     Ok(embedding)
 }
 
+/// The storage representation of every column of `table`, in ordinal order —
+/// [`encode_typed_row`]'s second argument.
+///
+/// Statement-invariant, for the same reason a statement's `Table` clone is:
+/// no DDL can interleave with a row loop. A statement that writes many rows
+/// builds this once and hands it to [`encode_typed_row_into`];
+/// [`encode_table_row`] is the single-row spelling of the same two lines.
+fn column_types(table: &Table) -> Vec<DataType> {
+    table.columns.iter().map(|column| column.ty).collect()
+}
+
 fn encode_table_row(table: &Table, row: &[Value]) -> Vec<u8> {
-    let types: Vec<DataType> = table.columns.iter().map(|column| column.ty).collect();
-    encode_typed_row(row, &types)
+    encode_typed_row(row, &column_types(table))
 }
 
 /// The decisions a `SELECT`'s `LIMIT`, `OFFSET` and driving-table filter make
