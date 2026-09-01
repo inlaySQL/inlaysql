@@ -64,6 +64,71 @@ pub const FORMAT_VERSION: u32 = 5;
 /// engine and checked at `CREATE TABLE`.
 const MIN_READABLE_FORMAT_VERSION: u32 = 3;
 
+/// How many raw leaf pages [`RawLeafCache`] holds.
+///
+/// Small on purpose. This exists so a *repeated* statement stops re-reading the
+/// same handful of leaves, which is a working set of a few pages; it is not a
+/// second page cache and must not grow into one. A sweep churns straight
+/// through it, which is fine — see [`RawLeafCache`] for why churning it is
+/// nearly free where churning the decoded cache was not.
+const RAW_LEAF_CACHE_PAGES: usize = 64;
+
+/// Raw, *undecoded* leaf pages the raw row scan has read, newest last.
+///
+/// The scan holds each leaf as a shared `Rc<[u8]>` and reads cells straight out
+/// of it (AHL-455's pattern), so it never needs the `entries` a `Node::Leaf`
+/// carries. Caching it *as* a `Node::Leaf` therefore means decoding a page
+/// purely in order to store it — which measured as a 1.42x win on repeated
+/// `LIMIT` joins and a ~10% **loss** on full scans, because a sweep pays that
+/// decode for thousands of pages it never looks at again (`PERF.md`,
+/// 2026-08-31). Three admission rules were tried to tell those two cases apart
+/// and none separated them cleanly.
+///
+/// Holding the bytes removes the trade instead of balancing it: an insert is an
+/// `Rc::clone` of a buffer the scan is already holding, so a sweep that churns
+/// this cache end to end pays refcount traffic and nothing else, while a
+/// repeated probe gets its page back without a `pread` and without a page copy.
+///
+/// Bounded by page count rather than bytes: every entry is exactly one page, so
+/// the two bounds are the same one and the count needs no arithmetic.
+struct RawLeafCache {
+    entries: Vec<(PageId, Rc<[u8]>)>,
+}
+
+impl RawLeafCache {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// The page's bytes, promoted to most-recent.
+    ///
+    /// Linear search, because this holds 64 `u64`s: scanning it costs a
+    /// fraction of the `pread` it exists to avoid, and a map would add hashing
+    /// and an allocation per insert to save nothing at this size.
+    fn get(&mut self, id: PageId) -> Option<Rc<[u8]>> {
+        let at = self.entries.iter().position(|(page, _)| *page == id)?;
+        let entry = self.entries.remove(at);
+        let bytes = Rc::clone(&entry.1);
+        self.entries.push(entry);
+        Some(bytes)
+    }
+
+    fn insert(&mut self, id: PageId, bytes: &Rc<[u8]>) {
+        if let Some(at) = self.entries.iter().position(|(page, _)| *page == id) {
+            self.entries.remove(at);
+        } else if self.entries.len() >= RAW_LEAF_CACHE_PAGES {
+            self.entries.remove(0);
+        }
+        self.entries.push((id, Rc::clone(bytes)));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 // ------------------------------------------------------------- header (block 0)
 
 /// The header is written once, at create, and never overwritten. It is the one
@@ -208,6 +273,11 @@ pub struct CowBTree<D: Device> {
     /// bounded resume that still fits in that leaf can avoid both the descent
     /// and the page read; a scan that needs another leaf falls back.
     row_scan_cursor: RefCell<Option<RawScanCursor>>,
+    /// Raw leaf pages the row scan has read, so a repeated statement does not
+    /// re-`pread` and re-copy the same leaves on every execution. Read and
+    /// filled only by [`CowBTree::walk_raw_row_values`]; see [`RawLeafCache`]
+    /// for why these are held undecoded and what that avoids.
+    raw_leaves: RefCell<RawLeafCache>,
     /// Whether [`CowBTree::alloc_page`] may hand out a page id the free list
     /// (Phase 2 item 6) has recorded as reclaimable. `false` by default and
     /// for every existing caller: with this off, allocation is exactly the
@@ -453,6 +523,7 @@ impl<D: Device> CowBTree<D> {
             cursor: RefCell::new(None),
             range_cursor: RefCell::new(None),
             row_scan_cursor: RefCell::new(None),
+            raw_leaves: RefCell::new(RawLeafCache::new()),
             reuse_enabled: false,
             durability: Durability::Full,
             free_candidates: Vec::new(),
@@ -589,6 +660,7 @@ impl<D: Device> CowBTree<D> {
     fn invalidate_for_reuse(&self) {
         if self.reuse_enabled || self.device.page_reuse_enabled() {
             self.cache.borrow_mut().clear();
+            self.raw_leaves.borrow_mut().clear();
             *self.cursor.borrow_mut() = None;
             *self.range_cursor.borrow_mut() = None;
             *self.row_scan_cursor.borrow_mut() = None;
@@ -2598,6 +2670,43 @@ impl<D: Device> CowBTree<D> {
         self.cache.try_borrow_mut().ok()?.get(id)
     }
 
+    /// A raw leaf page this scan read earlier, if it is still held.
+    ///
+    /// Gated by exactly the rules [`CowBTree::cached_page`] applies, and for
+    /// the same reasons: a page the open transaction has dirtied is not the
+    /// committed page, a device that reuses page ids breaks the "page id is a
+    /// stable identity" premise the whole cache rests on (D4), and nothing
+    /// outside the data area may be cached at all.
+    fn cached_raw_leaf(&self, id: PageId, pending: bool) -> Option<Rc<[u8]>> {
+        if pending && self.dirty.contains_key(&id) {
+            return None;
+        }
+        if self.device.page_reuse_enabled() {
+            return None;
+        }
+        if !cache::data_area_page(self.page_size, self.format_version, id) {
+            return None;
+        }
+        self.raw_leaves.try_borrow_mut().ok()?.get(id)
+    }
+
+    /// Hold a raw leaf page the scan just read, under the same rule
+    /// [`CowBTree::cached_raw_leaf`] reads it back by.
+    fn cache_raw_leaf(&self, id: PageId, pending: bool, bytes: &Rc<[u8]>) {
+        if pending && self.dirty.contains_key(&id) {
+            return;
+        }
+        if self.device.page_reuse_enabled() {
+            return;
+        }
+        if !cache::data_area_page(self.page_size, self.format_version, id) {
+            return;
+        }
+        if let Ok(mut cache) = self.raw_leaves.try_borrow_mut() {
+            cache.insert(id, bytes);
+        }
+    }
+
     /// Put a freshly decoded committed node in the cache, under the same rule
     /// [`CowBTree::cached_page`] reads it back by.
     fn cache_committed(&self, id: PageId, pending: bool, node: &Rc<Node>) {
@@ -3248,6 +3357,22 @@ impl<D: Device> CowBTree<D> {
             None => None,
         };
 
+        // A leaf this scan read before, still held as raw bytes. The decoded
+        // cache above only answers for a page some *other* path decoded; this
+        // is the one a previous execution of this same statement read, which is
+        // the repeat that used to cost a `pread` and a page copy every time.
+        if cached.is_none() {
+            if let Some(shared) = self.cached_raw_leaf(id, pending) {
+                *last_leaf = Some(RawScanCursorCandidate {
+                    low_source: span.low.clone(),
+                    high_source: span.high.clone(),
+                    bytes: Rc::clone(&shared),
+                });
+                self.scan_leaf_into(&shared, bounds, pending, out)?;
+                return Ok(());
+            }
+        }
+
         // Read the raw bytes once and dispatch on the kind byte: a leaf is
         // parsed in place, an internal node is decoded for navigation.
         let internal = match cached {
@@ -3272,6 +3397,10 @@ impl<D: Device> CowBTree<D> {
                                 high_source: span.high.clone(),
                                 bytes: Rc::clone(&shared),
                             });
+                            // Hold the bytes, not a decoded node: the next
+                            // execution of this statement wants exactly this
+                            // buffer, and storing it costs a refcount bump.
+                            self.cache_raw_leaf(id, pending, &shared);
                             self.scan_leaf_into(&shared, bounds, pending, out)?;
                             Ok(None)
                         }
@@ -5025,6 +5154,106 @@ mod tests {
             resumed,
             db.scan_prefix_row_values_from(prefix, Some(&after), 3)
                 .unwrap()
+        );
+    }
+
+    /// The raw leaf cache answers a repeated multi-leaf scan without touching
+    /// the device, and answers it with the rows the decoding path produces.
+    ///
+    /// Every clause here is load-bearing, and the first draft of this test had
+    /// none of them — it passed against a cache that stored nothing, because
+    /// the single-leaf `row_scan_cursor` was quietly serving the repeat. So:
+    /// the scan spans many leaves, which one retained leaf cannot cover; a
+    /// scan of a *different* part of the tree runs in between, which displaces
+    /// that cursor; and the decoded page cache is switched off, so a hit can
+    /// only come from the raw leaf cache. Verified by mutation — removing the
+    /// insert makes this fail.
+    #[test]
+    fn a_repeated_raw_scan_is_served_from_the_raw_leaf_cache() {
+        let row_key = |id: u64| {
+            let mut key = b"\x01tbl\0".to_vec();
+            key.extend_from_slice(&id.to_be_bytes());
+            key
+        };
+        let prefix = b"\x01tbl\0";
+        let device = Rc::new(RefCell::new(CountingDisk::new(true)));
+        let mut db = CowBTree::create(device, PAGE).unwrap();
+        for id in 0..400u64 {
+            db.put(&row_key(id), &id.to_le_bytes()).unwrap();
+            if id % 32 == 31 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+
+        // The decoded page cache stays on, and holds only the *internal* nodes
+        // of the descent: this scan never decodes a leaf into a `Node`, so a
+        // leaf can only come back from the raw leaf cache under test. With
+        // both, a repeat reaches the device zero times.
+
+        // Enough rows to span several leaves, so the one-leaf scan cursor
+        // cannot be what answers the repeat.
+        let first = db.scan_prefix_row_values_raw_from(prefix, None, 200).unwrap();
+        assert_eq!(first.len(), 200);
+
+        // Displace the scan cursor with a scan of a different span.
+        let far = row_key(350);
+        db.scan_prefix_row_values_raw_from(prefix, Some(&far), 8).unwrap();
+
+        reads_since(&db);
+        let again = db.scan_prefix_row_values_raw_from(prefix, None, 200).unwrap();
+        assert_eq!(
+            reads_since(&db),
+            0,
+            "a repeated multi-leaf raw scan should be served from retained leaf bytes"
+        );
+        assert_eq!(first, again, "the cached scan returned different rows");
+        assert_eq!(
+            again,
+            db.scan_prefix_row_values_from(prefix, None, 200).unwrap(),
+            "the raw scan and the decoding scan disagree"
+        );
+    }
+
+    /// A write is visible to the next scan rather than being masked by a
+    /// retained page.
+    ///
+    /// Stated precisely, because it is weaker than it looks: this does *not*
+    /// exercise `cached_raw_leaf`'s dirty-page guard, and cannot. The tree is
+    /// copy-on-write, so modifying a row copies its leaf to a *new* page id,
+    /// and the scan then asks for an id the cache has never seen. The guard
+    /// mirrors the decoded cache's rule and is kept for that reason — if page
+    /// ids ever stop being unique per version, it is what stops this cache
+    /// serving a stale page — but no test here can currently make it fire, and
+    /// mutation-testing confirms removing it changes nothing today.
+    #[test]
+    fn a_write_is_visible_to_the_next_raw_scan() {
+        let row_key = |id: u64| {
+            let mut key = b"\x01tbl\0".to_vec();
+            key.extend_from_slice(&id.to_be_bytes());
+            key
+        };
+        let prefix = b"\x01tbl\0";
+        let device = Rc::new(RefCell::new(CountingDisk::new(true)));
+        let mut db = CowBTree::create(device, PAGE).unwrap();
+        for id in 0..64u64 {
+            db.put(&row_key(id), &id.to_le_bytes()).unwrap();
+        }
+        db.commit().unwrap();
+        db.set_page_cache_bytes(0);
+
+        let before = db.scan_prefix_row_values_raw_from(prefix, None, 4).unwrap();
+        db.put(&row_key(0), b"changed").unwrap();
+        let after = db.scan_prefix_row_values_raw_from(prefix, None, 4).unwrap();
+
+        assert_ne!(
+            before, after,
+            "the scan returned the pre-write bytes from cache after a write"
+        );
+        assert_eq!(
+            after,
+            db.scan_prefix_row_values_from(prefix, None, 4).unwrap(),
+            "the raw scan and the decoding scan disagree after a write"
         );
     }
 

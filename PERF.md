@@ -2552,6 +2552,52 @@ flagged rather than discarded.
 
 ---
 
+### The uncached leaf, fixed by caching the bytes instead of the node (2026-09-01)
+
+B1 (below) found that the raw row scan never caches the leaves it reads, so a
+repeated prepared statement re-`pread`s and re-copies the same pages forever —
+20.1% of engine time in `memmove` on the `LIMIT 10` join shapes. It also found
+that the obvious fix does not work: caching the leaf as a `Node::Leaf` wins
+1.42x on those shapes and loses ~10% on full scans, because a sweep pays the
+per-cell `entries` decode for thousands of pages it never reuses. Three
+admission rules failed to separate the two cases and the change was reverted.
+
+The conclusion recorded then was "make insertion cheap, not admission clever",
+and that is what this is. `RawLeafCache` (`btree/tree.rs`) holds up to 64
+*undecoded* leaf pages as the `Rc<[u8]>` the scan already has in hand, so an
+insert is a refcount bump with no decode and no allocation, and a sweep that
+churns the whole cache pays nothing worth measuring. It is read and written
+only by `walk_raw_row_values`, under exactly the guards `cached_page` and
+`cache_committed` apply (D4's carve-outs: never a dirty page, never outside the
+data area, never under page reuse), and it is cleared wherever the decoded cache
+is.
+
+Measured, interleaved, three repetitions:
+
+| Shape | Before | After | |
+| --- | ---: | ---: | --- |
+| `joins-limit` (both `LIMIT 10` shapes) | 83,586 ops/s | **115,807** | **1.38x**, 3/3, non-overlapping |
+| `joins` (full shapes dominate) | 49–50 ops/s | 49–50 ops/s | flat — the regression that killed B1 is gone, sign flips between reps |
+| `points` | 1.78–1.85M ops/s | 1.80–1.87M ops/s | flat, sign flips |
+| `indexed-range` | 66.2–66.3k ops/s | 67.8–69.7k ops/s | flat to slightly better |
+
+**The first version of the test for this proved nothing, and mutation-testing
+is the only reason that was caught** — the second time in two days, which is
+now a pattern worth naming rather than an anecdote. Removing the insert
+entirely left it green, because the pre-existing single-leaf
+`row_scan_cursor` was serving the repeat. The test now scans across many
+leaves (which one retained leaf cannot cover) and runs a scan of a different
+span in between (which displaces that cursor), leaving the raw leaf cache as
+the only thing that can answer; with the insert removed it reports 25 device
+reads against the required 0.
+
+One guard is documented as untestable rather than quietly assumed: the
+dirty-page check cannot currently fire, because copy-on-write gives a modified
+leaf a *new* page id, so the scan asks for an id the cache has never seen. It
+mirrors the decoded cache's rule and stays for the day page ids stop being
+unique per version; the test that covers writes says explicitly that it does
+not cover that guard.
+
 ### A `REAL` join was 223x slower, and the obvious fix bought nothing (2026-09-01)
 
 The other half of the join-key audit. `hash_join_key` allowed `INTEGER | TEXT |
