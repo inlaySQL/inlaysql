@@ -83,10 +83,12 @@ fn every_blocking_operator_is_refused_past_the_ceiling() {
         "SELECT body, count(*) FROM t GROUP BY body",
         "SELECT DISTINCT grp FROM t",
         "SELECT id, row_number() OVER (ORDER BY id) FROM t",
-        // An aggregate over a *column* still holds one value per row, so the
-        // ceiling still catches it. `count(*)` no longer appears in this list:
-        // it holds nothing at all now and is asserted below to succeed.
-        "SELECT max(body) FROM t",
+        // A `DISTINCT` aggregate is the one that still holds a value per row:
+        // it cannot know what is a duplicate until every value has arrived, so
+        // the ceiling still catches it. `count(*)` and `max(body)` no longer
+        // appear in this list — they fold as the rows arrive and are asserted
+        // below to succeed.
+        "SELECT count(DISTINCT body) FROM t",
     ] {
         let message = refusal(&mut engine, sql);
         assert!(
@@ -103,6 +105,27 @@ fn every_blocking_operator_is_refused_past_the_ceiling() {
         .query("SELECT grp, count(*) FROM t GROUP BY grp", &[])
         .expect("a low-cardinality GROUP BY holds one row per group, not the table");
     assert_eq!(grouped.rows.len(), 7, "{:?}", grouped.rows);
+
+    // And what the incremental fold changed: `max(body)` used to be refused
+    // here, because it held every `body` in the table before comparing them.
+    // It holds one — the running best — so the size of its state does not
+    // depend on the number of rows, and the ceiling has nothing to catch.
+    let extreme = engine
+        .query("SELECT max(body), sum(grp), avg(id) FROM t", &[])
+        .expect("MIN/MAX/SUM/AVG fold as the rows arrive and hold one accumulator");
+    let largest_body = (1..=ROWS)
+        .map(|id| format!("row-{id}-padding-padding-padding"))
+        .max()
+        .expect("2000 rows");
+    assert_eq!(
+        extreme.rows,
+        vec![vec![
+            Value::Text(largest_body.into()),
+            Value::Integer((1..=ROWS).map(|id| id % 7).sum()),
+            Value::Real((1..=ROWS).sum::<i64>() as f64 / ROWS as f64),
+        ]],
+        "the folded answer must be the answer, not merely a cheap one"
+    );
 }
 
 /// The refusal names the number it hit and how to move it, because the person

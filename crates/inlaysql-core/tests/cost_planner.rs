@@ -24,6 +24,54 @@ fn answer(engine: &mut Engine, sql: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Every row a query answers with, or the message it refuses with, as
+/// comparable text.
+///
+/// A refusal is part of an aggregate's answer — `SUM`'s integer overflow is an
+/// error rather than a number — so a tie test that compared only rows would let
+/// one path refuse where the other returned a value, which is the drift that
+/// matters most.
+fn outcome(engine: &mut Engine, sql: &str) -> Result<Vec<Vec<String>>, String> {
+    engine
+        .query(sql, &[])
+        .map(|answer| {
+            answer
+                .rows
+                .iter()
+                .map(|row| row.iter().map(|cell| format!("{cell:?}")).collect())
+                .collect()
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// Require one query to answer the same folded from the row stream as it does
+/// folded from collected rows.
+///
+/// `GROUP_CONCAT` is the lever: `can_stream_aggregate` refuses any query
+/// containing one, because its separator is read from the group's first row. So
+/// appending one sends the whole query down the collecting path while leaving
+/// every other aggregate in it unchanged, and its column is dropped before
+/// comparing — what is compared is the same columns computed two ways.
+fn assert_streamed_matches_collected(engine: &mut Engine, projection: &str, rest: &str) {
+    let streamed = outcome(engine, &format!("SELECT {projection} FROM {rest}"));
+    let collected = outcome(
+        engine,
+        &format!("SELECT {projection}, GROUP_CONCAT(id) FROM {rest}"),
+    )
+    .map(|rows| {
+        rows.into_iter()
+            .map(|mut row| {
+                row.pop();
+                row
+            })
+            .collect()
+    });
+    assert_eq!(
+        streamed, collected,
+        "streamed and collected disagree on: SELECT {projection} FROM {rest}"
+    );
+}
+
 fn details(engine: &mut Engine, sql: &str) -> Vec<String> {
     engine
         .query(sql, &[])
@@ -434,54 +482,76 @@ fn group_by_folds_under_the_columns_collation() {
     );
 }
 
+/// The table both aggregate tie tests run over: `NULL`s in every position that
+/// matters, three groups of two, a `NOCASE` column beside a `BINARY` one.
+fn aggregate_engine() -> Engine {
+    let mut engine = engine();
+    run(
+        &mut engine,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, n INTEGER, r REAL, s TEXT, \
+         nc TEXT COLLATE NOCASE)",
+    );
+    for (id, g, n, r, s, nc) in [
+        (1, 1, "1", "1.5", "'b'", "'Bee'"),
+        (2, 1, "NULL", "2.5", "'a'", "'apple'"),
+        (3, 2, "3", "NULL", "NULL", "NULL"),
+        (4, 2, "3", "4.0", "'c'", "'Cat'"),
+        (5, 3, "-7", "0.5", "'a'", "'apple'"),
+        (6, 3, "9", "1.0", "'a'", "'APPLE'"),
+    ] {
+        run(
+            &mut engine,
+            &format!("INSERT INTO t VALUES ({id}, {g}, {n}, {r}, {s}, {nc})"),
+        );
+    }
+    engine
+}
+
+/// A `SUM` whose values arrive as integers and then as reals, in that order —
+/// the promotion that has to carry the exact integer total into the real one.
+/// Written as a `CAST` rather than trusted to a column's affinity so that what
+/// is being tested is in the query.
+const MIXED_SUM: &str = "SUM(CASE WHEN id <= 2 THEN CAST(n AS INTEGER) ELSE CAST(n AS REAL) END)";
+
 /// An aggregate answers the same streamed as it does collected.
 ///
 /// Streaming is a second path through the aggregate code, and this codebase's
 /// recurring bug shape is two paths through one rule — so the standing rule is
 /// that a fast path is tied to the slow one by a test.
 ///
-/// `GROUP_CONCAT` is what ties them: `can_stream_aggregate` refuses any query
-/// containing one, because its separator is read from the group's first row.
-/// So adding a `GROUP_CONCAT` to a query forces the whole thing down the
-/// collecting path while leaving every other aggregate in it unchanged, and
-/// the two answers must agree column for column.
-///
 /// The values reach the parts of the fold that are easy to get wrong from a
 /// stream: `NULL`s every function skips, a `SUM` mixing integers and reals,
-/// `MIN`/`MAX` across storage classes, `DISTINCT`, and `FILTER`, which narrows
-/// what one aggregate sees without touching the rest.
+/// `MIN`/`MAX` across storage classes and under a collation, `DISTINCT`, and
+/// `FILTER`, which narrows what one aggregate sees without touching the rest.
+///
+/// A tie test can only catch the two paths *disagreeing*, and since they now
+/// share one step function ([`eval::AggFold::step`]) a broken step breaks both
+/// alike — so `the_fold_answers_what_it_is_supposed_to` below pins the
+/// arithmetic itself, and the two tests are only meaningful together.
 #[test]
 fn an_aggregate_streams_to_the_same_answer_it_collects() {
-    let mut engine = engine();
-    run(
-        &mut engine,
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, n INTEGER, r REAL, s TEXT)",
-    );
-    for (id, g, n, r, s) in [
-        (1, 1, "1", "1.5", "'b'"),
-        (2, 1, "NULL", "2.5", "'a'"),
-        (3, 2, "3", "NULL", "NULL"),
-        (4, 2, "3", "4.0", "'c'"),
-        (5, 3, "-7", "0.5", "'a'"),
-        (6, 3, "9", "1.0", "'a'"),
-    ] {
-        run(
-            &mut engine,
-            &format!("INSERT INTO t VALUES ({id}, {g}, {n}, {r}, {s})"),
-        );
-    }
+    let mut engine = aggregate_engine();
 
     let shapes = [
         "COUNT(*)",
         "COUNT(n)",
         "SUM(n)",
         "SUM(r)",
+        MIXED_SUM,
+        "AVG(n)",
         "AVG(n), AVG(r)",
         "MIN(n), MAX(n)",
         "MIN(s), MAX(s)",
+        // The same values under a different collation: the fold's ordering has
+        // to be the argument's, not the default.
+        "MIN(nc), MAX(nc)",
         "COUNT(DISTINCT n)",
+        "SUM(DISTINCT n), AVG(DISTINCT n)",
+        "MIN(DISTINCT nc), MAX(DISTINCT s)",
         "COUNT(*) FILTER (WHERE n > 0)",
         "SUM(n) FILTER (WHERE id <> 5)",
+        "MIN(n) FILTER (WHERE n > 0), MAX(nc) FILTER (WHERE id < 4)",
+        "AVG(r) FILTER (WHERE r IS NOT NULL)",
         "COUNT(*), COUNT(n), SUM(n), AVG(r), MIN(s), MAX(s)",
         // A bare column beside an aggregate: which row represents the group is
         // observable, so it is pinned. Without this, taking the last row
@@ -491,29 +561,20 @@ fn an_aggregate_streams_to_the_same_answer_it_collects() {
         "id, n, MIN(s)",
     ];
 
-    for aggregates in shapes {
+    for projection in shapes {
         for tail in ["", " GROUP BY g", " GROUP BY g HAVING COUNT(*) > 1"] {
-            let streamed = answer(&mut engine, &format!("SELECT {aggregates} FROM t{tail}"));
-            // The same query with a GROUP_CONCAT appended runs collected. Its
-            // extra column is dropped before comparing, so what is compared is
-            // the same columns computed two ways.
-            let mut collected = answer(
-                &mut engine,
-                &format!("SELECT {aggregates}, GROUP_CONCAT(s) FROM t{tail}"),
-            );
-            for row in &mut collected {
-                row.pop();
-            }
-            assert_eq!(
-                streamed, collected,
-                "streamed and collected disagree on: SELECT {aggregates} FROM t{tail}"
-            );
+            assert_streamed_matches_collected(&mut engine, projection, &format!("t{tail}"));
         }
     }
 
     // Empty input: no `GROUP BY` still answers one row, a `GROUP BY` answers
     // none. Both paths agree on that too.
     run(&mut engine, "DELETE FROM t");
+    for projection in ["COUNT(*), SUM(n), MIN(s), AVG(n), MAX(nc)", "g, COUNT(*)"] {
+        for tail in ["", " GROUP BY g"] {
+            assert_streamed_matches_collected(&mut engine, projection, &format!("t{tail}"));
+        }
+    }
     assert_eq!(
         answer(&mut engine, "SELECT COUNT(*), SUM(n), MIN(s) FROM t"),
         vec![vec![
@@ -530,5 +591,88 @@ fn an_aggregate_streams_to_the_same_answer_it_collects() {
     assert!(
         answer(&mut engine, "SELECT COUNT(*) FROM t HAVING COUNT(*) > 0").is_empty(),
         "HAVING must be able to reject the streamed row"
+    );
+}
+
+/// What the two paths agree *on*.
+///
+/// Since they fold through one step function, a step that is wrong is wrong on
+/// both sides and the tie test above stays green while every number is
+/// different. This pins the numbers: the integer-to-real promotion carrying its
+/// running total, `AVG`'s divisor counting only the values it summed,
+/// `MIN`/`MAX` under the argument's collation rather than the default, and the
+/// `NULL` that every one of them skips.
+#[test]
+fn the_fold_answers_what_it_is_supposed_to() {
+    let mut engine = aggregate_engine();
+    assert_eq!(
+        answer(
+            &mut engine,
+            &format!(
+                "SELECT SUM(n), COUNT(n), AVG(n), AVG(r), {MIXED_SUM}, MIN(s), MAX(s), \
+                 MIN(nc), MAX(nc) FROM t"
+            )
+        ),
+        vec![vec![
+            // 1 + 3 + 3 - 7 + 9, with row 2's NULL skipped, and exact.
+            "Integer(9)".to_string(),
+            "Integer(5)".to_string(),
+            // 9 / 5, over the five non-NULL values and not over six rows.
+            "Real(1.8)".to_string(),
+            // (1.5 + 2.5 + 4.0 + 0.5 + 1.0) / 5.
+            "Real(1.9)".to_string(),
+            // Integer 1 from row 1, then reals 3.0, 3.0, -7.0, 9.0: the
+            // promotion has to carry the 1 across, so 9.0 and not 8.0.
+            "Real(9.0)".to_string(),
+            "Text(\"a\")".to_string(),
+            "Text(\"c\")".to_string(),
+            // Under NOCASE, 'apple' and 'APPLE' are equal and the first wins;
+            // under BINARY the answer would be 'APPLE'. The collation the
+            // argument carries is the one the fold has to compare under.
+            "Text(\"apple\")".to_string(),
+            "Text(\"Cat\")".to_string(),
+        ]],
+        "the fold's arithmetic, pinned independently of which path computes it"
+    );
+}
+
+/// `SUM` refuses an integer overflow rather than wrapping or silently
+/// promoting, folded incrementally exactly as it did folded at the end.
+///
+/// The exact sum of integers is what `SUM` promised, so this is an error in
+/// SQLite and here — and a refusal the streamed path made and the collected one
+/// did not (or the reverse) would be the worst kind of drift, because the two
+/// answers would both look plausible.
+#[test]
+fn a_streamed_sum_refuses_the_overflow_a_collected_one_refuses() {
+    let mut engine = engine();
+    run(
+        &mut engine,
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, n INTEGER)",
+    );
+    for (id, n) in [(1, "9223372036854775807"), (2, "1"), (3, "-1")] {
+        run(&mut engine, &format!("INSERT INTO big VALUES ({id}, {n})"));
+    }
+
+    // Ungrouped, and again with the overflowing values inside one group of a
+    // `GROUP BY` — the refusal has to survive being one group's answer.
+    for tail in ["", " GROUP BY n > 0"] {
+        assert_streamed_matches_collected(&mut engine, "SUM(n)", &format!("big{tail}"));
+    }
+
+    let refused = outcome(&mut engine, "SELECT SUM(n) FROM big").expect_err("i64::MAX + 1");
+    assert!(
+        refused.contains("integer overflow"),
+        "the refusal must name what it hit, got: {refused}"
+    );
+    // The same values that overflow as a `SUM` are fine as an `AVG`, which
+    // never promised an exact integer.
+    assert_eq!(
+        answer(&mut engine, "SELECT AVG(n) FROM big"),
+        vec![vec![format!(
+            "Real({:?})",
+            (i64::MAX as f64 + 1.0 - 1.0) / 3.0
+        )]],
+        "AVG accumulates in a real and has no overflow to refuse"
     );
 }

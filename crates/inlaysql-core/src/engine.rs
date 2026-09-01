@@ -6502,15 +6502,23 @@ impl Engine {
     ///
     /// What a group keeps is its first row — the representative the collecting
     /// path uses for non-aggregate projection expressions and for `HAVING` —
-    /// plus one accumulated value per aggregate that has an argument. For
+    /// plus one running accumulator per aggregate. For
     /// `SELECT n, COUNT(*) FROM t GROUP BY n` over 100,000 rows in 100 groups
     /// that is 100 rows and 100 counters, against 100,000 `ExecRow`s before.
     ///
-    /// The fold is [`eval::fold_aggregate_values`], the same one
-    /// [`Engine::aggregate`] reaches, so the two paths cannot drift apart on
-    /// `SUM`'s promotion rules or `MIN`/`MAX`'s ordering.
-    /// `an_aggregate_streams_to_the_same_answer_it_collects` requires them to
-    /// agree, on grouped and ungrouped shapes both.
+    /// The accumulator is [`eval::AggFold`], which is the same fold
+    /// [`Engine::aggregate`] finishes with: `fold_aggregate_values` is a loop
+    /// over `AggFold::step`, and this function takes that step as each row
+    /// arrives. So `SUM(n)` holds a running total rather than a hundred
+    /// thousand integers, and `MIN(body)` holds one body — with no second
+    /// implementation of `SUM`'s promotion rules or `MIN`/`MAX`'s ordering to
+    /// drift from the first.
+    /// `an_aggregate_streams_to_the_same_answer_it_collects` requires the two
+    /// paths to agree, on grouped and ungrouped shapes both.
+    ///
+    /// One aggregate still holds a value per row: `DISTINCT` folds equal values
+    /// into one before the function sees them, and cannot tell what is a
+    /// duplicate until every value has arrived.
     ///
     /// With no `GROUP BY`, empty input still emits one row, all `NULL` across
     /// the joined row's width: `SELECT COUNT(*) FROM empty` answers `0`, not
@@ -6521,13 +6529,48 @@ impl Engine {
         stream: RowStream<'_>,
         env: &Env<'_>,
     ) -> Result<Vec<ExecRow>> {
+        /// What one aggregate holds for one group while the stream runs.
+        ///
+        /// Which of the three it is follows from the aggregate itself and never
+        /// changes, so it is decided once per group rather than per row.
+        enum Slot {
+            /// `COUNT(*)`: rows, not values. There is no argument to evaluate
+            /// and nothing to hold but the counter.
+            Rows(i64),
+            /// Folded as the values arrive, through the same
+            /// [`eval::AggFold::step`] the collecting path finishes with. One
+            /// running scalar — or, for `MIN`/`MAX`, one value — instead of one
+            /// value per row.
+            Folding(eval::AggFold),
+            /// Held until the end. `DISTINCT` folds equal values into one
+            /// before the function sees them, and what is a duplicate is not
+            /// known until every value has arrived, so this one still costs a
+            /// value per row.
+            Collecting(Vec<Value>),
+        }
+
+        impl Slot {
+            fn new(aggregate: &Aggregate) -> Self {
+                match (&aggregate.arg, aggregate.distinct) {
+                    (None, _) => Slot::Rows(0),
+                    (Some(_), true) => Slot::Collecting(Vec::new()),
+                    (Some(_), false) => match eval::AggFold::new(aggregate) {
+                        Some(fold) => Slot::Folding(fold),
+                        // `GROUP_CONCAT`, which `can_stream_aggregate` has
+                        // already sent to the collecting path — so this is the
+                        // right answer to a question that is never asked.
+                        None => Slot::Collecting(Vec::new()),
+                    },
+                }
+            }
+        }
+
         /// One group's running state: what it will project from, and what each
         /// aggregate has accumulated for it.
         struct Accumulator {
             id: crate::traits::RowId,
             representative: Vec<Value>,
-            values: Vec<Vec<Value>>,
-            counted: Vec<i64>,
+            slots: Vec<Slot>,
         }
 
         let slots = plan.aggregates.len();
@@ -6564,8 +6607,7 @@ impl Engine {
                     groups.entry(key).or_insert(Accumulator {
                         id: row.id,
                         representative: row.values.clone(),
-                        values: (0..slots).map(|_| Vec::new()).collect(),
-                        counted: alloc::vec![0i64; slots],
+                        slots: plan.aggregates.iter().map(Slot::new).collect(),
                     })
                 }
             };
@@ -6581,28 +6623,51 @@ impl Engine {
                         continue;
                     }
                 }
-                group.counted[slot] += 1;
-                if let Some(arg) = &aggregate.arg {
-                    let value = eval::evaluate(arg, &row.values, Computed::NONE, env)?;
-                    held = held.saturating_add(value.heap_bytes() + core::mem::size_of::<Value>());
-                    group.values[slot].push(value);
+                let Some(arg) = &aggregate.arg else {
+                    // `COUNT(*)` has nothing to evaluate.
+                    if let Slot::Rows(count) = &mut group.slots[slot] {
+                        *count += 1;
+                    }
+                    continue;
+                };
+                let value = eval::evaluate(arg, &row.values, Computed::NONE, env)?;
+                match &mut group.slots[slot] {
+                    Slot::Folding(fold) => {
+                        // Re-read rather than added to: `MIN`/`MAX` *replaces*
+                        // its running value, so the ceiling has to charge for
+                        // the one it now holds and not for every one it ever
+                        // held. Everything else here owns no heap at all.
+                        let before = fold.heap_bytes();
+                        fold.step(value)?;
+                        held = held
+                            .saturating_sub(before)
+                            .saturating_add(fold.heap_bytes());
+                    }
+                    Slot::Collecting(values) => {
+                        held =
+                            held.saturating_add(value.heap_bytes() + core::mem::size_of::<Value>());
+                        values.push(value);
+                    }
+                    // A slot's shape came from this same aggregate, so a row
+                    // counter never has an argument to fold. Counted rather
+                    // than panicked on: a miscount is not worth a process.
+                    Slot::Rows(count) => *count += 1,
                 }
             }
 
-            // Streaming holds one row per group, but an aggregate with an
-            // argument still accumulates one value per row, and a `GROUP BY`
-            // over many distinct keys holds one representative per group —
-            // both grow with the input, so the same per-statement ceiling
-            // applies. `COUNT(*)` alone accumulates nothing and is genuinely
-            // bounded: it is no longer refused, because there is no longer
-            // anything for it to run out of.
+            // What still grows with the input, and so still meets the same
+            // per-statement ceiling: a `GROUP BY` over many distinct keys holds
+            // one representative row per group, and a `DISTINCT` aggregate
+            // holds one value per row because it cannot know what is a
+            // duplicate until it has them all. `SUM`/`AVG`/`MIN`/`MAX` no
+            // longer do — they fold as the rows arrive, so `MIN(body)` over any
+            // number of rows holds one body — and `COUNT(*)` never did.
             if budget > 0 && held > budget {
                 return Err(Error::Memory(alloc::format!(
-                    "this statement has to hold one value per row, and one row per group, \
-                     before it can answer (an aggregate over a column, or a GROUP BY), and \
-                     that is past the {budget}-byte per-statement ceiling. Narrow the \
-                     `WHERE`, or raise `EngineOptions::query_memory_bytes`. Nothing was \
-                     written."
+                    "this statement has to hold one row per group, and one value per row for \
+                     each DISTINCT aggregate, before it can answer, and that is past the \
+                     {budget}-byte per-statement ceiling. Narrow the `WHERE`, or raise \
+                     `EngineOptions::query_memory_bytes`. Nothing was written."
                 )));
             }
         }
@@ -6620,42 +6685,44 @@ impl Engine {
                 Accumulator {
                     id: 0,
                     representative: alloc::vec![Value::Null; width],
-                    values: (0..slots).map(|_| Vec::new()).collect(),
-                    counted: alloc::vec![0i64; slots],
+                    slots: plan.aggregates.iter().map(Slot::new).collect(),
                 },
             );
         }
 
         let mut out = Vec::with_capacity(groups.len());
-        for (_, mut group) in groups {
+        for (_, group) in groups {
             self.interrupt.check()?;
+            let Accumulator {
+                id,
+                representative,
+                slots: group_slots,
+            } = group;
             let mut aggregates = Vec::with_capacity(slots);
-            for (slot, aggregate) in plan.aggregates.iter().enumerate() {
-                aggregates.push(match &aggregate.arg {
+            for (aggregate, slot) in plan.aggregates.iter().zip(group_slots) {
+                aggregates.push(match slot {
                     // `COUNT(*)`: counts rows, not values. Any other function
                     // without an argument is refused in the same words the
                     // collecting path refuses it in.
-                    None => match aggregate.func {
-                        crate::plan::AggFunc::Count => Value::Integer(group.counted[slot]),
+                    Slot::Rows(count) => match aggregate.func {
+                        crate::plan::AggFunc::Count => Value::Integer(count),
                         _ => {
                             return Err(Error::Type(
                                 "SUM/AVG/MIN/MAX/GROUP_CONCAT require an argument".to_string(),
                             ))
                         }
                     },
-                    Some(_) => eval::fold_aggregate_values(
-                        aggregate,
-                        core::mem::take(&mut group.values[slot]),
-                        &[],
-                        env,
-                    )?,
+                    Slot::Folding(fold) => fold.finish()?,
+                    Slot::Collecting(values) => {
+                        eval::fold_aggregate_values(aggregate, values, &[], env)?
+                    }
                 });
             }
 
             if let Some(having) = &plan.having {
                 if !eval::is_truthy(&eval::evaluate(
                     having,
-                    &group.representative,
+                    &representative,
                     Computed::aggregates(&aggregates),
                     env,
                 )?) {
@@ -6664,9 +6731,9 @@ impl Engine {
             }
 
             out.push(ExecRow {
-                id: group.id,
+                id,
                 score: None,
-                values: group.representative,
+                values: representative,
                 aggregates,
                 windows: Vec::new(),
             });

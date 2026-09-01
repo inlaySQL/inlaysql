@@ -1122,8 +1122,12 @@ pub fn evaluate_aggregate(
 /// Only `GROUP_CONCAT` cannot: its separator is an expression read from the
 /// group's *first row*, so the rows have to still exist when it folds.
 /// Everything else looks at nothing but the values.
+///
+/// Asked of [`AggFold`] rather than of a second list of function names, so a
+/// function added to [`AggFunc`] cannot be streamed by a planner that has not
+/// been taught how to fold it: no fold, no streaming.
 pub fn folds_from_values_alone(aggregate: &Aggregate) -> bool {
-    !matches!(aggregate.func, AggFunc::GroupConcat)
+    AggFold::new(aggregate).is_some()
 }
 
 /// Fold a group's already-evaluated argument values into the aggregate's
@@ -1135,6 +1139,13 @@ pub fn folds_from_values_alone(aggregate: &Aggregate) -> bool {
 /// promotion and its overflow refusal, `MIN`/`MAX`'s total order, the `NULL`
 /// rules and the `DISTINCT` fold are subtle enough that two copies would drift,
 /// and an aggregate that drifts returns a wrong number rather than a slow one.
+///
+/// This function is now a loop over [`AggFold::step`] and nothing else, so
+/// "the same code" is the same *step*, not merely the same entry point: a
+/// caller that has one value in its hand and no list to put it in reaches the
+/// identical arithmetic. `GROUP_CONCAT` is the exception with no running state
+/// — its separator comes out of the group's rows — and is answered from the
+/// whole list, below.
 ///
 /// `group` is needed only by `GROUP_CONCAT`, for its separator — see
 /// [`folds_from_values_alone`], which a streaming caller checks first.
@@ -1148,90 +1159,167 @@ pub fn fold_aggregate_values(
         values = distinct_values(values, aggregate.collation);
     }
 
-    match aggregate.func {
-        AggFunc::Count => Ok(Value::Integer(
-            values.iter().filter(|value| **value != Value::Null).count() as i64,
-        )),
-        // `sumStep` accumulates in an `i64` until something forces it not to —
-        // a real argument, or an addition that overflows. An overflow is an
-        // error in SQLite, not a wrapped answer and not a silent promotion,
-        // because the exact sum of integers is what `SUM` promised.
-        AggFunc::Sum => {
-            let mut any = false;
-            let mut approximate = false;
-            let mut overflowed = false;
-            let mut integer = 0i64;
-            let mut real = 0.0f64;
-            for value in values {
-                match value {
-                    Value::Null => {}
-                    Value::Integer(i) => {
-                        any = true;
-                        if approximate {
-                            real += i as f64;
-                        } else {
-                            match integer.checked_add(i) {
-                                Some(sum) => integer = sum,
-                                None => {
-                                    overflowed = true;
-                                    approximate = true;
-                                    real = integer as f64 + i as f64;
-                                }
+    let Some(mut fold) = AggFold::new(aggregate) else {
+        return fold_group_concat(aggregate, values, group, env);
+    };
+    for value in values {
+        fold.step(value)?;
+    }
+    fold.finish()
+}
+
+/// One aggregate's running answer, advanced one argument value at a time.
+///
+/// This is *the* fold. [`fold_aggregate_values`] is a loop over [`AggFold::step`]
+/// finished by [`AggFold::finish`], and `Engine::stream_aggregate` steps the
+/// same state as rows arrive rather than holding a value per row — so `SUM`'s
+/// integer-to-real promotion, its overflow refusal, `AVG`'s divisor and
+/// `MIN`/`MAX`'s total order have one implementation between the two paths
+/// instead of two that can drift.
+///
+/// What it deliberately does not cover is the pre-pass a `DISTINCT` aggregate
+/// still owes: folding equal values into one cannot be done a value at a time,
+/// because what is a duplicate is not known until every value has arrived. A
+/// `DISTINCT` aggregate therefore still collects, and then folds through here.
+pub enum AggFold {
+    /// `COUNT(expr)`: how many non-`NULL` values arrived. `COUNT(*)` counts
+    /// rows rather than values and never reaches a fold — see
+    /// [`evaluate_aggregate`], which answers it before evaluating anything.
+    Count(i64),
+    /// `SUM`: an exact `i64` until something forces it not to be.
+    Sum {
+        /// Whether any non-`NULL` value arrived. `SUM` of nothing is `NULL`,
+        /// not `0`.
+        any: bool,
+        /// Whether the running total has moved into `real`.
+        approximate: bool,
+        /// Whether an integer addition overflowed, refused by `finish`.
+        overflowed: bool,
+        /// The exact total, while one is still possible.
+        integer: i64,
+        /// The approximate total, once one is not.
+        real: f64,
+    },
+    /// `AVG`: the same running sum, over how many values went into it.
+    Avg {
+        /// The running total of every non-`NULL` value.
+        sum: f64,
+        /// How many of them there were — the divisor.
+        count: i64,
+    },
+    /// `MIN`/`MAX`: the best value seen so far, which is the only state here
+    /// that can own heap memory (see [`AggFold::heap_bytes`]).
+    Extreme {
+        /// The running best, `None` until a non-`NULL` value arrives.
+        best: Option<Value>,
+        /// `MAX` keeps the greater value, `MIN` the lesser.
+        largest: bool,
+        /// The collating sequence the comparison runs under.
+        collation: Collation,
+    },
+}
+
+impl AggFold {
+    /// The fold for `aggregate`, or `None` for the one function that has no
+    /// running state to fold into — `GROUP_CONCAT`, whose separator is read
+    /// from the group's first row. [`folds_from_values_alone`] asks exactly
+    /// this question, so the planner and the fold cannot disagree about which
+    /// aggregates may stream.
+    ///
+    /// `DISTINCT` is not consulted: the distinct pre-pass happens before the
+    /// fold, and after it the arithmetic is the same.
+    pub fn new(aggregate: &Aggregate) -> Option<Self> {
+        Some(match aggregate.func {
+            AggFunc::Count => AggFold::Count(0),
+            AggFunc::Sum => AggFold::Sum {
+                any: false,
+                approximate: false,
+                overflowed: false,
+                integer: 0,
+                real: 0.0,
+            },
+            AggFunc::Avg => AggFold::Avg { sum: 0.0, count: 0 },
+            AggFunc::Min | AggFunc::Max => AggFold::Extreme {
+                best: None,
+                largest: matches!(aggregate.func, AggFunc::Max),
+                collation: aggregate.collation,
+            },
+            AggFunc::GroupConcat => return None,
+        })
+    }
+
+    /// Fold one argument value in.
+    ///
+    /// Every function here skips `NULL`, which is SQLite's rule and the reason
+    /// `SUM` over nothing but `NULL`s is `NULL` rather than `0`.
+    pub fn step(&mut self, value: Value) -> Result<()> {
+        match self {
+            AggFold::Count(count) => {
+                if value != Value::Null {
+                    *count += 1;
+                }
+            }
+            // `sumStep` accumulates in an `i64` until something forces it not
+            // to — a real argument, or an addition that overflows. An overflow
+            // is an error in SQLite, not a wrapped answer and not a silent
+            // promotion, because the exact sum of integers is what `SUM`
+            // promised. It is *recorded* rather than raised here so that the
+            // fold keeps the behaviour it had as a loop: a non-numeric value
+            // later in the same group still reports itself first.
+            AggFold::Sum {
+                any,
+                approximate,
+                overflowed,
+                integer,
+                real,
+            } => match value {
+                Value::Null => {}
+                Value::Integer(i) => {
+                    *any = true;
+                    if *approximate {
+                        *real += i as f64;
+                    } else {
+                        match integer.checked_add(i) {
+                            Some(sum) => *integer = sum,
+                            None => {
+                                *overflowed = true;
+                                *approximate = true;
+                                *real = *integer as f64 + i as f64;
                             }
                         }
                     }
-                    Value::Real(r) => {
-                        any = true;
-                        if !approximate {
-                            approximate = true;
-                            real = integer as f64;
-                        }
-                        real += r;
-                    }
-                    other => return Err(numeric_error(other.type_name())),
                 }
-            }
-            if overflowed {
-                return Err(Error::Type("integer overflow".to_string()));
-            }
-            Ok(if !any {
-                Value::Null
-            } else if approximate {
-                Value::Real(real)
-            } else {
-                Value::Integer(integer)
-            })
-        }
-        AggFunc::Avg => {
-            let mut sum = 0.0f64;
-            let mut count = 0i64;
-            for value in values {
-                match value {
-                    Value::Null => {}
-                    Value::Integer(i) => {
-                        sum += i as f64;
-                        count += 1;
+                Value::Real(r) => {
+                    *any = true;
+                    if !*approximate {
+                        *approximate = true;
+                        *real = *integer as f64;
                     }
-                    Value::Real(r) => {
-                        sum += r;
-                        count += 1;
-                    }
-                    other => return Err(numeric_error(other.type_name())),
+                    *real += r;
                 }
-            }
-            Ok(if count == 0 {
-                Value::Null
-            } else {
-                Value::Real(sum / count as f64)
-            })
-        }
-        AggFunc::Min | AggFunc::Max => {
-            let mut best: Option<Value> = None;
-            for value in values {
+                other => return Err(numeric_error(other.type_name())),
+            },
+            AggFold::Avg { sum, count } => match value {
+                Value::Null => {}
+                Value::Integer(i) => {
+                    *sum += i as f64;
+                    *count += 1;
+                }
+                Value::Real(r) => {
+                    *sum += r;
+                    *count += 1;
+                }
+                other => return Err(numeric_error(other.type_name())),
+            },
+            AggFold::Extreme {
+                best,
+                largest,
+                collation,
+            } => {
                 if value == Value::Null {
-                    continue;
+                    return Ok(());
                 }
-                let take = match &best {
+                let take = match best {
                     None => true,
                     Some(current) => {
                         // `mem_cmp` — the same total order `ORDER BY`,
@@ -1242,66 +1330,128 @@ pub fn fold_aggregate_values(
                         // `INTEGER`, say): a wrong "equal" here would have
                         // let a later value silently overwrite the running
                         // `MIN`/`MAX` instead of losing the comparison.
-                        let ordering = mem_cmp(&value, current, aggregate.collation);
-                        match aggregate.func {
-                            AggFunc::Min => ordering == Ordering::Less,
-                            _ => ordering == Ordering::Greater,
+                        let ordering = mem_cmp(&value, current, *collation);
+                        if *largest {
+                            ordering == Ordering::Greater
+                        } else {
+                            ordering == Ordering::Less
                         }
                     }
                 };
                 if take {
-                    best = Some(value);
+                    *best = Some(value);
                 }
             }
-            Ok(best.unwrap_or(Value::Null))
         }
-        AggFunc::GroupConcat => {
-            // The separator is an expression per SQLite's signature, but it is
-            // read once, from the first row of the group: a separator that
-            // varied per row would have no defined meaning, and SQLite reads
-            // whatever the first invocation supplied.
-            let separator = match &aggregate.separator {
-                Some(expr) => {
-                    let Some(first) = group.first() else {
-                        return Ok(Value::Null);
-                    };
-                    match evaluate(expr, first, Computed::NONE, env)? {
-                        // SQLite stops concatenating once the separator is
-                        // NULL; with one row that leaves the value itself.
-                        Value::Null => return Ok(Value::Null),
-                        other => as_text(&other)?,
-                    }
+        Ok(())
+    }
+
+    /// The aggregate's answer, and the point at which a recorded refusal is
+    /// raised.
+    pub fn finish(self) -> Result<Value> {
+        Ok(match self {
+            AggFold::Count(count) => Value::Integer(count),
+            AggFold::Sum {
+                any,
+                approximate,
+                overflowed,
+                integer,
+                real,
+            } => {
+                if overflowed {
+                    return Err(Error::Type("integer overflow".to_string()));
                 }
-                None => ",".to_string(),
-            };
-            let mut out = String::new();
-            let mut any = false;
-            for value in values {
-                if value == Value::Null {
-                    continue;
+                if !any {
+                    Value::Null
+                } else if approximate {
+                    Value::Real(real)
+                } else {
+                    Value::Integer(integer)
                 }
-                let text = as_text(&value)?;
-                // Checked per row rather than up front: the group's size is
-                // not known before it is walked, and an aggregate over enough
-                // rows reaches the bound without any one row being large.
-                let separator_len = if any { separator.len() } else { 0 };
-                check_length(
-                    out.len() as i128 + separator_len as i128 + text.len() as i128,
-                    "group_concat()",
-                )?;
-                if any {
-                    out.push_str(&separator);
-                }
-                out.push_str(&text);
-                any = true;
             }
-            Ok(if any {
-                Value::Text(out.into())
-            } else {
-                Value::Null
-            })
+            AggFold::Avg { sum, count } => {
+                if count == 0 {
+                    Value::Null
+                } else {
+                    Value::Real(sum / count as f64)
+                }
+            }
+            AggFold::Extreme { best, .. } => best.unwrap_or(Value::Null),
+        })
+    }
+
+    /// Heap bytes the running state owns, for the per-statement memory
+    /// ceiling.
+    ///
+    /// Only `MIN`/`MAX` can own any, and it owns *one* value however many rows
+    /// arrive — which is the whole point of folding as they do: `SUM(n)` over
+    /// a hundred million rows holds two words, and `MIN(body)` holds one body.
+    /// A caller that budgets re-reads this after each [`AggFold::step`] rather
+    /// than adding to a running total, because the extreme's value is replaced
+    /// rather than accumulated.
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            AggFold::Extreme {
+                best: Some(value), ..
+            } => value
+                .heap_bytes()
+                .saturating_add(core::mem::size_of::<Value>()),
+            _ => 0,
         }
     }
+}
+
+/// `GROUP_CONCAT`, the one aggregate that cannot fold from its values alone.
+fn fold_group_concat(
+    aggregate: &Aggregate,
+    values: Vec<Value>,
+    group: &[&[Value]],
+    env: &Env<'_>,
+) -> Result<Value> {
+    // The separator is an expression per SQLite's signature, but it is
+    // read once, from the first row of the group: a separator that
+    // varied per row would have no defined meaning, and SQLite reads
+    // whatever the first invocation supplied.
+    let separator = match &aggregate.separator {
+        Some(expr) => {
+            let Some(first) = group.first() else {
+                return Ok(Value::Null);
+            };
+            match evaluate(expr, first, Computed::NONE, env)? {
+                // SQLite stops concatenating once the separator is
+                // NULL; with one row that leaves the value itself.
+                Value::Null => return Ok(Value::Null),
+                other => as_text(&other)?,
+            }
+        }
+        None => ",".to_string(),
+    };
+    let mut out = String::new();
+    let mut any = false;
+    for value in values {
+        if value == Value::Null {
+            continue;
+        }
+        let text = as_text(&value)?;
+        // Checked per row rather than up front: the group's size is
+        // not known before it is walked, and an aggregate over enough
+        // rows reaches the bound without any one row being large.
+        let separator_len = if any { separator.len() } else { 0 };
+        check_length(
+            out.len() as i128 + separator_len as i128 + text.len() as i128,
+            "group_concat()",
+        )?;
+        if any {
+            out.push_str(&separator);
+        }
+        out.push_str(&text);
+        any = true;
+    }
+    Ok(if any {
+        Value::Text(out.into())
+    } else {
+        Value::Null
+    })
 }
 
 /// Fold values that are equal under SQLite's storage-class ordering into one,
