@@ -492,6 +492,192 @@ fn joins_agree(left: bool) {
     }
 }
 
+/// The key type a generated join joins on.
+///
+/// [`joins_agree`] joins two `INTEGER` columns, which is the only key class the
+/// hash join was ever allowed to build on. Two more are allowed now — a `REAL`
+/// key, and a `TEXT` key under a non-binary collation — and each was refused
+/// for a stated correctness reason that had to be answered before it could be
+/// allowed (`engine.rs`'s `hash_join_key`). A reason answered by argument and
+/// not by an oracle is how a wrong-answer bug ships, so these are the shapes
+/// this file did not cover and now does.
+#[derive(Clone, Copy, Debug)]
+enum KeyClass {
+    /// `-0.0` equals `+0.0` under `=` but has different bits, so the two must
+    /// share a hash bucket; `NULL` matches nothing.
+    Real,
+    /// `'A'` equals `'a'` under `NOCASE`, so the two must share a bucket even
+    /// though their bytes differ — the failure the refusal used to prevent.
+    NoCaseText,
+}
+
+impl KeyClass {
+    fn declaration(self) -> &'static str {
+        match self {
+            KeyClass::Real => "REAL",
+            KeyClass::NoCaseText => "TEXT COLLATE NOCASE",
+        }
+    }
+
+    /// One generated key, spelled as a SQL literal so both engines are handed
+    /// the identical text and no binding difference can explain a disagreement.
+    fn literal(self, rng: &mut SeededRng) -> String {
+        match self {
+            // A small pool with duplicates, both zeroes, and an integral value
+            // that a `REAL` column stores as a float.
+            KeyClass::Real => ["1.0", "2.5", "-0.0", "0.0", "3.0", "-2.5", "1.0"]
+                [(rng.next_u64() as usize) % 7]
+                .to_string(),
+            // Case variants of the same few keys, so most pairs are equal under
+            // NOCASE and unequal under BINARY.
+            KeyClass::NoCaseText => {
+                let text = ["ada", "ADA", "Ada", "grace", "GRACE", "", "zoe"]
+                    [(rng.next_u64() as usize) % 7];
+                format!("'{text}'")
+            }
+        }
+    }
+}
+
+/// How many rows each side of a typed join gets.
+///
+/// Deliberately not [`ROWS`], and the reason is the whole point of the test.
+/// The hash table sizes itself as `rows.next_power_of_two().max(16)`, and
+/// FNV-1a's low bits are *invariant* under the ASCII case bit — `'ada'` and
+/// `'ADA'` differ only by `0x20`, which cannot reach the bottom four bits
+/// through a multiply by an odd constant. So with 16 or 32 buckets, case
+/// variants always land in the same bucket whether the hash folds the
+/// collation or not, and a test at [`ROWS`] = 12 passes just as happily
+/// against a hash that does not fold at all. Verified by mutation: removing
+/// the fold left a 12-row version of this test green.
+///
+/// 80 rows puts the table at 128 buckets, which is past the point where the
+/// case bit changes the bucket index, so the fold is load-bearing again and
+/// its absence is a failure rather than a coincidence.
+const TYPED_JOIN_ROWS: usize = 80;
+
+/// The same join, on a key class the hash join only recently accepted.
+///
+/// Every round runs both join kinds against all three inner access paths, so a
+/// hash build that splits equal keys across buckets is caught by the
+/// materialising path disagreeing with it, and both are caught by SQLite.
+fn typed_joins_agree(class: KeyClass, left: bool) {
+    for seed in 0..rounds() {
+        let mut rng = SeededRng::new(seed);
+        // A fifth of the keys are NULL on each side, matching `generate_pairs`.
+        let keys = |rng: &mut SeededRng| -> Vec<Option<String>> {
+            (0..TYPED_JOIN_ROWS)
+                .map(|_| (!rng.next_u64().is_multiple_of(5)).then(|| class.literal(rng)))
+                .collect()
+        };
+        let xs = keys(&mut rng);
+        let ys = keys(&mut rng);
+        for path in [InnerPath::Scan, InnerPath::Index, InnerPath::RowId] {
+            let ours = inlaysql_typed_join(class, &xs, &ys, left, path)
+                .expect("InlaySQL join must answer");
+            let theirs =
+                sqlite_typed_join(class, &xs, &ys, left, path).expect("SQLite is the oracle");
+            assert_eq!(
+                ours, theirs,
+                "seed {seed}: {class:?} {} on {path:?} disagreed\nx: {xs:?}\ny: {ys:?}",
+                if left { "LEFT JOIN" } else { "INNER JOIN" }
+            );
+        }
+    }
+}
+
+fn typed_join_sql(class: KeyClass, keys: &[Option<String>], table: &str) -> Vec<String> {
+    let mut sql = vec![format!(
+        "CREATE TABLE {table} (id INTEGER PRIMARY KEY, k {})",
+        class.declaration()
+    )];
+    for (index, key) in keys.iter().enumerate() {
+        let value = key.clone().unwrap_or_else(|| "NULL".to_string());
+        sql.push(format!(
+            "INSERT INTO {table} (id, k) VALUES ({}, {value})",
+            index + 1
+        ));
+    }
+    sql
+}
+
+fn inlaysql_typed_join(
+    class: KeyClass,
+    xs: &[Option<String>],
+    ys: &[Option<String>],
+    left: bool,
+    path: InnerPath,
+) -> Result<Vec<Vec<String>>, inlaysql::Error> {
+    let mut db = Database::open_in_memory()?;
+    for sql in typed_join_sql(class, xs, "a") {
+        db.execute(&sql, &[])?;
+    }
+    for sql in typed_join_sql(class, ys, "b") {
+        db.execute(&sql, &[])?;
+    }
+    if path == InnerPath::Index {
+        db.execute("CREATE INDEX b_k ON b (k)", &[])?;
+    }
+    let kind = if left { "LEFT JOIN" } else { "JOIN" };
+    let result = db.query(
+        &format!("SELECT a.id, b.id FROM a {kind} b ON a.k = b.k"),
+        &[],
+    )?;
+    let mut rows: Vec<Vec<String>> = result
+        .rows
+        .iter()
+        .map(|row| row.iter().map(canonical_inlaysql).collect())
+        .collect();
+    rows.sort();
+    Ok(rows)
+}
+
+fn sqlite_typed_join(
+    class: KeyClass,
+    xs: &[Option<String>],
+    ys: &[Option<String>],
+    left: bool,
+    path: InnerPath,
+) -> rusqlite::Result<Vec<Vec<String>>> {
+    let conn = rusqlite::Connection::open_in_memory()?;
+    for sql in typed_join_sql(class, xs, "a") {
+        conn.execute(&sql, [])?;
+    }
+    for sql in typed_join_sql(class, ys, "b") {
+        conn.execute(&sql, [])?;
+    }
+    if path == InnerPath::Index {
+        conn.execute("CREATE INDEX b_k ON b (k)", [])?;
+    }
+    let kind = if left { "LEFT JOIN" } else { "JOIN" };
+    let mut statement =
+        conn.prepare(&format!("SELECT a.id, b.id FROM a {kind} b ON a.k = b.k"))?;
+    let columns = statement.column_count();
+    let mut rows = statement.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let mut values = Vec::with_capacity(columns);
+        for index in 0..columns {
+            values.push(canonical_sqlite(row.get_ref(index)?));
+        }
+        out.push(values);
+    }
+    out.sort();
+    Ok(out)
+}
+
+#[test]
+fn real_key_joins_agree_with_sqlite() {
+    typed_joins_agree(KeyClass::Real, false);
+    typed_joins_agree(KeyClass::Real, true);
+}
+
+#[test]
+fn nocase_key_joins_agree_with_sqlite() {
+    typed_joins_agree(KeyClass::NoCaseText, false);
+    typed_joins_agree(KeyClass::NoCaseText, true);
+}
+
 #[test]
 fn inner_joins_agree_with_sqlite() {
     joins_agree(false);

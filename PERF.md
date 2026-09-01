@@ -2552,6 +2552,55 @@ flagged rather than discarded.
 
 ---
 
+### A `REAL` join was 223x slower, and the obvious fix bought nothing (2026-09-01)
+
+The other half of the join-key audit. `hash_join_key` allowed `INTEGER | TEXT |
+BLOB`, so a `REAL` key fell to `Materialise` and a 2,000-row join took 77.7 ms
+against 277 µs for the identical join on an `INTEGER` column.
+
+The exclusion's stated reason was that an `INTEGER` next to a `REAL` "compares
+as `f64` and would need normalisation the hash does not do" — but the function
+already requires both sides to share a declared type, so that pair cannot reach
+it, and `REAL`-to-`REAL` was being refused for a hazard that could not occur.
+What makes a `REAL` key's values reliably `Value::Real` is write-side affinity:
+`sql::coerce` converts an `INTEGER` bound into a `REAL` column on the way in,
+and a derived column with no stored column behind it carries `DataType::Numeric`,
+which is not hash-eligible either.
+
+**Adding `REAL` to the list changed nothing, and the measurement is the only
+reason that was noticed.** `EXPLAIN` reported `HASH JOIN` and the runtime stayed
+at 78 ms — a hash join performing exactly like the nested loop it replaced. The
+cause is the bucket index, which is taken from the *low* bits of the hash: an
+`f64`'s mantissa sits in those low bits, and the values applications actually
+store (`1.5`, `3.0`, prices, counts scaled by a constant) use only the top few
+mantissa bits, so their bit patterns end in long runs of zeros. Multiplying by
+an odd constant cannot repair that — a pattern with *k* trailing zeros still has
+*k* trailing zeros after the multiply — so every key masked down to bucket zero
+and the "hash join" was a linear scan per probe.
+
+Mixing the bits down (SplitMix64's finaliser) fixes it. Measured, interleaved,
+three repetitions:
+
+| Shape | Before | After | |
+| --- | ---: | ---: | --- |
+| `REAL` join | 77.71 ms | **348 µs** | **223x**, 3/3, non-overlapping |
+| `INTEGER` join (control) | 277 µs | 262 µs | unchanged |
+
+**The test that was supposed to catch a wrong answer here could not have.** A
+differential join test was added for both new key classes, and mutation-testing
+it — deleting the collation fold, then the float normalisation, and re-running —
+showed it passing against both mutants. The reason is bucket arithmetic, not the
+oracle: the hash table sizes itself `max(16)` buckets, and FNV-1a's low four
+bits are invariant under the ASCII case bit, so at the fixture's twelve rows
+`'ada'` and `'ADA'` share a bucket whether the hash folds or not. It takes 64
+buckets before the case bit reaches the mask. The fixture now uses 80 rows,
+where the mutant does fail, and the invariant itself — equal keys hash alike —
+is additionally asserted directly as a unit test, which holds at any table size.
+The `-0.0`/`+0.0` normalisation is kept but is *not* load-bearing against the
+current multiplier (the sign bit cannot reach the low bits either); it is there
+for the next person who changes the hash, and the unit test says so rather than
+implying the measurement proved it.
+
 ### A case-insensitive join was 204x slower than a case-sensitive one (2026-09-01)
 
 Found by probing one join per key type rather than by profiling a known-slow

@@ -2075,6 +2075,59 @@ fn a_nocase_hash_join_agrees_with_the_probe_and_the_scan() {
     assert_eq!(by_hash, by_scan, "the hash join and the scan disagree");
 }
 
+/// A `REAL` hash join agrees with the materialising scan, including on the two
+/// float values that can break a hash.
+///
+/// `REAL` was excluded from the hash-join key types for a reason that only ever
+/// applied to a `REAL`-to-`INTEGER` key, which the same-declared-class check
+/// already makes unreachable; the exclusion cost ~235x by dropping the join to
+/// `Materialise`. Two values decide whether hashing floats is sound, and both
+/// are here: `-0.0`, which `=` calls equal to `+0.0` and so must share its
+/// bucket despite a different bit pattern, and `NULL`, which matches nothing.
+///
+/// The expected pairs were taken from a real `sqlite3` 3.54 binary on the same
+/// data, not from reasoning about what they should be.
+#[test]
+fn a_real_hash_join_agrees_with_the_scan() {
+    const SETUP: &[&str] = &[
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, v REAL)",
+        "INSERT INTO r VALUES (1, 1.0), (2, 2.5), (3, -0.0), (4, 0.0), (5, NULL), (6, 3.0)",
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, v REAL)",
+        "INSERT INTO s VALUES (1, 1.0), (2, 0.0), (3, 2.5), (4, NULL), (5, 3.0)",
+    ];
+    const JOIN: &str = "SELECT r.id, s.id FROM r JOIN s ON r.v = s.v ORDER BY r.id, s.id";
+
+    let (mut hashed, probe) = engine();
+    let (mut scanned, _) = engine();
+    for sql in SETUP {
+        run(&mut hashed, sql);
+        run(&mut scanned, sql);
+    }
+
+    probe.reset();
+    let by_hash = rows(&mut hashed, JOIN, &[]);
+    assert!(
+        probe.scans_of("s") > 0,
+        "the hash join is supposed to build from a scan of the inner side"
+    );
+    let by_scan = rows(&mut scanned, &format!("{JOIN} LIMIT 100"), &[]);
+
+    assert_eq!(
+        by_hash,
+        vec![
+            vec!["i:1", "i:1"],
+            vec!["i:2", "i:3"],
+            // -0.0 and 0.0 are one key: both find `s`'s 0.0.
+            vec!["i:3", "i:2"],
+            vec!["i:4", "i:2"],
+            // NULL (r.id 5) matches nothing, in either table.
+            vec!["i:6", "i:5"],
+        ],
+        "the REAL hash join's answer is not sqlite3's"
+    );
+    assert_eq!(by_hash, by_scan, "the hash join and the scan disagree");
+}
+
 /// The same tie for `RTRIM`, the other non-binary collation, whose folding
 /// removes bytes rather than changing them.
 #[test]

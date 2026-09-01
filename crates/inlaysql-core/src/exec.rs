@@ -945,9 +945,18 @@ fn hash_value(value: &Value, collation: Collation) -> u64 {
         // A `BLOB` is compared byte-wise whatever collation the `ON` resolved —
         // collations apply to text — so it hashes its bytes unfolded.
         Value::Blob(bytes) => fnv1a(bytes),
-        // A `NULL`/`REAL`/`VECTOR` key never reaches here: `NULL` is handled
-        // before the hash is asked, and the planner refuses those classes.
-        Value::Null | Value::Real(_) | Value::Vector(_) => 0,
+        // `-0.0 == 0.0` is true, so the two have to land in one bucket even
+        // though their bit patterns differ; adding `0.0` normalises the sign
+        // of zero and leaves every other value, including infinities,
+        // untouched. `NaN` needs no special case here: it is equal to nothing,
+        // not even itself, so whichever bucket it lands in the candidate
+        // comparison rejects it — a hash may over-group, it may not claim a
+        // match. See `hash_join_key` for why a `REAL` key's values are always
+        // `Value::Real` by the time they reach this.
+        Value::Real(real) => mix64((real + 0.0).to_bits()),
+        // A `NULL`/`VECTOR` key never reaches here: `NULL` is handled before
+        // the hash is asked, and the planner refuses vectors.
+        Value::Null | Value::Vector(_) => 0,
     }
 }
 
@@ -969,6 +978,26 @@ fn keys_equal(outer: &Value, inner: &Value, collation: Collation) -> bool {
         }
         _ => outer == inner,
     }
+}
+
+/// Spread a 64-bit pattern across all of its bits (SplitMix64's finaliser).
+///
+/// A plain multiply is not enough for an `f64`'s bit pattern, and the bucket
+/// index is taken from the *low* bits. A double's mantissa occupies those low
+/// bits, and the values an application actually stores — `1.5`, `3.0`, `4.5`,
+/// prices, counts scaled by a constant — use only the top few mantissa bits, so
+/// their patterns end in long runs of zeros. Multiplying by an odd constant
+/// cannot fix that: if the input has *k* trailing zero bits the product still
+/// does, so every such key masks down to bucket zero and the hash join
+/// degenerates into the linear scan it exists to avoid.
+///
+/// Measured, before this was here: a 2,000-row `REAL` join built a hash table
+/// whose keys all landed in one bucket and ran at 78 ms — indistinguishable
+/// from the `Materialise` plan it had just replaced. With the mix, 464 µs.
+fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 /// FNV-1a, chosen because it is deterministic and `no_std`: the hash only has
@@ -1266,5 +1295,79 @@ impl Iterator for NestedLoopJoin<'_> {
                 }));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hash_key_tests {
+    use super::{hash_value, keys_equal};
+    use crate::collation::Collation;
+    use crate::value::Value;
+
+    /// The invariant the whole hash join rests on, asserted directly rather
+    /// than through a join's answer.
+    ///
+    /// Going through a join cannot test this reliably at a small table size:
+    /// the bucket is `hash & (buckets - 1)`, the table has at least 16 buckets,
+    /// and FNV-1a's low four bits are invariant under the ASCII case bit — so
+    /// `'ada'` and `'ADA'` share a bucket even when the hash does *not* fold
+    /// the collation, and a join test only catches the missing fold once the
+    /// table is large enough for the case bit to reach the mask. That is a
+    /// property of the bucket count, not of the rule being tested. These
+    /// assertions hold at any size.
+    #[test]
+    fn equal_keys_hash_alike() {
+        let upper = Value::Text("ADA".into());
+        let lower = Value::Text("ada".into());
+        assert_eq!(
+            hash_value(&upper, Collation::NoCase),
+            hash_value(&lower, Collation::NoCase),
+            "NOCASE-equal texts must share a bucket"
+        );
+        assert!(keys_equal(&upper, &lower, Collation::NoCase));
+
+        // ... and must not be forced together under a collation that calls
+        // them different, which is what keeps BINARY joins as selective as
+        // they were.
+        assert!(!keys_equal(&upper, &lower, Collation::Binary));
+
+        let padded = Value::Text("a  ".into());
+        let bare = Value::Text("a".into());
+        assert_eq!(
+            hash_value(&padded, Collation::RTrim),
+            hash_value(&bare, Collation::RTrim),
+            "RTRIM-equal texts must share a bucket"
+        );
+        assert!(keys_equal(&padded, &bare, Collation::RTrim));
+
+        // `-0.0 == 0.0` is true, so the two have to hash alike. With the
+        // current multiplier they would collide even unnormalised — the sign
+        // bit cannot reach the low bits through a multiply — so this assertion
+        // is what keeps that true if the hash is ever changed to mix high bits
+        // downward, which is exactly when it would silently stop being true.
+        assert_eq!(
+            hash_value(&Value::Real(-0.0), Collation::Binary),
+            hash_value(&Value::Real(0.0), Collation::Binary),
+            "-0.0 and 0.0 are equal under `=` and must share a bucket"
+        );
+        assert!(keys_equal(
+            &Value::Real(-0.0),
+            &Value::Real(0.0),
+            Collation::Binary
+        ));
+    }
+
+    /// `NaN` is equal to nothing, including itself, so it may hash anywhere as
+    /// long as the comparison refuses it. `NULL` likewise never matches.
+    #[test]
+    fn keys_that_match_nothing_are_refused() {
+        let nan = Value::Real(f64::NAN);
+        assert!(!keys_equal(&nan, &nan, Collation::Binary));
+        assert!(!keys_equal(&Value::Null, &Value::Null, Collation::Binary));
+        assert!(!keys_equal(
+            &Value::Null,
+            &Value::Integer(1),
+            Collation::Binary
+        ));
     }
 }

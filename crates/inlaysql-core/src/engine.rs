@@ -7174,6 +7174,24 @@ pub(crate) struct JoinKey {
 /// measured ~183x on an unindexed `TEXT COLLATE NOCASE` join (it fell all the
 /// way to `Materialise`), which is the shape a MySQL-compatible server meets by
 /// default, since MySQL's own default collation is case-insensitive.
+///
+/// **`REAL` used to be refused too, and is not any more.** The type list was
+/// `INTEGER | TEXT | BLOB`, which excluded a `REAL`-to-`REAL` key for a reason
+/// that only ever applied to a `REAL`-to-`INTEGER` one — and the
+/// same-declared-class check above already makes that pair unreachable. So the
+/// exclusion cost ~235x (again all the way down to `Materialise`) and bought
+/// nothing. What a float key does need is two properties the hash now has, and
+/// neither is about class mixing: `-0.0` and `+0.0` are equal under `=` and
+/// must hash alike, and `NaN` is equal to nothing at all, so it may hash
+/// anywhere as long as the candidate comparison rejects it — which plain `f64`
+/// equality already does.
+///
+/// What keeps a `REAL` column's values *actually* `Value::Real`, so that
+/// hashing them as floats is sound, is write-side affinity:
+/// [`crate::sql::coerce`] converts an `INTEGER` bound into a `REAL` column to
+/// `Value::Real` on the way in, and refuses the classes it cannot convert. A
+/// derived column with no stored column behind it carries `DataType::Numeric`,
+/// which is not in this list, so it cannot reach the hash join either.
 pub(crate) fn hash_join_key(
     from: &[FromItem],
     inner_index: usize,
@@ -7187,7 +7205,7 @@ pub(crate) fn hash_join_key(
         let inner_ty = inner.columns[key.inner].ty;
         if !matches!(
             inner_ty,
-            DataType::Integer | DataType::Text | DataType::Blob
+            DataType::Integer | DataType::Real | DataType::Text | DataType::Blob
         ) {
             continue;
         }
