@@ -51,6 +51,28 @@ DEMO_PG="$ROOT/crates/inlaysql-wasm/www/demo/playground"
 mkdir -p "$DEMO_PG"
 cp "$ROOT/crates/inlaysql-wasm/demos/playground/index.html" "$DEMO_PG/index.html"
 
+# The JS SDK demo. The HTML is committed here; the SDK sources and the engine
+# module are copied from where they live. With a sibling inlaysql-js checkout
+# (SDK_DIR, default ../inlaysql-js) this leaves the demo fully runnable from
+# `--serve`; the org-site workflow supplies the SDK sources in CI, and the
+# engine module is the same www/pkg this script just built — no version skew.
+DEMO_JS="$ROOT/crates/inlaysql-wasm/www/demo/js-sdk"
+SDK_DIR="${SDK_DIR:-$ROOT/../inlaysql-js}"
+mkdir -p "$DEMO_JS/engine"
+cp "$ROOT/crates/inlaysql-wasm/demos/js-sdk/index.html" "$DEMO_JS/index.html"
+cp "$ROOT/crates/inlaysql-wasm/demos/js-sdk/simple.html" "$DEMO_JS/simple.html"
+cp "$OUT/inlaysql_wasm.js" "$DEMO_JS/engine/inlaysql_wasm.js"
+cp "$OUT/inlaysql_wasm_bg.wasm" "$DEMO_JS/engine/inlaysql_wasm_bg.wasm"
+if [ -d "$SDK_DIR/packages" ]; then
+  for pkg in wasm core orm storage simple; do
+    mkdir -p "$DEMO_JS/packages/$pkg"
+    cp -R "$SDK_DIR/packages/$pkg/src" "$DEMO_JS/packages/$pkg/src"
+  done
+  echo "js-sdk demo: SDK sources from $SDK_DIR"
+else
+  echo "js-sdk demo: no SDK checkout at $SDK_DIR — sources must be staged by the deploy workflow" >&2
+fi
+
 # Size is a first-class number for a module that ships over the network, so it
 # is printed rather than left for someone to check.
 raw=$(wc -c < "$OUT/inlaysql_wasm_bg.wasm")

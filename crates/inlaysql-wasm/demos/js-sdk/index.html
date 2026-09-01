@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>inlaysql-js — the SDK, live</title>
+<meta name="description" content="The JavaScript SDK for InlaySQL running from plain script files: a model declared, a row embedded on insert, hybrid search ranked — no build step.">
+<style>
+  :root { --bg: #08080b; --bg-raised: #101015; --line: #23232c;
+          --ink: #e8e8ee; --ink-dim: #9a9aab; --ink-faint: #6b6b7b;
+          --accent: #a78bfa; --accent-warm: #f0abfc; --good: #6ee7b7;
+          --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.65 system-ui, -apple-system, sans-serif; -webkit-font-smoothing: antialiased; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { font-family: var(--mono); font-size: .85em; background: var(--bg-raised);
+         padding: .1em .35em; border-radius: 4px; }
+  main { max-width: 46rem; margin: 0 auto; padding: 3rem 1.5rem 4rem; }
+  h1 { font-size: 1.9rem; letter-spacing: -.02em; margin: 0 0 .5rem; }
+  h1 .grad { background: linear-gradient(100deg, var(--accent), var(--accent-warm));
+             -webkit-background-clip: text; background-clip: text; color: transparent; }
+  p.lede { color: var(--ink-dim); margin: 0 0 2rem; }
+  pre { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px;
+        padding: 1rem 1.25rem; overflow-x: auto; font: .8rem/1.55 var(--mono); color: #d7e2ee; }
+  .ok { color: var(--good); font: 500 .9rem/1.7 var(--mono); }
+  .err { color: #f87171; font: 500 .9rem/1.7 var(--mono); }
+  footer { margin-top: 3rem; border-top: 1px solid var(--line); padding-top: 1.25rem;
+           color: var(--ink-faint); font-size: .85rem; }
+</style>
+
+<!-- The SDK's plain ES modules — the same files committed in
+     inlaySQL/inlaysql-js, copied here at deploy time by publish.yml. The
+     import map is the only ceremony vanilla JS needs. -->
+<script type="importmap">
+{
+  "imports": {
+    "@inlaysql/wasm": "./packages/wasm/src/index.js",
+    "@inlaysql/core": "./packages/core/src/index.js",
+    "@inlaysql/storage": "./packages/storage/src/index.js",
+    "@inlaysql/orm": "./packages/orm/src/index.js"
+  }
+}
+</script>
+</head>
+<body>
+<main>
+  <h1>The JS SDK, <span class="grad">running live</span></h1>
+  <p class="lede">
+    <a href="https://github.com/inlaySQL/inlaysql-js">inlaysql-js</a> is the
+    JavaScript face of the engine: a typed core, storage adapters, an ORM —
+    zero runtime dependencies, plain ESM files, no build step. This page
+    imports those exact source files and runs a model end to end.
+  </p>
+  <pre id="code">const Page = defineModel("pages", {
+  id: field.integer().primaryKey(),
+  title: field.text(),
+  body: field.text().index("bm25"),
+  embedding: field.vector(64).index("hnsw").embedFrom("body"),
+});
+
+const db = await openDatabase({ source: memory(), create: true });
+await install(db, Page);
+await repo(db, Page).insert([
+  { title: "Renew a passport", body: "Renew online in three steps; ten working days." },
+  { title: "File your tax return", body: "Returns are due by 30 June." },
+]);
+
+const hits = await repo(db, Page).search("renew a passport", { limit: 1 });</pre>
+  <pre id="sql"></pre>
+  <p class="ok" id="out">loading the SDK…</p>
+
+  <footer>
+    Prefer even less ceremony? The <a href="./simple.html">one-script-tag version</a>
+    uses the <code>InlaySQL</code> global. Engine demos:
+    <a href="../../">main</a> · <a href="../site-search/">site search</a> ·
+    <a href="../playground/">playground</a>.
+  </footer>
+</main>
+
+<script type="module">
+  import { openDatabase } from "@inlaysql/core";
+  import { memory } from "@inlaysql/storage";
+  import { defineModel, field, install, repo } from "@inlaysql/orm";
+
+  const out = document.getElementById("out");
+  try {
+    const Page = defineModel("pages", {
+      id: field.integer().primaryKey(),
+      title: field.text(),
+      body: field.text().index("bm25"),
+      embedding: field.vector(64).index("hnsw").embedFrom("body"),
+    });
+
+    const db = await openDatabase({ source: memory(), create: true });
+    await install(db, Page);
+    await repo(db, Page).insert([
+      { title: "Renew a passport", body: "Renew online in three steps; ten working days." },
+      { title: "File your tax return", body: "Returns are due by 30 June." },
+    ]);
+
+    const hits = await repo(db, Page).search("renew a passport", { limit: 1 });
+    document.getElementById("sql").textContent = hits.sql;
+    out.textContent = `✔ top result: ${hits.rows[0].title} (score ${hits.rows[0].score.toFixed(4)}) — the SDK's own source files, no build step`;
+  } catch (error) {
+    out.textContent = `error: ${error}`;
+    out.className = "err";
+  }
+</script>
+</body>
+</html>

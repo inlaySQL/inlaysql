@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>inlaysql-js — one script tag</title>
+<meta name="description" content="InlaySQL's JavaScript SDK from a single script tag: the InlaySQL global, shorthand models, hybrid search.">
+<style>
+  :root { --bg: #08080b; --bg-raised: #101015; --line: #23232c;
+          --ink: #e8e8ee; --ink-dim: #9a9aab; --ink-faint: #6b6b7b;
+          --accent: #a78bfa; --accent-warm: #f0abfc; --good: #6ee7b7;
+          --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.65 system-ui, -apple-system, sans-serif; -webkit-font-smoothing: antialiased; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { font-family: var(--mono); font-size: .85em; background: var(--bg-raised);
+         padding: .1em .35em; border-radius: 4px; }
+  main { max-width: 46rem; margin: 0 auto; padding: 3rem 1.5rem 4rem; }
+  h1 { font-size: 1.9rem; letter-spacing: -.02em; margin: 0 0 .5rem; }
+  h1 .grad { background: linear-gradient(100deg, var(--accent), var(--accent-warm));
+             -webkit-background-clip: text; background-clip: text; color: transparent; }
+  p.lede { color: var(--ink-dim); margin: 0 0 2rem; }
+  pre { background: var(--bg-raised); border: 1px solid var(--line); border-radius: 8px;
+        padding: 1rem 1.25rem; overflow-x: auto; font: .8rem/1.55 var(--mono); color: #d7e2ee; }
+  .ok { color: var(--good); font: 500 .9rem/1.7 var(--mono); }
+  .err { color: #f87171; font: 500 .9rem/1.7 var(--mono); }
+  footer { margin-top: 3rem; border-top: 1px solid var(--line); padding-top: 1.25rem;
+           color: var(--ink-faint); font-size: .85rem; }
+</style>
+
+<!-- The whole integration: one script tag. The @inlaysql/simple module
+     imports the rest of the SDK by relative paths, so no import map and no
+     bundler is needed. -->
+<script type="module" src="./packages/simple/src/inlaysql.js"></script>
+</head>
+<body>
+<main>
+  <h1>One script tag, <span class="grad">one global</span></h1>
+  <p class="lede">
+    <code>@inlaysql/simple</code> is the jQuery-shaped face of the SDK: an
+    <code>InlaySQL</code> global, shorthand models, and search that guesses
+    its columns from the schema.
+  </p>
+  <pre id="code">const db = await InlaySQL.open();
+
+const pages = await db.model("pages", {
+  id: "integer primary key",
+  title: "text",
+  body: "text bm25",
+  embedding: "vector(64) hnsw from:body",
+});
+await pages.insert([{ title: "Renew a passport", body: "…" }]);
+
+const hits = await db.search("pages", "renew a passport", { limit: 1 });</pre>
+  <pre id="sql"></pre>
+  <p class="ok" id="out">loading…</p>
+
+  <footer>
+    The <a href="./">full SDK surface</a> is the same files without the
+    global. Engine demos:
+    <a href="../../">main</a> · <a href="../site-search/">site search</a> ·
+    <a href="../playground/">playground</a>.
+  </footer>
+</main>
+
+<!-- Module scripts execute in document order: the global exists here. -->
+<script type="module">
+  const out = document.getElementById("out");
+
+  try {
+    const db = await InlaySQL.open();
+
+    const pages = await db.model("pages", {
+      id: "integer primary key",
+      title: "text",
+      body: "text bm25",
+      embedding: "vector(64) hnsw from:body",
+    });
+    await pages.insert([
+      { title: "Renew a passport", body: "Renew online in three steps; ten working days." },
+      { title: "File your tax return", body: "Returns are due by 30 June." },
+    ]);
+
+    const hits = await db.search("pages", "renew a passport", { limit: 1 });
+    document.getElementById("sql").textContent = hits.sql;
+    out.textContent = `✔ top result: ${hits.rows[0].title} (score ${hits.rows[0].score.toFixed(4)}) — one script tag, no build`;
+  } catch (error) {
+    out.textContent = `error: ${error}`;
+    out.className = "err";
+  }
+</script>
+</body>
+</html>
