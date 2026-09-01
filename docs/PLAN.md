@@ -17,37 +17,30 @@ current execution order without relying on local conversation history.
   planner-only changes still need the ordinary workspace and differential
   gates.
 
-## Current state
+## Current state (2026-09-02)
 
-- W1 raw row-id and bounded raw-leaf cursor slices are landed; range scans
-  remain a measured loss and should wait for stronger profile evidence.
-- W3's explicit normal-commit-ready seam, setup-separated concurrency timing,
-  focused writer selector and quiet-machine guard are landed. The focused
-  rerun was effectively flat against the old baseline, so cohort tuning is a
-  no-go for publication until a new pipeline hypothesis exists.
-- R4's staged prototype is landed. `ANALYZE` persists exact table row counts
-  and leading B-tree-key cardinalities with data/schema version stamps.
-  Complete current stats cost only the existing hash and index-probe join
-  operators in written order; missing, corrupt or stale stats use the old
-  rule-based path. `EXPLAIN` reports the costed choice. Join reordering is not
-  implemented.
-- The joins harness runs `ANALYZE` for both InlaySQL and SQLite before timing.
-  The cost constants are calibrated to InlaySQL's row-at-a-time probe cost;
-  the full secondary-index shape should remain on the hash path unless new
-  evidence changes that conclusion.
+- Cost-based join *reorder* landed as AHL-512: a two-table INNER join may run
+  with its sources exchanged when the cost model scores that cheaper, as a
+  plan rewrite with every ordinal remapped. Measured 1.31x on the joins
+  suite, interleaved. Bounded to full scans; `LIMIT` shapes refuse by design
+  (a different order is a different result set without `ORDER BY`).
+- Aggregate streaming landed as AHL-513/514/515: `GROUP BY` folds as rows
+  arrive through an ordered map, holding one representative row and one
+  accumulator set per group; ungrouped aggregates fold from the stream.
+- The raw-leaf cache and the collation-/`REAL`-keyed hash joins landed
+  earlier (see `PERF.md` 2026-08-31/09-01 sections).
+- **Every `BENCHMARK.md` table except joins predates all of the above**
+  (`2cb2539`, 2026-08-30). The published PK-inner-join and aggregate losses
+  may already be smaller than printed; nothing is claimed until regenerated.
+- A 2026-09-02 three-path code audit (root plan A4/A5/B4a/C7) attributed the
+  remaining read-, aggregate- and insert-path losses to specific line-item
+  allocation churn; that is the work queue below.
 
 ## Next work, in order
 
-1. ~~Run clean, guarded benchmark repeats when the host is quiet~~ — **owed,
-   re-deferred 2026-08-31 with a date: retry on or before 2026-09-07, in the
-   next quiet window.** Three attempts this date, all refused by the quiet
-   machine gate (1-minute load 4-10/18, desktop in active use). A
-   `BENCH_MAX_LOAD_PER_CPU=off` same-sitting variant of both commands *was*
-   run the same day as disclosed under-load data for the new
-   MySQL/PostgreSQL join/range cells (`BENCHMARK.md` "Read shapes and batch
-   insert against MySQL and PostgreSQL", `SCOREBOARD.md` §4.0) — but those
-   are **not** the clean back-tests this item owes and do not close it. The
-   pass criteria are unchanged: clean gate, three runs, spread within the
+1. **Run clean, guarded benchmark repeats when the host is quiet — still
+   owed, still first.** Now carries AHL-512/513/514/515, all unpublished.
+   Pass criteria unchanged: clean gate, three runs, spread within the
    suite's floor.
 
    ```sh
@@ -56,27 +49,48 @@ current execution order without relying on local conversation history.
    ```
 
    Keep the raw files in `bench/results/`; do not publish a row if the quiet
-   machine gate refuses or the repeat spread is too wide. `BENCH_MAX_LOAD_PER_CPU=off`
-   is for explicitly labelled diagnostics only.
+   machine gate refuses or the repeat spread is too wide.
+   `BENCH_MAX_LOAD_PER_CPU=off` is for explicitly labelled diagnostics only.
 
-   Side effect worth knowing before the retry: this session fixed a
-   `bench/run.sh` bug where any `BENCH_MAX_LOAD_PER_CPU=off` run exited 1
-   *after* publishing its results (an `[[ ]] &&` compound in the EXIT trap's
-   cleanup returning 1 under `set -e`), so pre-fix override runs in
-   `bench/results/` may show a spurious failure in their caller's log while
-   the result files themselves are complete.
+2. **The allocation diet** — bounded, invariant-free line items from the
+   audit, landed one at a time, each behind the existing gates. Read path:
+   `decode_value`'s double allocation per owned TEXT cell (`row.rs:436`);
+   `DecodeFilter`'s per-candidate `Vec<ValueRef>` including rejected rows;
+   `PartialEq<Value> for ValueRef` allocating per comparison;
+   `project_stream`'s per-row `Vec` with no capacity hint. Aggregate path:
+   `SUM`/`AVG`/`MIN`/`MAX` still hold every input value (only `COUNT` folds
+   incrementally) — fold incrementally through the same
+   `fold_aggregate_values` semantics, mutation-testing the tie; the group
+   key is re-materialised per row even on a hit and a miss descends the map
+   twice — probe borrowed, materialise on miss only. Insert path:
+   statement-invariant per-row work (`indexes_for`'s filtered `Vec`, the
+   per-row `Vec<Index>` clone the code flags at `engine.rs:665-668`,
+   `encode_table_row`'s rebuilt `Vec<DataType>`) hoisted to the statement.
+   The point read must not move; every fast path gets a test tying it to the
+   slow path.
 
-2. Compare the post-`ANALYZE` join result and `EXPLAIN` paths with SQLite. If
-   the clean data confirms the access-path constants, record the result in
-   `docs/research/cost-planner.md` and leave the published baseline unchanged.
+3. **Join-reorder remainder**: the `LIMIT`-shape output-order argument, then
+   index-probe access paths. The published `LIMIT`-join rows never benefit
+   from AHL-512 until this exists.
 
-3. Decide the next W2 stage-1 slice from evidence: either improve the losing
-   outer scan/materialisation path (W1/W2 machinery) or add a narrowly tested
-   access-path refinement. Do not add join reordering until output-order,
-   `LEFT JOIN`, `ORDER BY`, stale-stat and differential-result proofs exist.
+4. **`RangeCursor` extension** to `walk`/`scan_range_from` (WITHOUT ROWID
+   scans, `UNIQUE` collision check) — bounded, read-path-only.
 
-4. Keep W3, R9/server comparison, W4 retrieval validation and S4 scale work
-   parallel. Do not let a noisy W3 result block the planner work.
+5. **Batch executor (B4)** — owns the remaining aggregate floor (scan+decode,
+   10.28 ms of the 18.38 ms shape). R3 brief first; point read must not move.
+
+6. **Server posture F3/F4** — refuse-to-expose defaults; fuzz the packet path.
+
+7. **Insert structural half (C7)**: dirty pages held as decoded `Node`s
+   across a transaction, encoded once at commit (today every row re-decodes,
+   deep-clones and re-encodes every page on its path — `tree.rs:2597`).
+   Behind the `Storage` seam but changes what `rebase_pending` walks: both
+   release DST sweeps mandatory.
+
+8. **C1 commit-side logical group commit** — highest payoff, data-loss risk,
+   full DST rigor; only when it can be done carefully.
+
+9. **Serverless R13 brief → object-store prototype** — runs in parallel.
 
 ## Acceptance and handoff
 
