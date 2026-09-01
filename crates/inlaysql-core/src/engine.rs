@@ -5551,7 +5551,7 @@ impl Engine {
                         rows: Vec::new(),
                     })
                 }
-                None => project_stream(&plan.items, stream, env),
+                None => project_stream(&plan.items, stream, env, limit),
             };
         }
 
@@ -9326,14 +9326,49 @@ fn project(items: &[SelectItem], rows: Vec<ExecRow>, env: &Env<'_>) -> Result<Re
     })
 }
 
+/// The most output rows [`project_stream`] will reserve on a `LIMIT`'s word
+/// alone.
+///
+/// A `LIMIT` bounds the answer without describing it: `LIMIT 1000000` over a
+/// three-row table would otherwise reserve for a million rows and return
+/// three. Trusting it up to a page's worth puts every page a client actually
+/// asks for in one allocation, and caps the cost of a wrong guess at tens of
+/// kilobytes rather than tens of megabytes. Past this the vector doubles the
+/// way it always did.
+const PROJECTION_ROWS_RESERVED: usize = 1024;
+
+/// How many output rows to reserve for a stream bounded by `limit`.
+///
+/// An unbounded query reserves nothing: guessing the size of a scan's answer
+/// is cardinality estimation's job, and a guess made here would be wrong in
+/// the one direction that costs memory rather than time.
+fn reserved_rows(limit: Option<usize>) -> usize {
+    limit.unwrap_or(0).min(PROJECTION_ROWS_RESERVED)
+}
+
 /// [`project`] for a query whose rows stream straight out of the pipeline:
 /// the same projection, but consuming a [`RowStream`] rather than an already
 /// collected `Vec<ExecRow>`, so a non-blocking query never materialises the
 /// intermediate `ExecRow`s. The answer is identical — see [`Engine::run_select`]
 /// for why skipping the empty-`ORDER BY` re-sort is safe.
-fn project_stream(items: &[SelectItem], stream: RowStream<'_>, env: &Env<'_>) -> Result<ResultSet> {
+///
+/// `limit` is the caller's `LIMIT`, already applied to `stream`, and is used
+/// only to size the output vector — see [`reserved_rows`]. It cannot change
+/// which rows come out, because the rows it would have to drop have already
+/// been dropped by the `take` on the stream.
+///
+/// The per-row projection is [`moving_projection`]'s, the same as the
+/// collected path's: a plain column list moves each value out of the row
+/// rather than cloning it, and only a projection with an expression in it
+/// falls back to [`project_row`].
+fn project_stream(
+    items: &[SelectItem],
+    stream: RowStream<'_>,
+    env: &Env<'_>,
+    limit: Option<usize>,
+) -> Result<ResultSet> {
     let columns = items.iter().map(|item| item.label().to_string()).collect();
-    let mut out_rows = Vec::new();
+    let mut out_rows = Vec::with_capacity(reserved_rows(limit));
     match moving_projection(items) {
         Some(moves) => {
             for row in stream {
@@ -9729,6 +9764,30 @@ mod tests {
             compare_group_keys(&[text("a")], &[blob(b"a")], &collations),
             Ordering::Less,
             "TEXT orders below BLOB even with identical bytes"
+        );
+    }
+
+    /// The projection's capacity hint trusts a `LIMIT` only as far as it is
+    /// safe to: a page's worth, never the number a client happened to write.
+    ///
+    /// A hint is not an answer — the result is whatever the stream yields, and
+    /// `a_limit_stops_the_scan_rather_than_truncating_the_answer` in
+    /// `streaming.rs` is what pins that. This pins the arithmetic, including
+    /// the two ends that would otherwise be found by an out-of-memory report:
+    /// no `LIMIT` reserves nothing, and an absurd one reserves the cap.
+    #[test]
+    fn a_limit_reserves_a_page_at_most() {
+        assert_eq!(reserved_rows(None), 0, "an unbounded query guesses nothing");
+        assert_eq!(reserved_rows(Some(0)), 0);
+        assert_eq!(reserved_rows(Some(20)), 20, "a page-sized LIMIT is trusted");
+        assert_eq!(
+            reserved_rows(Some(PROJECTION_ROWS_RESERVED)),
+            PROJECTION_ROWS_RESERVED
+        );
+        assert_eq!(
+            reserved_rows(Some(usize::MAX)),
+            PROJECTION_ROWS_RESERVED,
+            "a LIMIT larger than any answer must not be reserved for"
         );
     }
 }
