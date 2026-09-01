@@ -201,14 +201,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "points" => run_points(&config, &path),
         "indexed" => run_indexed(&config, &path),
         "indexed-range" => run_indexed_range(&config, &path),
+        "aggregate" => run_aggregate(&config, &path),
         "joins" => run_joins(&config, &path, Shapes::All),
         "joins-limit" => run_joins(&config, &path, Shapes::LimitOnly),
         "writes" => run_writes(&config, &path),
         "retrieval" => run_retrieval(&config, &path),
         other => {
             eprintln!(
-                "unknown suite `{other}`, expected points, indexed, indexed-range, joins, \
-                 joins-limit, writes or retrieval"
+                "unknown suite `{other}`, expected points, indexed, indexed-range, aggregate, \
+                 joins, joins-limit, writes or retrieval"
             );
             std::process::exit(2);
         }
@@ -360,6 +361,59 @@ const RANGE_SIZE: usize = 50;
 /// suite (AHL-479) rather than folded into `run_indexed`'s loop, so a profile
 /// of the entry-range walk is not diluted by the point-lookup shape — the
 /// same reason `joins` gets its own suite rather than sharing `points`'.
+/// `aggregate`: the `GROUP BY` and scalar-aggregate shapes
+/// `crates/inlaysql-bench/src/bin/sql_shapes.rs` measures against MySQL and
+/// PostgreSQL, which is the worst multiple `BENCHMARK.md` publishes against
+/// anyone — 3.4-6.0x slower than both. Added so that loss can be attributed
+/// before anything is built to fix it.
+///
+/// Same schema and the same 100-bucket `n` column `read_driver.py` builds for
+/// the opponents, so what is profiled here is the shape that lost.
+fn run_aggregate(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut db = config.open(path)?;
+    db.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, body TEXT, n INTEGER)",
+        &[],
+    )?;
+    let insert = db.prepare("INSERT INTO users (id, email, body, n) VALUES (?, ?, ?, ?)")?;
+    let payload = "x".repeat(config.payload);
+
+    db.begin()?;
+    for id in 1..=config.rows as i64 {
+        let bound = [
+            Value::Integer(id),
+            Value::Text(email(id).into()),
+            Value::Text(payload.clone().into()),
+            Value::Integer(id % 100),
+        ];
+        if let Err(inlaysql::Error::Transaction(_)) = db.execute_prepared(&insert, &bound) {
+            db.commit()?;
+            db.begin()?;
+            db.execute_prepared(&insert, &bound)?;
+        }
+    }
+    db.commit()?;
+    db.execute("CREATE INDEX users_email ON users (email) USING BTREE", &[])?;
+    db.execute("ANALYZE", &[])?;
+
+    let group = db.prepare("SELECT n, COUNT(*) FROM users GROUP BY n")?;
+    let scalar = db.prepare("SELECT COUNT(*), MIN(id), MAX(id) FROM users")?;
+    // Warmed outside the timed window, as every other suite here does.
+    db.query_prepared(&group, &[])?;
+    db.query_prepared(&scalar, &[])?;
+
+    let timed: [&Statement; 2] = [&group, &scalar];
+    announce_query_phase();
+    let mut cycle = 0usize;
+    let (iterations, elapsed) = run_for(config.seconds, || {
+        let shape = timed[cycle % timed.len()];
+        cycle += 1;
+        db.query_prepared(shape, &[]).map(|_| ())
+    })?;
+    report("aggregate", iterations, elapsed);
+    Ok(())
+}
+
 fn run_indexed_range(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut db = config.open(path)?;
     db.execute(
