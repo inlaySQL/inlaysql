@@ -663,9 +663,10 @@ pub struct Engine {
     /// failure. Per table, both answers are exact.
     ///
     /// It costs a `BTreeSet` probe per indexed row where it used to cost a
-    /// store. That sits next to the `Vec<Index>` clone
-    /// [`Engine::index_row_retrieval`] already does per row, which is orders
-    /// of magnitude more.
+    /// store. That used to sit next to a `Vec<Index>` clone
+    /// [`Engine::index_row_retrieval`] did per row, which was orders of
+    /// magnitude more; that clone is now [`RowIndexes`], taken once per
+    /// statement, and this probe is what is left of the per-row cost.
     dirty_tables: BTreeSet<String>,
     next_row_id: RowId,
     /// The row id the last `INSERT` that auto-assigned one handed out. See
@@ -745,6 +746,49 @@ pub struct Engine {
     /// automatic indexing; `paged_vector_indexes` decides whether a vector
     /// index lives in the database or in memory.
     options: EngineOptions,
+}
+
+/// The index declarations one statement maintains, resolved once before its
+/// first row instead of again for every row.
+///
+/// [`Catalog::indexes_for`] filters the whole index map and allocates a
+/// `Vec<&Index>` on each call, and the retrieval half then deep-cloned every
+/// `Index` that `Vec` held — both of them per row, for a set that cannot
+/// change while a statement runs. Every write statement already depends on
+/// exactly that: it takes its own [`Table`] clone before the first row and
+/// never re-reads it, because no DDL can interleave with the row loop.
+///
+/// Owned rather than borrowed, and that is the whole reason the clone existed
+/// in the first place: every consumer needs `&mut self` immediately
+/// afterwards — `self.storage.put_index_entry`, a retrieval backend's
+/// `insert` — so a `Vec<&Index>` borrowed out of `self.catalog` cannot
+/// survive the call it exists to feed. The clone is still here; it is now one
+/// per statement rather than one per row.
+struct RowIndexes {
+    /// The B-tree indexes, in the catalog's name order — which is the order
+    /// [`btree_entry_keys`] emits entries in, and the order the DST sweep's
+    /// "one entry per row per index" count walks.
+    btree: Vec<Index>,
+    /// The retrieval indexes — `FullText` and `Vector` — in the same order.
+    retrieval: Vec<Index>,
+}
+
+impl RowIndexes {
+    /// Split one table's declared indexes into the two halves the write path
+    /// maintains separately. Exhaustive over [`IndexKind`] on purpose: a kind
+    /// added later has to be placed in one half or the other here, rather
+    /// than silently falling out of both and leaving an index nothing writes.
+    fn resolve(catalog: &Catalog, table: &str) -> Self {
+        let mut btree = Vec::new();
+        let mut retrieval = Vec::new();
+        for index in catalog.indexes_for(table) {
+            match index.kind {
+                IndexKind::BTree => btree.push(index.clone()),
+                IndexKind::FullText | IndexKind::Vector => retrieval.push(index.clone()),
+            }
+        }
+        Self { btree, retrieval }
+    }
 }
 
 impl Engine {
@@ -3037,6 +3081,7 @@ impl Engine {
             // emptied first, or the rows below would be indexed a second time
             // on top of the copy it just opened.
             self.reset_self_persisting_indexes(table)?;
+            let indexes = RowIndexes::resolve(&self.catalog, &table.name);
             // The one scan in this engine that is deliberately **not**
             // cancellable, and it has to stay that way.
             //
@@ -3063,7 +3108,7 @@ impl Engine {
                 // transaction as the rows they describe, so they are already
                 // exactly as current as the data — and re-deriving them here
                 // would make every open O(rows × indexes) of pointless writes.
-                self.index_row_retrieval(table, id, &row)?;
+                self.index_row_retrieval(table, &indexes, id, &row)?;
             }
         }
         // Every table has just been read or restored at the committed state,
@@ -3845,6 +3890,11 @@ impl Engine {
         // half a statement behind.
         let proposed = self.proposed_rows(insert, &table, &rules, params, &env)?;
 
+        // The indexes this statement maintains, for the same reason `table`
+        // above is a clone taken once: no DDL can interleave with the loop
+        // below, so the set every row writes into is the set resolved here.
+        let indexes = RowIndexes::resolve(&self.catalog, &table.name);
+
         let mut written = 0usize;
         let mut returned: Vec<Vec<Value>> = Vec::new();
         for mut row in proposed {
@@ -3911,9 +3961,19 @@ impl Engine {
                                 continue;
                             }
                             deleted.push(conflict.id);
-                            self.remove_btree_entries(&table, conflict.id, &conflict.values)?;
+                            self.remove_btree_entries(
+                                &table,
+                                &indexes,
+                                conflict.id,
+                                &conflict.values,
+                            )?;
                             self.storage.delete_row(&table.name, conflict.id)?;
-                            self.deindex_row_retrieval(&table, conflict.id, &conflict.values)?;
+                            self.deindex_row_retrieval(
+                                &table,
+                                &indexes,
+                                conflict.id,
+                                &conflict.values,
+                            )?;
                             if !table.temporary {
                                 self.note_change(&table.name, conflict.id, ChangeKind::Delete);
                             }
@@ -3927,7 +3987,8 @@ impl Engine {
                             let existing = conflict.id;
                             let old = conflict.values.clone();
                             self.ensure_unique(&table, &rules, existing, &next)?;
-                            let id = self.write_changed_row(&table, existing, &old, next)?;
+                            let id =
+                                self.write_changed_row(&table, &indexes, existing, &old, next)?;
                             written += 1;
                             if let Some(items) = &insert.returning {
                                 returned.push(self.project_stored(&table, id, items, &env)?);
@@ -3947,7 +4008,7 @@ impl Engine {
             if assigned {
                 self.last_insert_row_id = Some(id);
             }
-            self.index_row(&table, id, &row)?;
+            self.index_row(&table, &indexes, id, &row)?;
             if !table.temporary {
                 self.note_change(&table.name, id, ChangeKind::Insert);
             }
@@ -4316,6 +4377,7 @@ impl Engine {
     fn write_changed_row(
         &mut self,
         table: &Table,
+        indexes: &RowIndexes,
         id: RowId,
         old: &[Value],
         next: Vec<Value>,
@@ -4346,17 +4408,17 @@ impl Engine {
         // Every storage write this row needs, with nothing between them that
         // could commit — see [`Engine::write_btree_entries`]. The row and its
         // entries move together or not at all.
-        self.remove_btree_entries(table, id, old)?;
+        self.remove_btree_entries(table, indexes, id, old)?;
         if moved != id {
             self.storage.delete_row(&table.name, id)?;
         }
         self.storage
             .put_row(&table.name, moved, &encode_table_row(table, &next))?;
-        self.write_btree_entries(table, moved, &next)?;
+        self.write_btree_entries(table, indexes, moved, &next)?;
 
         // Then the retrieval backends, which may commit whatever is buffered.
-        self.deindex_row_retrieval(table, id, old)?;
-        self.index_row_retrieval(table, moved, &next)?;
+        self.deindex_row_retrieval(table, indexes, id, old)?;
+        self.index_row_retrieval(table, indexes, moved, &next)?;
 
         if moved != id {
             if !table.temporary {
@@ -4705,9 +4767,18 @@ impl Engine {
     /// itself. That is the crash-safety property in one sentence: there is no
     /// moment at which the row is durable and its index entry is not, because
     /// they reach the log in the same record.
-    fn index_row(&mut self, table: &Table, id: RowId, row: &[Value]) -> Result<()> {
-        self.write_btree_entries(table, id, row)?;
-        self.index_row_retrieval(table, id, row)
+    ///
+    /// `indexes` is the statement's own [`RowIndexes`], resolved once for
+    /// every row it writes.
+    fn index_row(
+        &mut self,
+        table: &Table,
+        indexes: &RowIndexes,
+        id: RowId,
+        row: &[Value],
+    ) -> Result<()> {
+        self.write_btree_entries(table, indexes, id, row)?;
+        self.index_row_retrieval(table, indexes, id, row)
     }
 
     /// Write this row's B-tree entries, and nothing else.
@@ -4723,8 +4794,14 @@ impl Engine {
     /// recovered database. A B-tree index has no write-version stamp to catch
     /// it with — the entries *are* the index — so the fix is that there is
     /// never a moment between them.
-    fn write_btree_entries(&mut self, table: &Table, id: RowId, row: &[Value]) -> Result<()> {
-        for key in self.btree_entry_keys(table, id, row)? {
+    fn write_btree_entries(
+        &mut self,
+        table: &Table,
+        indexes: &RowIndexes,
+        id: RowId,
+        row: &[Value],
+    ) -> Result<()> {
+        for key in btree_entry_keys(table, indexes, id, row)? {
             self.storage.put_index_entry(&key)?;
         }
         Ok(())
@@ -4732,8 +4809,14 @@ impl Engine {
 
     /// Remove this row's B-tree entries, and nothing else. See
     /// [`Engine::write_btree_entries`] for why it is separable.
-    fn remove_btree_entries(&mut self, table: &Table, id: RowId, row: &[Value]) -> Result<()> {
-        for key in self.btree_entry_keys(table, id, row)? {
+    fn remove_btree_entries(
+        &mut self,
+        table: &Table,
+        indexes: &RowIndexes,
+        id: RowId,
+        row: &[Value],
+    ) -> Result<()> {
+        for key in btree_entry_keys(table, indexes, id, row)? {
             self.storage.delete_index_entry(&key)?;
         }
         Ok(())
@@ -4747,46 +4830,18 @@ impl Engine {
     /// single-column `(body)` index and a multi-column `(title, body)` one
     /// can coexist — see `Catalog::create_index`'s dup-check), so "one index
     /// per column" is no longer the shape to iterate, "one index" is.
-    fn index_row_retrieval(&mut self, table: &Table, id: RowId, row: &[Value]) -> Result<()> {
+    fn index_row_retrieval(
+        &mut self,
+        table: &Table,
+        indexes: &RowIndexes,
+        id: RowId,
+        row: &[Value],
+    ) -> Result<()> {
         self.mark_indexes_dirty(&table.name);
-        let declared: Vec<Index> = self
-            .catalog
-            .indexes_for(&table.name)
-            .into_iter()
-            .filter(|index| index.kind.is_retrieval())
-            .cloned()
-            .collect();
-        for index in &declared {
+        for index in &indexes.retrieval {
             self.index_row_for_index(table, index, id, row)?;
         }
         Ok(())
-    }
-
-    /// The key this row contributes to each B-tree index of `table`.
-    ///
-    /// Every row contributes exactly one entry per index, `NULL`s included, so
-    /// "one entry per row per index" is an invariant a test can check — and
-    /// the DST sweep does.
-    fn btree_entry_keys(
-        &self,
-        table: &Table,
-        id: RowId,
-        row: &[Value],
-    ) -> Result<Vec<alloc::vec::Vec<u8>>> {
-        let mut keys = Vec::new();
-        for index in self.catalog.indexes_for(&table.name) {
-            if index.kind != IndexKind::BTree {
-                continue;
-            }
-            let values = index_values(table, index, row)?;
-            keys.push(crate::index::entry_key(
-                &index.name,
-                &values,
-                &index.collations,
-                id,
-            )?);
-        }
-        Ok(keys)
     }
 
     /// Add a row's contribution to one declared retrieval index, if its
@@ -4833,16 +4888,15 @@ impl Engine {
     /// interleave the storage half with its own row write, in the order
     /// [`Engine::write_btree_entries`] explains, and a convenience wrapper
     /// that hid the ordering is what made the DST sweep fail once already.
-    fn deindex_row_retrieval(&mut self, table: &Table, id: RowId, row: &[Value]) -> Result<()> {
+    fn deindex_row_retrieval(
+        &mut self,
+        table: &Table,
+        indexes: &RowIndexes,
+        id: RowId,
+        row: &[Value],
+    ) -> Result<()> {
         self.mark_indexes_dirty(&table.name);
-        let declared: Vec<Index> = self
-            .catalog
-            .indexes_for(&table.name)
-            .into_iter()
-            .filter(|index| index.kind.is_retrieval())
-            .cloned()
-            .collect();
-        for index in &declared {
+        for index in &indexes.retrieval {
             self.deindex_row_for_index(table, index, id, row)?;
         }
         Ok(())
@@ -4897,6 +4951,7 @@ impl Engine {
         }
         let rules = self.rules_for(&table)?;
         let env = self.env(params);
+        let indexes = RowIndexes::resolve(&self.catalog, &table.name);
         let mut count = 0;
         let mut returned: Vec<Vec<Value>> = Vec::new();
         for (id, bytes) in self.candidate_rows(&table, &plan.filter, params)? {
@@ -4923,7 +4978,7 @@ impl Engine {
             // row, which is the same O(rows) scan an `INSERT` pays and for the
             // same reason.
             self.ensure_unique(&table, &rules, id, &next)?;
-            let id = self.write_changed_row(&table, id, &row, next)?;
+            let id = self.write_changed_row(&table, &indexes, id, &row, next)?;
             count += 1;
             if let Some(items) = &plan.returning {
                 returned.push(self.project_stored(&table, id, items, &env)?);
@@ -5036,6 +5091,7 @@ impl Engine {
             return self.delete_without_rowid(plan, &table, params);
         }
         let env = self.env(params);
+        let indexes = RowIndexes::resolve(&self.catalog, &table.name);
         let mut count = 0;
         let mut returned: Vec<Vec<Value>> = Vec::new();
         for (id, bytes) in self.candidate_rows(&table, &plan.filter, params)? {
@@ -5057,9 +5113,9 @@ impl Engine {
                 returned.push(project_row(items, &exec, &env)?);
             }
             // Storage first, backends second — see `write_btree_entries`.
-            self.remove_btree_entries(&table, id, &row)?;
+            self.remove_btree_entries(&table, &indexes, id, &row)?;
             self.storage.delete_row(&table.name, id)?;
-            self.deindex_row_retrieval(&table, id, &row)?;
+            self.deindex_row_retrieval(&table, &indexes, id, &row)?;
             if !table.temporary {
                 self.note_change(&table.name, id, ChangeKind::Delete);
             }
@@ -7712,6 +7768,35 @@ fn index_values<'a>(table: &Table, index: &Index, row: &'a [Value]) -> Result<Ve
         values.push(row.get(ordinal).unwrap_or(&NULL));
     }
     Ok(values)
+}
+
+/// The key this row contributes to each B-tree index of `table`.
+///
+/// Every row contributes exactly one entry per index, `NULL`s included, so
+/// "one entry per row per index" is an invariant a test can check — and the
+/// DST sweep does.
+///
+/// Every key is built before any is written, and that is deliberate:
+/// [`index_values`] can fail on a row the catalog and the table disagree
+/// about, and a half-written entry list for one row is exactly the state
+/// [`Engine::write_btree_entries`] exists to make impossible.
+fn btree_entry_keys(
+    table: &Table,
+    indexes: &RowIndexes,
+    id: RowId,
+    row: &[Value],
+) -> Result<Vec<alloc::vec::Vec<u8>>> {
+    let mut keys = Vec::with_capacity(indexes.btree.len());
+    for index in &indexes.btree {
+        let values = index_values(table, index, row)?;
+        keys.push(crate::index::entry_key(
+            &index.name,
+            &values,
+            &index.collations,
+            id,
+        )?);
+    }
+    Ok(keys)
 }
 
 /// The text one row contributes to a (possibly multi-column) `FullText`
