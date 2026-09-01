@@ -23,6 +23,7 @@ use sqlparser::ast::{
     SetQuantifier, Statement, TableAliasColumnDef, TableFactor, TableObject, UnaryOperator,
     Value as AstValue, WindowSpec, WindowType, With,
 };
+use sqlparser::ast::BinaryOperator;
 use sqlparser::dialect::SQLiteDialect;
 use sqlparser::parser::Parser;
 
@@ -3100,20 +3101,74 @@ fn plan_select_body<'p>(
 
     let mut filter = None;
     if let Some(selection) = &select.selection {
-        let before = binder.aggregates.len();
-        let before_windows = binder.windows.len();
-        let resolved = resolve_expr(selection, &scope, binder)?;
-        if binder.aggregates.len() != before {
+        // A retrieval expression may drive the query from `WHERE` alone —
+        // MySQL's `WHERE MATCH (cols) AGAINST ('query')` shape, and the
+        // projectionless spelling of the retrieval functions. The conjunct
+        // that is a score function becomes the query's retrieval (unprojected:
+        // the output columns stay exactly the ones the statement wrote) and
+        // the remaining conjuncts stay the filter. One retrieval per query,
+        // the same rule the projection enforces; a score function anywhere
+        // else in the WHERE — a comparison threshold, `NOT`, an `OR` arm — is
+        // refused by name rather than left to die as a scalar call, because
+        // the engine has no scalar `bm25_score`.
+        let where_score = if score.is_none() {
+            split_where_score(selection)?
+        } else if where_contains_score(selection) {
             return Err(Error::Unsupported(
-                "aggregate functions are not allowed in WHERE".to_string(),
+                "a retrieval expression may appear in the projection or in WHERE, not both"
+                    .to_string(),
             ));
+        } else {
+            WhereScore::None
+        };
+        let mut where_handled = false;
+        match where_score {
+            WhereScore::None => {}
+            WhereScore::Multiple => {
+                return Err(Error::Unsupported(
+                    "a query may contain only one retrieval expression".to_string(),
+                ));
+            }
+            WhereScore::One { expr, rest } => {
+                let resolved_score = resolve_score_expr(expr, &scope, binder)?
+                    .expect("the splitter only lifts retrieval functions");
+                score = Some(resolved_score);
+                where_handled = true;
+                if let Some(rest) = rest {
+                    let before = binder.aggregates.len();
+                    let before_windows = binder.windows.len();
+                    let resolved = resolve_expr(&rest, &scope, binder)?;
+                    if binder.aggregates.len() != before {
+                        return Err(Error::Unsupported(
+                            "aggregate functions are not allowed in WHERE".to_string(),
+                        ));
+                    }
+                    if binder.windows.len() != before_windows {
+                        return Err(Error::Unsupported(
+                            "window functions are not allowed in WHERE".to_string(),
+                        ));
+                    }
+                    filter = Some(resolved);
+                }
+            }
         }
-        if binder.windows.len() != before_windows {
-            return Err(Error::Unsupported(
-                "window functions are not allowed in WHERE".to_string(),
-            ));
+        if !where_handled {
+            // The normal path: every remaining WHERE shape the engine knows.
+            let before = binder.aggregates.len();
+            let before_windows = binder.windows.len();
+            let resolved = resolve_expr(selection, &scope, binder)?;
+            if binder.aggregates.len() != before {
+                return Err(Error::Unsupported(
+                    "aggregate functions are not allowed in WHERE".to_string(),
+                ));
+            }
+            if binder.windows.len() != before_windows {
+                return Err(Error::Unsupported(
+                    "window functions are not allowed in WHERE".to_string(),
+                ));
+            }
+            filter = Some(resolved);
         }
-        filter = Some(resolved);
     }
 
     let (group_by, group_collations) = resolve_group_by(&select.group_by, &scope, binder)?;
@@ -6534,6 +6589,122 @@ fn resolve_scalar_function(
 }
 
 /// Recognise a retrieval expression, or return `None` for ordinary expressions.
+
+/// What a WHERE clause contributed to a retrieval query: either nothing
+/// (`WHERE id > 3` and friends, the ordinary filter path), exactly one
+/// conjunct that is a retrieval expression — the `WHERE MATCH (cols) AGAINST
+/// (query)` shape, with the remaining conjuncts handed back as the filter —
+/// or more than one, which no query may carry.
+enum WhereScore<'a> {
+    None,
+    One {
+        expr: &'a Expr,
+        rest: Option<Expr>,
+    },
+    Multiple,
+}
+
+/// Split a WHERE clause into its top-level conjunction and classify it. An
+/// `AND` tree is flattened — `a AND (b AND c)` is the same conjunction as its
+/// flat spelling, so parentheses cannot hide a retrieval expression from the
+/// query or smuggle in a second one.
+fn split_where_score(selection: &Expr) -> Result<WhereScore> {
+    let mut conjuncts = Vec::new();
+    collect_conjuncts(selection, &mut conjuncts);
+    let mut scores = Vec::new();
+    let mut rest = Vec::new();
+    for conjunct in conjuncts {
+        if is_score_fn(conjunct) {
+            scores.push(conjunct);
+        } else if where_contains_score(conjunct) {
+            // A score function nested inside anything that is not the bare
+            // conjunct — `MATCH (...) > 0.5`, `NOT MATCH (...)`, an `OR` arm —
+            // cannot drive the retrieval and has no scalar meaning. Refuse it
+            // by name rather than let it die later as "no such function", and
+            // say what the supported shapes are.
+            return Err(Error::Unsupported(
+                "a retrieval expression must be a whole WHERE conjunct (as in                  `WHERE MATCH (cols) AGAINST ('query') AND ...`); thresholds, negations                  and OR branches are not supported — alias the score in the projection                  instead"
+                    .to_string(),
+            ));
+        } else {
+            rest.push(conjunct);
+        }
+    }
+    match scores.len() {
+        0 => Ok(WhereScore::None),
+        1 => {
+            let rest = rest
+                .into_iter()
+                .rev()
+                .cloned()
+                .reduce(|right, left| Expr::BinaryOp {
+                    left: Box::new(left),
+                    op: BinaryOperator::And,
+                    right: Box::new(right),
+                });
+            Ok(WhereScore::One {
+                expr: scores[0],
+                rest,
+            })
+        }
+        _ => Ok(WhereScore::Multiple),
+    }
+}
+
+/// Flatten a WHERE clause into its top-level conjunction, unwrapping the
+/// parentheses sqlparser nests around grouped conditions.
+fn collect_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::Nested(inner) => collect_conjuncts(inner, out),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_conjuncts(left, out);
+            collect_conjuncts(right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Whether `expr` *is* a retrieval expression — a bare call to one of the
+/// three score functions. Parenthesised calls count; anything more elaborate
+/// (`bm25_score(..) > 0`) does not, by design — see `split_where_score`.
+fn is_score_fn(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nested(inner) => is_score_fn(inner),
+        Expr::Function(function) => {
+            let Ok(name) = object_name(&function.name) else {
+                return false;
+            };
+            matches!(function.args, FunctionArguments::List(_))
+                && (name.eq_ignore_ascii_case("bm25_score")
+                    || name.eq_ignore_ascii_case("vector_score")
+                    || name.eq_ignore_ascii_case("fuse")
+                    || name.eq_ignore_ascii_case("rrf"))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a score function appears anywhere inside `expr`, at any depth —
+/// the check that keeps a projected retrieval and a WHERE one from being
+/// requested in the same statement, and that refuses the unsupported nested
+/// spellings before they can fail as scalar calls.
+fn where_contains_score(expr: &Expr) -> bool {
+    if is_score_fn(expr) {
+        return true;
+    }
+    match expr {
+        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => where_contains_score(inner),
+        Expr::BinaryOp { left, right, .. } => {
+            where_contains_score(left) || where_contains_score(right)
+        }
+        _ => false,
+    }
+}
+
 fn resolve_score_expr(
     expr: &Expr,
     scope: &Scope,

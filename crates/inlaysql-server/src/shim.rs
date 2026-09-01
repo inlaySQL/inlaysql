@@ -19,7 +19,7 @@
 use inlaysql::{Catalog, DataType, ResultSet, Table, Value};
 
 use crate::errors::MysqlError;
-use crate::{mysqlddl, mysqlfunc};
+use crate::{mysqlddl, mysqlfunc, mysqlmatch};
 
 use crate::session::{Session, Warning, SERVER_VERSION};
 use crate::sqltext::{
@@ -408,7 +408,7 @@ pub fn intercept(
 
 /// Translate a statement out of MySQL's dialect and into the engine's.
 ///
-/// Two passes, in this order and only this order:
+/// Three passes, in this order and only this order:
 ///
 /// 1. [`crate::mysqlddl`] takes the MySQL-only DDL decoration off it, refusing
 ///    the clauses it cannot honour. It runs first because it recognises
@@ -416,6 +416,10 @@ pub fn intercept(
 ///    `NOW()` before it looked would hide the clause it exists to refuse.
 /// 2. [`crate::mysqlfunc`] rewrites the MySQL-named scalar functions into the
 ///    ones the engine has.
+/// 3. [`crate::mysqlmatch`] rewrites full-text search out of MySQL's
+///    `MATCH ... AGAINST` spelling and into the engine's native
+///    `bm25_score(...)` — a pure dialect change, so it runs last and touches
+///    nothing else.
 ///
 /// Shared with `COM_STMT_PREPARE`, which has to translate a statement it is not
 /// about to run, so the two paths cannot disagree about what a statement means.
@@ -424,7 +428,7 @@ pub fn translate(sql: &str, catalog: &Catalog) -> Result<mysqlddl::Translation, 
     let statements = translation
         .statements
         .iter()
-        .map(|statement| mysqlfunc::rewrite(statement))
+        .map(|statement| mysqlmatch::rewrite(&mysqlfunc::rewrite(statement)?))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(mysqlddl::Translation {
         statements,

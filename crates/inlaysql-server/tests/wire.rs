@@ -7367,3 +7367,95 @@ fn optimize_table_needs_mysqls_privileges_on_every_table_it_names() {
     reader.quit();
     root.quit();
 }
+
+// ------------------------------------------------------------- MATCH ... AGAINST
+//
+// MySQL's full-text spelling translates onto the engine's native BM25 probe.
+// These tests run the client's own spelling through the wire and compare it
+// against the `bm25_score` spelling of the same query, so the two cannot
+// disagree about which rows match or how they rank.
+
+#[test]
+fn mysql_match_against_translates_to_the_native_bm25_probe() {
+    let server = TestServer::start("match-against");
+    let mut client = server.client();
+    client.ok_query("CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, body TEXT)");
+    client.ok_query("CREATE INDEX docs_body ON docs (body)");
+    client.ok_query("CREATE INDEX docs_title ON docs (title)");
+    client.ok_query(
+        "INSERT INTO docs (id, title, body) VALUES \
+         (1, 'alpha', 'alpha alpha alpha'), (2, 'beta', 'beta beta beta'), \
+         (3, 'mixed', 'alpha beta')",
+    );
+
+    // Same rows, same order as the bm25_score spelling of the same query —
+    // the translation is a spelling change, not a different search.
+    let native = client
+        .ok_query(
+            "SELECT id, bm25_score(body, 'alpha') AS score FROM docs \
+             ORDER BY score DESC, id ASC",
+        )
+        .rows();
+    let translated = client
+        .ok_query(
+            "SELECT id, MATCH (body) AGAINST ('alpha') AS relevance FROM docs \
+             ORDER BY relevance DESC, id ASC",
+        )
+        .rows();
+    assert_eq!(translated.column("id"), vec!["1", "3"]);
+    assert_eq!(translated.column("id"), native.column("id"));
+    // The relevance value is the probe's score, not a constant.
+    assert_eq!(translated.column("relevance"), native.column("score"));
+
+    // WHERE + MATCH composes: the predicate is pushed into the retriever.
+    let filtered = client
+        .ok_query(
+            "SELECT id FROM docs WHERE id < 3 AND MATCH (body) AGAINST ('alpha')",
+        )
+        .rows();
+    assert_eq!(filtered.column("id"), vec!["1"]);
+
+    // Multi-column MATCH maps onto the multi-column probe.
+    let both = client
+        .ok_query(
+            "SELECT id FROM docs WHERE MATCH (title, body) AGAINST ('beta') \
+             ORDER BY id ASC",
+        )
+        .rows();
+    assert_eq!(both.column("id"), vec!["2", "3"]);
+
+    // The default mode, spelled out, is accepted: same query, same rows.
+    let explicit_mode = client
+        .ok_query(
+            "SELECT id FROM docs WHERE MATCH (body) \
+             AGAINST ('alpha' IN NATURAL LANGUAGE MODE)",
+        )
+        .rows();
+    assert_eq!(explicit_mode.column("id"), vec!["1", "3"]);
+
+    // A prepared statement keeps its ordinal: the `?` passes through the
+    // rewrite untouched, so the bind lands on the search query.
+    let statement = client
+        .prepare("SELECT id FROM docs WHERE MATCH (body) AGAINST (?)")
+        .expect("prepare a MATCH ... AGAINST (?)");
+    assert_eq!(statement.param_count, 1, "the rewrite must not move ordinals");
+    let executed = client
+        .execute(&statement, &[Param::Str("alpha".to_string())])
+        .expect("execute the prepared full-text search");
+    assert_eq!(executed.rows().column("id"), vec!["1", "3"]);
+
+    // The modes whose semantics the BM25 index does not implement are
+    // refused with their names in the message, never accepted and ignored.
+    let (_, boolean) = client.query_until_error(
+        "SELECT id FROM docs WHERE MATCH (body) AGAINST ('+alpha -beta' IN BOOLEAN MODE)",
+    );
+    assert_eq!(boolean.code, 1235, "{boolean:?}");
+    assert!(boolean.message.contains("BOOLEAN MODE"), "{boolean:?}");
+    let (_, expansion) = client.query_until_error(
+        "SELECT id FROM docs WHERE MATCH (body) AGAINST ('alpha' WITH QUERY EXPANSION)",
+    );
+    assert_eq!(expansion.code, 1235, "{expansion:?}");
+    assert!(expansion.message.contains("QUERY EXPANSION"), "{expansion:?}");
+
+    client.quit();
+}

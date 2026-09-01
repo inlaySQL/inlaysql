@@ -78,6 +78,7 @@ mod infoschema;
 mod metrics;
 mod mysqlddl;
 mod mysqlfunc;
+mod mysqlmatch;
 mod packet;
 mod protocol;
 mod session;

@@ -56,10 +56,17 @@ SUITE=quantization DOCS=100000 QUERIES=50 ./bench/run.sh           # x3, median 
 | Raw output | **`run.sh`/SQLite/sqlite-vec/concurrency/retrieval, median of three** (points, indexed, joins, vectors, concurrency 1/2/4/8, retrieval): `bench/results/20260830T{120941,122626,123414}Z.txt`, load 3.0–4.4/18. **Concurrency wide sweep + tail latency, median of three**: `bench/results/20260830T{124155,124632,125240}Z.txt`, `WRITER_LEVELS=1,2,3,4,5,6,8,12,16,24,32`, load 2.9–3.6/18 — one sweep now supplies every concurrency table on this page. **Quantisation spot-check at scale, median of three**: `bench/results/20260830T{125800,131326,132715}Z.txt`, `SUITE=quantization DOCS=100000 QUERIES=50`, load 2.3–4.8/18. **DuckDB/pgvector/Meilisearch retrieval, single run** (no repeat wrapper exists for `compare.sh`): `bench/results/20260830T134642Z-compare.txt`, load 1.1–1.9/18, four unrelated Docker containers idle throughout. **Carried forward, not regenerated this edition** (see each section for why): the "Against MySQL and PostgreSQL" table, its correction and its interleaved rerun (commit `b4798ce`, 2026-08-30, 5 repetitions, load-gated — `bench/results/20260830T095714Z-interleaved-oltp-compare.txt` and `bench/results/20260830T095714Z-rep{1..5}-{inlaysql-container,mysql,postgres}.json`); the "Server-to-server" table (process-based driver, 2026-08-29, `f8e29e9`); the concurrent-writer old-vs-new A/B (`08f5fd4`, 2026-08-30, `bench/results/ab-head-run{1,2,3}-*.txt` and `ab-pre94d96a6-run{1,2,3}-*.txt`). |
 
 One developer machine. Reproduce it; do not trust it. Every table on this
-page now comes from `2cb2539` — either measured fresh in this sitting, or an
+page comes from `2cb2539` — either measured fresh in that sitting, or an
 explicitly carried-forward section whose own commit and date are stated where
 it appears, per table, so a reader can always tell which build produced which
-number.
+number — **with one exception, added 2026-09-01: the joins table was
+regenerated on its own at `2eeced7`** and says so in place. It was singled out
+because three changes landed against exactly those shapes; every other table
+here predates them and is unaffected by them, because none of the three touch
+a path those tables measure. A full regeneration at the current commit is
+still owed, and is blocked on nothing but a machine quiet enough to pass the
+gate for the twenty-odd minutes the whole suite takes — which this one has not
+been.
 
 **Tooling correction, 2026-08-31 — every `compare.sh`-sourced table below is
 now owed a regeneration.** Several sections on this page disclose, correctly
