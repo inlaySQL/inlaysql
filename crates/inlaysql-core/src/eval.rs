@@ -1113,6 +1113,37 @@ pub fn evaluate_aggregate(
         values.push(evaluate(arg, row, Computed::NONE, env)?);
     }
 
+    fold_aggregate_values(aggregate, values, group, env)
+}
+
+/// Whether [`fold_aggregate_values`] can answer this aggregate from its
+/// argument values alone, with no access to the rows they came from.
+///
+/// Only `GROUP_CONCAT` cannot: its separator is an expression read from the
+/// group's *first row*, so the rows have to still exist when it folds.
+/// Everything else looks at nothing but the values.
+pub fn folds_from_values_alone(aggregate: &Aggregate) -> bool {
+    !matches!(aggregate.func, AggFunc::GroupConcat)
+}
+
+/// Fold a group's already-evaluated argument values into the aggregate's
+/// answer.
+///
+/// Split out of [`evaluate_aggregate`] so a caller that streams — folding rows
+/// as they arrive instead of holding the group — reaches **this same code**
+/// rather than a second implementation of it. `SUM`'s integer-to-real
+/// promotion and its overflow refusal, `MIN`/`MAX`'s total order, the `NULL`
+/// rules and the `DISTINCT` fold are subtle enough that two copies would drift,
+/// and an aggregate that drifts returns a wrong number rather than a slow one.
+///
+/// `group` is needed only by `GROUP_CONCAT`, for its separator — see
+/// [`folds_from_values_alone`], which a streaming caller checks first.
+pub fn fold_aggregate_values(
+    aggregate: &Aggregate,
+    mut values: Vec<Value>,
+    group: &[&[Value]],
+    env: &Env<'_>,
+) -> Result<Value> {
     if aggregate.distinct {
         values = distinct_values(values, aggregate.collation);
     }

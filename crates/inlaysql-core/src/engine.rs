@@ -5492,16 +5492,31 @@ impl Engine {
             };
         }
 
+        // An ungrouped aggregate does not have to hold its input at all: its
+        // answer is one row, and every function it can use folds from the
+        // argument values alone. Streaming it skips materialising the whole
+        // table into `ExecRow`s only to fold and drop them — measured at
+        // 18.38 ms against a 10.28 ms scan-and-decode floor for
+        // `SELECT ... FROM users`, so the holding was 44% of the query
+        // (`PERF.md`, 2026-09-01).
+        //
+        // Everything else below still blocks, and `collect_bounded`'s
+        // per-statement ceiling still applies to it.
         // Past this point the query is blocking: it has to hold every input row
         // before it can produce a single output row, so this is where one
         // statement can take the process down and where the per-statement
-        // ceiling is applied. See [`collect_bounded`].
-        let mut rows: Vec<ExecRow> =
-            collect_bounded(stream, self.options.query_memory_bytes, &self.interrupt)?;
-
-        if is_aggregate {
-            rows = self.aggregate(plan, rows, env)?;
-        }
+        // ceiling is applied. See [`collect_bounded`]. The streamed case above
+        // is the exception, and everything after this point is shared by both.
+        let mut rows: Vec<ExecRow> = if self.can_stream_ungrouped_aggregate(plan) {
+            self.stream_ungrouped_aggregate(plan, stream, env)?
+        } else {
+            let mut collected =
+                collect_bounded(stream, self.options.query_memory_bytes, &self.interrupt)?;
+            if is_aggregate {
+                collected = self.aggregate(plan, collected, env)?;
+            }
+            collected
+        };
 
         // Window functions run over the rows a `GROUP BY` already folded (or
         // the plain joined rows, for a non-aggregate query) — after
@@ -6397,6 +6412,140 @@ impl Engine {
     }
 
     /// Group the joined rows by the `GROUP BY` keys and compute the aggregates,
+    /// Whether an aggregate query can be folded as its rows arrive, instead of
+    /// being held and folded afterwards.
+    ///
+    /// Four conditions, and each one is a case where holding the rows is doing
+    /// something streaming would lose:
+    ///
+    /// * There is an aggregate, and no `GROUP BY`. One group means one output
+    ///   row and no grouping structure to build.
+    /// * No window function. A window runs over the rows a `GROUP BY` folded,
+    ///   and reasoning about that on a streamed single row is a separate
+    ///   change with its own argument to make.
+    /// * Every aggregate folds from its argument values alone
+    ///   ([`eval::folds_from_values_alone`]) — `GROUP_CONCAT` reads its
+    ///   separator from the group's first row and so needs the rows.
+    fn can_stream_ungrouped_aggregate(&self, plan: &SelectPlan) -> bool {
+        !plan.aggregates.is_empty()
+            && plan.group_by.is_empty()
+            && plan.windows.is_empty()
+            && plan.aggregates.iter().all(eval::folds_from_values_alone)
+    }
+
+    /// Fold an ungrouped aggregate from the row stream, holding one row.
+    ///
+    /// The row it holds is the *first*, because that is the representative the
+    /// collecting path uses for non-aggregate projection expressions and for
+    /// `HAVING` — this produces the same answer as
+    /// [`Engine::aggregate`] would, from the same fold code
+    /// ([`eval::fold_aggregate_values`]), and
+    /// `an_ungrouped_aggregate_streams_to_the_same_answer_it_collects`
+    /// requires the two to agree.
+    ///
+    /// Empty input still emits one row, all `NULL` across the joined row's
+    /// width: `SELECT COUNT(*) FROM empty` answers `0`, not nothing.
+    fn stream_ungrouped_aggregate(
+        &self,
+        plan: &SelectPlan,
+        stream: RowStream<'_>,
+        env: &Env<'_>,
+    ) -> Result<Vec<ExecRow>> {
+        let slots = plan.aggregates.len();
+        let mut values: Vec<Vec<Value>> = (0..slots).map(|_| Vec::new()).collect();
+        let mut counted = alloc::vec![0i64; slots];
+        let mut first: Option<(crate::traits::RowId, Vec<Value>)> = None;
+        let budget = self.options.query_memory_bytes;
+        let mut held = 0usize;
+
+        for row in stream {
+            let row = row?;
+            self.interrupt.check()?;
+            for (slot, aggregate) in plan.aggregates.iter().enumerate() {
+                // `FILTER (WHERE ...)` narrows what this aggregate folds and
+                // nothing else, exactly as it does on the collecting path —
+                // including for `COUNT(*)`, which is why it runs before the
+                // count rather than after it.
+                if let Some(filter) = &aggregate.filter {
+                    if !eval::is_truthy(&eval::evaluate(filter, &row.values, Computed::NONE, env)?)
+                    {
+                        continue;
+                    }
+                }
+                counted[slot] += 1;
+                if let Some(arg) = &aggregate.arg {
+                    let value = eval::evaluate(arg, &row.values, Computed::NONE, env)?;
+                    // Streaming holds one row, but an aggregate with an
+                    // argument still accumulates one value per row — `MIN(body)`
+                    // over a large table is as able to take the process down as
+                    // the collecting path was, so the same per-statement
+                    // ceiling applies to what it accumulates. `COUNT(*)` has no
+                    // argument, accumulates nothing, and is now genuinely
+                    // bounded: it is no longer refused, because there is no
+                    // longer anything for it to run out of.
+                    held = held.saturating_add(value.heap_bytes() + core::mem::size_of::<Value>());
+                    if budget > 0 && held > budget {
+                        return Err(Error::Memory(alloc::format!(
+                            "this statement has to hold one value per row before it can answer \
+                             (an aggregate over a column), and that is past the {budget}-byte \
+                             per-statement ceiling. Narrow the `WHERE`, or raise \
+                             `EngineOptions::query_memory_bytes`. Nothing was written."
+                        )));
+                    }
+                    values[slot].push(value);
+                }
+            }
+            if first.is_none() {
+                first = Some((row.id, row.values));
+            }
+        }
+
+        let mut aggregates = Vec::with_capacity(slots);
+        for (slot, aggregate) in plan.aggregates.iter().enumerate() {
+            aggregates.push(match &aggregate.arg {
+                // `COUNT(*)`: counts rows, not values. Any other function
+                // without an argument is refused in the same words the
+                // collecting path refuses it in.
+                None => match aggregate.func {
+                    crate::plan::AggFunc::Count => Value::Integer(counted[slot]),
+                    _ => {
+                        return Err(Error::Type(
+                            "SUM/AVG/MIN/MAX/GROUP_CONCAT require an argument".to_string(),
+                        ))
+                    }
+                },
+                Some(_) => eval::fold_aggregate_values(
+                    aggregate,
+                    core::mem::take(&mut values[slot]),
+                    &[],
+                    env,
+                )?,
+            });
+        }
+
+        let width = plan.from.iter().map(|item| item.table.columns.len()).sum();
+        let (id, representative) = first.unwrap_or_else(|| (0, alloc::vec![Value::Null; width]));
+
+        if let Some(having) = &plan.having {
+            if !eval::is_truthy(&eval::evaluate(
+                having,
+                &representative,
+                Computed::aggregates(&aggregates),
+                env,
+            )?) {
+                return Ok(Vec::new());
+            }
+        }
+
+        Ok(alloc::vec![ExecRow {
+            id,
+            score: None,
+            values: representative,
+            aggregates,
+            windows: Vec::new(),
+        }])
+    }
+
     /// emitting one row per group.
     ///
     /// Without a `GROUP BY` the whole input is one group — empty input still

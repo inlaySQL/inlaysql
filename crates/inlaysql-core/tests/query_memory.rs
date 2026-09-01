@@ -79,7 +79,10 @@ fn every_blocking_operator_is_refused_past_the_ceiling() {
         "SELECT grp, count(*) FROM t GROUP BY grp",
         "SELECT DISTINCT grp FROM t",
         "SELECT id, row_number() OVER (ORDER BY id) FROM t",
-        "SELECT count(*) FROM t",
+        // An aggregate over a *column* still holds one value per row, so the
+        // ceiling still catches it. `count(*)` no longer appears in this list:
+        // it holds nothing at all now and is asserted below to succeed.
+        "SELECT max(body) FROM t",
     ] {
         let message = refusal(&mut engine, sql);
         assert!(
@@ -196,11 +199,15 @@ fn the_handle_is_still_usable_after_a_refusal() {
             ],
         )
         .expect("and can still write");
-    let count = engine.query("SELECT count(*) FROM t", &[]);
-    // Counting is itself a blocking operator, so it is refused under this
-    // ceiling too — asked here only to show the refusal is about *memory* and
-    // not about the handle having been poisoned.
-    assert!(matches!(count, Err(Error::Memory(_))));
+    // `count(*)` used to be refused here, because counting meant holding every
+    // row first. It is streamed now — it accumulates nothing, so there is
+    // nothing for it to run out of — and answering under a ceiling this tight
+    // is the point: the refusals above are about memory that is genuinely
+    // needed, not about aggregation being blocking by nature.
+    let count = engine
+        .query("SELECT count(*) FROM t", &[])
+        .expect("count(*) holds nothing and must answer under any ceiling");
+    assert_eq!(count.rows, vec![vec![Value::Integer(ROWS + 1)]]);
     let after = engine
         .query(
             "SELECT body FROM t WHERE id = ?",
