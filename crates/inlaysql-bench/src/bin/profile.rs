@@ -474,6 +474,12 @@ fn run_joins(
         "CREATE INDEX posts_user_id ON posts (user_id) USING BTREE",
         &[],
     )?;
+    // The same statistics `crates/inlaysql-bench/src/joins.rs` collects before
+    // it times anything. Without it the planner falls back to its shape rules
+    // and this profile measures a *different planner state* than the benchmark
+    // it is meant to explain — which is how a join-ordering change measured as
+    // "no difference" here while changing the plan there.
+    db.execute("ANALYZE", &[])?;
 
     let pk_inner = db
         .prepare("SELECT posts.id, users.name FROM posts JOIN users ON posts.user_id = users.id")?;
