@@ -418,8 +418,137 @@ impl<'a> From<&'a Value> for ValueRef<'a> {
     }
 }
 
+/// Compare a borrowed cell with an owned one without materialising the
+/// borrowed side.
+///
+/// This used to go through [`ValueRef::to_owned_value`], which allocates a
+/// `Text` or a `Vec<u8>` for every `TEXT`/`BLOB` comparison — including the
+/// ones about to answer "no". The allocation was never the answer, only the
+/// route to it: the payloads compare as `&str` and `&[u8]` directly. Nothing
+/// inside this workspace reaches this impl today — the executor compares
+/// through `eval`'s `Cell`, which has SQL's rules — so it is the borrowed
+/// half of a `pub` type's ordinary equality, kept cheap for the caller that
+/// does reach it rather than a hot path being fixed.
+///
+/// Bit-identical to what the old route computed, which is [`Value`]'s own
+/// derived `PartialEq`: same variant compares the payloads, and *every* other
+/// pairing is unequal. In particular there is no numeric coercion here —
+/// `Integer(1) != Real(1.0)`, exactly as `Value` says today — because this
+/// operator is `Value`'s equality reached through a borrow, not SQL's `=`.
+/// SQL's comparison rules, with their storage-class ordering and their
+/// collations, live in `crate::eval`; a coercion invented here would quietly
+/// disagree with them. `borrowed_equality_matches_the_owned_one` pins every
+/// ordered pair of variants against the old route.
 impl PartialEq<Value> for ValueRef<'_> {
     fn eq(&self, other: &Value) -> bool {
-        self.to_owned_value() == *other
+        match (self, other) {
+            (ValueRef::Null, Value::Null) => true,
+            (ValueRef::Integer(left), Value::Integer(right)) => left == right,
+            (ValueRef::Real(left), Value::Real(right)) => left == right,
+            (ValueRef::Text(left), Value::Text(right)) => *left == right.as_str(),
+            (ValueRef::Blob(left), Value::Blob(right)) => *left == right.as_slice(),
+            (ValueRef::Vector(left), Value::Vector(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Value, ValueRef};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// One value per storage class, with the payloads that have ever made an
+    /// equality subtle: both zeroes, `NaN`, the empty text and the empty blob,
+    /// two spellings that differ only in case, and a vector holding each of
+    /// those floats.
+    fn menagerie() -> Vec<Value> {
+        vec![
+            Value::Null,
+            Value::Integer(0),
+            Value::Integer(1),
+            Value::Integer(-1),
+            Value::Integer(i64::MIN),
+            Value::Integer(i64::MAX),
+            Value::Real(0.0),
+            Value::Real(-0.0),
+            Value::Real(1.0),
+            Value::Real(f64::NAN),
+            Value::Real(f64::INFINITY),
+            Value::Text("".into()),
+            Value::Text("a".into()),
+            Value::Text("A".into()),
+            Value::Text("näme".into()),
+            Value::Blob(Vec::new()),
+            Value::Blob(vec![0]),
+            Value::Blob(vec![0, 255]),
+            Value::Vector(Vec::new()),
+            Value::Vector(vec![0.0]),
+            Value::Vector(vec![-0.0]),
+            Value::Vector(vec![f32::NAN]),
+            Value::Vector(vec![1.0, 2.0]),
+        ]
+    }
+
+    /// Which storage class a value is, as an index — so the test can prove it
+    /// covered every ordered pair of them rather than assume it.
+    fn class(value: &Value) -> usize {
+        match value {
+            Value::Null => 0,
+            Value::Integer(_) => 1,
+            Value::Real(_) => 2,
+            Value::Text(_) => 3,
+            Value::Blob(_) => 4,
+            Value::Vector(_) => 5,
+        }
+    }
+
+    /// The comparison this impl replaced: materialise the borrowed side, then
+    /// use `Value`'s own derived equality. Every answer below is checked
+    /// against this, so "bit-identical to what it did before" is asserted
+    /// rather than argued.
+    fn through_an_owned_value(left: &ValueRef<'_>, right: &Value) -> bool {
+        left.to_owned_value() == *right
+    }
+
+    #[test]
+    fn borrowed_equality_matches_the_owned_one() {
+        let values = menagerie();
+        let mut covered = [[false; 6]; 6];
+        for left in &values {
+            for right in &values {
+                let borrowed = ValueRef::from(left);
+                assert_eq!(
+                    borrowed == *right,
+                    through_an_owned_value(&borrowed, right),
+                    "{left:?} == {right:?}"
+                );
+                covered[class(left)][class(right)] = true;
+            }
+        }
+        assert!(
+            covered.iter().all(|row| row.iter().all(|seen| *seen)),
+            "some pair of storage classes was never compared"
+        );
+    }
+
+    /// The three answers a reader is most likely to expect the other way
+    /// round, written out rather than left to the sweep above.
+    ///
+    /// No numeric coercion: `Value`'s equality does not have it, so neither
+    /// does this. `NaN` equals nothing, including the same `NaN`. The two
+    /// zeroes do equal each other, because IEEE-754 says so and `f64`'s
+    /// `PartialEq` follows it.
+    #[test]
+    fn the_pairings_that_look_like_they_might_coerce_do_not() {
+        assert!(ValueRef::Integer(1) != Value::Real(1.0));
+        assert!(ValueRef::Real(1.0) != Value::Integer(1));
+        assert!(ValueRef::Text("1") != Value::Integer(1));
+        assert!(ValueRef::Blob(b"a") != Value::Text("a".into()));
+        assert!(ValueRef::Null != Value::Integer(0));
+
+        assert!(ValueRef::Real(f64::NAN) != Value::Real(f64::NAN));
+        assert!(ValueRef::Real(0.0) == Value::Real(-0.0));
     }
 }
