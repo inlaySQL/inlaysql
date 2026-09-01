@@ -52,22 +52,17 @@ current execution order without relying on local conversation history.
    machine gate refuses or the repeat spread is too wide.
    `BENCH_MAX_LOAD_PER_CPU=off` is for explicitly labelled diagnostics only.
 
-2. **The allocation diet** — bounded, invariant-free line items from the
-   audit, landed one at a time, each behind the existing gates. Read path:
-   `decode_value`'s double allocation per owned TEXT cell (`row.rs:436`);
-   `DecodeFilter`'s per-candidate `Vec<ValueRef>` including rejected rows;
-   `PartialEq<Value> for ValueRef` allocating per comparison;
-   `project_stream`'s per-row `Vec` with no capacity hint. Aggregate path:
-   `SUM`/`AVG`/`MIN`/`MAX` still hold every input value (only `COUNT` folds
-   incrementally) — fold incrementally through the same
-   `fold_aggregate_values` semantics, mutation-testing the tie; the group
-   key is re-materialised per row even on a hit and a miss descends the map
-   twice — probe borrowed, materialise on miss only. Insert path:
-   statement-invariant per-row work (`indexes_for`'s filtered `Vec`, the
-   per-row `Vec<Index>` clone the code flags at `engine.rs:665-668`,
-   `encode_table_row`'s rebuilt `Vec<DataType>`) hoisted to the statement.
-   The point read must not move; every fast path gets a test tying it to the
-   slow path.
+2. ~~**The allocation diet**~~ — **landed 2026-09-02** as eight commits
+   (`84e62a5..aa42cd5`, AHL-517–520 plus four read-path commits), all gates
+   green including both release DST sweeps on the index-path change.
+   Corrections the build produced: the `PartialEq<Value> for ValueRef`
+   allocation was unreachable from the executor (landed as a cheaper public
+   impl, but it is not a read-path finding), and `moving_projection` was
+   already wired into `project_stream`. Wall-clock for every item is
+   **unmeasured and owed to item 1's quiet window** — no published number
+   changes until then. Left open, recorded in the root plan: `UPDATE`'s
+   per-row `encode_table_row`, the collecting aggregate path's per-row key,
+   and the miss path's second map descent (per group, accepted).
 
 3. **Join-reorder remainder**: the `LIMIT`-shape output-order argument, then
    index-probe access paths. The published `LIMIT`-join rows never benefit
