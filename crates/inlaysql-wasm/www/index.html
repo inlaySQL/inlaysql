@@ -607,11 +607,12 @@
       </li>
       <li>
         <strong>The MySQL server is plaintext unless you configure TLS.</strong>
-        <code>--tls-cert</code>/<code>--tls-key</code> turns it on and
-        <code>--tls-required</code> refuses logins that do not use it, but the
-        default is off, the account model is still a single credential from a
-        flag, and it binds to 127.0.0.1. Without a certificate, do not put it
-        on a network you do not own.
+        <code>--tls-cert</code>/<code>--tls-key</code> turns it on,
+        <code>--tls-required</code> refuses logins that do not use it, and
+        <code>--strong-passwords</code> stores salted PBKDF2 so a stolen
+        database file is not a stolen password list. All three are off by
+        default, and it binds to 127.0.0.1. Without a certificate, do not put
+        it on a network you do not own.
       </li>
       <li>
         <strong>Recall on uniformly random vectors is poor</strong> — and

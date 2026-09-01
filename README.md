@@ -317,9 +317,13 @@ AHL-494 and now go through byte-for-byte, because MySQL 8 spells them the way
 SQLite does and the shim has no reason to touch them. The collation mapping
 still folds ASCII case only: `WHERE name = 'ADA'` matches a stored `'ada'`
 under a `*_ci` collation the way MySQL does, but not an accent
-(`'é' = 'e'`). It is single-user and binds `127.0.0.1` by default, and the
-wire is plaintext until `--tls-cert`/`--tls-key` are given — `--tls-required`
-then refuses any login that did not encrypt.
+(`'é' = 'e'`). It binds `127.0.0.1` by default and the wire is plaintext until
+`--tls-cert`/`--tls-key` are given — `--tls-required` then refuses any login
+that did not encrypt, and `--strong-passwords` stores salted PBKDF2 instead of
+the MySQL plugins' unsalted two-hash verifiers, so a stolen database file is
+not a stolen password list. Accounts, `GRANT`/`REVOKE` and per-table
+privileges live in the file itself; the `--user`/`--password` flags are the
+whole credential only until the first `CREATE USER`.
 [`docs/server.md`](docs/server.md) has the full security posture, the
 function-by-function mapping and the complete divergence list, each checked
 against a real MySQL 8.4.11.
