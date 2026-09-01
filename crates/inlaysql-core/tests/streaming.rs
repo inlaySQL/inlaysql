@@ -156,6 +156,151 @@ fn ids(engine: &mut Engine, sql: &str) -> Vec<i64> {
         .collect()
 }
 
+/// A table whose columns cover every case the borrowed decode has a separate
+/// arm for: `TEXT` under two collations, `BLOB`, `NULL` in each of them, and
+/// the empty string and empty blob beside the multi-byte ones.
+///
+/// Most of the 300 rows are there to be rejected: every predicate below admits
+/// a handful, so the rows the fused operator drops without materialising
+/// outnumber the rows it keeps by two orders of magnitude.
+fn mixed_columns() -> Engine {
+    let mut engine = Engine::open(
+        Box::new(MemStorage::new()),
+        Box::new(MemIndexFactory),
+        Box::new(LogicalClock::new()),
+    )
+    .expect("open");
+    engine
+        .execute(
+            "CREATE TABLE t (
+                 id INTEGER PRIMARY KEY,
+                 nc TEXT COLLATE NOCASE,
+                 bin TEXT,
+                 body TEXT,
+                 b BLOB,
+                 n INTEGER
+             )",
+            &[],
+        )
+        .unwrap();
+    engine.begin().unwrap();
+    for id in 1..=300i64 {
+        engine
+            .execute(
+                "INSERT INTO t (id, nc, bin, body, b, n) VALUES (?, ?, ?, ?, ?, ?)",
+                &[
+                    Value::Integer(id),
+                    match id {
+                        // Two spellings of one NOCASE group, and the empty
+                        // string, each on exactly one row.
+                        7 => Value::Text("Ada".into()),
+                        13 => Value::Text("ADA".into()),
+                        19 => Value::Text("".into()),
+                        _ if id % 5 == 0 => Value::Null,
+                        _ => Value::Text(format!("näme-{id}").into()),
+                    },
+                    match id {
+                        11 => Value::Text("ada".into()),
+                        17 => Value::Text("ADA".into()),
+                        _ if id % 4 == 0 => Value::Null,
+                        _ => Value::Text(format!("bin-{id}").into()),
+                    },
+                    if id % 7 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Text(format!("row-{id}").into())
+                    },
+                    match id {
+                        23 => Value::Blob(vec![0x00, 0xff]),
+                        29 => Value::Blob(Vec::new()),
+                        _ if id % 6 == 0 => Value::Null,
+                        _ => Value::Blob(vec![id as u8, 0x2c]),
+                    },
+                    if id % 11 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Integer(id % 97)
+                    },
+                ],
+            )
+            .unwrap();
+    }
+    engine.commit().unwrap();
+    engine
+}
+
+/// The fused decode-and-filter answers what decode-then-filter answers.
+///
+/// `SELECT ... FROM t WHERE p` runs `DecodeFilter`: the row's cells are
+/// borrowed out of its bytes, the predicate is tested against those, and owned
+/// `Value`s are built only for a row that survives — and, since the operator
+/// keeps one scratch buffer across rows, a rejected row now allocates nothing
+/// at all. Wrapping the same table in a derived table takes the other path
+/// entirely: the inner query has no predicate, so every row is decoded into
+/// owned `Value`s by `Decode`, and the outer `WHERE` runs afterwards as a
+/// separate `Filter` over those. One predicate, two operators, and the answers
+/// have to be identical row for row and in the same order — including the
+/// `NULL`s, the empty text and blob cells, and the `NOCASE` column whose
+/// comparison the borrowed path has to get right without materialising
+/// anything.
+#[test]
+fn a_fused_filter_admits_what_filtering_after_the_decode_admits() {
+    let mut engine = mixed_columns();
+    let predicates = [
+        // The NOCASE column: two spellings of one group, decided on borrowed
+        // `&str`s.
+        "nc = 'ada'",
+        "nc = ''",
+        // The same text under BINARY, and the explicit collation override.
+        "bin = 'ada'",
+        "bin = 'ADA' COLLATE NOCASE",
+        // Blobs, including the empty one.
+        "b = x'00ff'",
+        "b = x''",
+        // Three-valued logic on each nullable column.
+        "body IS NULL",
+        "n IS NULL",
+        "n > 90",
+        "body IS NULL AND b IS NULL",
+        // Text functions over a borrowed cell, and a multi-byte one.
+        "body LIKE 'row-29%'",
+        "nc LIKE 'n%me-7_'",
+        "length(nc) = 0",
+        // A predicate no row satisfies: every candidate is rejected.
+        "bin = 'nobody'",
+    ];
+    let projections = ["id", "id, nc, bin, body, b, n", "*"];
+
+    for predicate in predicates {
+        for projection in projections {
+            let fused = pairs(
+                &mut engine,
+                &format!("SELECT {projection} FROM t WHERE {predicate}"),
+            );
+            let unfused = pairs(
+                &mut engine,
+                &format!("SELECT {projection} FROM (SELECT * FROM t) WHERE {predicate}"),
+            );
+            assert_eq!(
+                fused, unfused,
+                "SELECT {projection} FROM t WHERE {predicate}"
+            );
+            // Both halves of "mostly rejecting", so the test cannot quietly
+            // become one that admits everything or one that admits nothing.
+            let admitted = fused.len();
+            if predicate == "bin = 'nobody'" {
+                assert_eq!(admitted, 0, "WHERE {predicate} was meant to admit none");
+            } else {
+                assert!(
+                    (1..60).contains(&admitted),
+                    "WHERE {predicate} admitted {admitted} of 300 rows, which is \
+                     not the mostly-rejecting shape this test is about"
+                );
+            }
+        }
+    }
+}
+
 /// The headline claim: a `LIMIT` over a big table stops the scan.
 #[test]
 fn a_limit_stops_the_scan_rather_than_truncating_the_answer() {

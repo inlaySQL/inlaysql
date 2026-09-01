@@ -325,18 +325,44 @@ pub fn decode_row_masked(bytes: &[u8], mask: &ColumnMask) -> Result<Vec<Value>> 
 /// [`ValueRef`]'s type-level doc for why a zero-copy view is not available in
 /// safe Rust here.
 pub fn decode_row_ref_masked<'a>(bytes: &'a [u8], mask: &ColumnMask) -> Result<Vec<ValueRef<'a>>> {
+    let mut values = Vec::new();
+    decode_row_ref_masked_into(bytes, mask, &mut values)?;
+    Ok(values)
+}
+
+/// [`decode_row_ref_masked`] into a buffer the caller already owns.
+///
+/// Identical cells, identical mask semantics, identical errors — the only
+/// difference is where the `Vec` comes from. Borrowing the cells removed the
+/// per-cell allocation for `TEXT`/`BLOB`; the container they are pushed into
+/// was what remained, and a filter that rejects most of what it reads pays it
+/// once per *candidate* row rather than once per surviving row. A caller that
+/// decodes row after row can hand the same buffer back here instead, which is
+/// what [`crate::exec`]'s fused decode-and-filter does.
+///
+/// `out` is cleared first, so a caller never sees the previous row's cells. A
+/// decode that fails part-way leaves the cells read before the failure in it;
+/// every caller either stops at the first error — the pipeline's contract, see
+/// [`crate::exec`] — or clears it again on the next row, so those are never
+/// read.
+pub fn decode_row_ref_masked_into<'a>(
+    bytes: &'a [u8],
+    mask: &ColumnMask,
+    out: &mut Vec<ValueRef<'a>>,
+) -> Result<()> {
+    out.clear();
     let mut cursor = Cursor::new(bytes);
     let count = cursor.count(1)?;
-    let mut values = Vec::with_capacity(count);
+    out.reserve(count);
     for ordinal in 0..count {
         if mask.wants(ordinal) {
-            values.push(decode_value_ref(&mut cursor)?);
+            out.push(decode_value_ref(&mut cursor)?);
         } else {
             skip_value(&mut cursor)?;
-            values.push(ValueRef::Null);
+            out.push(ValueRef::Null);
         }
     }
-    Ok(values)
+    Ok(())
 }
 
 /// Decode exactly one column of a row, skipping every other column.

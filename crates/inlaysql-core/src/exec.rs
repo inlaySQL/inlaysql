@@ -39,7 +39,7 @@ use crate::error::Result;
 use crate::eval::{self, Computed, Env};
 use crate::index::KeyRange;
 use crate::plan::{Expr, JoinKind};
-use crate::row::{decode_row_masked, decode_row_ref_masked, ColumnMask, RowBuf};
+use crate::row::{decode_row_masked, decode_row_ref_masked_into, ColumnMask, RowBuf};
 use crate::traits::{Interrupt, RowId, RowScan, Storage};
 use crate::value::{DataType, Value, ValueRef};
 
@@ -338,11 +338,22 @@ impl Iterator for Filter<'_> {
 /// A row with no predicate at all (`WHERE` absent) is not built with this —
 /// `Decode` alone is used, since there is nothing to filter and the borrowed
 /// intermediate would only cost a decode pass for no benefit.
+///
+/// One allocation per candidate row survived that change: the `Vec` the
+/// borrowed cells were pushed into, paid for the rejected rows too. It is now
+/// [`DecodeFilter::scratch`], cleared and refilled per row, so a rejected row
+/// allocates nothing at all.
 pub(crate) struct DecodeFilter<'a> {
     source: RowBytes<'a>,
     mask: &'a ColumnMask,
     predicate: &'a Expr,
     env: &'a Env<'a>,
+    /// The buffer every candidate row decodes into, parked here between rows.
+    ///
+    /// Empty whenever it is parked — [`park`] clears it before it comes back —
+    /// which is what makes the `'static` honest: a cell borrowed from a row's
+    /// bytes cannot outlive that row, and none is ever stored here.
+    scratch: Vec<ValueRef<'static>>,
 }
 
 impl<'a> DecodeFilter<'a> {
@@ -360,6 +371,7 @@ impl<'a> DecodeFilter<'a> {
             mask,
             predicate,
             env,
+            scratch: Vec::new(),
         }
     }
 }
@@ -373,21 +385,51 @@ impl Iterator for DecodeFilter<'_> {
                 Ok(row) => row,
                 Err(error) => return Some(Err(error)),
             };
-            let cells = match decode_row_ref_masked(&bytes, self.mask) {
-                Ok(cells) => cells,
-                Err(error) => return Some(Err(error)),
-            };
-            match eval::evaluate_ref(self.predicate, &cells, Computed::NONE, self.env) {
-                Ok(value) => {
-                    if eval::is_truthy(&value) {
-                        let values = cells.iter().map(ValueRef::to_owned_value).collect();
-                        return Some(Ok(ExecRow::scanned(id, values)));
-                    }
-                }
+            // The parked buffer is empty, so lending it to this row's cells is
+            // only a shortening of `'static`: nothing in it borrows anything
+            // yet, and `park` empties it again before it is stored back.
+            let mut cells: Vec<ValueRef<'_>> = core::mem::take(&mut self.scratch);
+            let verdict = decode_row_ref_masked_into(&bytes, self.mask, &mut cells)
+                .and_then(|()| eval::evaluate_ref(self.predicate, &cells, Computed::NONE, self.env))
+                .map(|truth| {
+                    // "A projected row allocates once at the boundary": only a
+                    // surviving row is turned into owned `Value`s, and this is
+                    // that boundary. A rejected row leaves this arm with the
+                    // borrowed cells and nothing else.
+                    eval::is_truthy(&truth).then(|| {
+                        cells
+                            .iter()
+                            .map(ValueRef::to_owned_value)
+                            .collect::<Vec<_>>()
+                    })
+                });
+            self.scratch = park(cells);
+            match verdict {
+                Ok(Some(values)) => return Some(Ok(ExecRow::scanned(id, values))),
+                Ok(None) => continue,
                 Err(error) => return Some(Err(error)),
             }
         }
     }
+}
+
+/// Park a decode buffer for the next row: the same allocation, with the
+/// lifetime its cells borrowed forgotten.
+///
+/// An empty vector borrows nothing, so a cleared `Vec<ValueRef<'row>>` is a
+/// `Vec<ValueRef<'static>>` in every way that matters — but safe Rust has no
+/// way to *say* so, and `#![forbid(unsafe_code)]` rules out the transmute that
+/// would. What it does have is in-place collection: `Vec<T>::into_iter()`
+/// mapped and collected into a `Vec<U>` reuses the source's allocation when
+/// the two elements have the same layout, which two spellings of one type
+/// always do. The closure never runs — `clear` dropped every cell first — so
+/// this moves no bytes and frees nothing; `a_parked_buffer_keeps_its_allocation`
+/// is the test that it really does keep the allocation, because that reuse is
+/// a library optimisation rather than a language guarantee and losing it
+/// silently would put the per-row allocation back.
+fn park(mut cells: Vec<ValueRef<'_>>) -> Vec<ValueRef<'static>> {
+    cells.clear();
+    cells.into_iter().map(|_| unreachable!()).collect()
 }
 
 /// Where a join's inner rows come from.
@@ -1368,5 +1410,40 @@ mod hash_key_tests {
             &Value::Integer(1),
             Collation::Binary
         ));
+    }
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::park;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    use crate::value::ValueRef;
+
+    /// Parking a buffer has to *keep* the buffer, or the fused decode-and-filter
+    /// is back to one allocation per candidate row.
+    ///
+    /// The reuse comes from `Vec`'s in-place collection, which is a library
+    /// optimisation rather than a language guarantee — so it is asserted here
+    /// instead of assumed. A capacity of zero coming back out means a toolchain
+    /// stopped collecting in place, and `park` needs another way to say "the
+    /// same allocation, a different cell lifetime".
+    #[test]
+    fn a_parked_buffer_keeps_its_allocation() {
+        let text = String::from("borrowed from a row's bytes");
+        let mut cells: Vec<ValueRef<'_>> = Vec::with_capacity(8);
+        cells.push(ValueRef::Text(&text));
+        cells.push(ValueRef::Integer(1));
+        let capacity = cells.capacity();
+
+        let parked = park(cells);
+
+        assert!(parked.is_empty(), "a parked buffer holds no borrowed cell");
+        assert_eq!(
+            parked.capacity(),
+            capacity,
+            "parking reallocated instead of reusing the buffer"
+        );
     }
 }
