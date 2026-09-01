@@ -6412,33 +6412,42 @@ impl Engine {
         if plan.group_by.is_empty() {
             groups.push(rows);
         } else {
-            let mut keyed: Vec<(Vec<Value>, ExecRow)> = Vec::with_capacity(rows.len());
+            // Grouped by an ordered map keyed on the group key, not by sorting
+            // every input row.
+            //
+            // This used to build a `(key, row)` pair per input row and sort the
+            // whole vector. That is `O(n log n)` comparisons for a query whose
+            // answer has `g` rows, and it moves an entire `ExecRow` on every
+            // swap — profiling `SELECT n, COUNT(*) FROM users GROUP BY n` over
+            // 100,000 rows with 100 groups put **~15% of the query in
+            // `quicksort`** and much of the `memmove` beside it (`PERF.md`,
+            // 2026-09-01). Both servers this loses to hash-aggregate instead.
+            //
+            // A `BTreeMap` makes it `O(n log g)` — 100 groups is seven
+            // comparisons per row rather than seventeen — and moves no rows at
+            // all. Ordered rather than hashed on purpose: iteration order is
+            // group-key order, which is exactly the order the sort produced, so
+            // a query with no `ORDER BY` sees the rows it saw before. Switching
+            // to a hash map would be faster still and would change that order,
+            // which is a separate decision with its own output-order argument
+            // to make (see D6's, for joins).
+            let collations: Rc<[Collation]> = plan.group_collations.as_slice().into();
+            let mut buckets: BTreeMap<GroupKey, Vec<ExecRow>> = BTreeMap::new();
             for row in rows {
                 self.interrupt.check()?;
                 let mut keys = Vec::with_capacity(plan.group_by.len());
                 for expr in &plan.group_by {
                     keys.push(eval::evaluate(expr, &row.values, Computed::NONE, env)?);
                 }
-                keyed.push((keys, row));
+                buckets
+                    .entry(GroupKey {
+                        values: keys,
+                        collations: Rc::clone(&collations),
+                    })
+                    .or_default()
+                    .push(row);
             }
-            let collations = &plan.group_collations;
-            keyed.sort_by(|a, b| compare_group_keys(&a.0, &b.0, collations));
-
-            let mut current: Vec<ExecRow> = Vec::new();
-            let mut current_key: Option<Vec<Value>> = None;
-            for (key, row) in keyed {
-                if let Some(previous) = &current_key {
-                    if compare_group_keys(previous, &key, collations) != core::cmp::Ordering::Equal
-                    {
-                        groups.push(core::mem::take(&mut current));
-                    }
-                }
-                current_key = Some(key);
-                current.push(row);
-            }
-            if !current.is_empty() {
-                groups.push(current);
-            }
+            groups.extend(buckets.into_values());
         }
 
         let width = plan.from.iter().map(|item| item.table.columns.len()).sum();
@@ -8873,6 +8882,37 @@ fn project_row(items: &[SelectItem], row: &ExecRow, env: &Env<'_>) -> Result<Vec
 
 /// Compare two `GROUP BY` keys lexicographically by [`compare_values`], each
 /// under the collation its own key expression resolved.
+/// A `GROUP BY` key, ordered the way [`compare_group_keys`] orders one.
+///
+/// Carries its collations because [`Ord`] takes no context and grouping is a
+/// collation question: `'Ada'` and `'ADA'` are one group under `NOCASE` and two
+/// under `BINARY`. Every key in one query shares the same slice, so this is a
+/// refcount bump per group rather than a copy per row.
+struct GroupKey {
+    values: Vec<Value>,
+    collations: Rc<[Collation]>,
+}
+
+impl PartialEq for GroupKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == core::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for GroupKey {}
+
+impl PartialOrd for GroupKey {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for GroupKey {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        compare_group_keys(&self.values, &other.values, &self.collations)
+    }
+}
+
 fn compare_group_keys(
     left: &[Value],
     right: &[Value],

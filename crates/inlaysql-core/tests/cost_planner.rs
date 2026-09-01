@@ -339,3 +339,97 @@ fn a_reordered_join_answers_exactly_as_the_written_order_does() {
         );
     }
 }
+
+/// Grouping is correct, and the rewrite did not move the rows.
+///
+/// Grouping moved from sorting every input row to an ordered map, so the
+/// question this pins is whether anything observable changed. Two things are
+/// asserted and one deliberately is not:
+///
+/// * The groups and their counts are right.
+/// * An explicit `ORDER BY` orders them.
+/// * The order *without* an `ORDER BY` is **not** asserted, because it is not
+///   key order and never was — checked against the pre-rewrite engine, which
+///   emits the same first-seen order this one does. The old code sorted its
+///   input only to bring equal keys adjacent, not to order the output, so
+///   removing that sort changed no order anyone could observe. Writing this
+///   down because the obvious assumption — sorted input, sorted output — is
+///   wrong here, and a future rewrite to a hash map should know that the
+///   order is already unspecified rather than discover it.
+#[test]
+fn group_by_groups_correctly_and_orders_when_asked() {
+    let mut engine = engine();
+    run(
+        &mut engine,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, name TEXT)",
+    );
+    for (id, n) in [
+        (1, 7),
+        (2, 3),
+        (3, 9),
+        (4, 3),
+        (5, 1),
+        (6, 7),
+        (7, 1),
+        (8, 5),
+    ] {
+        run(
+            &mut engine,
+            &format!("INSERT INTO t VALUES ({id}, {n}, 'row{id}')"),
+        );
+    }
+
+    let ordered = answer(
+        &mut engine,
+        "SELECT n, COUNT(*) FROM t GROUP BY n ORDER BY n",
+    );
+    assert_eq!(
+        ordered,
+        vec![
+            vec!["Integer(1)".to_string(), "Integer(2)".to_string()],
+            vec!["Integer(3)".to_string(), "Integer(2)".to_string()],
+            vec!["Integer(5)".to_string(), "Integer(1)".to_string()],
+            vec!["Integer(7)".to_string(), "Integer(2)".to_string()],
+            vec!["Integer(9)".to_string(), "Integer(1)".to_string()],
+        ],
+        "wrong groups or counts"
+    );
+
+    // The same groups arrive with no `ORDER BY`, whatever order they arrive in.
+    let mut implicit = answer(&mut engine, "SELECT n, COUNT(*) FROM t GROUP BY n");
+    implicit.sort();
+    let mut expected = ordered;
+    expected.sort();
+    assert_eq!(
+        implicit, expected,
+        "the implicit and explicit orders disagree on content"
+    );
+}
+
+/// Grouping is a collation question, and the key type carries the collation to
+/// answer it: `'Ada'` and `'ADA'` are one group under `NOCASE`, two under
+/// `BINARY`.
+#[test]
+fn group_by_folds_under_the_columns_collation() {
+    let mut engine = engine();
+    run(
+        &mut engine,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, nc TEXT COLLATE NOCASE, bin TEXT)",
+    );
+    for (id, text) in [(1, "Ada"), (2, "ADA"), (3, "ada"), (4, "Grace")] {
+        run(
+            &mut engine,
+            &format!("INSERT INTO t VALUES ({id}, '{text}', '{text}')"),
+        );
+    }
+    assert_eq!(
+        answer(&mut engine, "SELECT nc, COUNT(*) FROM t GROUP BY nc").len(),
+        2,
+        "NOCASE should fold the three spellings of ada into one group"
+    );
+    assert_eq!(
+        answer(&mut engine, "SELECT bin, COUNT(*) FROM t GROUP BY bin").len(),
+        4,
+        "BINARY should keep them apart"
+    );
+}
