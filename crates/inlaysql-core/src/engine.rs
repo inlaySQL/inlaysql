@@ -6579,20 +6579,31 @@ impl Engine {
         let budget = self.options.query_memory_bytes;
         let mut held = 0usize;
 
+        // One key, refilled per row and reused. Most rows land in a group that
+        // already exists — that is what grouping *is*, a hundred thousand rows
+        // into a hundred groups — and such a row now allocates nothing to find
+        // its group: the probe is this buffer, cleared and refilled, and the
+        // collations are one `Rc` held for the whole loop rather than a
+        // refcount bump per row. Only a row that opens a new group materialises
+        // an owned key, and it does so by *taking* this buffer rather than
+        // copying it, so a key is built once per group and never per row.
+        let mut probe = GroupKey {
+            values: Vec::with_capacity(plan.group_by.len()),
+            collations: Rc::clone(&collations),
+        };
+
         for row in stream {
             let row = row?;
             self.interrupt.check()?;
 
-            let mut keys = Vec::with_capacity(plan.group_by.len());
+            probe.values.clear();
             for expr in &plan.group_by {
-                keys.push(eval::evaluate(expr, &row.values, Computed::NONE, env)?);
+                probe
+                    .values
+                    .push(eval::evaluate(expr, &row.values, Computed::NONE, env)?);
             }
-            let key = GroupKey {
-                values: keys,
-                collations: Rc::clone(&collations),
-            };
 
-            let group = match groups.get_mut(&key) {
+            let group = match groups.get_mut(&probe) {
                 Some(group) => group,
                 None => {
                     // A new group keeps this row, because the first row of a
@@ -6603,6 +6614,21 @@ impl Engine {
                             .iter()
                             .map(|value| value.heap_bytes())
                             .sum::<usize>(),
+                    );
+                    // The probe *becomes* the stored key rather than being
+                    // copied into one, so a group's key and the probe later
+                    // rows are compared against are the same construction,
+                    // collations included. Both sides are consulted — a lookup
+                    // makes the probe the receiver of `GroupKey::cmp` and an
+                    // insertion makes the owned key the receiver — so a key
+                    // whose collations differed from the probe's would group
+                    // one way and search another.
+                    let key = core::mem::replace(
+                        &mut probe,
+                        GroupKey {
+                            values: Vec::with_capacity(plan.group_by.len()),
+                            collations: Rc::clone(&collations),
+                        },
                     );
                     groups.entry(key).or_insert(Accumulator {
                         id: row.id,

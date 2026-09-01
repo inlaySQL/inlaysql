@@ -482,6 +482,81 @@ fn group_by_folds_under_the_columns_collation() {
     );
 }
 
+/// The streamed group key finds the same groups the collected one does.
+///
+/// A row whose group already exists probes the map with a key buffer reused
+/// across rows and materialises nothing; only a row that opens a group builds
+/// an owned key. That is a change to *when* the key exists, and it would be an
+/// easy place to lose the part of the key that is not the values — the
+/// collations, without which `'Ada'` and `'ADA'` stop being one group — or to
+/// carry a stale value from the previous row into a shorter key.
+///
+/// So both paths are made to group the same rows and agree on every group, in
+/// order, with the same representative row: `NULL` keys, which sort before
+/// everything and are one group rather than none; a `NOCASE` column beside the
+/// `BINARY` spelling of the same values; and multi-column keys, where only the
+/// second column distinguishes two rows.
+#[test]
+fn a_streamed_group_key_finds_the_same_groups_a_collected_one_does() {
+    let mut engine = engine();
+    run(
+        &mut engine,
+        "CREATE TABLE k (id INTEGER PRIMARY KEY, nc TEXT COLLATE NOCASE, bin TEXT, n INTEGER)",
+    );
+    for (id, nc, bin, n) in [
+        (1, "'Ada'", "'Ada'", "1"),
+        (2, "'ADA'", "'ADA'", "1"),
+        (3, "'ada'", "'ada'", "2"),
+        (4, "'Grace'", "'Grace'", "NULL"),
+        (5, "NULL", "NULL", "1"),
+        (6, "NULL", "'x'", "NULL"),
+        (7, "'Ada'", "NULL", "2"),
+    ] {
+        run(
+            &mut engine,
+            &format!("INSERT INTO k VALUES ({id}, {nc}, {bin}, {n})"),
+        );
+    }
+
+    for keys in [
+        "nc",
+        "bin",
+        "n",
+        "nc, n",
+        "n, nc",
+        "nc, bin",
+        "bin, nc, n",
+        "n, n",
+    ] {
+        for projection in ["COUNT(*)", "id, COUNT(*)", "COUNT(*), MIN(bin), MAX(nc)"] {
+            assert_streamed_matches_collected(
+                &mut engine,
+                projection,
+                &format!("k GROUP BY {keys}"),
+            );
+        }
+    }
+
+    // And what those groups are, pinned once: the collation decides how many
+    // there are, and `NULL` is a group of its own rather than a row that
+    // vanishes.
+    assert_eq!(
+        answer(&mut engine, "SELECT nc, COUNT(*) FROM k GROUP BY nc").len(),
+        3,
+        "NOCASE: the four spellings of ada, Grace, and the two NULLs"
+    );
+    assert_eq!(
+        answer(&mut engine, "SELECT bin, COUNT(*) FROM k GROUP BY bin").len(),
+        6,
+        "BINARY: the same values, with the spellings of ada kept apart"
+    );
+    assert_eq!(
+        answer(&mut engine, "SELECT nc, n, COUNT(*) FROM k GROUP BY nc, n").len(),
+        5,
+        "a multi-column key must distinguish rows the first column alone does not"
+    );
+}
+
 /// The table both aggregate tie tests run over: `NULL`s in every position that
 /// matters, three groups of two, a `NOCASE` column beside a `BINARY` one.
 fn aggregate_engine() -> Engine {
