@@ -2552,6 +2552,64 @@ flagged rather than discarded.
 
 ---
 
+### Residual-filter elision, measured before being built — and not worth its price (2026-09-01)
+
+`PLAN.md`'s A1 proposed skipping the residual `WHERE` on an indexed range when
+the index range was built from the same predicate, estimating **15-20%** of the
+shape's engine time. The estimate came from adding the eval cluster (~11%) to
+"a chosen index's `_platform_memcmp` share, because `compare_cells` on `TEXT`
+calls it". Measured properly, that addition is wrong and the item is not worth
+what it costs.
+
+**Where `memcmp` actually goes.** Attributing every `memcmp` sample to its
+nearest engine-level ancestor, rather than assuming: `CowBTree::get_from` 8.5%,
+`WalkBounds::admits` 2.3%, `starts_below` 1.3%, `child_index` 1.2%,
+`ReadCursor::admits` 1.2%, `walk_raw_row_ids` 1.1% — B-tree key comparison
+during descent, every one of them. `Collation::compare`, the only path the
+*filter's* text comparison can reach it by, is **0.9%**. The `memcmp` share is
+descent cost that elision cannot touch; folding it into the filter's share
+roughly doubled the apparent prize.
+
+**The ceiling, measured rather than argued.** The residual filter was skipped
+*entirely and unconditionally* on the indexed path — deliberately unsound, and
+reverted — to put a number on the best case elision could ever reach:
+
+| | ops/s (3 interleaved repetitions) |
+| --- | --- |
+| Baseline | 48,977 / 46,438 / 46,509 |
+| Filter skipped entirely | 56,293 / 54,909 / 54,159 |
+
+**1.18x**, non-overlapping. And that is the *ceiling*, on the friendliest
+possible query: `WHERE email >= ? AND email < ?` against an index on `email`
+binds both terms, so nothing residual remains and the skip is total. A correct
+implementation fires only where it can prove equivalence, pays plan-time proof
+cost, and is refused by every shape `collect_conjuncts` does not fully
+recognise — so it lands below 1.18x by construction.
+
+**What it would cost.** `Engine::candidate_bytes`'s doc comment states the
+invariant elision breaks: "the filter is still evaluated over every row all
+three yield, so this is purely a matter of how many rows are read — never of
+which ones match... which is why choosing badly here is slow rather than
+wrong." That property is what makes every future access-path change safe by
+construction. Trading it for at most 1.18x on one shape — which still loses
+~2x to SQLite journal afterwards, so the loss is not closed either — is a bad
+trade, and this is a recommendation not to make it.
+
+**Where the time actually is**, from the same profile (23,952 samples,
+`--suite indexed-range`): B-tree/page work **21.1%**, allocator **20.9%**,
+`memcmp` **16.7%** (descent, per above), eval/filter **12.3%**, harness timer
+6.0%. The allocator share is the familiar one — `_xzm_xzone_malloc_tiny` 6.4%
+plus `_xzm_free_main` 6.5%, the per-cell `Entry`/`Value` decode cost AHL-488
+diagnosed and AHL-493 failed to remove with page views. The point path reaches
+it through `node_at`, which decodes a leaf into `Node::Leaf { entries }` even
+on a cursor hit.
+
+**The lead worth following instead:** B1a fixed the *scan* path's version of
+exactly this by caching page **bytes** rather than decoded nodes, and measured
+1.38x with no regression anywhere. The point path has the same shape of cost
+and no equivalent yet. That is a larger prize than 1.18x, on the same shape,
+without touching an invariant.
+
 ### The uncached leaf, fixed by caching the bytes instead of the node (2026-09-01)
 
 B1 (below) found that the raw row scan never caches the leaves it reads, so a
