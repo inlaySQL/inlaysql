@@ -24,7 +24,7 @@ use core::ops::{Deref, Range};
 
 use crate::error::{Error, Result};
 use crate::quantize::Q8Vector;
-use crate::value::{DataType, Value, ValueRef};
+use crate::value::{DataType, Text, Value, ValueRef};
 
 /// A row's encoded bytes, shared out of the page cache rather than copied.
 ///
@@ -442,7 +442,11 @@ fn decode_value(cursor: &mut Cursor<'_>) -> Result<Value> {
             let bytes = cursor.take(len)?;
             let text = core::str::from_utf8(bytes)
                 .map_err(|_| Error::Corrupt("text column is not valid UTF-8".to_string()))?;
-            Ok(Value::Text(String::from(text).into()))
+            // Straight from the borrowed `str` into the `Arc<str>`: one
+            // allocation and one copy. Going through `String` first allocated
+            // and copied twice, because `Text::from(String)` reads the bytes
+            // back out of the `String` to build the `Arc` and then drops it.
+            Ok(Value::Text(Text::from(text)))
         }
         TAG_BLOB => {
             let len = cursor.u32()? as usize;
