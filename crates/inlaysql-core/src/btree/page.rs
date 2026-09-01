@@ -230,7 +230,7 @@ pub fn leaf_size(source: &[u8], entries: &[Entry]) -> usize {
 /// correct: an inline cell can be nearly a page long, and an overflow pointer is
 /// tiny, so a leaf mixing the two could reach a size no prefix/suffix split can
 /// break into two fitting halves. Requiring every entry to fit in half a page
-/// makes a split always possible — see [`leaf_split_point`]'s caller in
+/// makes a split always possible — see `leaf_split_point`'s caller in
 /// `btree/tree.rs`.
 pub fn inline_entry_fits(page_size: usize, key: &[u8], value: &[u8]) -> bool {
     HEADER_SIZE + SLOT_SIZE + leaf_cell_size(key, &ValueRef::Owned(Rc::from(value)))

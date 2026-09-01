@@ -1,6 +1,6 @@
 //! Row storage over the in-house copy-on-write B+ tree.
 //!
-//! This is the bridge between the engine's [`Storage`](crate::Storage) trait
+//! This is the bridge between the engine's [`crate::Storage`] trait
 //! and the tree that actually holds the bytes. It lives in the core crate
 //! because it needs nothing from the operating system: hand it any
 //! [`Device`] — a file, an `io_uring` ring, a `Vec<u8>` in a browser tab, a
@@ -228,7 +228,7 @@ impl<D: Device> Storage for TreeStorage<D> {
     /// The point read. The key is built on the stack — see [`RowKeyBuf`] — so
     /// the lookup reaches the tree without a heap allocation, and a cache hit
     /// no longer copies the row bytes either (`AHL-478`) — see
-    /// [`RowBuf`](crate::row::RowBuf).
+    /// [`crate::row::RowBuf`].
     fn get_row(&self, table: &str, id: RowId) -> Result<Option<RowBuf>> {
         let mut key = RowKeyBuf::new();
         self.tree.get(key.key(table, id))

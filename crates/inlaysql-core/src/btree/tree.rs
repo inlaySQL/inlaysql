@@ -895,13 +895,13 @@ impl<D: Device> CowBTree<D> {
     /// retained leaf, when `key` is still inside the span that leaf covers —
     /// the cursor behaviour SQLite gets by tracking `(page, position)` across
     /// seeks of the same cursor, narrowed to the one case that is both by far
-    /// the most common for a join probe (the row ids [`IndexProbe::prepare`]
-    /// fetches are sorted, so consecutive fetches are typically adjacent keys
-    /// on the same leaf) and the cheapest to keep correct: this tree's nodes
-    /// carry no parent or sibling pointer, so answering anything past "is it
-    /// still on this exact leaf" would mean walking back up a retained path,
-    /// which is the more general design `PERF.md` leaves as a further step if
-    /// this narrower one stops paying.
+    /// the most common for a join probe (the row ids
+    /// [`crate::exec::IndexProbe::prepare`] fetches are sorted, so consecutive
+    /// fetches are typically adjacent keys on the same leaf) and the cheapest
+    /// to keep correct: this tree's nodes carry no parent or sibling pointer,
+    /// so answering anything past "is it still on this exact leaf" would mean
+    /// walking back up a retained path, which is the more general design
+    /// `PERF.md` leaves as a further step if this narrower one stops paying.
     ///
     /// Returns `Ok(None)` when the retained leaf cannot answer this lookup at
     /// all — nothing retained yet, a different `root`, or `key` outside its
@@ -1857,9 +1857,9 @@ impl<D: Device> CowBTree<D> {
     /// The row-id-and-value form of [`CowBTree::scan_range_from`]: same pruning,
     /// same order, same `WalkBounds` semantics — only the leaf branch differs
     /// (row id out of the borrowed key, value resolved, no key clone). Crate-
-    /// private for the same reason as [`CowBTree::scan_prefix_row_values_from`]:
-    /// it only answers correctly over a key space whose keys end in an eight-
-    /// byte big-endian row id. Test-only parity oracle for the raw-leaf walk.
+    /// private for the same reason as `scan_prefix_row_values_from`: it only
+    /// answers correctly over a key space whose keys end in an eight-byte
+    /// big-endian row id. Test-only parity oracle for the raw-leaf walk.
     #[cfg(test)]
     pub(crate) fn scan_range_row_values_from(
         &self,
@@ -1882,10 +1882,10 @@ impl<D: Device> CowBTree<D> {
         Ok(out)
     }
 
-    /// The raw-leaf form of [`CowBTree::scan_prefix_row_values_from`] — same
-    /// bounds, order, resume and value semantics, but leaf pages are parsed in
-    /// place rather than decoded into a cached node. This is the production
-    /// path for a table scan; the decoded walk is its parity oracle.
+    /// The raw-leaf form of `scan_prefix_row_values_from` — same bounds,
+    /// order, resume and value semantics, but leaf pages are parsed in place
+    /// rather than decoded into a cached node. This is the production path for
+    /// a table scan; the decoded walk is its parity oracle.
     pub(crate) fn scan_prefix_row_values_raw_from(
         &self,
         prefix: &[u8],
@@ -1896,7 +1896,7 @@ impl<D: Device> CowBTree<D> {
         self.scan_range_row_values_raw_from(prefix, upper.as_deref(), after, limit)
     }
 
-    /// The raw-leaf form of [`CowBTree::scan_range_row_values_from`].
+    /// The raw-leaf form of `scan_range_row_values_from`.
     pub(crate) fn scan_range_row_values_raw_from(
         &self,
         start: &[u8],
@@ -3300,8 +3300,7 @@ impl<D: Device> CowBTree<D> {
         Ok(())
     }
 
-    /// [`CowBTree::walk_row_values`]'s raw-leaf sibling, for the sequential
-    /// scan.
+    /// `walk_row_values`'s raw-leaf sibling, for the sequential scan.
     ///
     /// Internal nodes are decoded and navigated exactly as the general walk
     /// does — they are few, and their separators have to be read to descend.

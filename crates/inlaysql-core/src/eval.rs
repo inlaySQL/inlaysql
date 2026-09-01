@@ -74,11 +74,11 @@ pub struct Env<'a> {
     /// evaluating the CTE's own seed.
     ///
     /// Set fresh by [`crate::Engine::run_recursive`] before each step, not
-    /// carried in from the enclosing environment the way [`Env::outer`] is —
-    /// a recursive CTE referenced *inside* another recursive CTE's recursive
+    /// carried in from the enclosing environment the way [`Env::outer`] is — a
+    /// recursive CTE referenced *inside* another recursive CTE's recursive
     /// term is a different self-reference with its own frontier, and each
-    /// [`Engine::run_body`] call for a [`crate::plan::SubqueryBody::Recursive`]
-    /// establishes its own.
+    /// [`crate::engine::Engine::run_body`] call for a
+    /// [`crate::plan::SubqueryBody::Recursive`] establishes its own.
     recursive_frontier: Option<&'a [Vec<Value>]>,
 }
 

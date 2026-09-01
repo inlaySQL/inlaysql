@@ -8506,9 +8506,9 @@ struct FrameContext<'a> {
 ///
 /// `is_start` only matters for `Range`/`Groups`: a `CURRENT ROW` bound reads
 /// `peer_start` as a frame start and `peer_end` as a frame end (the "whole
-/// peer group" reinterpretation [`WindowFrame`]'s doc measures against
-/// sqlite3, on *either* side, unlike the position a `ROWS` `CURRENT ROW`
-/// always means); a `Groups` offset bound resolves to its target group's
+/// peer group" reinterpretation [`crate::plan::WindowFrame`]'s doc measures
+/// against sqlite3, on *either* side, unlike the position a `ROWS` `CURRENT
+/// ROW` always means); a `Groups` offset bound resolves to its target group's
 /// first position as a start, last as an end.
 fn bound_position(
     ctx: &FrameContext,
@@ -8571,10 +8571,11 @@ fn bound_position(
 /// `FOLLOWING` "toward a larger one", the same either way.
 ///
 /// The current row's own key is `None` when it is `NULL` or (a disclosed,
-/// narrower answer than sqlite3's own degenerate one — see [`WindowFrame`]'s
-/// doc) not numeric at all; either way this returns the row's own peer
-/// group rather than attempting a value comparison, matching sqlite3's
-/// measured `NULL` behaviour and standing in for the non-numeric case too.
+/// narrower answer than sqlite3's own degenerate one — see
+/// [`crate::plan::WindowFrame`]'s doc) not numeric at all; either way this
+/// returns the row's own peer group rather than attempting a value comparison,
+/// matching sqlite3's measured `NULL` behaviour and standing in for the
+/// non-numeric case too.
 fn numeric_range_bound(
     numeric: &NumericFrameKeys<'_>,
     position: usize,

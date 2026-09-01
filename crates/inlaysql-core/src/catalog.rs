@@ -454,7 +454,7 @@ pub struct Index {
     /// distance; searched under another they route the walk by the wrong
     /// geometry and return plausible, wrong rows with no error — so this
     /// travels to the backend at open time and is checked against the graph on
-    /// disk there ([`crate::hnsw::HnswIndex::load`],
+    /// disk there ([`crate::hnsw::HnswIndex`]'s `load`,
     /// [`crate::hnsw_paged::PagedHnswIndex::restore`]).
     ///
     /// Every other kind carries [`VectorMetric::Cosine`] and means nothing by

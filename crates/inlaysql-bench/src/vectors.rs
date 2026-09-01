@@ -409,7 +409,8 @@ fn paged_build(
     Ok((file_bytes, resident_vector_bytes))
 }
 
-/// Incremental ANN maintenance, measured directly against [`HnswIndex`].
+/// Incremental ANN maintenance, measured directly against
+/// [`inlaysql_core::hnsw::HnswIndex`].
 ///
 /// The SQL path above cannot show this: the engine defers index commits to the
 /// first read, so a load there pays one full build whatever the maintenance

@@ -24,7 +24,7 @@
 //!
 //! **D2 — Thread-per-connection, one handle each.** `std::net::TcpListener`, one
 //! OS thread per connection, and each thread opens its own
-//! [`Database`](inlaysql::Database) on the same file. The engine is `!Send` by
+//! [`inlaysql::Database`] on the same file. The engine is `!Send` by
 //! design, and several handles on one file already commit concurrently with
 //! first-committer-wins, so this needs no locking of its own. What the handles
 //! *share* is the file device's per-file raw-page read cache
@@ -68,6 +68,14 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// Doc comments here explain the implementation to whoever is reading the
+// source, so they link to private items on purpose: `[`CommitCoordinator`]`
+// is the thing the sentence is about, whether or not a docs.rs reader can
+// click it. Rustdoc's default is to reject those links in the docs of a
+// public item, which would mean either deleting the reference or promoting
+// an internal type to keep a sentence readable. Allowed instead; every other
+// rustdoc lint stays denied; `AGENTS.md` documents the gate that runs them.
+#![allow(rustdoc::private_intra_doc_links)]
 
 mod acl;
 mod auth;

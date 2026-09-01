@@ -10,14 +10,14 @@
 //!
 //! # Why this is not `vacuum`
 //!
-//! [`crate::vacuum`] rebuilds a database from its own SQL: it opens the source
-//! read-write, holds the exclusive advisory lock for the whole copy *and* the
-//! rename, and replays `CREATE TABLE`/`INSERT`/`CREATE INDEX` into a fresh
-//! file. That makes it compaction, and it makes it unable to run at all beside
-//! a live server, which holds that lock for its lifetime. It is also, table by
-//! table, a sequence of separate statements — each one refreshing onto
-//! whatever snapshot it landed on, so two tables can come from two different
-//! commits.
+//! [`crate::vacuum()`] rebuilds a database from its own SQL: it opens the
+//! source read-write, holds the exclusive advisory lock for the whole copy
+//! *and* the rename, and replays `CREATE TABLE`/`INSERT`/`CREATE INDEX` into a
+//! fresh file. That makes it compaction, and it makes it unable to run at all
+//! beside a live server, which holds that lock for its lifetime. It is also,
+//! table by table, a sequence of separate statements — each one refreshing
+//! onto whatever snapshot it landed on, so two tables can come from two
+//! different commits.
 //!
 //! This writes no byte of the source, takes no lock of its own, and reads one
 //! root. The trade is the other way round: the copy is not compacted (page ids
@@ -165,7 +165,7 @@ impl Database {
 /// cannot know what it has.
 ///
 /// `source` must exist. It is never created — the same refusal
-/// [`crate::vacuum`] makes, for the same reason: a typo'd path that silently
+/// [`crate::vacuum()`] makes, for the same reason: a typo'd path that silently
 /// "backed up" a database that never existed produces an empty file with a
 /// reassuring name.
 pub fn backup(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> Result<BackupOutcome> {

@@ -81,6 +81,7 @@ a PR, not after:
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 cargo test --workspace
 python3 bench/test_summarise.py
 cargo run --example hybrid_search -p inlaysql
@@ -92,6 +93,16 @@ cargo test -p inlaysql-core --test logic_bugs -- --nocapture
 
 `inlaysql-bench` builds `rusqlite` and `sqlite-vec` from bundled C sources, so
 a full workspace test run needs a C compiler available.
+
+The rustdoc step exists because the doc comments here carry the reasoning, not
+just the signature, and a `[`link`]` to a renamed or deleted symbol is a reader
+sent nowhere. It runs with `--document-private-items` so the internals' prose is
+checked too. Two things it deliberately does not fail on: a doc comment on a
+public item linking to a private one (allowed at each crate root — the sentence
+is about the private thing whether or not docs.rs can link it), and a reference
+to a `#[cfg(test)]` item, which does not exist in a doc build and so has to be a
+plain code span rather than a link. Cross-module references to another module's
+private free function are the same case: not a nameable path, so not a link.
 
 **The list above is one of four jobs `ci.yml` gates a merge on**, and the
 other three fail a merge just as hard. Run all of them on Linux, on the same

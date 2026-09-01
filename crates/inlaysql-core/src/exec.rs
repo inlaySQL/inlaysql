@@ -506,9 +506,8 @@ pub(crate) enum ProbeKind {
     /// leading column equals the key, then fetches the rows they name.
     ///
     /// A composite index qualifies on its *leading* column alone, for the
-    /// reason [`crate::engine::index_probe`] gives: entries that agree on the
-    /// leading column are contiguous, and nothing past the first unbound column
-    /// is.
+    /// reason `engine::index_probe` gives: entries that agree on the leading
+    /// column are contiguous, and nothing past the first unbound column is.
     Index(String),
 }
 

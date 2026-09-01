@@ -55,8 +55,8 @@ use alloc::vec::Vec;
 /// `Int`/`Real` mirror SQLite's own split of JSON's single `number`
 /// production: a JSON number that parses as an `i64` is `Int`, and one that
 /// does not (has a `.`/exponent, or overflows) is `Real` — the same rule
-/// [`crate::sql::bind_literal`] uses for a SQL numeric literal, checked
-/// against sqlite3's `json_type`/`typeof`.
+/// `sql::bind_literal` uses for a SQL numeric literal, checked against
+/// sqlite3's `json_type`/`typeof`.
 ///
 /// `Real` carries its rendered text alongside the `f64` (AHL-492). Checked
 /// against sqlite3: parsing a document and re-emitting it preserves a

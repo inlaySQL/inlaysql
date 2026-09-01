@@ -54,6 +54,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Doc comments are load-bearing here: much of the reasoning behind the
+      # storage and planner code lives in them, and a cross-reference that no
+      # longer resolves is a reader sent to a symbol that has been renamed or
+      # deleted. Nothing checked these until AHL-516, by which point 32 links
+      # were broken. `--document-private-items` because the internals carry
+      # most of that prose; links from public docs *into* private items are
+      # allowed at each crate root, which is why this stays quiet about them.
+      - name: Rustdoc
+        run: |
+          RUSTDOCFLAGS="-D warnings" \
+            cargo doc --workspace --no-deps --document-private-items
+
       # `inlaysql-bench` builds `rusqlite` and `sqlite-vec` from bundled C
       # sources, so a workspace test run needs a C compiler. The runner has
       # one — the benchmark job in `trust.yml` has built them green — and this

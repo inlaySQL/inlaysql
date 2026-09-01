@@ -212,11 +212,11 @@ impl<'e> Explainer<'e> {
     // --------------------------------------------------------------- queries
 
     /// `cap` is the caller's own row budget, threaded exactly as
-    /// [`Engine::run_body`]'s is: `EXISTS` and a scalar subquery want one row,
-    /// and that budget reaches the access-path choice through
-    /// [`ScanShape::full_scan`]. Reporting a hash join for an `EXISTS`
-    /// subquery that in fact probes would be the drift this module exists to
-    /// rule out.
+    /// [`crate::engine::Engine::run_body`]'s is: `EXISTS` and a scalar
+    /// subquery want one row, and that budget reaches the access-path choice
+    /// through [`crate::engine::ScanShape::full_scan`]. Reporting a hash join
+    /// for an `EXISTS` subquery that in fact probes would be the drift this
+    /// module exists to rule out.
     fn body(&mut self, body: &SubqueryBody, parent: i64, cap: Option<usize>) -> Result<()> {
         match body {
             SubqueryBody::Select(plan) => self.select(plan, parent, cap),
@@ -235,8 +235,8 @@ impl<'e> Explainer<'e> {
 
     /// `cap` is not threaded to either arm: [`Engine::run_recursive`] applies
     /// it to the accumulated total between steps, not to one call of
-    /// [`Engine::run_body`], so there is no single access path here a budget
-    /// would change.
+    /// [`crate::engine::Engine::run_body`], so there is no single access path
+    /// here a budget would change.
     fn recursive(&mut self, plan: &RecursivePlan, parent: i64) -> Result<()> {
         let id = self.push(
             parent,

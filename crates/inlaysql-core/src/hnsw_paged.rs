@@ -1172,7 +1172,7 @@ impl<S: Storage> PagedHnswIndex<S> {
     /// With a `filter`, only live rows the filter admits enter `results` and
     /// count toward `ef`; rejected rows are still expanded, so the walk
     /// reaches admissible neighbours on their far side — see
-    /// [`crate::hnsw::search_layer`] for why severing that connectivity would
+    /// `hnsw::search_layer` for why severing that connectivity would
     /// silently drop matches, and for the two stop rules (beam full, frontier
     /// drained). The record fetch a filtered walk needs for the row id is the
     /// same one the distance already needs, so the filter costs predicate
@@ -1216,7 +1216,7 @@ impl<S: Storage> PagedHnswIndex<S> {
         }
 
         while let Some(Reverse(current)) = frontier.pop() {
-            // See [`crate::hnsw::search_layer`]: the beam-full stop compares
+            // See `hnsw::search_layer`: the beam-full stop compares
             // against the worst *admissible* result, so a filter that admits
             // few rows keeps the walk going past the rejected ones — until
             // the frontier runs out, which is the exact-scan fallback.

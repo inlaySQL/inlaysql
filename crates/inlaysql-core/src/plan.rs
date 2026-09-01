@@ -1000,8 +1000,8 @@ pub enum SubqueryBody {
     /// The recursive term's own reference to the common table expression it
     /// belongs to — resolved at plan time to this rather than to a stored
     /// table or a cloned body, because what it means is "whatever
-    /// [`Engine::run_recursive`] is holding as the current step's frontier",
-    /// which does not exist until execution.
+    /// [`crate::engine::Engine::run_recursive`] is holding as the current
+    /// step's frontier", which does not exist until execution.
     ///
     /// Never appears anywhere but inside a [`RecursivePlan::recursive`]
     /// body's `FROM`/`JOIN` list, and at most once there — `sql.rs`'s planner
@@ -1771,8 +1771,8 @@ pub enum CastType {
 /// expression produced.
 ///
 /// This is stage one of a two-stage rule (AHL-486); [`crate::eval::mem_cmp`]
-/// and [`crate::eval::compare_cells`]'s storage-class ranking is stage two
-/// and is unconditional — it runs whether or not this converted anything.
+/// and `eval::compare_cells`'s storage-class ranking is stage two and is
+/// unconditional — it runs whether or not this converted anything.
 /// `eval.rs`'s `affinity_conversion` is what actually applies a resolved
 /// value of this type to one comparison operand, immediately before
 /// `compare_cells` ranks the (possibly converted) pair. Checked against a
@@ -2516,9 +2516,10 @@ impl WindowFunc {
 }
 
 /// A window frame: which rows of the partition, relative to the current row,
-/// [`WindowFunc::FirstValue`]/[`LastValue`]/[`NthValue`]/[`WindowFunc::Agg`]
-/// fold over. The ranking and navigation functions ([`WindowFunc::reads_frame`]
-/// is `false`) ignore this entirely.
+/// [`WindowFunc::FirstValue`], [`WindowFunc::LastValue`],
+/// [`WindowFunc::NthValue`] and [`WindowFunc::Agg`] fold over. The ranking and
+/// navigation functions ([`WindowFunc::reads_frame`] is `false`) ignore this
+/// entirely.
 ///
 /// [`WindowFrame::unit`] tells the executor which of three readings applies —
 /// confirmed against sqlite3 3.54, since a value-based (`RANGE`) or
@@ -2603,10 +2604,10 @@ impl WindowFrame {
 /// `Preceding`/`Following` carry an expression rather than a bare count for
 /// the same reason [`SelectPlan::limit`] does: SQLite allows a bound
 /// parameter (`ROWS BETWEEN ? PRECEDING AND CURRENT ROW`), so the row count
-/// is not known until execution. Only meaningful when [`WindowFrame::rows`]
-/// is `true` — the default-frame bounds ([`WindowFrame::whole_partition`],
-/// [`WindowFrame::default_range`]) only ever use the three constant
-/// variants.
+/// is not known until execution. Only meaningful when the frame's
+/// [`WindowFrame::unit`] is [`FrameUnit::Rows`] — the default-frame bounds
+/// ([`WindowFrame::whole_partition`], [`WindowFrame::default_range`]) only
+/// ever use the three constant variants.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FrameBound {
     /// The partition's first row.

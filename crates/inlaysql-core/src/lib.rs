@@ -18,6 +18,14 @@
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+// Doc comments here explain the implementation to whoever is reading the
+// source, so they link to private items on purpose: `[`CommitCoordinator`]`
+// is the thing the sentence is about, whether or not a docs.rs reader can
+// click it. Rustdoc's default is to reject those links in the docs of a
+// public item, which would mean either deleting the reference or promoting
+// an internal type to keep a sentence readable. Allowed instead; every other
+// rustdoc lint stays denied; `AGENTS.md` documents the gate that runs them.
+#![allow(rustdoc::private_intra_doc_links)]
 
 extern crate alloc;
 

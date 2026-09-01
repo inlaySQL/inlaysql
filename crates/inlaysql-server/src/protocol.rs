@@ -344,7 +344,7 @@ pub fn streamed_column_def(name: String, declared: Option<DataType>) -> Option<C
 
 /// Choose a wire type for a column whose declared type the plan already
 /// knows — `COM_STMT_PREPARE`'s answer, built before a single row exists to
-/// [`unify_column_type`] over. `None` (a computed expression, a retrieval
+/// [`infer_column_type`] over. `None` (a computed expression, a retrieval
 /// score, or a column of a `SELECT` with no `FROM`) gets the same text
 /// fallback an all-`NULL` column does there: the widest type, and a client
 /// already copes with the real metadata replacing it once the statement
@@ -434,9 +434,9 @@ fn format_vector(values: &[f32]) -> String {
 /// Append a value to a binary-protocol row, encoded as `ty` says it is.
 ///
 /// The type has already been unified across the result set by
-/// [`unify_column_type`], so the fallback arms here are unreachable for a value
-/// that came from that path; they exist so a mismatch degrades to a correct
-/// string rather than a misframed packet.
+/// [`infer_column_type`], so the fallback arms here are unreachable for a
+/// value that came from that path; they exist so a mismatch degrades to a
+/// correct string rather than a misframed packet.
 pub fn put_binary_value(out: &mut Vec<u8>, ty: u8, value: &Value) {
     match (ty, value) {
         (_, Value::Null) => {}
