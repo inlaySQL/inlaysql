@@ -199,14 +199,32 @@ family as the join loss below.
 from the warm p50 — the cold column is where the join plan and its tables get
 built, so it is the expensive one:
 
-Median of three runs, same session as the point/indexed tables above.
+**Regenerated 2026-09-01 at `2eeced7`** (`SUITE=joins REPEATS=3`, median of
+three, quiet-machine gate passed throughout and no run marked `CONTAMINATED`;
+raw: `bench/results/20260901T032752Z-repeat.txt`). This table is the only one
+on this page measured at that commit — the rest are the 2026-08-30 edition
+described in the provenance header, and are carried forward. It was
+regenerated on its own because three changes landed against exactly these
+shapes (below) and the previous figures predate all of them.
 
-| Query shape | InlaySQL cold → p50 (median) | SQLite journal cold → p50 (median) | vs journal (range across the 3 runs) |
+| Query shape | InlaySQL cold → p50 (median) | SQLite journal cold → p50 (median) | vs journal |
 | --- | --- | --- | --- |
-| PK inner, full join | 15.96 ms → 12.51 ms | 11.34 ms → 10.70 ms | **~1.1-1.3x slower** |
-| PK inner, LIMIT 10 | 86.54 µs → 11.42 µs | 10.54 µs → 3.92 µs | ~2.8-3.5x slower |
-| Secondary-index inner, full | 26.45 ms → 4.22 ms | 32.41 ms → 31.78 ms | **~5-9x faster** |
-| Secondary-index inner, LIMIT 10 | 83.92 µs → 10.75 µs | 22.00 µs → 4.58 µs | ~2.2-2.6x slower |
+| PK inner, full join | 16.29 ms → 11.72 ms | 10.99 ms → 9.99 ms | **~1.15x slower** |
+| PK inner, LIMIT 10 | 68.50 µs → 6.13 µs | 8.58 µs → 3.33 µs | ~2.0x slower |
+| Secondary-index inner, full | 36.59 ms → 3.71 ms | 30.24 ms → 30.26 ms | **~7.5x faster** |
+| Secondary-index inner, LIMIT 10 | 72.38 µs → 8.75 µs | 15.25 µs → 4.33 µs | ~2.1x slower |
+
+**Both `LIMIT` rows improved, and the reason is three landed changes rather
+than a quieter afternoon.** They were 2.8-3.5x and 2.2-2.6x slower in the
+previous edition and are 2.0x and 2.1x here. What changed: `e4086ad` gave the
+raw leaf scan a cache for the *undecoded* pages it re-reads on every execution
+of a prepared statement (1.38x on these two shapes, measured interleaved), and
+`2da02a7`/`3e0eec1` let the hash join build on collated `TEXT` and on `REAL`
+keys, which those shapes do not use but which removed the same class of
+over-restriction. The `joins/s` and `p50` columns did not appear in this run's
+own ≥10% disagreement list, so the second digit here is better supported than
+this table's history would suggest; `cold`, `max` and `p99` are single samples
+and swung 20-214%, which is what those columns always do.
 
 The last column is the harness's own throughput ratio (joins/s against
 joins/s); the range given is not a formatting flourish — InlaySQL's own

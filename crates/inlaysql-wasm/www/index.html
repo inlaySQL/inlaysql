@@ -502,9 +502,9 @@
         </tr>
         <tr>
           <td>Secondary-index inner join, 20k × 160k rows</td>
-          <td class="num">4.22 ms</td>
+          <td class="num">3.71 ms</td>
           <td>SQLite</td>
-          <td class="win">~5-9× faster</td>
+          <td class="win">~7.5× faster</td>
         </tr>
         <tr>
           <td>Indexed range scan, 50 rows</td>
@@ -595,9 +595,12 @@
         own benchmark that single choice is worth about 8×.
       </li>
       <li>
-        <strong>The MySQL server is localhost-plaintext for now.</strong> No
-        TLS, a single credential from a flag, and it binds to 127.0.0.1 by
-        default. Do not put it on a network you do not own.
+        <strong>The MySQL server is plaintext unless you configure TLS.</strong>
+        <code>--tls-cert</code>/<code>--tls-key</code> turns it on and
+        <code>--tls-required</code> refuses logins that do not use it, but the
+        default is off, the account model is still a single credential from a
+        flag, and it binds to 127.0.0.1. Without a certificate, do not put it
+        on a network you do not own.
       </li>
       <li>
         <strong>Recall on uniformly random vectors is poor</strong> — and

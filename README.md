@@ -302,7 +302,9 @@ AHL-494 and now go through byte-for-byte, because MySQL 8 spells them the way
 SQLite does and the shim has no reason to touch them. The collation mapping
 still folds ASCII case only: `WHERE name = 'ADA'` matches a stored `'ada'`
 under a `*_ci` collation the way MySQL does, but not an accent
-(`'é' = 'e'`). It is plaintext, single-user and binds `127.0.0.1` by default.
+(`'é' = 'e'`). It is single-user and binds `127.0.0.1` by default, and the
+wire is plaintext until `--tls-cert`/`--tls-key` are given — `--tls-required`
+then refuses any login that did not encrypt.
 [`docs/server.md`](docs/server.md) has the full security posture, the
 function-by-function mapping and the complete divergence list, each checked
 against a real MySQL 8.4.11.
@@ -844,18 +846,18 @@ harder target.
 | Point read by primary key | **522,562 ops/s**, 1.38 µs p50 | 160,236 ops/s (**~2-4x**) | 1,118,819 ops/s (we lose ~2x) |
 | Point read, secondary index | **371,478 ops/s**, 2.25 µs p50 | 245,790 ops/s (**~1.5x**) | 619,985 ops/s (we lose ~1.7x) |
 | Indexed range scan, 50 rows | 64,250 ops/s, 14.00 µs p50 | 124,662 ops/s (we lose ~2x) | 182,357 ops/s (we lose ~2.9x) |
-| Join, PK inner, full scan | 12.51 ms p50 | 10.70 ms p50 (we lose ~1.1-1.3x) | — |
-| Join, secondary-index inner, full scan | **4.22 ms p50** | 31.78 ms p50 (we win ~5-9x) | — |
+| Join, PK inner, full scan | 11.72 ms p50 | 9.99 ms p50 (we lose ~1.15x) | — |
+| Join, secondary-index inner, full scan | **3.71 ms p50** | 30.26 ms p50 (we win ~7.5x) | — |
 | Durable write, one commit each | **240 ops/s**, 3.97 ms p50 | 90 ops/s (**~2.7x**) | — |
 | Concurrent durable writers, 8 threads | **1,209 commits/s**, 0.0% aborted | 88 commits/s (**~13x**) | — |
 
 A single indexed point probe wins — the index itself is worth roughly 550x
 over the engine's own unindexed scan. **Iterating rows is where we lose**:
 the 50-row range scan is behind both SQLite configurations (roughly 2x and
-2.9x), and the `LIMIT 10` form of both join shapes stays roughly 2.2-3.5x
-behind (down from 4.7–5.8x two editions ago, after two fixes described in
-`BENCHMARK.md`), which is what pins the remaining cost as per-row rather than
-per-query. Every multiple in this paragraph is stated to the precision
+2.9x), and the `LIMIT 10` form of both join shapes stays roughly 2.0-2.1x
+behind (regenerated 2026-09-01; down from 2.2-3.5x after the raw-leaf cache in
+`e4086ad`, and from 4.7–5.8x two editions before that), which is what pins the
+remaining cost as per-row rather than per-query. Every multiple in this paragraph is stated to the precision
 `BENCHMARK.md`'s own measured run-to-run spread supports, not to three
 digits — see that file's opening note. This is the top open performance
 target — [`PERF.md`](PERF.md) has the profile, and index selection stops at
