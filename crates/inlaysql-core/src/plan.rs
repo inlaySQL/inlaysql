@@ -1317,6 +1317,94 @@ impl Expr {
         }
     }
 
+    /// Rewrite every column ordinal this expression reads through `map`.
+    ///
+    /// Used to move an expression from one joined-row layout to another — see
+    /// [`SelectPlan::swap_leading_join`], which is the only caller and the only
+    /// reason this exists.
+    ///
+    /// **A subquery's body is deliberately not descended into.** Its
+    /// [`Expr::Column`] ordinals index *its own* row, not this one; what it
+    /// reads from the enclosing row it reads through [`Expr::Outer`] and its
+    /// capture list. So the captures and an `IN`'s probe are remapped, because
+    /// those are evaluated out here, and the body is left exactly alone. This
+    /// is the same split [`Expr::tables_read`] makes, for the same reason, and
+    /// getting it backwards would silently rewrite an unrelated query's
+    /// column references.
+    pub fn remap_columns(&mut self, map: &dyn Fn(usize) -> usize) {
+        match self {
+            Expr::Column(index) => *index = map(*index),
+            // `Agg`/`Window` are indices into the plan's own aggregate and
+            // window lists, not row ordinals; those lists are remapped
+            // separately by `SelectPlan::remap_columns`.
+            Expr::Literal(_) | Expr::Param(_) | Expr::Agg(_) | Expr::Window(_) | Expr::Outer(_) => {
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Collate { expr, .. } => {
+                expr.remap_columns(map)
+            }
+            Expr::Binary { left, right, .. } => {
+                left.remap_columns(map);
+                right.remap_columns(map);
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                expr.remap_columns(map);
+                pattern.remap_columns(map);
+                if let Some(escape) = escape {
+                    escape.remap_columns(map);
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                expr.remap_columns(map);
+                for item in list {
+                    item.remap_columns(map);
+                }
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                expr.remap_columns(map);
+                low.remap_columns(map);
+                high.remap_columns(map);
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_result,
+                ..
+            } => {
+                if let Some(operand) = operand {
+                    operand.remap_columns(map);
+                }
+                for (when, then) in branches {
+                    when.remap_columns(map);
+                    then.remap_columns(map);
+                }
+                if let Some(else_result) = else_result {
+                    else_result.remap_columns(map);
+                }
+            }
+            Expr::Func { args, .. } => {
+                for arg in args {
+                    arg.remap_columns(map);
+                }
+            }
+            Expr::Subquery { op, query } => {
+                if let SubqueryOp::In { probe, .. } = op {
+                    probe.remap_columns(map);
+                }
+                for capture in &mut query.captures {
+                    capture.remap_columns(map);
+                }
+                // `query.body` is not descended into — see this method's doc.
+            }
+        }
+    }
+
     /// Record every stored table reachable from this expression's subqueries.
     ///
     /// [`Plan::tables`] is what a prepared statement re-checks before it runs,
@@ -1963,6 +2051,142 @@ impl SelectPlan {
         select_item_columns(&self.items, &tables)
     }
 
+    /// Whether this plan is a shape [`SelectPlan::swap_leading_join`] may
+    /// reorder.
+    ///
+    /// Deliberately narrow. Every condition rules out a case where swapping
+    /// would change an answer rather than only the work done to reach it:
+    ///
+    /// * **Exactly two sources.** Three-way reordering is a search problem;
+    ///   this is one comparison.
+    /// * **`INNER`.** `a LEFT JOIN b` is not `b LEFT JOIN a` — the padded side
+    ///   changes — so an outer join is not commutative and is refused.
+    /// * **No derived table.** Its rows come from a nested plan whose own
+    ///   ordinals this rewrite does not own.
+    /// * **No retrieval score.** `score` is answered from the driving table
+    ///   only (see [`SelectPlan::score`]), so which table drives is part of
+    ///   the query's meaning rather than a cost decision.
+    pub fn can_swap_leading_join(&self) -> bool {
+        self.from.len() == 2
+            && self.joins.len() == 1
+            && self.joins[0].kind == JoinKind::Inner
+            && self.from.iter().all(|item| item.derived.is_none())
+            && self.score.is_none()
+    }
+
+    /// Exchange the two sources of a two-table inner join, rewriting every
+    /// column ordinal so the plan means exactly what it meant before.
+    ///
+    /// The joined row is the first source's columns followed by the second's,
+    /// and every expression in the plan indexes into that. Swapping the
+    /// sources therefore moves every ordinal: a column of the old first source
+    /// shifts up by the second's width, and a column of the old second source
+    /// shifts down by the first's. Nothing else about the plan changes —
+    /// the projection still names the same columns in the same output order,
+    /// because its ordinals move with everything else.
+    ///
+    /// The result is byte-for-byte the plan the same query written the other
+    /// way round would have produced, which is the property that makes this
+    /// safe to do at all: it produces a plan the engine already knows how to
+    /// execute, rather than a new kind of plan.
+    ///
+    /// Caller must have checked [`SelectPlan::can_swap_leading_join`].
+    pub fn swap_leading_join(&mut self) {
+        debug_assert!(self.can_swap_leading_join());
+        let first_width = self.from[0].table.columns.len();
+        let second_width = self.from[1].table.columns.len();
+        let map = move |index: usize| {
+            if index < first_width {
+                index + second_width
+            } else {
+                index - first_width
+            }
+        };
+        self.from.swap(0, 1);
+        self.remap_columns(&map);
+    }
+
+    /// Rewrite every column ordinal in this plan through `map`.
+    ///
+    /// Every field that can carry one is listed here rather than reached by a
+    /// generic walk, so that adding a field to [`SelectPlan`] without deciding
+    /// what it means for this rewrite is a compile error waiting to be noticed
+    /// rather than a silently missed ordinal.
+    fn remap_columns(&mut self, map: &dyn Fn(usize) -> usize) {
+        let SelectPlan {
+            distinct: _,
+            distinct_collations: _,
+            from: _,
+            joins,
+            items,
+            score: _,
+            filter,
+            group_by,
+            group_collations: _,
+            having,
+            aggregates,
+            windows,
+            order,
+            limit,
+            offset,
+        } = self;
+
+        for join in joins {
+            if let Some(on) = &mut join.on {
+                on.remap_columns(map);
+            }
+        }
+        for item in items {
+            match item {
+                SelectItem::Column { index, .. } => *index = map(*index),
+                SelectItem::Expr { expr, .. } => expr.remap_columns(map),
+                SelectItem::Score { .. } => {}
+            }
+        }
+        for expr in [filter, having].into_iter().flatten() {
+            expr.remap_columns(map);
+        }
+        for key in group_by {
+            key.remap_columns(map);
+        }
+        for aggregate in aggregates {
+            for expr in [
+                &mut aggregate.arg,
+                &mut aggregate.separator,
+                &mut aggregate.filter,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                expr.remap_columns(map);
+            }
+        }
+        for window in windows {
+            for arg in &mut window.args {
+                arg.remap_columns(map);
+            }
+            if let Some(filter) = &mut window.filter {
+                filter.remap_columns(map);
+            }
+            for key in &mut window.partition_by {
+                key.remap_columns(map);
+            }
+            for term in &mut window.order_by {
+                term.remap_columns(map);
+            }
+        }
+        for term in order {
+            term.remap_columns(map);
+        }
+        // `LIMIT`/`OFFSET` cannot name a column in SQL, but they are
+        // expressions and are remapped rather than assumed: an assumption
+        // about what a field cannot contain is the kind that stops being true
+        // quietly.
+        for expr in [limit, offset].into_iter().flatten() {
+            expr.remap_columns(map);
+        }
+    }
+
     /// Record every stored table this query reads, including through its
     /// derived tables and its subqueries. See [`Expr::tables_read`].
     pub fn tables_read<'a>(&'a self, out: &mut Vec<&'a str>) {
@@ -2498,6 +2722,17 @@ pub struct Order {
     /// `!desc` — first ascending, last descending — and an explicit
     /// `NULLS FIRST`/`NULLS LAST` overrides it in either direction.
     pub nulls_first: bool,
+}
+
+impl Order {
+    /// Rewrite this sort term's column ordinals through `map`.
+    fn remap_columns(&mut self, map: &dyn Fn(usize) -> usize) {
+        match &mut self.key {
+            OrderKey::Column(index) => *index = map(*index),
+            OrderKey::Expr(expr) => expr.remap_columns(map),
+            OrderKey::Score => {}
+        }
+    }
 }
 
 impl Order {

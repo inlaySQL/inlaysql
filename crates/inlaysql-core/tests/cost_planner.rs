@@ -13,6 +13,17 @@ fn run(engine: &mut Engine, sql: &str) {
         .unwrap_or_else(|error| panic!("`{sql}`: {error}"));
 }
 
+/// Every row a query answers with, as comparable text.
+fn answer(engine: &mut Engine, sql: &str) -> Vec<Vec<String>> {
+    engine
+        .query(sql, &[])
+        .unwrap_or_else(|error| panic!("`{sql}`: {error}"))
+        .rows
+        .iter()
+        .map(|row| row.iter().map(|cell| format!("{cell:?}")).collect())
+        .collect()
+}
+
 fn details(engine: &mut Engine, sql: &str) -> Vec<String> {
     engine
         .query(sql, &[])
@@ -91,14 +102,22 @@ fn analyze_costs_existing_join_paths_and_explain_matches_execution() {
         .iter()
         .any(|detail| detail.contains("HASH JOIN users") && detail.contains("COSTED")));
 
+    // Written `users JOIN posts`, planned `posts JOIN users`: with statistics
+    // the cost model is now allowed to choose which side drives, and building
+    // the smaller side is cheaper than building the larger one. The assertion
+    // moved with the behaviour rather than being relaxed — it still pins a
+    // costed hash join, on the side the model actually picks.
     let secondary = details(
         &mut engine,
         "EXPLAIN SELECT users.name, posts.title FROM users \
          JOIN posts ON posts.user_id = users.id",
     );
-    assert!(secondary
-        .iter()
-        .any(|detail| { detail.contains("HASH JOIN posts") && detail.contains("COSTED") }));
+    assert!(
+        secondary
+            .iter()
+            .any(|detail| { detail.contains("HASH JOIN users") && detail.contains("COSTED") }),
+        "expected the reordered plan, got {secondary:?}"
+    );
 
     let limited = details(
         &mut engine,
@@ -183,9 +202,14 @@ fn analyzed_stats_survive_reopening_the_engine() {
         "EXPLAIN SELECT users.name, posts.title FROM users \
          JOIN posts ON posts.user_id = users.id",
     );
-    assert!(plan
-        .iter()
-        .any(|detail| { detail.contains("HASH JOIN posts") && detail.contains("COSTED") }));
+    // `HASH JOIN users` from a query written `users JOIN posts`: the stats
+    // survived the reopen, so the cost model is live and reorders — which is
+    // what this test is really asserting.
+    assert!(
+        plan.iter()
+            .any(|detail| { detail.contains("HASH JOIN users") && detail.contains("COSTED") }),
+        "expected costed, reordered plan after reopening, got {plan:?}"
+    );
 }
 
 #[test]
@@ -238,4 +262,80 @@ fn a_corrupt_persisted_stats_blob_falls_back_to_rules() {
     assert!(plan
         .iter()
         .any(|detail| detail.starts_with("HASH JOIN posts")));
+}
+
+/// A reordered join returns exactly what the written order returns.
+///
+/// Join *ordering* is the one planner choice that can change an answer rather
+/// than only the work: every expression in the plan indexes into the joined
+/// row by ordinal, and swapping the sources moves every one of them. A remap
+/// that missed a field would not be slow, it would be wrong — in the
+/// projection, the `WHERE`, an `ORDER BY`, an aggregate's argument.
+///
+/// So each query below is run twice on identical data: once with statistics,
+/// where the cost model is free to reorder, and once without, where it cannot.
+/// The two must agree, whatever the planner chose.
+#[test]
+fn a_reordered_join_answers_exactly_as_the_written_order_does() {
+    let queries = [
+        "SELECT users.name, posts.title FROM users JOIN posts ON posts.user_id = users.id \
+         ORDER BY users.name, posts.title",
+        "SELECT posts.id, users.name FROM posts JOIN users ON posts.user_id = users.id \
+         ORDER BY posts.id",
+        // A `WHERE` over both sides: its ordinals move with everything else.
+        "SELECT users.name, posts.title FROM users JOIN posts ON posts.user_id = users.id \
+         WHERE users.id < 4 AND posts.title <> 'zzz' ORDER BY users.name, posts.title",
+        // An aggregate and a GROUP BY, whose keys are ordinals too.
+        "SELECT users.name, COUNT(*), MAX(posts.title) FROM users JOIN posts \
+         ON posts.user_id = users.id GROUP BY users.name ORDER BY users.name",
+        // `SELECT *`, where the output order itself is the thing at risk.
+        "SELECT * FROM users JOIN posts ON posts.user_id = users.id \
+         ORDER BY users.id, posts.id",
+        // An expression over both sides, and a LIMIT.
+        "SELECT users.name || '/' || posts.title FROM users JOIN posts \
+         ON posts.user_id = users.id ORDER BY 1 LIMIT 7",
+    ];
+
+    let build = |analyse: bool| {
+        let mut engine = engine();
+        run(
+            &mut engine,
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+        );
+        run(
+            &mut engine,
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT)",
+        );
+        for id in 1..=6i64 {
+            run(
+                &mut engine,
+                &format!("INSERT INTO users VALUES ({id}, 'user{id}')"),
+            );
+        }
+        for id in 1..=48i64 {
+            let user = 1 + ((id - 1) % 6);
+            run(
+                &mut engine,
+                &format!("INSERT INTO posts VALUES ({id}, {user}, 'title{id}')"),
+            );
+        }
+        run(
+            &mut engine,
+            "CREATE INDEX posts_user_id ON posts (user_id) USING BTREE",
+        );
+        if analyse {
+            run(&mut engine, "ANALYZE");
+        }
+        engine
+    };
+
+    let mut costed = build(true);
+    let mut plain = build(false);
+    for sql in queries {
+        assert_eq!(
+            answer(&mut costed, sql),
+            answer(&mut plain, sql),
+            "the costed plan and the shape-rule plan disagree on: {sql}"
+        );
+    }
 }

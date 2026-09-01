@@ -5258,9 +5258,6 @@ impl Engine {
         cap: Option<usize>,
         mut sink: Option<&mut RowSink<'_>>,
     ) -> Result<ResultSet> {
-        let driving = &plan.from[0];
-        let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
-
         let ScanShape {
             limit,
             offset,
@@ -5268,6 +5265,29 @@ impl Engine {
             stop_after,
             full_scan,
         } = scan_shape(plan, env, cap)?;
+
+        // Join *ordering*, the one choice the cost model was never allowed to
+        // make. The rewrite produces the plan the same query written the other
+        // way round would have produced, so what runs afterwards is a shape
+        // this engine already executes — see `should_swap_leading_join`.
+        //
+        // The clone is paid only by a two-table inner join whose stats say the
+        // written order is the worse one; `can_swap_leading_join` is checked
+        // first and costs nothing.
+        let swapped;
+        let plan = if full_scan && self.should_swap_leading_join(plan, fetch, env.params()) {
+            swapped = {
+                let mut candidate = plan.clone();
+                candidate.swap_leading_join();
+                candidate
+            };
+            &swapped
+        } else {
+            plan
+        };
+
+        let driving = &plan.from[0];
+        let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
         let outer_rows = self.estimated_outer_rows(plan, fetch, env.params());
 
         // Which columns any of this can observe. Everything else is walked past
@@ -5915,6 +5935,68 @@ impl Engine {
             table.row_count
         };
         Some(fetch.map_or(rows, |fetch| rows.min(fetch as u64)))
+    }
+
+    /// Whether a two-table inner join is cheaper with its sources exchanged.
+    ///
+    /// This is the one thing the cost model was never allowed to decide. Until
+    /// now it chose *how* to join two tables — hash build or index probe — but
+    /// never *which one drives*, so a join ran in written order whatever the
+    /// cardinalities were. `BENCHMARK.md` measures what that costs: the same
+    /// two tables, the same `ON`, written both ways round, come out ~7.5x
+    /// faster one way and ~1.15x slower the other. Nothing chose between them
+    /// and the faster one only won by being written that way.
+    ///
+    /// Both orientations are costed by the *same* function the path choice
+    /// uses, rather than by a second cost model that could disagree with it.
+    /// The swapped plan is built with [`SelectPlan::swap_leading_join`], so
+    /// what is costed is exactly what would run.
+    ///
+    /// Ties keep the written order. A cost model that reorders on equal
+    /// estimates would make the plan depend on estimation noise, and a query
+    /// whose plan changes without its data changing is one nobody can reason
+    /// about.
+    pub(crate) fn should_swap_leading_join(
+        &self,
+        plan: &SelectPlan,
+        fetch: Option<usize>,
+        params: &[Value],
+    ) -> bool {
+        if !plan.can_swap_leading_join() || !self.planner_stats.is_current(self.write_version) {
+            return false;
+        }
+        let Some(as_written) = self.leading_join_cost(plan, fetch, params) else {
+            return false;
+        };
+        let mut swapped = plan.clone();
+        swapped.swap_leading_join();
+        let Some(other) = self.leading_join_cost(&swapped, fetch, params) else {
+            return false;
+        };
+        other < as_written
+    }
+
+    /// The costed work units for `plan`'s leading join as written, or `None`
+    /// when anything the estimate needs is missing.
+    fn leading_join_cost(
+        &self,
+        plan: &SelectPlan,
+        fetch: Option<usize>,
+        params: &[Value],
+    ) -> Option<u64> {
+        let outer_rows = self.estimated_outer_rows(plan, fetch, params)?;
+        let offset_of = plan.from[0].table.columns.len();
+        let on = plan.joins[0].on.as_ref();
+        let hash_available = hash_join_key(&plan.from, 1, offset_of, on).is_some();
+        let probe = self.join_probe(&plan.from[1].table, offset_of, on);
+        self.costed_join_decision(
+            &plan.from,
+            1,
+            Some(outer_rows),
+            hash_available,
+            probe.as_ref(),
+        )
+        .map(|decision| decision.cost)
     }
 
     /// Choose one join path for the executor and `EXPLAIN` to share.

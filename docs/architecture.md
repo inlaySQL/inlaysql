@@ -94,10 +94,28 @@ point-pinning `WHERE` keeps the probe (few outer rows → few descents), while a
 scan prefers the hash table (one O(inner) build amortised over every outer row).
 The first staged cost layer now exists after `ANALYZE`: with a complete,
 current statistics snapshot it may choose between the existing hash and probe
-operators by cardinality, still in written join order. Missing or stale stats
-fall back to these shape rules. Join reordering remains later work, after
-output-order and stale-stat proofs exist. Do not build a broader cost model
-before the access paths.
+operators by cardinality. Missing or stale stats fall back to these shape
+rules. Do not build a broader cost model before the access paths.
+
+**Join reordering landed 2026-09-01, for full scans only.** A two-table inner
+join may now be executed with its sources exchanged when the same cost
+function scores that cheaper — measured at 1.31x on the `joins` suite,
+interleaved. Three things bound it, and the third is the output-order proof
+this decision used to defer:
+
+* Two stored tables, `INNER`, no derived source and no retrieval score. An
+  outer join is not commutative and a scored query answers from its driving
+  table by definition.
+* The rewrite is a plan rewrite: sources are exchanged and every column
+  ordinal in the plan is remapped, producing exactly the plan the same query
+  written the other way round would have produced. What executes is a shape
+  the engine already ran, not a new one.
+* **Full scans only.** Reordering changes the order rows come out of an
+  unordered join — legal SQL, and what SQLite does — but under a `LIMIT` with
+  no `ORDER BY` a different order is a different *set*, and a plan choice may
+  not decide which rows a query returns. A limited join keeps its written
+  order. Ties keep the written order too, so a plan does not move on
+  estimation noise.
 
 ### D7 — Types follow SQLite affinity, not strict names
 Replace the strict `resolve_data_type` whitelist with SQLite's affinity rules

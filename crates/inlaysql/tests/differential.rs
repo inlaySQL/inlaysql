@@ -404,6 +404,14 @@ fn inlaysql_join(
             ],
         )?;
     }
+    // Statistics, so the cost model is live rather than falling back to its
+    // shape rules. Join *reordering* only happens with current stats, so
+    // without this the oracle never sees a reordered plan and the one thing
+    // that could turn a planner choice into a wrong answer goes unchecked.
+    // SQLite is not analysed to match: the two engines are compared on their
+    // answers, and an answer that depends on whether ANALYZE ran is the bug
+    // this is looking for.
+    db.execute("ANALYZE", &[])?;
     let kind = if left { "LEFT JOIN" } else { "JOIN" };
     let result = db.query(
         &format!("SELECT a.id, b.id FROM a {kind} b ON {}", path.on()),
@@ -619,6 +627,7 @@ fn inlaysql_typed_join(
     if path == InnerPath::Index {
         db.execute("CREATE INDEX b_k ON b (k)", &[])?;
     }
+    db.execute("ANALYZE", &[])?;
     let kind = if left { "LEFT JOIN" } else { "JOIN" };
     let result = db.query(
         &format!("SELECT a.id, b.id FROM a {kind} b ON a.k = b.k"),

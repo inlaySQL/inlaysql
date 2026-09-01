@@ -269,6 +269,28 @@ impl<'e> Explainer<'e> {
 
     fn select(&mut self, plan: &SelectPlan, parent: i64, cap: Option<usize>) -> Result<()> {
         let shape = scan_shape(plan, &self.env, cap)?;
+
+        // The same join-order decision `Engine::run_select_to` makes, made the
+        // same way and from the same function. `EXPLAIN` describing the plan as
+        // written while the executor ran it the other way round would be worse
+        // than not reporting the reordering at all: the one thing a plan
+        // listing has to be is the plan that runs.
+        let swapped;
+        let plan = if shape.full_scan
+            && self
+                .engine
+                .should_swap_leading_join(plan, shape.fetch, self.env.params())
+        {
+            swapped = {
+                let mut candidate = plan.clone();
+                candidate.swap_leading_join();
+                candidate
+            };
+            &swapped
+        } else {
+            plan
+        };
+
         let driving = &plan.from[0];
         let outer_rows = self
             .engine
