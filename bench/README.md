@@ -21,6 +21,10 @@ REPEATS=5 SUITE=retrieval ./bench/repeat.sh
 REPEATS=5 ./bench/repeat-compare.sh # compare.sh five times, median and spread
 COOLDOWN_SECONDS=0 ./bench/repeat-compare.sh   # no pause between repetitions
 
+# Profiling, and comparing two builds of it honestly.
+./bench/profile_ab.sh joins-limit HEAD~1   # interleaved A/B, medians and ranges
+./bench/attribute.py /tmp/x.sample         # who asked for the memcmp/allocator work
+
 # The HNSW parameter grid behind the shipped defaults. Not in `all`: it is
 # one graph build per (M, ef_construction) point and takes minutes.
 cargo run --release -p inlaysql-bench -- --suite sweep --docs 20000
@@ -110,6 +114,32 @@ other rose in the same window. Nothing was wrong with the harness. A
 latency-shaped micro-benchmark on a laptop simply has an error bar of roughly a
 factor of two, and publishing a single run to three significant digits pretends
 otherwise.
+
+### Profiling: two instruments, and the mistakes they exist to stop
+
+`bin/profile` runs one suite in a loop so a sampler can attach to it. Two
+things wrap it, and both were built after the thing they prevent had already
+happened once:
+
+`./bench/profile_ab.sh <suite> <git-ref>` builds the profile binary twice — the
+working tree and `<git-ref>`, via a worktree so a committed change still has a
+"before" to compare against — and runs them **alternately**, one repetition
+each. The `LIMIT`-join cache was first measured at 1.31x by comparing a run to
+another run taken half an hour later; interleaved, the same *before* binary
+moved from 68k to 85-89k ops/s and the real figure was 1.42x. The machine had
+drifted, and the error flattered the change. Interleaving does not quiet a
+machine, it makes the drift land on both sides. The script prints both ranges
+and says plainly when they overlap, because a ratio quoted from overlapping
+ranges is not a result.
+
+`./bench/attribute.py <sample-file>` answers "which engine function asked for
+this work" instead of "what was the CPU in". A profile of this engine is mostly
+`memcmp`, `memmove` and the allocator, three answers that name a mechanism and
+no cause, and reading the call graph by eye has gone wrong twice: a
+residual-filter optimisation was scoped at 15-20% by counting descent `memcmp`
+as the filter's (attributed: 8.5% `get_from`, 0.9% the filter's actual route),
+and its replacement assumed a per-cell leaf decode that the profile shows
+never happens. Both took minutes to disprove once attributed.
 
 `./bench/repeat.sh` is the answer to that. It runs `run.sh` N times with
 identical parameters, keeps every raw file, and reports each number's median
