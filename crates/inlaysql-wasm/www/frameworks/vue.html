@@ -1,0 +1,83 @@
+<!doctype html>
+<!-- Vue without a bundler: the import map points `vue` at the browser build
+     that includes the template compiler (esm.sh's default is runtime-only,
+     which silently renders nothing for a string template), and the component
+     below is the real pattern a Vite app uses — initialise the engine once,
+     keep the database in a module-level promise, render query results from a
+     ref. Swap the import map for `npm install inlaysql-wasm` and a bundler
+     alias when the app grows one; the component does not change. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>InlaySQL — with Vue</title>
+<script type="importmap">
+{
+  "imports": {
+    "vue": "https://unpkg.com/vue@3.4.38/dist/vue.esm-browser.prod.js"
+  }
+}
+</script>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 1.5rem; }
+  table { border-collapse: collapse; }
+  td, th { border: 1px solid #ccc; padding: .2rem .5rem; text-align: left; }
+  .ok { color: #0a7d38; }
+  .err { color: #b42318; }
+</style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <script type="module">
+    import { createApp, ref, onMounted } from "vue";
+    import init, { Database } from "../pkg/inlaysql_wasm.js";
+
+    // One initialisation per page, shared by every component.
+    const engine = (async () => {
+      await init();
+      const db = new Database();
+      db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)", null);
+      db.execute(
+        "INSERT INTO docs (id, body) VALUES (?, ?), (?, ?), (?, ?)",
+        JSON.stringify([
+          1, "an embedded database written in rust",
+          2, "search that lives in sql",
+          3, "one file, no server",
+        ]),
+      );
+      return db;
+    })();
+
+    createApp({
+      setup() {
+        const rows = ref([]);
+        const status = ref("loading");
+
+        onMounted(async () => {
+          try {
+            const db = await engine;
+            rows.value = JSON.parse(
+              db.query("SELECT id, body FROM docs WHERE body LIKE ? ORDER BY id",
+                JSON.stringify(["%rust%"])),
+            ).rows;
+            status.value = "ok";
+          } catch (error) {
+            status.value = `error: ${error}`;
+          }
+        });
+
+        return { rows, status };
+      },
+      template: `
+        <p :class="status" :data-status="status.startsWith('error') ? 'error' : status">
+          {{ status === 'ok' ? rows.length + ' row(s) via Vue' : status }}
+        </p>
+        <table v-if="rows.length">
+          <tbody>
+            <tr v-for="[id, body] in rows" :key="id"><td>{{ id }}</td><td>{{ body }}</td></tr>
+          </tbody>
+        </table>`,
+    }).mount("#app");
+  </script>
+</body>
+</html>

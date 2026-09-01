@@ -1,0 +1,77 @@
+<!doctype html>
+<!-- The jQuery pattern: an existing app that already drives the DOM with
+     jQuery adds InlaySQL with one dynamic `import()` — no build step, no
+     bundler, jQuery keeps doing what it does and the database is just
+     another thing a handler calls. jQuery itself comes from its CDN as a
+     classic script; the module is loaded lazily on first use. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>InlaySQL — with jQuery</title>
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 1.5rem; }
+  #rows td { border: 1px solid #ccc; padding: .2rem .5rem; }
+  #status.ok { color: #0a7d38; }
+  #status.err { color: #b42318; }
+</style>
+</head>
+<body>
+  <h1>InlaySQL with jQuery</h1>
+  <p id="status" data-status="loading">loading…</p>
+  <button id="search">Search</button>
+  <table id="rows"></table>
+
+  <script>
+    // The WASM glue is an ES module; a jQuery-era app that is not a module
+    // loads it lazily with one dynamic import. The promise is cached so the
+    // module initialises exactly once no matter how many handlers need it.
+    let inlaysqlPromise = null;
+    function inlaysql() {
+      // The glue exports `init` as its default export — a dynamic import
+      // reaches it through `module.default`, not `module.init`.
+      inlaysqlPromise ??= import("../pkg/inlaysql_wasm.js").then(async (module) => {
+        await module.default();
+        return module;
+      });
+      return inlaysqlPromise;
+    }
+
+    $(async function () {
+      const status = $("#status");
+      // The search box first, so the handler below always finds it.
+      $("<input>").attr("id", "q").val("rust").insertBefore("#search");
+      try {
+        const { Database } = await inlaysql();
+        const db = new Database();
+        db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)", null);
+        db.execute(
+          "INSERT INTO docs (id, body) VALUES (?, ?), (?, ?), (?, ?)",
+          JSON.stringify([
+            1, "an embedded database written in rust",
+            2, "search that lives in sql",
+            3, "one file, no server",
+          ]),
+        );
+
+        $("#search").on("click", function () {
+          // Plain SQL with a bound parameter; the rows land in the table
+          // jQuery already knows how to build.
+          const { rows } = JSON.parse(
+            db.query("SELECT id, body FROM docs WHERE body LIKE ? ORDER BY id",
+              JSON.stringify(["%" + $("#q").val() + "%"])),
+          );
+          $("#rows").empty().append(
+            rows.map(([id, body]) => $("<tr>").append($("<td>").text(id), $("<td>").text(body))),
+          );
+          status.attr("data-status", "ok").addClass("ok").removeClass("err")
+            .text(`${rows.length} row(s)`);
+        }).click();
+      } catch (error) {
+        status.attr("data-status", "error").addClass("err").removeClass("ok")
+          .text(String(error));
+      }
+    });
+  </script>
+</body>
+</html>

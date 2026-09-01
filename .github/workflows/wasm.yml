@@ -120,6 +120,15 @@ jobs:
           npx playwright install --with-deps chromium
           npm run smoke
 
+      # The framework examples are what the documentation sends React/Vue/
+      # jQuery users to, so each one is opened in the same browser and must
+      # answer a real query. React and Vue load from their CDN import maps,
+      # so this is also the check that the documented no-bundler spelling
+      # still works.
+      - name: The framework examples work in a real browser
+        working-directory: crates/inlaysql-wasm/browser
+        run: npm run smoke:frameworks
+
       # `www/` is published verbatim, so it is uploaded as it stands — the
       # Playwright harness deliberately lives in a sibling directory.
       - name: Package the demo for Pages

@@ -1,0 +1,46 @@
+<!doctype html>
+<!-- Plain JavaScript — no build tools, no framework. Copy this file, change
+     nothing but your SQL, and you have InlaySQL running in a page. This is
+     also the shape a jQuery app uses: jQuery drives the DOM, InlaySQL loads
+     through one dynamic `import()` — see jquery.html for that spelling. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>InlaySQL — plain JavaScript</title>
+</head>
+<body>
+  <h1>InlaySQL in plain JavaScript</h1>
+  <pre id="out" data-status="loading">loading module…</pre>
+
+  <script type="module">
+    import init, { Database } from "../pkg/inlaysql_wasm.js";
+
+    const out = document.getElementById("out");
+    try {
+      // One call instantiates the WASM module; `init()` fetches the .wasm
+      // sitting next to the JS glue. After this, everything is synchronous.
+      await init();
+      const db = new Database();
+
+      // A database is one file, here in memory. `execute` writes, `query`
+      // reads; parameters are a JSON array — an inner array of numbers binds
+      // as a vector.
+      db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)", null);
+      db.execute(
+        "INSERT INTO docs (id, body) VALUES (?, ?), (?, ?)",
+        JSON.stringify([1, "an embedded database written in rust", 2, "search that lives in sql"]),
+      );
+      const { columns, rows } = JSON.parse(
+        db.query("SELECT id, body FROM docs ORDER BY id", null),
+      );
+
+      out.dataset.status = "ok";
+      out.textContent =
+        `${columns.join(" | ")}\n` + rows.map((r) => r.join(" | ")).join("\n");
+    } catch (error) {
+      out.dataset.status = "error";
+      out.textContent = String(error);
+    }
+  </script>
+</body>
+</html>

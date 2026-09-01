@@ -3,9 +3,10 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "Drives ../www in headless Chromium, so the browser demo cannot rot unnoticed.",
+  "description": "Drives ../www in headless Chromium, so the browser demo and the framework examples cannot rot unnoticed.",
   "scripts": {
-    "smoke": "node smoke.mjs"
+    "smoke": "node smoke.mjs",
+    "smoke:frameworks": "node frameworks.mjs"
   },
   "devDependencies": {
     "playwright": "1.62.1"

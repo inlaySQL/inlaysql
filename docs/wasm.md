@@ -96,6 +96,21 @@ database created empty in the tab. Where site-search shows the engine
 answering, the playground shows it *working*: DDL, DML, vectors, BM25 and
 hybrid fusion, every statement editable and every error verbatim.
 
+## Using it from a framework: React, Vue, jQuery, plain JS
+
+The module is a plain ES module — `init()`, `new Database()`, `query()` — so
+the integration is the same three steps everywhere. The worked examples for
+each spelling live in `crates/inlaysql-wasm/www/frameworks/` (guide:
+[frameworks/README.md](../crates/inlaysql-wasm/www/frameworks/README.md)),
+are published live at `/frameworks/` on the Pages site, and are driven in
+headless Chromium by the same workflow job that checks the demo page: each
+example must answer a real query, so a framework release that breaks one of
+these patterns fails CI rather than a visitor. The no-bundler spellings have
+one non-obvious requirement each — React without JSX is `createElement`, Vue
+needs the browser build *with* the template compiler (esm.sh's default is
+runtime-only and silently renders nothing for a string template) — which is
+exactly why they are pinned by a test instead of asserted in prose.
+
 ## The edge worker
 
 ```sh
