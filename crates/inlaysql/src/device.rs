@@ -2124,6 +2124,19 @@ mod group_commit_tests {
             // writer could slip through first depending on how the scheduler
             // happens to interleave the two spawns — which would make the
             // rest of this test flaky rather than deterministic.
+            // Both polls below can time out on a machine loaded enough to
+            // miss `POLL_TIMEOUT`, and neither may panic on the spot. The fake
+            // leader is parked on `release_rx`, and `std::thread::scope` does
+            // not return until every spawned thread has, so unwinding before
+            // the release turns a failed assertion into a hang that reports
+            // nothing at all — a CI job burning its whole timeout in silence
+            // rather than printing the message that says what went wrong.
+            // Record the failure, release the leader, then panic.
+            let fail = |message: &'static str| -> ! {
+                let _ = release_tx.send(());
+                panic!("{message}");
+            };
+
             let gate_deadline = Instant::now() + POLL_TIMEOUT;
             loop {
                 if *coordinator
@@ -2133,10 +2146,9 @@ mod group_commit_tests {
                 {
                     break;
                 }
-                assert!(
-                    Instant::now() < gate_deadline,
-                    "the checkpoint never took the reservation gate"
-                );
+                if Instant::now() >= gate_deadline {
+                    fail("the checkpoint never took the reservation gate");
+                }
                 std::thread::yield_now();
             }
 
@@ -2164,12 +2176,13 @@ mod group_commit_tests {
                 if coordinator.normal_waiters.load(Ordering::Acquire) >= WAITERS {
                     break;
                 }
-                assert!(
-                    Instant::now() < waiters_deadline,
-                    "writers never piled into normal_waiters behind the checkpoint's \
-                     held reservation gate — the race this test exists to exercise \
-                     never set up"
-                );
+                if Instant::now() >= waiters_deadline {
+                    fail(
+                        "writers never piled into normal_waiters behind the checkpoint's \
+                         held reservation gate — the race this test exists to exercise \
+                         never set up",
+                    );
+                }
                 std::thread::yield_now();
             }
 

@@ -207,12 +207,11 @@ impl<S: Read + Write + crate::tls::Upgradable> Connection<S> {
                 ))?;
                 return Ok(false);
             };
-            if let Err(error) = self.stream.upgrade_to_tls(&config) {
-                // The socket is poisoned rather than reverted, so there is no
-                // reply to send: writing an error here would go out on a stream
-                // whose state the client no longer agrees with.
-                return Err(error);
-            }
+            // Propagated, not answered: a failed upgrade poisons the socket
+            // rather than reverting it, so there is no reply to send. Writing
+            // an error packet here would push it onto a stream whose state the
+            // client no longer agrees with.
+            self.stream.upgrade_to_tls(&config)?;
             let Some(encrypted) = self.stream.read_message()? else {
                 return Ok(false);
             };

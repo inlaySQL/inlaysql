@@ -65,7 +65,7 @@ fn start(fixture: &Fixture, tune: impl FnOnce(&mut ServerOptions)) -> SocketAddr
         ..ServerOptions::default()
     };
     tune(&mut options);
-    let server = Server::bind(&fixture.database(), &options).expect("bind");
+    let server = Server::bind(fixture.database(), &options).expect("bind");
     let addr = server.local_addr().expect("local_addr");
     std::thread::spawn(move || {
         let _ = server.run();
@@ -381,7 +381,7 @@ fn requiring_tls_without_a_certificate_refuses_to_start() {
         tls_required: true,
         ..ServerOptions::default()
     };
-    let error = Server::bind(&fixture.database(), &options)
+    let error = Server::bind(fixture.database(), &options)
         .err()
         .expect("bind must refuse");
     assert!(
