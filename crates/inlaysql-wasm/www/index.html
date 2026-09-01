@@ -373,11 +373,22 @@
       <div class="card">
         <h3>Your ORM already speaks it</h3>
         <p>
-          <code>inlaysql serve --mysql</code> talks the MySQL wire protocol.
-          The statements a Laravel migration and Eloquent CRUD emit — including
-          <code>upsert()</code>, eager loads and paginated reads — run over it,
-          asserted end to end from Laravel 11's own grammars. Nobody has yet
-          pointed a real <code>php artisan migrate</code> at it.
+          <code>inlaysql serve --mysql</code> talks the MySQL wire protocol. A
+          stock Laravel 11 app runs against it for real — <code>php artisan
+          migrate</code> completes, and ordinary Eloquent traffic works:
+          <code>upsert()</code>, eager loads, <code>whereHas</code>,
+          <code>paginate()</code>. Running the real thing found two shim bugs a
+          hand-written approximation had missed.
+        </p>
+      </div>
+      <div class="card">
+        <h3><code>MATCH … AGAINST</code> is the real BM25</h3>
+        <p>
+          MySQL's full-text spelling maps onto the engine's own retriever, not
+          an emulation of it: <code>MATCH (body) AGAINST (?)</code> becomes a
+          native BM25 probe, and as a whole <code>WHERE</code> conjunct it
+          drives the query. Boolean mode is refused by name rather than
+          quietly answered as if it were natural language.
         </p>
       </div>
       <div class="card">

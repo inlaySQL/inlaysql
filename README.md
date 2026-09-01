@@ -280,6 +280,21 @@ dialect (`inlaysql-core` gains nothing from this crate, which is what the
 `determinism` CI job polices); a dropped clause is never silent — it comes
 back as a MySQL `1618` warning naming it, visible in `SHOW WARNINGS`.
 
+**`MATCH ... AGAINST` is the engine's own BM25, under MySQL's spelling.** A
+client that writes MySQL's full-text syntax gets the native retriever rather
+than an emulation: `MATCH (body) AGAINST (?)` is rewritten to
+`bm25_score(body, ?)`, and used as a whole `WHERE` conjunct it *drives* the
+query — the BM25 probe supplies the rows and the remaining predicates filter
+inside its walk, which is the spelling Laravel Scout's database engine emits.
+`CREATE FULLTEXT INDEX` and `ALTER TABLE ... ADD FULLTEXT INDEX` — what
+Laravel's `$table->fullText()` compiles to — translate to
+`CREATE INDEX ... USING FULLTEXT`. Boolean mode and query expansion are
+refused by name (`1235`) rather than silently answered as if they were
+natural-language mode, because a search that quietly ignores `+required
+-excluded` is worse than one that says it cannot. Full translation table and
+refusal list in
+[`docs/server.md`](docs/server.md#full-text-search-match--against-translated-to-the-native-bm25-probe).
+
 **A stock Laravel 11 app runs against this for real now** — not an
 approximation of one. `composer create-project laravel/laravel`, `.env`
 pointed at `inlaysql serve --mysql`, and `php artisan migrate` completes the
