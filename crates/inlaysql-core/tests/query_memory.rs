@@ -76,7 +76,11 @@ fn every_blocking_operator_is_refused_past_the_ceiling() {
     let mut engine = seeded(ROWS as usize * APPROX_ROW_BYTES / 8);
     for sql in [
         "SELECT id, body FROM t ORDER BY body",
-        "SELECT grp, count(*) FROM t GROUP BY grp",
+        // A `GROUP BY` with one group per row holds one representative row per
+        // group, which is every row — so it is still bounded. The
+        // low-cardinality version of this is asserted below to *succeed*: it
+        // holds seven rows now, not two thousand.
+        "SELECT body, count(*) FROM t GROUP BY body",
         "SELECT DISTINCT grp FROM t",
         "SELECT id, row_number() OVER (ORDER BY id) FROM t",
         // An aggregate over a *column* still holds one value per row, so the
@@ -90,6 +94,15 @@ fn every_blocking_operator_is_refused_past_the_ceiling() {
             "{sql}: the refusal must say what it hit, got: {message}"
         );
     }
+
+    // What streaming changed: an aggregate whose state is small no longer has
+    // to hold the table to produce it. `grp` has seven distinct values, so this
+    // holds seven rows and seven counters and answers under a ceiling that
+    // refuses every query above. It used to be refused with them.
+    let grouped = engine
+        .query("SELECT grp, count(*) FROM t GROUP BY grp", &[])
+        .expect("a low-cardinality GROUP BY holds one row per group, not the table");
+    assert_eq!(grouped.rows.len(), 7, "{:?}", grouped.rows);
 }
 
 /// The refusal names the number it hit and how to move it, because the person

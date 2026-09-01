@@ -434,45 +434,48 @@ fn group_by_folds_under_the_columns_collation() {
     );
 }
 
-/// An ungrouped aggregate answers the same streamed as it does collected.
+/// An aggregate answers the same streamed as it does collected.
 ///
 /// Streaming is a second path through the aggregate code, and this codebase's
 /// recurring bug shape is two paths through one rule — so the standing rule is
-/// that a fast path is tied to the slow one by a test. The tie here is
-/// `GROUP BY`: adding a constant grouping key produces the identical answer
-/// through the *collecting* path, because `can_stream_ungrouped_aggregate`
-/// refuses anything with a `GROUP BY`.
+/// that a fast path is tied to the slow one by a test.
 ///
-/// The values are chosen to reach the parts of the fold that are easy to get
-/// wrong from a stream: `NULL`s that every function skips, a `SUM` that mixes
-/// integers and reals, `MIN`/`MAX` across storage classes, `DISTINCT`, and
-/// `FILTER`, which narrows what one aggregate sees without touching the rest.
+/// `GROUP_CONCAT` is what ties them: `can_stream_aggregate` refuses any query
+/// containing one, because its separator is read from the group's first row.
+/// So adding a `GROUP_CONCAT` to a query forces the whole thing down the
+/// collecting path while leaving every other aggregate in it unchanged, and
+/// the two answers must agree column for column.
+///
+/// The values reach the parts of the fold that are easy to get wrong from a
+/// stream: `NULL`s every function skips, a `SUM` mixing integers and reals,
+/// `MIN`/`MAX` across storage classes, `DISTINCT`, and `FILTER`, which narrows
+/// what one aggregate sees without touching the rest.
 #[test]
-fn an_ungrouped_aggregate_streams_to_the_same_answer_it_collects() {
+fn an_aggregate_streams_to_the_same_answer_it_collects() {
     let mut engine = engine();
     run(
         &mut engine,
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, r REAL, s TEXT)",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, n INTEGER, r REAL, s TEXT)",
     );
-    for (id, n, r, s) in [
-        (1, "1", "1.5", "'b'"),
-        (2, "NULL", "2.5", "'a'"),
-        (3, "3", "NULL", "NULL"),
-        (4, "3", "4.0", "'c'"),
-        (5, "-7", "0.5", "'a'"),
+    for (id, g, n, r, s) in [
+        (1, 1, "1", "1.5", "'b'"),
+        (2, 1, "NULL", "2.5", "'a'"),
+        (3, 2, "3", "NULL", "NULL"),
+        (4, 2, "3", "4.0", "'c'"),
+        (5, 3, "-7", "0.5", "'a'"),
+        (6, 3, "9", "1.0", "'a'"),
     ] {
         run(
             &mut engine,
-            &format!("INSERT INTO t VALUES ({id}, {n}, {r}, {s})"),
+            &format!("INSERT INTO t VALUES ({id}, {g}, {n}, {r}, {s})"),
         );
     }
 
-    for aggregates in [
+    let shapes = [
         "COUNT(*)",
         "COUNT(n)",
         "SUM(n)",
         "SUM(r)",
-        "SUM(n) + SUM(r)",
         "AVG(n), AVG(r)",
         "MIN(n), MAX(n)",
         "MIN(s), MAX(s)",
@@ -480,29 +483,36 @@ fn an_ungrouped_aggregate_streams_to_the_same_answer_it_collects() {
         "COUNT(*) FILTER (WHERE n > 0)",
         "SUM(n) FILTER (WHERE id <> 5)",
         "COUNT(*), COUNT(n), SUM(n), AVG(r), MIN(s), MAX(s)",
-        // A bare column beside an aggregate, with no `GROUP BY`: SQLite allows
-        // it and answers from one arbitrary row of the group. Which row that is
-        // is observable, so it is pinned — the streamed path has to pick the
-        // same representative the collecting path does (the first), and
-        // without this case picking the last would go unnoticed.
+        // A bare column beside an aggregate: which row represents the group is
+        // observable, so it is pinned. Without this, taking the last row
+        // instead of the first would go unnoticed — every other shape here
+        // projects only aggregates.
         "s, COUNT(*)",
         "id, n, MIN(s)",
-    ] {
-        let streamed = answer(&mut engine, &format!("SELECT {aggregates} FROM t"));
-        // `GROUP BY 1` is one constant group over the same rows — the same
-        // answer, reached by the collecting path.
-        let collected = answer(
-            &mut engine,
-            &format!("SELECT {aggregates} FROM t GROUP BY 1"),
-        );
-        assert_eq!(
-            streamed, collected,
-            "streamed and collected disagree on: {aggregates}"
-        );
+    ];
+
+    for aggregates in shapes {
+        for tail in ["", " GROUP BY g", " GROUP BY g HAVING COUNT(*) > 1"] {
+            let streamed = answer(&mut engine, &format!("SELECT {aggregates} FROM t{tail}"));
+            // The same query with a GROUP_CONCAT appended runs collected. Its
+            // extra column is dropped before comparing, so what is compared is
+            // the same columns computed two ways.
+            let mut collected = answer(
+                &mut engine,
+                &format!("SELECT {aggregates}, GROUP_CONCAT(s) FROM t{tail}"),
+            );
+            for row in &mut collected {
+                row.pop();
+            }
+            assert_eq!(
+                streamed, collected,
+                "streamed and collected disagree on: SELECT {aggregates} FROM t{tail}"
+            );
+        }
     }
 
-    // Empty input still answers, and answers the same way on both paths:
-    // one row, `COUNT(*)` zero, everything else `NULL`.
+    // Empty input: no `GROUP BY` still answers one row, a `GROUP BY` answers
+    // none. Both paths agree on that too.
     run(&mut engine, "DELETE FROM t");
     assert_eq!(
         answer(&mut engine, "SELECT COUNT(*), SUM(n), MIN(s) FROM t"),
@@ -513,8 +523,10 @@ fn an_ungrouped_aggregate_streams_to_the_same_answer_it_collects() {
         ]],
         "an ungrouped aggregate over no rows must still answer one row"
     );
-
-    // `HAVING` applies to the streamed row too.
+    assert!(
+        answer(&mut engine, "SELECT g, COUNT(*) FROM t GROUP BY g").is_empty(),
+        "a GROUP BY over no rows must answer no rows"
+    );
     assert!(
         answer(&mut engine, "SELECT COUNT(*) FROM t HAVING COUNT(*) > 0").is_empty(),
         "HAVING must be able to reject the streamed row"
