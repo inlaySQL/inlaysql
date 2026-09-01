@@ -43,8 +43,10 @@ pub const CLIENT_SSL: u32 = 0x0000_0800;
 ///
 /// Notably absent, each on purpose:
 ///
-/// * `CLIENT_SSL` — v1 is plaintext (see `docs/server.md`). Not advertising it
-///   means a client cannot start a TLS handshake this server would fail.
+/// * `CLIENT_SSL` — not part of this constant because it is not constant: it
+///   is added per-connection by [`handshake`] when the server was started with
+///   a certificate. A server without one still does not advertise it, so a
+///   client cannot start a TLS handshake this server would fail.
 /// * `CLIENT_DEPRECATE_EOF` — result sets are terminated with EOF packets, the
 ///   form every client still understands, rather than supporting two framings.
 /// * `CLIENT_MULTI_STATEMENTS` / `CLIENT_MULTI_RESULTS` — the engine runs
@@ -528,17 +530,26 @@ pub fn err_packet_before_handshake(code: u16, message: &str) -> Vec<u8> {
 /// that already knows it wants `mysql_native_password` (PHP's PDO and the
 /// `mysql` CLI both still complete it directly) says so itself and is never
 /// asked to switch; see `connection::Connection::authenticate`.
-pub fn handshake(connection_id: u32, scramble: &[u8], server_version: &str) -> Vec<u8> {
+/// `tls` adds `CLIENT_SSL` to the advertised capabilities. A client only
+/// offers to upgrade if the server said it could, so this flag is the whole
+/// difference between a deployment where TLS is reachable and one where it is
+/// not.
+pub fn handshake(connection_id: u32, scramble: &[u8], server_version: &str, tls: bool) -> Vec<u8> {
+    let capabilities = if tls {
+        SERVER_CAPABILITIES | CLIENT_SSL
+    } else {
+        SERVER_CAPABILITIES
+    };
     let mut out = vec![10];
     put_nul_str(&mut out, server_version);
     out.extend_from_slice(&connection_id.to_le_bytes());
     // The challenge arrives in two pieces for backwards compatibility.
     out.extend_from_slice(&scramble[..8]);
     out.push(0);
-    out.extend_from_slice(&SERVER_CAPABILITIES.to_le_bytes()[..2]);
+    out.extend_from_slice(&capabilities.to_le_bytes()[..2]);
     out.push(CHARSET_UTF8MB4 as u8);
     out.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
-    out.extend_from_slice(&SERVER_CAPABILITIES.to_le_bytes()[2..]);
+    out.extend_from_slice(&capabilities.to_le_bytes()[2..]);
     // Total challenge length, counting the trailing NUL of part two.
     out.push(scramble.len() as u8 + 1);
     out.extend_from_slice(&[0u8; 10]);
@@ -582,10 +593,45 @@ mod tests {
     use super::*;
     use crate::packet::Reader;
 
+    /// The one bit that decides whether a client will ever offer to encrypt.
+    ///
+    /// A client only sends `SSLRequest` if the greeting advertised
+    /// `CLIENT_SSL`, so this flag is the whole difference between a deployment
+    /// where TLS is reachable and one where it is not — and its absence is the
+    /// default, which is why both directions are asserted.
+    #[test]
+    fn client_ssl_is_advertised_only_when_a_certificate_is_configured() {
+        let scramble: Vec<u8> = (1..=20).collect();
+        let capabilities_of = |tls: bool| {
+            let packet = handshake(7, &scramble, "8.0.35-inlaysql", tls);
+            let mut reader = Reader::new(&packet);
+            reader.u8().unwrap();
+            reader.nul_str().unwrap();
+            reader.u32().unwrap();
+            reader.take(8).unwrap();
+            reader.u8().unwrap();
+            let lower = reader.u16().unwrap() as u32;
+            reader.u8().unwrap();
+            reader.u16().unwrap();
+            let upper = reader.u16().unwrap() as u32;
+            lower | (upper << 16)
+        };
+        assert_eq!(
+            capabilities_of(false) & CLIENT_SSL,
+            0,
+            "a plaintext server must not advertise CLIENT_SSL"
+        );
+        assert_eq!(
+            capabilities_of(true) & CLIENT_SSL,
+            CLIENT_SSL,
+            "a server with a certificate must advertise CLIENT_SSL"
+        );
+    }
+
     #[test]
     fn the_handshake_parses_back_the_way_a_client_reads_it() {
         let scramble: Vec<u8> = (1..=20).collect();
-        let packet = handshake(7, &scramble, "8.0.35-inlaysql");
+        let packet = handshake(7, &scramble, "8.0.35-inlaysql", false);
         let mut reader = Reader::new(&packet);
 
         assert_eq!(reader.u8().unwrap(), 10, "protocol version");

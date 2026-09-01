@@ -51,6 +51,15 @@ SERVE --mysql OPTIONS:
                        thing that lets the flags overwrite the file. Needs
                        write access to the database, which is already full
                        access to it, so it grants nothing new.
+    --tls-cert <path>  PEM certificate chain to serve, leaf first. With
+    --tls-key <path>   its PEM private key, this turns TLS on: the server
+                       advertises CLIENT_SSL and upgrades when a client asks.
+                       Both or neither. Without them the wire is plaintext,
+                       which is the default and is stated at startup.
+    --tls-required     Refuse any login that did not upgrade to TLS. Needs
+                       --tls-cert/--tls-key. Without this a certificate only
+                       makes TLS *available*, and a client that does not ask
+                       still sends its credential in the clear.
     --max-connections <n>
                        Most connections served at once (default 64).
     --wait-timeout <n> Seconds a connection may be silent before the server
@@ -267,6 +276,23 @@ fn serve_mysql(args: &[String]) -> Result<(), String> {
                     .ok_or_else(|| "--bind needs an address".to_string())?
             }
             "--port" => options.port = number(rest.next(), "--port")? as u16,
+            "--tls-cert" => {
+                options.tls_cert = Some(
+                    rest.next()
+                        .cloned()
+                        .ok_or_else(|| "--tls-cert needs a path".to_string())?
+                        .into(),
+                )
+            }
+            "--tls-key" => {
+                options.tls_key = Some(
+                    rest.next()
+                        .cloned()
+                        .ok_or_else(|| "--tls-key needs a path".to_string())?
+                        .into(),
+                )
+            }
+            "--tls-required" => options.tls_required = true,
             "--user" => {
                 options.user = rest
                     .next()

@@ -52,8 +52,12 @@ struct Prepared {
 }
 
 /// One client connection.
-pub struct Connection<S: Read + Write> {
+pub struct Connection<S: Read + Write + crate::tls::Upgradable> {
     stream: Stream<S>,
+    /// The server's TLS certificate, when one was configured. `None` is the
+    /// default and means this connection is plaintext and says so in its
+    /// greeting — see [`crate::tls`].
+    tls: Option<crate::tls::TlsConfig>,
     db: Database,
     session: Session,
     statements: HashMap<u32, Prepared>,
@@ -89,7 +93,7 @@ pub struct Connection<S: Read + Write> {
     keeper: Arc<FileDevice>,
 }
 
-impl<S: Read + Write> Connection<S> {
+impl<S: Read + Write + crate::tls::Upgradable> Connection<S> {
     /// Wrap an accepted connection.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -102,9 +106,11 @@ impl<S: Read + Write> Connection<S> {
         registry: Arc<Registry>,
         server_counters: Arc<Metrics>,
         keeper: Arc<FileDevice>,
+        tls: Option<crate::tls::TlsConfig>,
     ) -> Self {
         Self {
             stream: Stream::new(read_half, write_half),
+            tls,
             db,
             session: Session::new(Arc::clone(&control), "", None, limits),
             statements: HashMap::new(),
@@ -163,17 +169,19 @@ impl<S: Read + Write> Connection<S> {
 
     fn authenticate(&mut self) -> io::Result<bool> {
         let challenge = auth::scramble()?;
+        let tls_offered = self.tls.is_some();
         self.stream.write_message(&handshake(
             self.session.connection_id,
             &challenge,
             SERVER_VERSION,
+            tls_offered,
         ))?;
         self.stream.flush()?;
 
         let Some(response) = self.stream.read_message()? else {
             return Ok(false);
         };
-        let response = match parse_handshake_response(&response) {
+        let mut response = match parse_handshake_response(&response) {
             Ok(response) => response,
             Err(error) => {
                 self.fail(&error)?;
@@ -181,15 +189,57 @@ impl<S: Read + Write> Connection<S> {
             }
         };
 
-        // TLS is never advertised, so a client cannot have negotiated it. If
-        // one asks anyway, say so plainly rather than letting it send a
-        // password into a channel it believes is encrypted.
+        // A client that set `CLIENT_SSL` has sent an `SSLRequest` — the first
+        // 32 bytes of a handshake response and nothing more — and is now
+        // waiting to start a TLS handshake. Everything after this point,
+        // including the user name and the password proof, arrives encrypted.
         if response.capabilities & protocol::CLIENT_SSL != 0 {
+            let Some(config) = self.tls.clone() else {
+                // Unreachable through a well-behaved client, which only offers
+                // what the greeting advertised — but a client is not a thing to
+                // trust. Refuse rather than let it send a password into a
+                // channel it believes is encrypted and is not.
+                self.fail(&MysqlError::new(
+                    2026,
+                    "HY000",
+                    "SSL connection error: this server has no certificate configured. \
+                     Start it with --tls-cert and --tls-key, or connect without TLS.",
+                ))?;
+                return Ok(false);
+            };
+            if let Err(error) = self.stream.upgrade_to_tls(&config) {
+                // The socket is poisoned rather than reverted, so there is no
+                // reply to send: writing an error here would go out on a stream
+                // whose state the client no longer agrees with.
+                return Err(error);
+            }
+            let Some(encrypted) = self.stream.read_message()? else {
+                return Ok(false);
+            };
+            response = match parse_handshake_response(&encrypted) {
+                Ok(response) => response,
+                Err(error) => {
+                    self.fail(&error)?;
+                    return Ok(false);
+                }
+            };
+        }
+
+        // `TlsPolicy::Required` is what makes "the credential never crosses the
+        // network in the clear" a property of this server rather than a hope
+        // about its clients. Checked after the upgrade, so it sees what the
+        // connection actually is and not what it asked for.
+        if self
+            .tls
+            .as_ref()
+            .is_some_and(|config| config.policy() == crate::tls::TlsPolicy::Required)
+            && !self.stream.is_encrypted()
+        {
             self.fail(&MysqlError::new(
-                2026,
-                "HY000",
-                "SSL connection error: this server is plaintext only (v1 has no TLS). \
-                 Connect without TLS, over a loopback or trusted link.",
+                1045,
+                "28000",
+                "Access denied: this server requires TLS. Connect with --ssl-mode=REQUIRED \
+                 (or your client's equivalent).",
             ))?;
             return Ok(false);
         }
@@ -291,6 +341,10 @@ impl<S: Read + Write> Connection<S> {
             response.database.clone(),
             self.limits,
         );
+        // `have_ssl` describes this link, so it is read off the stream rather
+        // than from whether the server holds a certificate: a client that
+        // chose not to upgrade really is in the clear and must be told so.
+        self.session.encrypted = self.stream.is_encrypted();
         // Recorded on the shared control, not only in the session: `KILL` and
         // `SHOW PROCESSLIST` run on somebody else's thread and have to be able
         // to ask whose connection this is without touching state this thread
@@ -1686,7 +1740,7 @@ impl<S: Read + Write> Connection<S> {
 /// really did cross the wire. Put at the end of the happy path only, the bytes
 /// of every abnormally-ended connection would go missing from `Bytes_sent`,
 /// which is precisely the connection an operator is looking into.
-impl<S: Read + Write> Drop for Connection<S> {
+impl<S: Read + Write + crate::tls::Upgradable> Drop for Connection<S> {
     fn drop(&mut self) {
         self.publish_traffic();
     }

@@ -37,12 +37,26 @@ accepts a statement and means something slightly different by it.
 
 Four things, none of them optional reading.
 
-**It is plaintext. There is no TLS in this version.** Every statement, every
-result and every credential crosses the connection in the clear. `CLIENT_SSL`
-is never advertised, so a client cannot negotiate encryption and then be
-silently downgraded to none — it is told up front, and `SHOW VARIABLES LIKE
-'have_ssl'` answers `DISABLED`. Do not run this across a network you do not
-already trust.
+**It is plaintext until you give it a certificate.** With no `--tls-cert`,
+every statement, result and credential crosses the connection in the clear,
+and the server says so: `CLIENT_SSL` is not advertised, so a client cannot
+negotiate encryption and then be silently downgraded to none — it is told up
+front — and `SHOW VARIABLES LIKE 'have_ssl'` answers `DISABLED`.
+
+`--tls-cert <pem> --tls-key <pem>` turns it on. The server then advertises
+`CLIENT_SSL`, and a client that asks upgrades before it sends its user name or
+its password proof — that ordering is the point, and it is what keeps the
+credential out of the clear. Adding `--tls-required` refuses any login that did
+not upgrade; without it a certificate only makes TLS *available*, and a client
+that does not ask still sends its credential in the clear. `have_ssl` describes
+the connection rather than the server, so a plaintext client talking to a
+TLS-capable server still reads `DISABLED`, which is the truth about its own
+link.
+
+Two things this does not do. There is no client certificate authentication —
+that is a second authentication system, and nothing asks for it yet. And a
+certificate is read once at startup: rotating one means restarting the server.
+The startup banner states which of the three postures is in force.
 
 **It binds `127.0.0.1` by default.** Reaching the network takes an explicit
 `--bind`, and doing so prints a warning that names the risk. A database server
@@ -297,7 +311,7 @@ accepted and quietly meaning less than it says.
 | `IDENTIFIED ... AS '<hash>'` | Refused, `1235`: a hash pasted in is a hash this server cannot check the plugin of. |
 | Hiding metadata | **Not refused, and the one real gap.** Any authenticated account can run `SHOW TABLES` and `DESCRIBE`. Real MySQL shows only what you hold a privilege on; this does not, so table and column *names* are readable by every account even where their contents are not. `SHOW PROCESSLIST` deliberately does **not** join this gap: it is filtered by account, on `KILL`'s rule. |
 | Account locking, password expiry, failed-login lockout, an audit log | Absent. `Aborted_connects` counts failed logins in aggregate and `Inlaysql_com_account` counts privilege statements, but neither records *which* — a counter is not an audit trail, and this does not have one. |
-| TLS | Still absent, and still the first thing to know about this server. |
+| Client certificate authentication | Absent. Server-side TLS exists (`--tls-cert`), but a client is still authenticated by password only. |
 
 ### The limits a client is told are the limits that are enforced
 
@@ -970,7 +984,7 @@ unchanged, which is what the `determinism` CI job polices.
 | `COM_STMT_CLOSE` / `COM_STMT_RESET` | yes |
 | `COM_FIELD_LIST` | refused with `1047` — use `SHOW COLUMNS` |
 | `COM_PROCESS_KILL` | yes — the same operation as `KILL CONNECTION`, through the same registry and the same privilege check |
-| TLS | no, and not advertised |
+| TLS | yes, with `--tls-cert`/`--tls-key`; not advertised without them |
 | Multi-statement / multi-result | no, and not advertised |
 | `LOAD DATA LOCAL INFILE` | no, and not advertised |
 

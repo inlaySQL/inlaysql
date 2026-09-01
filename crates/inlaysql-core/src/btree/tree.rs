@@ -5193,15 +5193,20 @@ mod tests {
 
         // Enough rows to span several leaves, so the one-leaf scan cursor
         // cannot be what answers the repeat.
-        let first = db.scan_prefix_row_values_raw_from(prefix, None, 200).unwrap();
+        let first = db
+            .scan_prefix_row_values_raw_from(prefix, None, 200)
+            .unwrap();
         assert_eq!(first.len(), 200);
 
         // Displace the scan cursor with a scan of a different span.
         let far = row_key(350);
-        db.scan_prefix_row_values_raw_from(prefix, Some(&far), 8).unwrap();
+        db.scan_prefix_row_values_raw_from(prefix, Some(&far), 8)
+            .unwrap();
 
         reads_since(&db);
-        let again = db.scan_prefix_row_values_raw_from(prefix, None, 200).unwrap();
+        let again = db
+            .scan_prefix_row_values_raw_from(prefix, None, 200)
+            .unwrap();
         assert_eq!(
             reads_since(&db),
             0,

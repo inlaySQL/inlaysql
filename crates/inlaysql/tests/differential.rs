@@ -578,7 +578,8 @@ fn typed_joins_agree(class: KeyClass, left: bool) {
             let theirs =
                 sqlite_typed_join(class, &xs, &ys, left, path).expect("SQLite is the oracle");
             assert_eq!(
-                ours, theirs,
+                ours,
+                theirs,
                 "seed {seed}: {class:?} {} on {path:?} disagreed\nx: {xs:?}\ny: {ys:?}",
                 if left { "LEFT JOIN" } else { "INNER JOIN" }
             );
@@ -650,8 +651,7 @@ fn sqlite_typed_join(
         conn.execute("CREATE INDEX b_k ON b (k)", [])?;
     }
     let kind = if left { "LEFT JOIN" } else { "JOIN" };
-    let mut statement =
-        conn.prepare(&format!("SELECT a.id, b.id FROM a {kind} b ON a.k = b.k"))?;
+    let mut statement = conn.prepare(&format!("SELECT a.id, b.id FROM a {kind} b ON a.k = b.k"))?;
     let columns = statement.column_count();
     let mut rows = statement.query([])?;
     let mut out = Vec::new();

@@ -46,6 +46,16 @@ redb = "4.1"
 io-uring = "0.7"
 serde_json = "1"
 
+# TLS for the MySQL wire (`inlaysql-server`). `ring` rather than the default
+# `aws-lc-rs` provider: it is the smaller build (no cmake) and the longer
+# -established of the two, and this crate's whole dependency surface was one
+# entry before TLS, so the one being added is chosen deliberately.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring", "logging"] }
+rustls-pemfile = "2"
+# Test-only: generates the self-signed certificate the TLS wire tests serve, so
+# no private key is committed to this repository.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+
 # `Durability::Normal`'s barrier (`crates/inlaysql/src/device.rs`): plain
 # `fsync(2)` on macOS, `fdatasync` on Linux. `std::fs::File::sync_data()` is
 # *not* a weaker barrier than `sync_all()` on macOS — measured directly (both

@@ -41,10 +41,13 @@
 //! * **The listener binds `127.0.0.1` unless told otherwise.** A database that
 //!   defaults to every interface is a liability, so reaching the network is an
 //!   explicit act.
-//! * **v1 is plaintext. There is no TLS.** `CLIENT_SSL` is never advertised, so
-//!   a client cannot negotiate encryption and then be quietly downgraded — it is
-//!   told. Statements, results and the whole session cross the wire in the
-//!   clear. Do not run this across a network you do not trust.
+//! * **Plaintext by default; TLS when a certificate is configured.** Without
+//!   `--tls-cert`/`--tls-key` nothing changes and nothing pretends otherwise:
+//!   `CLIENT_SSL` is not advertised, so a client cannot negotiate encryption
+//!   and then be quietly downgraded — it is told, and statements, results and
+//!   credentials cross the wire in the clear. With a certificate the server
+//!   advertises `CLIENT_SSL` and upgrades on request, and `--tls-required`
+//!   refuses any login that did not upgrade. See [`tls`].
 //! * **Accounts and privileges live in the database file** (the `acl` module):
 //!   `CREATE USER`, `GRANT`/`REVOKE`, `SELECT`/`INSERT`/`UPDATE`/`DELETE`/
 //!   `CREATE`/`DROP`/`ALTER` globally or per table, and a superuser. Every
@@ -80,6 +83,7 @@ mod protocol;
 mod session;
 mod shim;
 mod sqltext;
+pub mod tls;
 
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
@@ -349,6 +353,18 @@ pub struct ServerOptions {
     /// It is not a privilege escalation: it needs write access to the database
     /// file, and anything with that can already read every row in it.
     pub reset_superuser: bool,
+    /// PEM certificate chain to serve, leaf first. `None` — the default —
+    /// leaves the server plaintext exactly as it has always been: `CLIENT_SSL`
+    /// is not advertised and a client asking for TLS is refused.
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key for [`ServerOptions::tls_cert`]. Both or neither.
+    pub tls_key: Option<PathBuf>,
+    /// Refuse any login that did not upgrade to TLS. Requires a certificate.
+    ///
+    /// This is the setting that makes "the credential never crosses the network
+    /// in the clear" a property of the server rather than a hope about its
+    /// clients; without it a certificate only makes TLS *available*.
+    pub tls_required: bool,
     /// Log a line to stderr for every statement that runs longer than this
     /// many milliseconds. `0` (the default) is off.
     ///
@@ -411,6 +427,9 @@ impl Default for ServerOptions {
             // Overwriting a stored password is never something to do by
             // default; see the field's doc.
             reset_superuser: false,
+            tls_cert: None,
+            tls_key: None,
+            tls_required: false,
             slow_query_log_ms: 0,
             // Holding statement text is a policy change about user data, so it
             // is asked for and never inherited. See the field's doc.
@@ -448,6 +467,8 @@ pub struct Server {
     /// `--user`/`--password`, hashed. The plaintext is dropped in
     /// [`Server::bind`] and no part of this process holds one afterwards.
     bootstrap: acl::Bootstrap,
+    /// The certificate every connection offers, when one was configured.
+    tls: Option<tls::TlsConfig>,
 }
 
 impl Server {
@@ -496,10 +517,41 @@ impl Server {
         // exists to avoid.
         drop(db);
 
+        // Loaded before the listener opens, so a bad certificate is a startup
+        // failure rather than something every client discovers separately. A
+        // server that could not load its certificate must not fall back to
+        // plaintext: falling back is how an operator ends up believing a link
+        // is encrypted when it is not.
+        let tls_config = match (&options.tls_cert, &options.tls_key) {
+            (Some(certificate), Some(key)) => {
+                let policy = if options.tls_required {
+                    tls::TlsPolicy::Required
+                } else {
+                    tls::TlsPolicy::Available
+                };
+                Some(tls::TlsConfig::load(certificate, key, policy).map_err(io::Error::other)?)
+            }
+            (None, None) => {
+                if options.tls_required {
+                    return Err(io::Error::other(
+                        "--tls-required needs --tls-cert and --tls-key: there is no certificate \
+                         to require TLS with",
+                    ));
+                }
+                None
+            }
+            _ => {
+                return Err(io::Error::other(
+                    "--tls-cert and --tls-key must be given together",
+                ))
+            }
+        };
+
         let listener = TcpListener::bind((options.bind.as_str(), options.port))?;
         Ok(Self {
             listener,
             path,
+            tls: tls_config,
             notices: notices_for(&installed),
             bootstrap: acl::Bootstrap::new(&options.user, &options.password),
             // The clamped cap, not the requested one: a session reports what
@@ -667,6 +719,7 @@ impl Server {
             let registry_for_thread = registry.clone();
             let counters_for_thread = counters.clone();
             let keeper_for_thread = keeper.clone();
+            let tls_for_thread = self.tls.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("inlaysql-conn-{id}"))
                 .spawn(move || {
@@ -675,6 +728,7 @@ impl Server {
                     if let Err(error) = serve_connection(
                         stream,
                         &path,
+                        tls_for_thread,
                         control,
                         limits,
                         engine,
@@ -727,6 +781,7 @@ impl Drop for Registered {
 fn serve_connection(
     stream: TcpStream,
     path: &Path,
+    tls_config: Option<tls::TlsConfig>,
     control: Arc<Control>,
     limits: session::Limits,
     engine: EngineOptions,
@@ -778,8 +833,20 @@ fn serve_connection(
     // no second copy of it to fall out of step — see [`control::Tuning`].
     db.set_vector_tuning(Box::new(control::Tuning::new(Arc::clone(&control))));
 
+    // Both halves start plaintext. The reader upgrades itself if the client
+    // asks and a certificate is configured, and points the writer at the same
+    // session — see `packet::Stream::upgrade_to_tls`.
     let result = connection::Connection::new(
-        stream, write_half, db, control, limits, bootstrap, registry, counters, keeper,
+        tls::MaybeTls::plain(stream),
+        tls::MaybeTls::plain(write_half),
+        db,
+        control,
+        limits,
+        bootstrap,
+        registry,
+        counters,
+        keeper,
+        tls_config,
     )
     .serve();
     // A socket timeout arrives as a bare `WouldBlock`/`TimedOut` from whatever
@@ -891,10 +958,25 @@ fn notices_for(installed: &acl::Installed) -> Vec<String> {
 /// Write the warning the CLI prints, so the text lives beside the behaviour it
 /// describes rather than in an argument parser.
 pub fn print_exposure_warning(options: &ServerOptions, out: &mut impl Write) -> io::Result<()> {
-    writeln!(
-        out,
-        "inlaysql: the MySQL protocol is served in PLAINTEXT — there is no TLS in this version."
-    )?;
+    // The line an operator most needs is the one about *this* server, so it
+    // states what is configured rather than a fact about the version.
+    match (options.tls_cert.is_some(), options.tls_required) {
+        (true, true) => writeln!(
+            out,
+            "inlaysql: the MySQL protocol is served over TLS, and logins without it are refused."
+        )?,
+        (true, false) => writeln!(
+            out,
+            "inlaysql: TLS is available on the MySQL protocol, but NOT required — a client that \n\
+             inlaysql:          does not ask for it still sends its credential in the clear. Use \n\
+             inlaysql:          --tls-required to refuse those."
+        )?,
+        (false, _) => writeln!(
+            out,
+            "inlaysql: the MySQL protocol is served in PLAINTEXT — no certificate is configured. \n\
+             inlaysql:          Start with --tls-cert and --tls-key to encrypt it."
+        )?,
+    }
     if options.is_public() {
         writeln!(
             out,
@@ -1047,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn the_warning_always_says_plaintext_and_flags_the_risky_defaults() {
+    fn the_warning_states_this_servers_tls_posture_and_flags_the_risky_defaults() {
         let mut out = Vec::new();
         print_exposure_warning(&ServerOptions::default(), &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
@@ -1068,6 +1150,37 @@ mod tests {
         assert!(text.contains("reachable from other machines"), "{text}");
         // The password must never appear in anything the server prints.
         assert!(!text.contains("hunter2"), "{text}");
+
+        // A certificate without --tls-required is the posture most likely to be
+        // mistaken for a safe one, so it gets its own line saying it is not.
+        let mut out = Vec::new();
+        print_exposure_warning(
+            &ServerOptions {
+                tls_cert: Some(PathBuf::from("cert.pem")),
+                tls_key: Some(PathBuf::from("key.pem")),
+                ..ServerOptions::default()
+            },
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("NOT required"), "{text}");
+        assert!(!text.contains("PLAINTEXT"), "{text}");
+
+        let mut out = Vec::new();
+        print_exposure_warning(
+            &ServerOptions {
+                tls_cert: Some(PathBuf::from("cert.pem")),
+                tls_key: Some(PathBuf::from("key.pem")),
+                tls_required: true,
+                ..ServerOptions::default()
+            },
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("logins without it are refused"), "{text}");
+        assert!(!text.contains("PLAINTEXT"), "{text}");
     }
 
     /// The empty-password warning moved out of [`print_exposure_warning`] and

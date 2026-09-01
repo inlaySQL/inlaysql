@@ -62,6 +62,50 @@ impl<S: Read + Write> Stream<S> {
         }
     }
 
+    /// Upgrade both directions of this stream to TLS.
+    ///
+    /// Called from the handshake, after the client's `SSLRequest` has been
+    /// read and before anything else is. Three things have to be true at once
+    /// and each is handled here rather than assumed:
+    ///
+    /// * **Nothing buffered may be dropped.** The reader is buffered, so it may
+    ///   already hold the first bytes of the client's TLS `ClientHello`. Those
+    ///   bytes are handed to the session (see [`crate::tls::Prefixed`]);
+    ///   losing them hangs the handshake.
+    /// * **The writer's pending bytes must reach the client in the clear.** The
+    ///   greeting is plaintext by definition, so the writer is flushed before
+    ///   the socket is taken over.
+    /// * **Both directions must share one session.** A TLS session is one state
+    ///   machine over one byte stream; the second descriptor this stream was
+    ///   built with is dropped, and the writer is pointed at the session the
+    ///   reader negotiated.
+    pub fn upgrade_to_tls(&mut self, config: &crate::tls::TlsConfig) -> io::Result<()>
+    where
+        S: crate::tls::Upgradable,
+    {
+        self.writer.flush()?;
+        let buffered = self.reader.buffer().to_vec();
+        let reader = std::mem::replace(&mut self.reader, BufReader::new(S::placeholder()));
+        let mut inner = reader.into_inner();
+        let shared = inner.upgrade_with(config, buffered)?;
+        self.reader = BufReader::new(inner);
+        let mut writer_half = S::placeholder();
+        writer_half.adopt_session(shared);
+        // The old write descriptor goes out of scope here, closing this
+        // process's second handle on the socket while the session's own handle
+        // keeps it open.
+        self.writer = BufWriter::new(writer_half);
+        Ok(())
+    }
+
+    /// Whether this connection is encrypted.
+    pub fn is_encrypted(&self) -> bool
+    where
+        S: crate::tls::Upgradable,
+    {
+        self.reader.get_ref().encrypted()
+    }
+
     /// The bytes read and written since this last ran, and reset.
     ///
     /// Taken rather than read so the caller can add them to a running total

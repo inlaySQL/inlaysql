@@ -123,6 +123,11 @@ pub struct Session {
     /// changed through [`Session::set_database`], which also mirrors it onto
     /// the control so `SHOW PROCESSLIST` can report it from another thread.
     database: Option<String>,
+    /// Whether this connection is encrypted, which is what `have_ssl` and
+    /// `ssl_cipher` report. Set by the connection once its handshake has
+    /// settled — a client may be deciding whether to trust this link with a
+    /// password, so the answer has to describe the link and not the build.
+    pub encrypted: bool,
     /// Whether each statement commits on its own.
     pub autocommit: bool,
     /// Whether the engine currently has a transaction open.
@@ -164,6 +169,7 @@ impl Session {
         Self {
             connection_id: control.id(),
             control,
+            encrypted: false,
             user: user.to_string(),
             database,
             autocommit: true,
@@ -356,8 +362,17 @@ impl Session {
                 )
             }
             // Said plainly, because a client may be deciding whether to trust
-            // this link with a password.
-            "have_ssl" | "have_openssl" => "DISABLED",
+            // this link with a password. It describes *this connection*, not
+            // the server's capability: a server with a certificate still
+            // answers DISABLED to a client that chose not to upgrade, because
+            // that client's link really is in the clear.
+            "have_ssl" | "have_openssl" => {
+                if self.encrypted {
+                    "YES"
+                } else {
+                    "DISABLED"
+                }
+            }
             "ssl_cipher" => "",
             // MySQL answers `GPL` for its community build and `Commercial`
             // for the licensed one, and a client that inspects this is asking
