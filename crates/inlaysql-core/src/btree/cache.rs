@@ -85,7 +85,6 @@
 //! [`EngineOptions::page_cache_bytes`](crate::EngineOptions) — `0` disables the
 //! cache entirely and restores the old read-every-time behaviour.
 
-use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::mem::size_of;
@@ -149,6 +148,162 @@ pub fn data_area_page(page_size: usize, format_version: u32, id: PageId) -> bool
         >= crate::wal::all_regions_end(page_size, format_version)
 }
 
+/// Page id → slot index, as an open-addressing hash table.
+///
+/// This used to be a `BTreeMap<PageId, usize>`, and that lookup was the
+/// single hottest frame in the `LIMIT`-join profile (18% of the query — see
+/// `PERF.md`, 2026-09-02): a join descends root-to-leaf per outer row and a
+/// point read per descent level, so every level pays one lookup, and a
+/// `BTreeMap` pays `log n` node visits with a key compare in each. A page id
+/// is one integer, so the right structure is a hash table whose hit is one
+/// multiply, one mask and one compare.
+///
+/// Linear probing with backward-shift deletion, so there are no tombstones
+/// and a lookup for an absent id stops at the first empty bucket. Load is
+/// held at or under one half, so probe runs stay short. Nothing here is a
+/// dependency: `alloc` only, no `unsafe`, same as the rest of core.
+struct SlotIndex {
+    /// Bucket page ids; meaningful only where `slots[i] != EMPTY`.
+    keys: Vec<PageId>,
+    /// Bucket slot indices; `EMPTY` marks a vacant bucket.
+    slots: Vec<u32>,
+    /// Occupied buckets.
+    len: usize,
+}
+
+/// A vacant bucket.
+const EMPTY: u32 = u32::MAX;
+
+impl SlotIndex {
+    const fn new() -> Self {
+        Self {
+            keys: Vec::new(),
+            slots: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.slots.clear();
+        self.len = 0;
+    }
+
+    /// Fibonacci hashing: the page id spread over the top bits by the golden
+    /// ratio's fixed-point form, then shifted down to the table's width. Page
+    /// ids are dense small integers, so a plain mask would map neighbouring
+    /// pages to neighbouring buckets and every descent would probe through
+    /// its own siblings.
+    #[inline]
+    fn bucket(&self, id: PageId) -> usize {
+        let bits = self.keys.len().trailing_zeros();
+        (id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - bits)) as usize
+    }
+
+    #[inline]
+    fn get(&self, id: PageId) -> Option<usize> {
+        if self.keys.is_empty() {
+            return None;
+        }
+        let mask = self.keys.len() - 1;
+        let mut at = self.bucket(id);
+        loop {
+            let slot = self.slots[at];
+            if slot == EMPTY {
+                return None;
+            }
+            if self.keys[at] == id {
+                return Some(slot as usize);
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    /// Bind `id` to `slot`, replacing any earlier binding.
+    fn insert(&mut self, id: PageId, slot: usize) {
+        let slot = u32::try_from(slot).unwrap_or(EMPTY - 1);
+        if self.keys.is_empty() || (self.len + 1) * 2 > self.keys.len() {
+            self.grow();
+        }
+        let mask = self.keys.len() - 1;
+        let mut at = self.bucket(id);
+        loop {
+            if self.slots[at] == EMPTY {
+                self.keys[at] = id;
+                self.slots[at] = slot;
+                self.len += 1;
+                return;
+            }
+            if self.keys[at] == id {
+                self.slots[at] = slot;
+                return;
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    /// Unbind `id`, shifting the rest of its probe run back so no bucket
+    /// between a key's home and its position is ever left empty.
+    fn remove(&mut self, id: PageId) {
+        if self.keys.is_empty() {
+            return;
+        }
+        let mask = self.keys.len() - 1;
+        let mut at = self.bucket(id);
+        loop {
+            if self.slots[at] == EMPTY {
+                return;
+            }
+            if self.keys[at] == id {
+                break;
+            }
+            at = (at + 1) & mask;
+        }
+        self.slots[at] = EMPTY;
+        self.len -= 1;
+        let mut hole = at;
+        let mut next = (at + 1) & mask;
+        while self.slots[next] != EMPTY {
+            let home = self.bucket(self.keys[next]);
+            // `next` may move back into `hole` only if its home is not in the
+            // cyclic interval `(hole, next]`; otherwise it is already as close
+            // to home as it may be.
+            let in_between = if hole <= next {
+                hole < home && home <= next
+            } else {
+                hole < home || home <= next
+            };
+            if !in_between {
+                self.keys[hole] = self.keys[next];
+                self.slots[hole] = self.slots[next];
+                self.slots[next] = EMPTY;
+                hole = next;
+            }
+            next = (next + 1) & mask;
+        }
+    }
+
+    fn grow(&mut self) {
+        let capacity = (self.keys.len() * 2).max(64);
+        let keys = core::mem::replace(&mut self.keys, alloc::vec![0; capacity]);
+        let slots = core::mem::replace(&mut self.slots, alloc::vec![EMPTY; capacity]);
+        self.len = 0;
+        for (key, slot) in keys.into_iter().zip(slots) {
+            if slot != EMPTY {
+                self.insert(key, slot as usize);
+            }
+        }
+    }
+}
+
 /// One resident page.
 struct Slot {
     id: PageId,
@@ -192,7 +347,7 @@ pub struct PageCache {
     /// Indices of free slots.
     free: Vec<usize>,
     /// Page id to slot index.
-    index: BTreeMap<PageId, usize>,
+    index: SlotIndex,
     /// The clock hand: the next slot index eviction will examine.
     hand: usize,
 }
@@ -205,7 +360,7 @@ impl PageCache {
             bytes: 0,
             slots: Vec::new(),
             free: Vec::new(),
-            index: BTreeMap::new(),
+            index: SlotIndex::new(),
             hand: 0,
         }
     }
@@ -253,7 +408,7 @@ impl PageCache {
     /// lookup and one `bool` write, touching no other entry, where the LRU
     /// list this replaced had to detach and re-link a node on every hit.
     pub fn get(&mut self, id: PageId) -> Option<Rc<Node>> {
-        let slot = *self.index.get(&id)?;
+        let slot = self.index.get(id)?;
         let entry = self.slots.get_mut(slot)?.as_mut()?;
         entry.referenced = true;
         Some(Rc::clone(&entry.node))
@@ -268,7 +423,7 @@ impl PageCache {
         if self.budget == 0 {
             return;
         }
-        if let Some(&slot) = self.index.get(&id) {
+        if let Some(slot) = self.index.get(id) {
             // Already resident. The bytes cannot have changed (a page id names
             // one immutable page), so this is only a reference-bit update —
             // the insert path counts as a touch too.
@@ -341,7 +496,7 @@ impl PageCache {
                 continue;
             }
             let slot = place.take().expect("just confirmed occupied above");
-            self.index.remove(&slot.id);
+            self.index.remove(slot.id);
             self.bytes = self.bytes.saturating_sub(slot.footprint);
             self.free.push(at);
             return true;
@@ -354,6 +509,38 @@ impl PageCache {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn the_slot_index_agrees_with_a_map_under_churn() {
+        // Insert, look up and remove a few thousand ids in a scrambled order,
+        // checking against a `BTreeMap` at every step so the backward-shift
+        // deletion is exercised across wrap-around and across dense runs.
+        let mut index = SlotIndex::new();
+        let mut model = alloc::collections::BTreeMap::new();
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for step in 0..20_000u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let id = (seed % 1_500) as PageId;
+            if seed & 4 == 0 {
+                index.remove(id);
+                model.remove(&id);
+            } else {
+                index.insert(id, step as usize);
+                model.insert(id, step as usize);
+            }
+            let probe = (seed >> 20) % 1_500;
+            assert_eq!(index.get(probe), model.get(&probe).copied(), "step {step}");
+            assert_eq!(index.len(), model.len());
+        }
+        for id in 0..1_500 {
+            assert_eq!(index.get(id), model.get(&id).copied());
+        }
+        index.clear();
+        assert!(index.is_empty());
+        assert_eq!(index.get(7), None);
+    }
 
     fn leaf(key: &[u8]) -> Rc<Node> {
         Rc::new(Node::Leaf {

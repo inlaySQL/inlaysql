@@ -2838,6 +2838,44 @@ same sitting, control side re-measured in every repetition. `bench/repeat.sh`
 exists for exactly this reason and `bin/profile.rs` has no equivalent; a
 harness that interleaves A/B binaries would have caught it automatically.
 
+### `PageCache::get` was a `BTreeMap` lookup; now it is a hash (AHL-521, 2026-09-02)
+
+Profiled `bin/profile.rs --suite joins-limit` again (release, `sample` over
+the query phase, 13,124 samples, machine at load 8–12/18 so shares not
+wall-clock are the evidence). Leaf symbol: **`PageCache::get` 18.5%**, the
+single hottest frame — 1,364 samples beneath `CowBTree::node_at` (the probe
+descents, one lookup per level per outer row) and 1,050 beneath
+`walk_raw_row_values` (the driving scan re-descending root-to-leaf on every
+execution of the prepared statement). `_platform_memcmp` 13.5% is next, split
+between `partition_point` (the separator search), `WalkBounds::admits` and
+`get_from`. The root plan's A5 estimated this cost at ~9% on the range shape;
+on the `LIMIT` join it is twice that, because that shape is nearly all descent.
+
+**Cause.** The cache's page-id → slot index was a `BTreeMap<PageId, usize>`.
+The hit path had already been made as cheap as a `BTreeMap` allows (clock
+bits, no LRU relink) — what remained was the map itself: `log n` node visits
+and a key compare in each, for a key that is one integer.
+
+**Fix.** An open-addressing hash table in `cache.rs`: Fibonacci hash of the
+page id, linear probing, backward-shift deletion (no tombstones), load held
+at or under one half, `alloc` only. A hit is one multiply, one mask and one
+compare. Pinned against a `BTreeMap` model under 20,000 scrambled
+insert/remove/lookup steps across wrap-around.
+
+**Measured**, interleaved, same sitting, control re-run in every repetition,
+`--seconds 4..6`:
+
+| Shape | Before | After | Verdict |
+| --- | --- | --- | --- |
+| `joins-limit` | 116.3k / 117.1k / 117.5k ops/s | **129.9k / 129.2k / 131.3k** | **1.11x**, 3/3, non-overlapping |
+| `points` | 1.60 / 1.55 / 1.60 / 1.65 / 1.63 M ops/s | 1.67 / 1.58 / 1.61 / 1.67 / 1.61 M | flat; after wins 4/5 — the point read did not move |
+| `joins` (full shapes) | 65 / 65 ops/s | 65 / 64 | flat |
+
+The full-join shape is flat because its cost is elsewhere (it is the
+`walk_raw_row_values` sweep and the hash build, not descents). The
+wall-clock tables in `BENCHMARK.md` owe this the same regeneration they owe
+AHL-512 through 520.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness
