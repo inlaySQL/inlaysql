@@ -834,7 +834,8 @@ REPEATS=5 ./bench/repeat.sh     # run.sh five times: median plus how far the run
 ```
 
 Every number below is [`BENCHMARK.md`](BENCHMARK.md), regenerated at commit
-`2cb2539` on a developer machine, most of it a median of three runs. One
+`7b20175` (2026-09-02) on a developer machine, most of it a median of three
+runs. One
 developer machine — reproduce it, do not trust it. Not every table below is
 from the same sitting: `BENCHMARK.md`'s own provenance header says exactly
 which tables were regenerated this edition and which are carried forward from
@@ -862,18 +863,18 @@ harder target.
 
 | Workload | InlaySQL | SQLite, durable | SQLite, fastest |
 | --- | --- | --- | --- |
-| Point read by primary key | **522,562 ops/s**, 1.38 µs p50 | 160,236 ops/s (**~2-4x**) | 1,118,819 ops/s (we lose ~2x) |
-| Point read, secondary index | **371,478 ops/s**, 2.25 µs p50 | 245,790 ops/s (**~1.5x**) | 619,985 ops/s (we lose ~1.7x) |
-| Indexed range scan, 50 rows | 64,250 ops/s, 14.00 µs p50 | 124,662 ops/s (we lose ~2x) | 182,357 ops/s (we lose ~2.9x) |
+| Point read by primary key | **533,943 ops/s**, 1.04 µs p50 | 170,234 ops/s (**~2-3x**) | 1,257,756 ops/s (we lose ~2-3.5x) |
+| Point read, secondary index | **421,625 ops/s**, 2.08 µs p50 | 260,282 ops/s (**~1.6x**) | 749,148 ops/s (we lose ~1.8x) |
+| Indexed range scan, 50 rows | 77,559 ops/s, 12.13 µs p50 | 121,531 ops/s (we lose ~1.6x) | 198,857 ops/s (we lose ~2.6x) |
 | Join, PK inner, full scan | 11.72 ms p50 | 9.99 ms p50 (we lose ~1.15x) | — |
 | Join, secondary-index inner, full scan | **3.71 ms p50** | 30.26 ms p50 (we win ~7.5x) | — |
-| Durable write, one commit each | **240 ops/s**, 3.97 ms p50 | 90 ops/s (**~2.7x**) | — |
-| Concurrent durable writers, 8 threads | **1,209 commits/s**, 0.0% aborted | 88 commits/s (**~13x**) | — |
+| Durable write, one commit each | **241 ops/s**, 3.98 ms p50 | 97 ops/s (**~2.5x**) | — |
+| Concurrent durable writers, 8 threads | **1,148 commits/s**, 0.0% aborted | 87 commits/s (**~13x**) | — |
 
-A single indexed point probe wins — the index itself is worth roughly 550x
+A single indexed point probe wins — the index itself is worth roughly 515x
 over the engine's own unindexed scan. **Iterating rows is where we lose**:
-the 50-row range scan is behind both SQLite configurations (roughly 2x and
-2.9x), and the `LIMIT 10` form of both join shapes stays roughly 2.0-2.1x
+the 50-row range scan is behind both SQLite configurations (roughly 1.6x and
+2.6x), and the `LIMIT 10` form of both join shapes stays roughly 2.0-2.1x
 behind (regenerated 2026-09-01; down from 2.2-3.5x after the raw-leaf cache in
 `e4086ad`, and from 4.7–5.8x two editions before that), which is what pins the
 remaining cost as per-row rather than per-query. Every multiple in this paragraph is stated to the precision
@@ -883,12 +884,13 @@ target — [`PERF.md`](PERF.md) has the profile, and index selection stops at
 the narrow rule in [What this is not](#what-this-is-not).
 
 The point-read row has now been published at 636,980, then 342,747, then
-901,158, and now 522,562 ops/s across four editions, with nothing identified
-in the commit history as touching that path. Read the ratio against the
-durable configuration, not the absolute figure — and read that ratio loosely
-too: the three individual runs behind this edition's median disagreed with
-each other by nearly 2x, and a same-binary A/A test on this exact metric
-alone (`PERF.md` §4) found a 20.4% max-min spread on a quiet machine.
+901,158, then 522,562, and now 533,943 ops/s across five editions, with
+nothing identified in the commit history as touching that path. Read the
+ratio against the durable configuration, not the absolute figure — and read
+that ratio loosely too: the three individual runs behind this edition's
+median disagreed with each other by 1.8x on a machine that passed the load
+gate throughout, and a same-binary A/A test on this exact metric alone
+(`PERF.md` §4) found a 20.4% max-min spread on a quiet machine.
 `BENCHMARK.md` walks through why.
 
 The point-read win is the page cache (AHL-420): caching decoded pages took
@@ -906,11 +908,12 @@ up more slowly.
 
 Durable writes win because we pay one `fsync` per commit against the
 journal's several; batching the same workload into one commit per many rows
-reaches 58,320 ops/s at 11.25 µs (**~240x**) — a bulk-load number, not the
+reaches 60,990 ops/s at 10.63 µs (**~250x**) — a bulk-load number, not the
 transaction one above. Concurrent writers scale well past eight now: the
-adaptive commit-coalesce window (94d96a6) lets 8 writers do roughly 5x the
+adaptive commit-coalesce window (94d96a6) lets 8 writers do roughly 4.7x the
 work of one. Eight is not the peak, though — the fuller sweep in
-`BENCHMARK.md` finds it at 16 writers (1,616 commits/s) — and past the peak
+`BENCHMARK.md` (carried forward from 2026-08-30; this edition re-ran only
+1/2/4/8 writers) finds it at 16 writers (1,616 commits/s) — and past the peak
 throughput falls (1,307 commits/s at 24 writers, 974 at 32) because every
 writer's whole commit prepare phase, not only its `fsync`, still serializes
 behind one gate — `BENCHMARK.md` has the fuller sweep, including the p99 tail
@@ -923,8 +926,8 @@ exhaustive oracle:
 
 | Corpus | recall@10 | InlaySQL p50 | vs `sqlite-vec` |
 | --- | --- | --- | --- |
-| Text-derived embeddings | 1.000 | 78.96 µs | **~8-10x faster at 100% of its recall** |
-| Uniform random | 0.922 | 100.29 µs | ~6.5-7x faster at 92.2% of its recall |
+| Text-derived embeddings | 1.000 | 69.54 µs | **~9-10x faster at 100% of its recall** |
+| Uniform random | 0.922 | 92.08 µs | ~7x faster at 92.2% of its recall |
 
 Both corpus shapes are published because only one of them flatters us:
 uniformly random vectors in 384 dimensions have no structure for a graph
@@ -934,8 +937,8 @@ quantisation costs 0.014 recall on the realistic corpus for a 3.96x smaller
 resident vector payload.
 
 Hybrid retrieval (vector + BM25, fused in one SQL statement) at 2,000
-documents, `LIMIT 10`: ingest 14,214 docs/s, vector p50 75.67 µs, **BM25 p50
-51.21 µs**, **hybrid p50 102.46 µs**. BM25 was 347.50 µs and hybrid 453.88 µs
+documents, `LIMIT 10`: ingest 13,930 docs/s, vector p50 68.42 µs, **BM25 p50
+46.67 µs**, **hybrid p50 95.54 µs**. BM25 was 347.50 µs and hybrid 453.88 µs
 two commits ago: the full-text index stopped being a map of maps, top-`k`
 became a bounded heap instead of scoring and sorting the whole corpus to keep
 ten rows, and a MaxScore walk now skips documents whose entire possible score

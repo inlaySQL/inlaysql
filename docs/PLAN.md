@@ -17,75 +17,74 @@ current execution order without relying on local conversation history.
   planner-only changes still need the ordinary workspace and differential
   gates.
 
-## Current state (2026-09-02)
+## Current state (2026-09-02, evening)
 
-- Cost-based join *reorder* landed as AHL-512: a two-table INNER join may run
-  with its sources exchanged when the cost model scores that cheaper, as a
-  plan rewrite with every ordinal remapped. Measured 1.31x on the joins
-  suite, interleaved. Bounded to full scans; `LIMIT` shapes refuse by design
-  (a different order is a different result set without `ORDER BY`).
-- Aggregate streaming landed as AHL-513/514/515: `GROUP BY` folds as rows
-  arrive through an ordered map, holding one representative row and one
-  accumulator set per group; ungrouped aggregates fold from the stream.
-- The raw-leaf cache and the collation-/`REAL`-keyed hash joins landed
-  earlier (see `PERF.md` 2026-08-31/09-01 sections).
-- **Every `BENCHMARK.md` table except joins predates all of the above**
-  (`2cb2539`, 2026-08-30). The published PK-inner-join and aggregate losses
-  may already be smaller than printed; nothing is claimed until regenerated.
-- A 2026-09-02 three-path code audit (root plan A4/A5/B4a/C7) attributed the
-  remaining read-, aggregate- and insert-path losses to specific line-item
-  allocation churn; that is the work queue below.
+- **Every `run.sh` suite was regenerated at `7b20175`** (three gated runs,
+  none contaminated; `bench/results/20260902T022325Z-repeat.txt`).
+  `BENCHMARK.md`, `README.md` and the web copy carry the new figures; the
+  sync checker is green. The joins table is withheld: see item 1.
+- **The regeneration caught a real regression.** AHL-512's join cost model
+  priced an outer row at one unit and drove from the larger table; the
+  secondary-index full join went 3.7 ms → 14 ms. Fixed as AHL-524
+  (`OUTER_ROW_COST` in `planner.rs`); both written orders now run
+  users-driving at ~3.3 ms against SQLite's 10 ms and 30 ms (gate-off single
+  run; the gated run is owed). Bisect in `PERF.md`.
+- Landed the same day, each measured interleaved on `bin/profile` and
+  recorded in `PERF.md`: AHL-521 (page-cache index is a hash, 1.11x on the
+  `LIMIT` join), AHL-522 (raw scan reads sixteen pages per syscall, 1.26x on
+  `aggregate` 100k, 1.17x full joins), AHL-523 (`GROUP BY` by hash table,
+  1.12x), AHL-525 (`ORDER BY` + `LIMIT` joins may reorder; bare `LIMIT`
+  still refuses). The point read did not move through any of them.
+- Earlier in the day: the allocation diet (AHL-517–520 plus four read-path
+  commits) and aggregate streaming (AHL-513/514/515).
+- **Still stale:** every `compare.sh`-sourced table (MySQL/PostgreSQL OLTP
+  and aggregate rows, DuckDB/pgvector/Meilisearch, server-to-server) is
+  from 2026-08-30. The published 3.4–6x aggregate loss predates everything
+  above; the profile's aggregate shape is 1.44x faster since the morning's
+  baseline, so it is very likely smaller, and unproven.
 
 ## Next work, in order
 
-1. **Run clean, guarded benchmark repeats when the host is quiet — still
-   owed, still first.** Now carries AHL-512/513/514/515, all unpublished.
-   Pass criteria unchanged: clean gate, three runs, spread within the
-   suite's floor.
+1. **Gated `SUITE=joins REPEATS=3` at HEAD, then `repeat-compare.sh`.** The
+   joins table must be replaced from a clean run (two attempts on 2026-09-02
+   were `CONTAMINATED` by spikes just over the gate). Then the `compare.sh`
+   tables, which have never had the repeat wrapper. Pre-build the bench
+   binary before the run so its own compile cannot trip the gate; the quiet
+   window on this machine is mid-morning.
 
    ```sh
-   REPEATS=3 SUITE=joins ROWS=20000 QUERIES=100 LIMIT=20 ./bench/repeat.sh
-   REPEATS=3 SUITE=indexed ROWS=100000 QUERIES=100 ./bench/repeat.sh
+   cargo build --release -p inlaysql-bench
+   REPEATS=3 SUITE=joins ./bench/repeat.sh
+   REPEATS=5 ./bench/repeat-compare.sh
    ```
 
-   Keep the raw files in `bench/results/`; do not publish a row if the quiet
-   machine gate refuses or the repeat spread is too wide.
-   `BENCH_MAX_LOAD_PER_CPU=off` is for explicitly labelled diagnostics only.
+2. **Batch executor (B4)** — now the majority of what is left on the
+   aggregate shape: the 10.28 ms scan-and-decode floor. R3 brief first
+   (decode one leaf into a 1k-row column batch, measure filter+aggregate
+   against the row loop); the point read must not move.
 
-2. ~~**The allocation diet**~~ — **landed 2026-09-02** as eight commits
-   (`84e62a5..aa42cd5`, AHL-517–520 plus four read-path commits), all gates
-   green including both release DST sweeps on the index-path change.
-   Corrections the build produced: the `PartialEq<Value> for ValueRef`
-   allocation was unreachable from the executor (landed as a cheaper public
-   impl, but it is not a read-path finding), and `moving_projection` was
-   already wired into `project_stream`. Wall-clock for every item is
-   **unmeasured and owed to item 1's quiet window** — no published number
-   changes until then. Left open, recorded in the root plan: `UPDATE`'s
-   per-row `encode_table_row`, the collecting aggregate path's per-row key,
-   and the miss path's second map descent (per group, accepted).
+3. **`RangeCursor` extension (A3)** to `walk`/`scan_range_from` — the
+   cheapest first step is `colliding_rows` using `scan_index_row_ids`
+   (already cursor-backed, no per-key `Vec`); WITHOUT ROWID scans next.
 
-3. **Join-reorder remainder**: the `LIMIT`-shape output-order argument, then
-   index-probe access paths. The published `LIMIT`-join rows never benefit
-   from AHL-512 until this exists.
+4. **B2's last piece**: index-probe access paths do not reorder. B3
+   (multi-slot point cursor) is low-payoff on the published shapes; profile
+   before building.
 
-4. **`RangeCursor` extension** to `walk`/`scan_range_from` (WITHOUT ROWID
-   scans, `UNIQUE` collision check) — bounded, read-path-only.
+5. **Server posture F3/F4** — refuse-to-expose defaults; fuzz the packet path.
 
-5. **Batch executor (B4)** — owns the remaining aggregate floor (scan+decode,
-   10.28 ms of the 18.38 ms shape). R3 brief first; point read must not move.
+6. **Insert structural half (C7)**: dirty pages held as decoded `Node`s
+   across a transaction, encoded once at commit. Both release DST sweeps
+   mandatory.
 
-6. **Server posture F3/F4** — refuse-to-expose defaults; fuzz the packet path.
-
-7. **Insert structural half (C7)**: dirty pages held as decoded `Node`s
-   across a transaction, encoded once at commit (today every row re-decodes,
-   deep-clones and re-encodes every page on its path — `tree.rs:2597`).
-   Behind the `Storage` seam but changes what `rebase_pending` walks: both
-   release DST sweeps mandatory.
-
-8. **C1 commit-side logical group commit** — highest payoff, data-loss risk,
+7. **C1 commit-side logical group commit** — highest payoff, data-loss risk,
    full DST rigor; only when it can be done carefully.
 
-9. **Serverless R13 brief → object-store prototype** — runs in parallel.
+8. **Serverless R13 brief → object-store prototype** — runs in parallel.
+
+Standing lesson from today, now in the root plan's rules: a suite-level
+number is not a per-shape number. A commit that changes a plan decision
+quotes every shape it can touch.
 
 ## Acceptance and handoff
 
