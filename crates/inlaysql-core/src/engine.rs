@@ -9489,6 +9489,16 @@ trait AggregateCells {
 
 impl AggregateCells for [Value] {
     fn eval(&self, expr: &crate::plan::Expr, env: &Env<'_>) -> Result<Value> {
+        // A bare column — the common `GROUP BY n` and `SUM(n)` — is read
+        // straight off the row here; the general evaluator's answer is the
+        // same, this just spares its call and dispatch per row per
+        // expression. It is not spared the bounds check: an ordinal past the
+        // row is the same corruption whichever way it is read.
+        if let crate::plan::Expr::Column(index) = expr {
+            if let Some(value) = self.get(*index) {
+                return Ok(value.clone());
+            }
+        }
         eval::evaluate(expr, self, Computed::NONE, env)
     }
 
@@ -9499,6 +9509,11 @@ impl AggregateCells for [Value] {
 
 impl AggregateCells for [ValueRef<'_>] {
     fn eval(&self, expr: &crate::plan::Expr, env: &Env<'_>) -> Result<Value> {
+        if let crate::plan::Expr::Column(index) = expr {
+            if let Some(cell) = self.get(*index) {
+                return Ok(cell.to_owned_value());
+            }
+        }
         eval::evaluate_ref(expr, self, Computed::NONE, env)
     }
 

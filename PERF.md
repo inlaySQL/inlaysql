@@ -3135,6 +3135,48 @@ control re-run each rep, load 4–5:
 Kept on the 20k row and the profile (`admits` 7.9% → 1.4% inclusive after),
 and recorded as the small one it is.
 
+### The fold reads a bare column straight off the row (AHL-528c, 2026-09-02)
+
+`GROUP BY n`, `SUM(n)`, `MIN(id)`: the group key and most aggregate arguments
+are a bare `Expr::Column`, and each went through the general evaluator's call
+and dispatch per row per expression (`eval::evaluate` 4.6% of the baseline
+profile). Both `AggregateCells` evaluators now answer that case first — a
+bounds-checked read and a clone (`to_owned_value` for a borrowed cell), the
+same answer the evaluator gives, and the same corruption error for an ordinal
+past the row, which falls through to it.
+
+**Measured** on top of AHL-528a/b, interleaved, control re-run each rep, load
+4–5:
+
+| Shape | AHL-528a+b | + AHL-528c | Verdict |
+| --- | --- | --- | --- |
+| `aggregate`, 100k rows | 155 / 156 / 160 ops/s | **161 / 170 / 167** | **1.04x**, 3/3, non-overlapping by one |
+| `aggregate`, 20k rows | 821 / 807 / 823 | **860 / 847 / 828** | **1.04x**, 3/3, non-overlapping by five |
+
+Small, and said so. No behaviour to pin beyond the tie tests, which cover it.
+
+**What is left, profiled at the end of the three** (7,257 samples, load
+4–5): `stream_aggregate`'s inlined loop 14.1% self, `pread` 10.2% and
+`memmove` 9.3% (the table does not fit the shared cache — a memory-policy
+choice this work does not touch), `decode_row_ref_masked_into` 9.2% self /
+15.0% inclusive with `skip_value` 5.7% beneath it, `scan_leaf_cells` 6.7%
+self / 16.3% inclusive, `GroupTable::find` 6.5%, `resolve_value_at` (the
+per-row `RowBuf::Shared` refcount bump) 3.2%, `hash_group_key` 2.7%. The
+allocator is no longer in the top twenty-five; `decode_row_masked`,
+`drop_in_place<ExecRow>` and the 7.9% `admits` are gone. `WalkBounds::admits`
+is 1.4%.
+
+**Not taken.** The root plan's fourth candidate — the raw scan's per-row
+`Rc` clone and `skip_value` — measures at 3.2% and 5.7% after the above. The
+`Rc` bump is the price of a `RowBuf` that outlives the leaf callback and is
+not removable without turning the batch into a callback. `skip_value` walks
+the columns the mask does not want because the row format has no column
+directory (`docs/architecture.md` D5); an early exit after the last wanted
+ordinal would spare the scalar shape three skips per row but would stop
+catching a structurally corrupt trailing column, which `decode_row_masked`'s
+doc promises it does. That is a contract change, not a perf item, and it is
+left where it is.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness
