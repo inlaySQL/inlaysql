@@ -38,6 +38,25 @@
 //! 50-row range shape in `bench/run.sh`) can be profiled on its own rather
 //! than diluted by `indexed`'s point-lookup loop.
 //!
+//! # How the answer is consumed (AHL-535)
+//!
+//! `points` and `indexed-range` read their rows through
+//! `Database::query_prepared_each_ref` and *touch every column they select* —
+//! summing a row id and a body's length into a checksum the loop
+//! `black_box`es at the end. Before AHL-535 both called `query_prepared` and
+//! looked only at `rows.len()`.
+//!
+//! Both halves of that change matter and they pull in opposite directions.
+//! Stepping rows through the borrowing API is what SQLite's side has always
+//! done — `sqlite3_step` into caller-owned registers — so the old harness was
+//! comparing SQLite's step loop against a `Vec<Vec<Value>>` built and dropped
+//! per query, which is a difference in API shape, not in engine speed.
+//! Reading the columns is the other half: an answer nobody looks at is not a
+//! workload anybody has, and a row count is a number the engine can produce
+//! without the caller ever touching a byte. Together they measure the same
+//! thing on both sides — descend, decode, hand the caller the bytes, caller
+//! reads them.
+//!
 //! And `writes` (AHL-480), the write-mode sibling: it profiles the *durable
 //! commit* loop instead of a read loop, one `INSERT` auto-committed at a time
 //! on a single connection, matching `crates/inlaysql-bench/src/points.rs`'s
@@ -294,13 +313,23 @@ fn run_points(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Er
     let mut rng = SeededRng::new(config.seed);
     let rows = config.rows as u64;
 
+    // Read through the borrowing API, and read the column rather than
+    // counting the rows: `query_prepared_each_ref` hands back a `&str` into
+    // the page, so summing its length is the whole cost of consuming the
+    // answer. See `read_the_answer` for why this is the fair shape and not
+    // the flattering one.
+    let mut checksum = 0u64;
     announce_query_phase();
     let (iterations, elapsed) = run_for(config.seconds, || {
         let key = 1 + (rng.next_u64() % rows) as i64;
-        let result = db.query_prepared(&lookup, &[Value::Integer(key)])?;
-        debug_assert_eq!(result.rows.len(), 1);
+        let delivered = db.query_prepared_each_ref(&lookup, &[Value::Integer(key)], |row| {
+            checksum += row[0].as_str().map_or(0, str::len) as u64;
+            Ok(())
+        })?;
+        debug_assert_eq!(delivered, 1);
         Ok(())
     })?;
+    std::hint::black_box(checksum);
     report("points", iterations, elapsed);
     Ok(())
 }
@@ -443,19 +472,29 @@ fn run_indexed_range(config: &Config, path: &Path) -> Result<(), Box<dyn std::er
     let mut rng = SeededRng::new(config.seed);
     let bound = (config.rows.saturating_sub(RANGE_SIZE)).max(1) as u64;
 
+    // Both columns are read, per row, for the reason this module's "How the
+    // answer is consumed" gives: a fifty-row answer nobody looks at is not
+    // the workload anybody has.
+    let mut checksum = 0u64;
     announce_query_phase();
     let (iterations, elapsed) = run_for(config.seconds, || {
         let start = 1 + (rng.next_u64() % bound) as i64;
-        let result = db.query_prepared(
+        let delivered = db.query_prepared_each_ref(
             &range,
             &[
                 Value::Text(email(start).into()),
                 Value::Text(email(start + RANGE_SIZE as i64).into()),
             ],
+            |row| {
+                checksum += row[0].as_i64().unwrap_or(0) as u64;
+                checksum += row[1].as_str().map_or(0, str::len) as u64;
+                Ok(())
+            },
         )?;
-        debug_assert_eq!(result.rows.len(), RANGE_SIZE);
+        debug_assert_eq!(delivered, RANGE_SIZE);
         Ok(())
     })?;
+    std::hint::black_box(checksum);
     report("indexed-range", iterations, elapsed);
     Ok(())
 }

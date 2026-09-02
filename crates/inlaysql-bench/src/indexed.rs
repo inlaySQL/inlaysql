@@ -32,6 +32,18 @@
 //!   different syntax.
 //! * **Prepared statements on both sides**, bound per iteration, as in
 //!   `points` — otherwise this measures a parser.
+//! * **Both sides step, both sides read** (AHL-535). SQLite's API has always
+//!   stepped one row at a time into caller-owned registers; until AHL-535
+//!   InlaySQL had no equivalent, so this suite called `query_prepared` and
+//!   compared SQLite's step loop against a `Vec<Vec<Value>>` built and dropped
+//!   per query — a difference in API shape, not in engine speed, and it mattered
+//!   most on exactly this suite's fifty-row range. Both sides now step a row and
+//!   read *both* selected columns off it without copying: InlaySQL through
+//!   `query_prepared_each_ref`'s `ValueRef`, SQLite through `row.get_ref(..)`
+//!   rather than `row.get::<String>(..)`. That change removed an allocation per
+//!   row from SQLite's loop as well as ours, so the comparison got harder rather
+//!   than easier. Reading the columns instead of counting the rows is the other
+//!   half of it: an answer nobody looks at is not a workload anybody has.
 //! * **The same seeded lookup sequence**, so both engines answer the same
 //!   questions in the same order, and every point lookup matches exactly one
 //!   row.
@@ -250,13 +262,21 @@ fn inlaysql_lookup(
         "InlaySQL (no index: full scan)".to_string()
     };
 
+    // Stepped and read on both sides — see the module note "Both sides step,
+    // both sides read". `checksum` is what stops the reads being elided.
+    let mut checksum = 0u64;
     let lookup = db.prepare("SELECT id, body FROM users WHERE email = ?")?;
     let mut samples = Vec::with_capacity(keys.len());
     let started = Instant::now();
     for key in keys {
         let at = Instant::now();
-        let result = db.query_prepared(&lookup, &[Value::Text(key.clone().into())])?;
-        debug_assert_eq!(result.rows.len(), 1, "every key matches exactly one row");
+        let delivered =
+            db.query_prepared_each_ref(&lookup, &[Value::Text(key.clone().into())], |row| {
+                checksum += row[0].as_i64().unwrap_or(0) as u64;
+                checksum += row[1].as_str().map_or(0, str::len) as u64;
+                Ok(())
+            })?;
+        debug_assert_eq!(delivered, 1, "every key matches exactly one row");
         samples.push(at.elapsed());
     }
     let point_elapsed = started.elapsed();
@@ -273,16 +293,23 @@ fn inlaysql_lookup(
         let low = email(start);
         let high = email(start + RANGE_SIZE as i64);
         let at = Instant::now();
-        let result =
-            db.query_prepared(&range, &[Value::Text(low.into()), Value::Text(high.into())])?;
+        let delivered = db.query_prepared_each_ref(
+            &range,
+            &[Value::Text(low.into()), Value::Text(high.into())],
+            |row| {
+                checksum += row[0].as_i64().unwrap_or(0) as u64;
+                checksum += row[1].as_str().map_or(0, str::len) as u64;
+                Ok(())
+            },
+        )?;
         debug_assert_eq!(
-            result.rows.len(),
-            RANGE_SIZE,
+            delivered, RANGE_SIZE,
             "every range starts inside the table and is RANGE_SIZE wide"
         );
         samples.push(at.elapsed());
     }
     let range_elapsed = started.elapsed();
+    std::hint::black_box(checksum);
     let range = Timing {
         label,
         elapsed: range_elapsed,
@@ -319,12 +346,20 @@ fn sqlite_lookup(
 
     let label = durability.label();
 
+    // `get_ref` rather than `get::<String>`: SQLite hands back a pointer into
+    // its own page and `row.get(1)` would copy it into a `String`. Both
+    // columns are read on both sides — see the module note.
+    let mut checksum = 0u64;
     let mut samples = Vec::with_capacity(keys.len());
     let mut lookup = conn.prepare("SELECT id, body FROM users WHERE email = ?1")?;
     let started = Instant::now();
     for key in keys {
         let at = Instant::now();
-        let _: (i64, String) = lookup.query_row([key], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        lookup.query_row([key], |row| {
+            checksum += row.get_ref(0)?.as_i64().unwrap_or(0) as u64;
+            checksum += row.get_ref(1)?.as_str().map(str::len).unwrap_or(0) as u64;
+            Ok(())
+        })?;
         samples.push(at.elapsed());
     }
     let point_elapsed = started.elapsed();
@@ -344,13 +379,16 @@ fn sqlite_lookup(
         let at = Instant::now();
         let rows_returned = range
             .query_map(rusqlite::params![low, high], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                checksum += row.get_ref(0)?.as_i64().unwrap_or(0) as u64;
+                checksum += row.get_ref(1)?.as_str().map(str::len).unwrap_or(0) as u64;
+                Ok(())
             })?
             .count();
         debug_assert_eq!(rows_returned, RANGE_SIZE);
         samples.push(at.elapsed());
     }
     let range_elapsed = started.elapsed();
+    std::hint::black_box(checksum);
     drop(range);
     let range = Timing {
         label: format!("{label} (index)"),

@@ -13,10 +13,25 @@
 //!   both engines, so both do one tree descent per lookup.
 //! * **Prepared statements on both sides.** Each engine prepares its statement
 //!   once outside the timed loop and binds the key per iteration: InlaySQL
-//!   through `Database::prepare` + `query_prepared`, SQLite through
+//!   through `Database::prepare` + `query_prepared_each_ref`, SQLite through
 //!   `Connection::prepare` + `Statement::query_row`. Preparing on one side and
 //!   not the other would measure a parser, not a storage engine — which is
 //!   what this suite used to have to do, because InlaySQL had no prepare API.
+//! * **Both sides step, both sides read.** SQLite's API has always been
+//!   `sqlite3_step` into caller-owned registers and `sqlite3_column_text` into
+//!   the caller's hands; until AHL-535 InlaySQL had no equivalent, so this
+//!   suite called `query_prepared` and compared a step loop against a
+//!   `Vec<Vec<Value>>` built and dropped per query. That was a difference in
+//!   API shape, not in engine speed, and it is gone: both sides now step a row
+//!   and read the `body` column as a borrowed `&str`, summing its length into
+//!   a checksum the loop `black_box`es. SQLite's side changed too, from
+//!   `row.get::<String>(0)` — which copies out of its page — to
+//!   `row.get_ref(0)?.as_str()`, which does not. The comparison got *harder*
+//!   for us, not easier: this removed an allocation per lookup from SQLite's
+//!   loop as well as from ours. Reading the column rather than counting rows
+//!   is the other half of the same fairness: an answer nobody looks at is not
+//!   a workload anybody has, and a row count is a number either engine can
+//!   produce without the caller touching a byte.
 //! * **Durability stated, not assumed.** SQLite is measured twice: in its
 //!   default rollback-journal mode with `synchronous=FULL` *and* `fullfsync`
 //!   (which is what makes it comparable to InlaySQL on macOS — see the pragma
@@ -171,15 +186,23 @@ fn inlaysql_points(
     }
     let write_elapsed = started.elapsed();
 
+    // Stepped and read, not collected and counted — see the module note "Both
+    // sides step, both sides read". `checksum` exists so the read cannot be
+    // optimised away; it is `black_box`ed below.
+    let mut checksum = 0u64;
     let mut reads = Vec::with_capacity(keys.len());
     let started = Instant::now();
     for key in keys {
         let at = Instant::now();
-        let result = db.query_prepared(&lookup, &[Value::Integer(*key)])?;
-        debug_assert_eq!(result.rows.len(), 1, "point read missed row {key}");
+        let delivered = db.query_prepared_each_ref(&lookup, &[Value::Integer(*key)], |row| {
+            checksum += row[0].as_str().map_or(0, str::len) as u64;
+            Ok(())
+        })?;
+        debug_assert_eq!(delivered, 1, "point read missed row {key}");
         reads.push(at.elapsed());
     }
     let read_elapsed = started.elapsed();
+    std::hint::black_box(checksum);
 
     debug_assert_eq!(
         db.statements_parsed(),
@@ -341,14 +364,23 @@ fn sqlite_points(
     }
     let write_elapsed = started.elapsed();
 
+    // `get_ref` rather than `get::<String>`: SQLite hands back a pointer into
+    // its own page and `row.get(0)` copies it into a `String`. Reading the
+    // length off the borrowed `&str` is what the InlaySQL side now does too —
+    // see the module note "Both sides step, both sides read".
+    let mut checksum = 0u64;
     let mut reads = Vec::with_capacity(keys.len());
     let started = Instant::now();
     for key in keys {
         let at = Instant::now();
-        let _: String = lookup.query_row([key], |row| row.get(0))?;
+        lookup.query_row([key], |row| {
+            checksum += row.get_ref(0)?.as_str().map(str::len).unwrap_or(0) as u64;
+            Ok(())
+        })?;
         reads.push(at.elapsed());
     }
     let read_elapsed = started.elapsed();
+    std::hint::black_box(checksum);
 
     drop(insert);
     drop(lookup);
