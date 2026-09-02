@@ -3542,6 +3542,154 @@ that backend and not of this path — but it is worth knowing, because it means
 gated job on a quiet machine, and the load ceiling has been blocking it since
 AHL-513. What is in the tree is the harness those numbers will come out of when
 it runs, and the published tables stay as they are until it does.
+### The leaf scan borrows the device's page instead of copying it twice (AHL-536, 2026-09-02)
+
+The end-state profile after AHL-528 had `pread + memmove` at 19.5% of the
+100k-row `GROUP BY`, and the obvious remedy — the shared raw cache 8 → 64
+MiB — measured flat (root plan §9a). That was the proof the cost was not the
+syscall but the copy: every full scan paid two `memmove`s per page even when
+the page was resident. `FileDevice::read(offset, &mut [u8])` can only answer
+a hit by copying the cache's `Arc<[u8]>` into the caller's buffer (sixteen
+pages at a time under AHL-522's window), and `walk_raw_row_values` then
+copied the page *again* into the per-leaf `Rc<[u8]>` its rows borrow from.
+The seam was the `Device` trait's `read` signature, which forces a copy by
+type.
+
+**The one measurement that decided the design.** The tree held leaf bytes as
+`Rc<[u8]>` (`RowBuf::Shared`, `Node`, `ValueRef::Owned`, `RawLeafCache`, the
+scan cursors); the device holds them as `Arc<[u8]>`, because it is shared
+across threads. Handing the device's `Arc` to the tree means every row's
+refcount bump becomes atomic — or the device converts by copying, which is
+the copy this exists to remove. So `Rc<[u8]>` → `Arc<[u8]>` was built alone
+first, with nothing else changed, and measured interleaved against `dc180db`,
+control re-run every repetition, order alternated:
+
+| Shape | `Rc<[u8]>` | `Arc<[u8]>`, nothing else | Verdict |
+| --- | --- | --- | --- |
+| `aggregate`, 100k rows, `--seconds 5` | 170 / 172 / 171 ops/s | 171 / 171 / 170 | flat |
+| `aggregate`, 20k rows | 868 / 865 / 867 | 861 / 858 / 864 | flat, −0.5% |
+| `joins`, 20k | 51 / 52 / 50 | 51 / 51 / 52 | flat |
+
+The atomic bump is visible in the profile — `resolve_value_at`, the per-row
+`RowBuf::Shared` clone, 3.6% → 5.2% self — and invisible in the wall clock,
+which is what an uncontended `ldadd` against a 4 KiB `memmove` should look
+like. Design (a) it is.
+
+**Fix.** `Device::read_shared(offset, len) -> Option<Arc<[u8]>>`, default
+`None`, so every other device — the simulation disks, the WASM in-memory
+device, `io_uring` — keeps working unchanged (the WASM target still compiles;
+`inlaysql-uring` is Linux-only and was not checked from this macOS session).
+`FileDevice` answers it from the shared raw cache under exactly the gates
+`read`'s hit path already uses (a read-write handle, reuse never enabled,
+layout known, at or beyond the data area, an entry of exactly `len` bytes):
+one read lock, one hash lookup, one `Arc::clone`, no copy, and never a fetch —
+a page-at-a-time fetch on a miss would quietly undo the read-ahead window.
+In the tree, `shared_page` asks for it behind `cached_raw_leaf`'s gates (not
+dirtied by the open transaction, reuse off, a data-area page, and the length
+checked again on the way in); `walk_raw_row_values` asks before it reads and
+keeps the device's `Arc` as the leaf the rows borrow from; `with_raw_page`
+asks before the window, so the row-id walk and the cursor scans borrow too;
+and `read_committed_node` decodes a shared page in place through
+`page::decode_shared`, so a descent's cache miss copies nothing either.
+`invalidate_for_reuse` and the reuse gating are untouched: a page reachable
+from a committed root is immutable unless reuse is on, and reuse already
+switches every cache off on both sides of the seam.
+
+**Two attempts inside the change, one dropped, one kept.**
+
+*Dropped: sharing without telling the read-ahead window.* The first cut lost
+the 100k shape 3/3 — 171 / 157 / 167 → 157 / 149 / 155 ops/s — while the 20k
+shape (fits the cache) was mixed. The window's streak counts consecutive
+page ids reaching `plan`; with resident pages now served before it, the
+window saw only misses, so the first miss after a run of resident pages
+started a fresh streak and its first two pages were single reads, which the
+device admits *by evicting*. Two new holes in the resident head per
+execution, each a single-page miss on the next, until a five-second run had
+fragmented an 8 MiB resident set into single-page `pread`s — the same
+mechanism AHL-522 found when it tried admitting by eviction. `Readahead::
+note_served` keeps the bookkeeping current for a shared hit, so that miss is
+read sixteen wide and admitted only while there is room, as before; with it
+the 3/3 loss became the 3/3 win below. Noting the decoded and raw-leaf
+caches' hits the same way was then tried on the theory that an internal node
+between two leaf runs breaks the streak too: base 172 / 171 / 172 vs 174 /
+178 / 173, and against the shared-only version 177 / 178 / 178 vs 178 / 176 /
+175 — flat, and the `memmove` under `insert` it was meant to remove turned
+out to be `RawLeafCache::insert`, not the device admitting. Left out.
+
+*Kept: a shared leaf is not indexed a second time.* That `memmove` was the
+raw-leaf cache's `Vec::remove(0)` shifting 64 entries per leaf, beside a
+64-entry linear `get` miss per page — ~3.7% of the sweep maintaining a second
+index of pages the device already answers from one hash lookup. A leaf the
+device shares is no longer inserted there (a leaf the device does not hold
+still is, so the `LIMIT` joins on a simulation device, and on a real device's
+cold pages, keep the cache that bought them 1.42x). Measured against the
+shared-only version: 100k 180 / 179 / 179 → 181 / 180 / 182; 20k 966 / 972 /
+969 → 995 / 991 / 993 (3/3, non-overlapping); `joins-limit` 166.0 / 168.7 /
+166.9k → 165.3 / 165.0 / 165.0k, 1% behind 3/3 — a repeated statement over a
+few resident leaves now pays a lock and a hash where it paid a short linear
+scan — and inside §4's floor by a factor of four.
+
+**Measured**, the final binary against `dc180db`'s, interleaved, control
+re-run every repetition, order alternated per repetition, `--seconds 5` for
+the 100k shape and `4` for the rest, two other agents benchmarking on the
+same machine throughout (load in the notes):
+
+| Shape | `dc180db` | AHL-536 | Verdict |
+| --- | --- | --- | --- |
+| `aggregate`, 100k rows / 100 groups (does not fit the caches) | 174 / 173 / 173 ops/s | **182 / 183 / 180** | **1.05x**, 3/3, non-overlapping (load 2.3–2.5) |
+| `aggregate`, 20k rows (fits) | 873 / 868 / 874 | **996 / 999 / 991** | **1.14x**, 3/3, non-overlapping (load 2.1–3.8) |
+| `joins`, 20k (full-scan shapes) | 54 / 55 / 55 | 55 / 56 / 56 | flat, +2% (load 2.0–3.3) |
+| `indexed-range`, 20k | 75.6 / 74.5 / 74.1k | 76.0 / 77.8 / 74.2k | flat, mixed (load 1.9–3.5) |
+| `points`, 20k | 2.09 / 2.10 / 2.02M | 2.18 / 2.12 / 2.14M | flat, +3% inside the floor — the point read does not take this path except on a decoded-cache miss (load 3.6–4.1) |
+| `joins-limit`, 20k | 165.2 / 167.5 / 167.7k | 165.6 / 161.0 / 168.6k | flat, mixed sign (load 1.7–2.9) |
+
+An earlier pass of the same six suites had `joins` 3/3 behind (49 / 50 / 52
+vs 38 / 47 / 43) under a load that spiked to 5.1 with another agent's run;
+re-measured twice on a quieter machine it was 50 / 49 / 50 vs 50 / 49 / 53
+and then the row above. A first `points` pass in this final series ran into
+a load spike to 27.8 and produced 0.74–1.9M on both sides; it was thrown
+away and re-run, which is the row above. Recorded because a 3/3 loss that
+evaporates on re-measurement is the floor §4 describes, and the honest
+account is that it happened.
+
+**Profile after** (`--suite aggregate --rows 100000`, 5,811 samples against
+the baseline's 5,579, load 2.5–4.5): `FileDevice::read` 14.6% → 6.4%
+inclusive; `pread` 10.5% → 5.7% self, `memmove` 8.5% → 3.6%. What `memmove`
+still is: the one copy left on the path, the window → per-leaf `Arc` for the
+fifth of the table the 8 MiB cache does not hold (2.0%), `scan_leaf_cells`'
+cell reads (1.1%), and the raw-leaf cache's shifts for those same pages
+(0.5%, down from 1.5%). Why the 100k shape gained 5% and not the 19% the two
+frames added up to: the page parse now takes the cache misses the `memmove`
+used to absorb — `decode_row_ref_masked_into` 10.1% → 12.9% self,
+`stream_aggregate` 14.0% → 15.4%, `scan_leaf_cells` 6.7% → 7.4%.
+A `memcpy` streams a page into L1 with the prefetcher's help and the parse
+then runs hot; borrowing the device's buffer makes the parse pay those lines
+itself, in a less sequential order. The copy was half prefetch. On the 20k
+shape, which is L2-resident either way, the whole copy was waste and the win
+is the full 1.14x.
+
+**What it does not do.** The miss path still copies once: a page the device
+does not hold is `pread` into the window and copied into the per-leaf `Arc`,
+and on a cold pass the device copies it again to admit it. Reading straight
+into an `Arc<[u8]>` needs `Arc::new_uninit_slice` + `assume_init`, which is
+`unsafe`, and both crates are `#![forbid(unsafe_code)]`; without it a fresh
+`Arc<[u8]>` is a zeroed `Vec` plus the copy `Arc::from` makes, which is the
+copy it would be removing. A device-side page pool that hands out `Arc`s to
+read into is the next shape, and it is a device change, not a tree change.
+
+**Pinned.** `a_sweep_over_pages_the_device_holds_reads_nothing_and_copies_nothing`
+(`tree.rs`): `CountingDisk` gains a sharing mode standing in for the native
+cache; with the tree's own caches emptied and a table of more leaves than
+the raw-leaf cache holds, a repeated sweep performs zero `Device::read`s, every
+row is a `RowBuf::Shared` whose `Arc` is pointer-equal to the device's own
+buffer (a device that copied on `read_shared` would pass the read count and
+fail this), and the rows equal both the copying raw path's and the decoding
+path's. Mutation-checked: with `shared_page` returning `None` it fails at "a
+sweep over resident pages must not read". `read_shared_hands_out_the_resident_page_itself_and_nothing_else`
+(`device.rs`) pins the device's half: the cache's `Arc` itself for a resident
+page, `None` for a wrong length, a miss, an offset below the data area, a
+read-only handle, and after reuse is enabled. The raw-vs-decoded parity tests
+and both DST sweeps pass unchanged.
 
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 

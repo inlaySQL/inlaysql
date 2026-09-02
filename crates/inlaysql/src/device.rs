@@ -428,18 +428,18 @@ impl ReadCache {
         self.order.clear();
     }
 
-    /// The resident page at `offset`, if one covers exactly `buf`'s length —
+    /// The resident page at `offset`, if one covers exactly `len` bytes —
     /// and if `offset` lies at or beyond the data area. The boundary is
     /// enforced here, on every lookup, because a hit below it would serve
     /// stale bytes for a region the tree rewrites in place; keeping the check
     /// beside the data makes a caller that forgets it fail closed.
-    fn get(&self, offset: u64, buf: &[u8]) -> Option<Arc<[u8]>> {
+    fn get(&self, offset: u64, len: usize) -> Option<Arc<[u8]>> {
         let boundary = self.boundary()?;
         if (offset as usize) < boundary {
             return None;
         }
         let bytes = self.pages.get(&offset)?;
-        if bytes.len() != buf.len() {
+        if bytes.len() != len {
             return None;
         }
         Some(Arc::clone(bytes))
@@ -1091,7 +1091,7 @@ impl FileDevice {
             cache.hits.fetch_add(1, Ordering::Relaxed);
             return true;
         }
-        let Some(bytes) = cache.get(offset as u64, buf) else {
+        let Some(bytes) = cache.get(offset as u64, buf.len()) else {
             cache.misses.fetch_add(1, Ordering::Relaxed);
             return false;
         };
@@ -1220,6 +1220,30 @@ impl Device for FileDevice {
             .map_err(io_error)?;
         self.fill_shared_cache(offset, buf);
         Ok(())
+    }
+
+    /// The shared raw cache's own `Arc` for a resident page, so the tree's
+    /// leaf scan borrows from it instead of copying it out twice (AHL-536).
+    ///
+    /// Exactly the lookup [`FileDevice::read`]'s hit path performs, minus
+    /// the copy, under the same gates: a read-write handle with a
+    /// coordinator, reuse never enabled, the layout known, the offset at or
+    /// beyond the data area, and an entry of exactly `len` bytes. A miss
+    /// counts nothing here — the `read` that follows it counts the miss —
+    /// and never fetches: the caller's fallback reads sixteen pages at a
+    /// time, and a fetch here would quietly undo that.
+    fn read_shared(&self, offset: usize, len: usize) -> Option<Arc<[u8]>> {
+        let coordinator = self.coordinator.as_ref()?;
+        if coordinator.reuse_enabled.load(Ordering::Acquire) || len == 0 {
+            return None;
+        }
+        let cache = coordinator
+            .read_cache
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bytes = cache.get(offset as u64, len)?;
+        cache.hits.fetch_add(1, Ordering::Relaxed);
+        Some(bytes)
     }
 
     fn write(&mut self, offset: usize, data: &[u8]) -> Result<()> {
@@ -2505,13 +2529,11 @@ mod shared_read_cache_tests {
         assert!(cache.insert_if_room(at + page, &[2u8; DEFAULT_PAGE_SIZE]));
         assert!(!cache.insert_if_room(at + 2 * page, &[3u8; DEFAULT_PAGE_SIZE]));
         assert!(
-            cache.get(at, &[0u8; DEFAULT_PAGE_SIZE]).is_some(),
+            cache.get(at, DEFAULT_PAGE_SIZE).is_some(),
             "an evict happened"
         );
-        assert!(cache.get(at + page, &[0u8; DEFAULT_PAGE_SIZE]).is_some());
-        assert!(cache
-            .get(at + 2 * page, &[0u8; DEFAULT_PAGE_SIZE])
-            .is_none());
+        assert!(cache.get(at + page, DEFAULT_PAGE_SIZE).is_some());
+        assert!(cache.get(at + 2 * page, DEFAULT_PAGE_SIZE).is_none());
     }
 
     #[test]
@@ -2526,7 +2548,7 @@ mod shared_read_cache_tests {
 
         let mut buf = vec![0u8; DEFAULT_PAGE_SIZE];
         let served = cache
-            .get(offset as u64, &buf)
+            .get(offset as u64, buf.len())
             .expect("page must be resident");
         buf.copy_from_slice(&served);
         assert_eq!(buf, page);
@@ -2546,7 +2568,7 @@ mod shared_read_cache_tests {
                 "offset {bad} must not cache"
             );
             assert!(
-                cache.get(bad as u64, &page).is_none(),
+                cache.get(bad as u64, page.len()).is_none(),
                 "offset {bad} must never be served"
             );
         }
@@ -2559,7 +2581,7 @@ mod shared_read_cache_tests {
         let mut cache = cache_with_budget(0);
         assert!(!cache.insert(boundary(&cache) as u64, &vec![0u8; DEFAULT_PAGE_SIZE]));
         assert!(cache
-            .get(boundary(&cache) as u64, &vec![0u8; DEFAULT_PAGE_SIZE])
+            .get(boundary(&cache) as u64, DEFAULT_PAGE_SIZE)
             .is_none());
     }
 
@@ -2581,13 +2603,10 @@ mod shared_read_cache_tests {
         }
         assert!(cache.bytes <= cache.budget);
         // The oldest entry went first.
-        assert!(cache.get(base, &vec![0u8; DEFAULT_PAGE_SIZE]).is_none());
+        assert!(cache.get(base, DEFAULT_PAGE_SIZE).is_none());
         for i in 1..3u64 {
             assert!(cache
-                .get(
-                    base + i * DEFAULT_PAGE_SIZE as u64,
-                    &vec![0u8; DEFAULT_PAGE_SIZE]
-                )
+                .get(base + i * DEFAULT_PAGE_SIZE as u64, DEFAULT_PAGE_SIZE)
                 .is_some());
         }
     }
@@ -2602,7 +2621,7 @@ mod shared_read_cache_tests {
         cache.note_layout((DEFAULT_PAGE_SIZE * 2, FORMAT_VERSION));
         assert!(cache.pages.is_empty());
         assert_eq!(cache.bytes, 0);
-        assert!(cache.get(offset, &vec![0u8; DEFAULT_PAGE_SIZE]).is_none());
+        assert!(cache.get(offset, DEFAULT_PAGE_SIZE).is_none());
     }
 
     /// End to end: a tree populates the shared cache as it reads, and a
@@ -2669,6 +2688,82 @@ mod shared_read_cache_tests {
         drop(cache);
 
         drop(device);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `read_shared` hands out the cache's own `Arc` for a resident page — the
+    /// very buffer, not a copy — and nothing for anything else: a length that
+    /// is not the page's, an offset nothing is resident at, an offset below
+    /// the data area, a read-only handle, and a handle that opted into reuse.
+    #[test]
+    fn read_shared_hands_out_the_resident_page_itself_and_nothing_else() {
+        let path = std::env::temp_dir().join(format!(
+            "inlaysql-shared-cache-read-shared-{}.inlay",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let device = FileDevice::open(&path).expect("open");
+        let coordinator = device.coordinator.clone().expect("rw handle");
+        let mut tree = CowBTree::open_or_create(device, DEFAULT_PAGE_SIZE).expect("create");
+        for key in 0..64 {
+            tree.put(format!("key-{key}").as_bytes(), b"value")
+                .expect("put");
+        }
+        tree.commit().expect("commit");
+        let device = tree.device();
+
+        let mut header = [0u8; 24];
+        device.read(0, &mut header).expect("header");
+        let (page_size, version) =
+            inlaysql_core::btree::tree::parse_header(&header).expect("layout");
+        let offset = inlaysql_core::wal::data_offset_for(page_size, version, 1);
+        let mut page = vec![0u8; page_size];
+        device
+            .read(offset, &mut page)
+            .expect("read makes the page resident");
+
+        let shared = device
+            .read_shared(offset, page_size)
+            .expect("a resident page is shared");
+        assert_eq!(&shared[..], &page[..]);
+        {
+            let cache = coordinator.read_cache.read().unwrap();
+            let resident = cache.pages.get(&(offset as u64)).expect("resident");
+            assert!(
+                Arc::ptr_eq(resident, &shared),
+                "read_shared must hand out the cache's buffer, not a copy"
+            );
+        }
+        assert!(
+            device.read_shared(offset, page_size - 1).is_none(),
+            "a length other than the resident page's is not answered"
+        );
+        assert!(
+            device
+                .read_shared(offset + 1_000 * page_size, page_size)
+                .is_none(),
+            "a miss is a miss, never a fetch"
+        );
+        assert!(
+            device.read_shared(0, header.len()).is_none(),
+            "nothing below the data area is shared"
+        );
+
+        let read_only = FileDevice::open_read_only(&path).expect("read-only handle");
+        assert!(
+            read_only.read_shared(offset, page_size).is_none(),
+            "a read-only handle has no shared cache to answer from"
+        );
+        drop(read_only);
+
+        device.note_page_reuse_enabled();
+        assert!(
+            device.read_shared(offset, page_size).is_none(),
+            "reuse gates sharing off, whatever was resident"
+        );
+
+        drop(tree);
         let _ = std::fs::remove_file(&path);
     }
 
