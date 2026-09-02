@@ -303,14 +303,14 @@
   </p>
   <div class="figures">
     <div class="figure">
-      <b>533,943</b>
+      <b>1,069,233</b>
       <span>point reads per second</span>
-      <em>~2-3× SQLite in journal mode, durable</em>
+      <em>~2.5-4× SQLite in journal mode, durable</em>
     </div>
     <div class="figure">
-      <b>~13×</b>
+      <b>~14×</b>
       <span>SQLite on concurrent writes</span>
-      <em>1,148 commits/s at 8 writers, 0% aborted</em>
+      <em>1,347 commits/s at 8 writers, 0% aborted</em>
     </div>
     <div class="figure">
       <b>198 µs</b>
@@ -478,21 +478,21 @@
       <tbody>
         <tr>
           <td>Point read by primary key</td>
-          <td class="num">533,943 ops/s</td>
+          <td class="num">1,069,233 ops/s</td>
           <td>SQLite, journal (durable)</td>
-          <td class="win">~2-3× faster</td>
+          <td class="win">~2.5-4× faster</td>
         </tr>
         <tr>
           <td>Concurrent writes, 8 writers</td>
-          <td class="num">1,148 commits/s</td>
+          <td class="num">1,347 commits/s</td>
           <td>SQLite, journal</td>
-          <td class="win">~13× faster</td>
+          <td class="win">~14× faster</td>
         </tr>
         <tr>
           <td>Vector search, recall@10 1.000</td>
-          <td class="num">69.54 µs</td>
+          <td class="num">75.17 µs</td>
           <td><code>sqlite-vec</code></td>
-          <td class="win">~9-10× faster</td>
+          <td class="win">~9× faster</td>
         </tr>
         <tr>
           <td>Hybrid search (BM25 + vector)</td>
@@ -514,15 +514,15 @@
         </tr>
         <tr>
           <td>Secondary-index inner join, 20k × 160k rows</td>
-          <td class="num">3.71 ms</td>
+          <td class="num">3.78 ms</td>
           <td>SQLite</td>
-          <td class="win">~7.5× faster</td>
+          <td class="win">~8× faster</td>
         </tr>
         <tr>
           <td>Indexed range scan, 50 rows</td>
-          <td class="num">12.13 µs</td>
+          <td class="num">13.67 µs</td>
           <td>SQLite, journal</td>
-          <td class="loss">~1.6× slower</td>
+          <td class="loss">~2× slower</td>
         </tr>
         <tr>
           <td>Indexed range scan, 50 rows</td>
@@ -584,13 +584,14 @@
         loudly rather than guessing.
       </li>
       <li>
-        <strong>Row iteration loses to SQLite.</strong> Range scans and the
-        PK-ordered full join are slower than SQLite; the secondary-index join
-        and both <code>LIMIT</code> shapes are faster, and against MySQL and
+        <strong>Row iteration loses to SQLite.</strong> Range scans and both
+        <code>LIMIT 10</code> join shapes are slower than SQLite (roughly 2×
+        and 1.7-1.9×); both full joins are faster, and against MySQL and
         PostgreSQL the range scan wins outright. Measured, published above,
-        and the current top priority. The cause of the <code>LIMIT</code>-shape
-        gap is now profiled: the raw leaf scan re-reads and re-copies the same
-        page on every execution rather than caching it.
+        and the current top priority. What is left in the
+        <code>LIMIT</code>-shape gap is profiled: per-row page-decode cost,
+        with the obvious fix tried twice and rejected for regressing point
+        reads.
       </li>
       <li>
         <strong><code>GROUP BY</code> and aggregates are the worst shape we
@@ -600,11 +601,13 @@
         is not built.
       </li>
       <li>
-        <strong>Joins are ordered as written.</strong> <code>ANALYZE</code>
-        collects row counts and leading-key cardinalities, and index selection
-        and hash-versus-probe are costed from them — but nothing reorders a
-        join, so which table drives it is whichever one you wrote first. On our
-        own benchmark that single choice is worth about 8×.
+        <strong>Join reordering is new and narrow.</strong> <code>ANALYZE</code>
+        collects row counts and leading-key cardinalities; index selection,
+        hash-versus-probe and — since AHL-512 — which table drives a two-table
+        join are costed from them. The first cost model got that choice
+        backwards and the benchmark caught it (AHL-524); the fix is what puts
+        both full joins ahead of SQLite above. A <code>LIMIT</code> shape is
+        still never reordered unless an <code>ORDER BY</code> asks for it.
       </li>
       <li>
         <strong>The MySQL server is plaintext unless you configure TLS.</strong>
