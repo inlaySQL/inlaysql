@@ -43,6 +43,13 @@ current execution order without relying on local conversation history.
   1.5x** on top of the morning's 1.44x). A third agent found the range
   shape's row ids were already fetched in rowid order and that a multi-slot
   point cursor measures *negative* on the published shapes — B3 is closed.
+- Night: AHL-535 (borrowing row API `query_prepared_each_ref`, zero
+  allocations per row on the point/range shapes; benches step rows on both
+  sides; **points 1.56x, range 1.40x**), AHL-536 (leaf scan borrows the
+  device's resident page, `Arc` throughout; aggregate 20k 1.14x), AHL-537
+  (B4 brief: the fold is ~1% of the cost, decode/fetch is the floor — B4
+  re-scoped to the decode). A merged tree was pushed before it was built
+  once (`b55e7de`, fixed `619f5ba`): build before push, always.
 - Late evening: AHL-532 (a limited scan's first batch is the limit, not
   32; `joins-limit` 1.2–1.4x). Three ideas were built, measured and dropped
   with the numbers recorded in `PERF.md`/root plan §9a: a per-statement
@@ -76,10 +83,10 @@ current execution order without relying on local conversation history.
    REPEATS=5 ./bench/repeat-compare.sh
    ```
 
-2. **Batch executor (B4)** — now the majority of what is left on the
-   aggregate shape: the 10.28 ms scan-and-decode floor. R3 brief first
-   (decode one leaf into a 1k-row column batch, measure filter+aggregate
-   against the row loop); the point read must not move.
+2. **B4, re-scoped**: batch the leaf→column *decode* of the needed
+   ordinals (R3 measured the fold at 0.3–5 ns/row against 46–124 ns/row of
+   decode). A8: `MemStorage::get_row` copies rows (in-memory databases get
+   none of AHL-535's win). A9: the cold-sweep miss path still copies once.
 
 3. **`RangeCursor` extension (A3)** to `walk`/`scan_range_from` — the
    cheapest first step is `colliding_rows` using `scan_index_row_ids`
