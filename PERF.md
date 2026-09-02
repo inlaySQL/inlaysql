@@ -3389,6 +3389,160 @@ shapes ask `[3]` on the driving side and nothing on the probed one.
 Mutation-checked: with the hint forced to `None` the first case fails with
 `[32]`.
 
+### The answer stops being a copy of the row (AHL-535, 2026-09-02)
+
+AHL-527 ended by naming what was left on the point read and refusing to
+claim it: `drop_in_place<ResultSet>` 9.2% and `ValueRef::to_owned_value`
+2.1% are "the public API's cost, not the statement's", and "it does not come
+off without a borrowing result API". The range scan said it louder —
+`to_owned_value` 8%, `ResultSet` drop 4.5%, `ExecRow` drop 4.6%, allocator
+12% — and §9a of `PLAN.md` had, by the end of that evening, refuted every
+*other* explanation for that shape's loss: not the number of lookups
+(`reseek` already collapses sorted probe ids to one descent), not the fetch
+order (`indexed_candidates` already sorts, and the suite's zero-padded emails
+are contiguous anyway), not the residual filter (A1, rejected on measurement).
+What was left was per-row decode and owned output. This is the owned output.
+
+**The API.** `Database::query_prepared_each_ref` — `Engine::run_query_each_ref`
+under it — hands the callback `&[ValueRef]` instead of `&[Value]`. A `TEXT`
+cell is a `&str` into the page the row was decoded out of, a `BLOB` is a
+`&[u8]` of the same. `query_prepared` and `query_prepared_each` are untouched;
+every existing caller keeps the API it has.
+
+It is the shape SQLite has always had. `sqlite3_step` advances one row into
+caller-owned registers and `sqlite3_column_text` hands back a pointer into
+SQLite's own page; the caller copies if it wants to keep it.
+`query_prepared_each` already reused its projected row's `Vec` — what it could
+not do was stop the cells *inside* it from being owned.
+
+**Where it actually borrows.** One stored table projected as bare columns,
+with `WHERE`, `LIMIT` and `OFFSET`: `run_borrowed_select` decodes each row into
+a borrowed buffer, tests the predicate on those cells exactly as
+`DecodeFilter` does, and hands the surviving cells straight to the callback —
+never crossing the "a projected row allocates once at the boundary" line at
+all, because the boundary is now the caller's.
+
+Three buffers — the projection, the decoded cells, the projected row — live on
+the handle in a `RefCell` and are re-lent to every row through `exec::park`.
+They are on the handle rather than the call because **a point read is one row
+and one query**: scoped to the call they would have allocated three vectors per
+lookup, which is most of what this exists to remove.
+
+Everything else falls back to the owned pipeline and borrows out of the row it
+built — `ORDER BY`, `GROUP BY` and aggregates, windows, `DISTINCT`, joins,
+derived tables, scored retrieval, `WITHOUT ROWID` tables, and any projection
+holding an expression. **This is stated rather than hidden.** The blocking four
+cannot do otherwise: none of them can emit a first row before it has seen the
+last input row, so the rows have to exist somewhere while they are sorted or
+folded. Same rows, same order, either way; only the allocations differ.
+
+**The harness changed, and here is why it is still a fair comparison.**
+`bin/profile`'s `points` and `indexed-range` and the published
+`crates/inlaysql-bench/src/points.rs` and `indexed.rs` now do two things they
+did not do before.
+
+1. **InlaySQL steps.** They call `query_prepared_each_ref` rather than
+   `query_prepared`. The SQLite side of those benches has always stepped, so
+   the old harness was comparing a step loop against a `Vec<Vec<Value>>` built
+   and dropped per query — a difference in *API shape*, not in engine speed.
+2. **Both sides read.** Every column the statement selects has its value
+   touched per row, summed into a checksum the loop `black_box`es. A row count
+   is a number either engine can produce without the caller ever looking at a
+   byte, and an answer nobody looks at is not a workload anybody has.
+
+The second change cuts against us twice: it adds work to our loop that was not
+there before, and it removed an allocation per row from *SQLite's* loop as
+well — `row.get_ref(i)?.as_str()` rather than `row.get::<String>(i)`, which
+copies out of SQLite's page. The comparison got harder rather than easier,
+which is the only direction a fairness fix is allowed to go.
+
+**Measured**, interleaved against `dc180db`, control re-run every repetition,
+`--rows 20000 --seconds 4`, load 2.6–3.6/18 with two other agents measuring on
+the same machine. The two tables answer different questions and are kept
+apart.
+
+*Old harness on both binaries — the engine change alone, which no existing
+caller can see:*
+
+| Suite | `dc180db` | AHL-535 | Verdict |
+| --- | --- | --- | --- |
+| `points` | 2.138 / 2.093 / 2.142M | 2.086 / 2.093 / 2.056M | flat |
+| `indexed-range` | 71.9 / 70.4 / 72.5k | 73.5 / 71.2 / 72.2k | flat |
+| `indexed` | 457 / 457 / 467k | 449 / 460 / 465k | flat |
+| `joins-limit` | 163 / 160 / 162k | 165 / 162 / 162k | flat |
+| `aggregate` | 861 / 865 / 866 | 858 / 859 / 816 | flat |
+
+That is what a purely additive API should measure, and it is worth having:
+the change cannot be paying for itself out of somebody else's path.
+
+*New harness against the published baseline — what the profiled shapes now
+cost end to end:*
+
+| Suite | `dc180db`, old harness | AHL-535, new harness | Verdict |
+| --- | --- | --- | --- |
+| `points` | 2.148 / 2.162 / 2.116M | **3.390 / 3.361 / 3.270M** | **1.56x**, 3/3, non-overlapping |
+| `indexed-range` | 72.7 / 72.6 / 71.2k | **102.7 / 100.4 / 102.0k** | **1.40x**, 3/3, non-overlapping |
+
+`indexed`, `joins-limit` and `aggregate` keep the harness they had, so their
+row is the flat one above.
+
+**What the profile says afterwards.** `points`, sampled over the query phase
+(7,017 samples): `malloc`, `free` and `drop_in_place<ResultSet>` are **not in
+the top 25 self entries at all**. Before this the allocator was 17.0% self and
+the `ResultSet` drop 9.2% inclusive. What is there instead:
+
+| Entry | Self |
+| --- | --- |
+| `_platform_memcmp` | 36.5% |
+| `decode_row_ref_masked_into` | 5.7% |
+| `CowBTree::get_from` | 5.6% |
+| `Cursor::count` | 5.4% |
+| `run_borrowed_select` | 4.4% |
+| `partition_point` | 4.2% |
+| `from_utf8` | 3.8% |
+
+The point read is now a tree descent and a decode, and nothing else — `memcmp`
+at 36.5% is not bigger in absolute terms, it is a bigger share of a smaller
+whole. `indexed-range` (7,060 samples) reads the same way: no allocator
+anywhere in the top 25, `memcmp` 21.3%, the residual filter about 16% between
+`evaluate_ref`, `compare_cells`, `eval_operand` and `affinity_conversion`,
+`decode_row_ref_masked_into` 5.0%, `from_utf8` 5.3%.
+
+**So item 3 of the brief — "if the point path still shows allocations, chase
+them" — has no work in it.** Two independent instruments agree that there are
+none: the profile above, and a counting global allocator that puts 200 warm
+point reads through the borrowing API at **0 allocations** against the owned
+API's 1,800 over the same lookups.
+
+**Tests.** `crates/inlaysql/tests/borrowed_rows.rs` runs both APIs over the
+same data for 40 query shapes and requires them to agree row for row, cell for
+cell, in order: both profiled shapes, the borrowing pipeline's
+`WHERE`/`LIMIT`/`OFFSET` edges including `LIMIT 0`, a repeated column (which
+may not be *moved* out of the decoded row), a bound `LIMIT`/`OFFSET` pair, and
+every one of the fallback conditions — that condition list is the thing that
+will drift. `crates/inlaysql/tests/borrowed_row_allocations.rs` is the counting
+allocator, in its own binary because the allocator is process-wide: 0
+allocations for 200 point reads, and delivering 40 rows off a scan costs
+exactly what delivering 1 off the same scan costs, with the owned path's count
+asserted large enough for that to mean something.
+
+Mutation-checked four ways: counting a filter-rejected row against `OFFSET`,
+dropping `ORDER BY` from the fallback list, moving a repeated column instead of
+cloning it, and allocating the cell buffer per row instead of parking it. Each
+fails exactly one of the tests above.
+
+**A note on the in-memory backend.** The allocation test opens a *file-backed*
+handle deliberately. `Database::open_in_memory`'s `MemStorage` copies each row
+out of a `BTreeMap` into an owned `Vec` before anything above it can borrow, so
+it allocates twice per lookup whatever this API does. That is a property of
+that backend and not of this path — but it is worth knowing, because it means
+`open_in_memory` does not get the win the file backend does.
+
+**Not done here.** `BENCHMARK.md` is not regenerated: that is `bench/repeat.sh`'s
+gated job on a quiet machine, and the load ceiling has been blocking it since
+AHL-513. What is in the tree is the harness those numbers will come out of when
+it runs, and the published tables stay as they are until it does.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness
