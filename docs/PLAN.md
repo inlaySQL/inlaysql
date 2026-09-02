@@ -35,6 +35,14 @@ current execution order without relying on local conversation history.
   `aggregate` 100k, 1.17x full joins), AHL-523 (`GROUP BY` by hash table,
   1.12x), AHL-525 (`ORDER BY` + `LIMIT` joins may reorder; bare `LIMIT`
   still refuses). The point read did not move through any of them.
+- **Evening, three parallel agents on the fresh per-shape profiles:**
+  AHL-527 (point read stops allocating for its bookkeeping — cursor bounds
+  borrowed, lazy statement clock, inline column mask; **points 1.23x, 8/8**),
+  AHL-528a/b/c (streamed aggregate folds from the row bytes through one
+  reused buffer, whole-leaf admission, bare-column fast path; **aggregate
+  1.5x** on top of the morning's 1.44x). A third agent found the range
+  shape's row ids were already fetched in rowid order and that a multi-slot
+  point cursor measures *negative* on the published shapes — B3 is closed.
 - Earlier in the day: the allocation diet (AHL-517–520 plus four read-path
   commits) and aggregate streaming (AHL-513/514/515).
 - **Still stale:** every `compare.sh`-sourced table (MySQL/PostgreSQL OLTP
@@ -67,9 +75,10 @@ current execution order without relying on local conversation history.
    cheapest first step is `colliding_rows` using `scan_index_row_ids`
    (already cursor-backed, no per-key `Vec`); WITHOUT ROWID scans next.
 
-4. **B2's last piece**: index-probe access paths do not reorder. B3
-   (multi-slot point cursor) is low-payoff on the published shapes; profile
-   before building.
+4. **B2's last piece**: index-probe access paths do not reorder. B3 is
+   closed (measured negative). **A7**: a borrowing result API, so the point
+   read's answer is not an owned `Vec<Vec<Value>>` per query — 9% of what is
+   left on that shape; API change, design first.
 
 5. **Server posture F3/F4** — refuse-to-expose defaults; fuzz the packet path.
 
