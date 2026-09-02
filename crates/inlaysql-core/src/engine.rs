@@ -4578,6 +4578,7 @@ impl Engine {
         table: &Table,
         filter: &Option<crate::plan::Expr>,
         params: &[Value],
+        first_batch: Option<usize>,
     ) -> Result<RowBytes<'_>> {
         if let Some(id) = pinned_rowid(table, filter.as_ref(), params) {
             return Ok(RowBytes::Point(
@@ -4594,7 +4595,11 @@ impl Engine {
                 &self.interrupt,
             ));
         }
-        Ok(RowBytes::Scan(self.scan(&table.name)))
+        let scan = self.scan(&table.name);
+        Ok(RowBytes::Scan(match first_batch {
+            Some(rows) => scan.with_first_batch(rows),
+            None => scan,
+        }))
     }
 
     /// The rows a *write* statement has to consider, materialised.
@@ -4614,7 +4619,7 @@ impl Engine {
     ) -> Result<Vec<(RowId, RowBuf)>> {
         // The same three access paths a reader gets — point, index probe,
         // scan — drained into a `Vec` up front rather than pulled row by row.
-        self.candidate_bytes(table, filter, params)?.collect()
+        self.candidate_bytes(table, filter, params, None)?.collect()
     }
 
     /// Which scalar B-tree index answers a filter, and over what range — or
@@ -5399,6 +5404,18 @@ impl Engine {
         // budget filtered afterwards under-fills a restrictive `WHERE`.
         let params = env.params();
 
+        // How many driving rows the first scan batch should hold. `stop_after`
+        // is the most rows the pipeline will pull before `LIMIT` ends it, and
+        // without a `WHERE` every driving row reaches the consumer, so a
+        // first batch that size reads exactly what a `LIMIT 10` needs instead
+        // of `FIRST_SCAN_BATCH` rows it then drops. Under a filter the rows
+        // needed is unknown and the default batch stands.
+        let first_batch = if plan.filter.is_none() {
+            stop_after
+        } else {
+            None
+        };
+
         // One ordinary join can stay borrowed all the way into a row callback:
         // no iterator item ever has to own the joined row, and one projection
         // buffer serves the complete result. Multi-join and residual-filter
@@ -5437,7 +5454,7 @@ impl Engine {
             && !driving.table.without_rowid
             && self.can_stream_aggregate(plan)
         {
-            let source = self.candidate_bytes(&driving.table, &plan.filter, params)?;
+            let source = self.candidate_bytes(&driving.table, &plan.filter, params, None)?;
             let rows = self.stream_aggregate(
                 plan,
                 AggregateInput::Bytes {
@@ -5503,7 +5520,8 @@ impl Engine {
                     }
                 }
                 (None, None, _) => {
-                    let source = self.candidate_bytes(&driving.table, &plan.filter, params)?;
+                    let source =
+                        self.candidate_bytes(&driving.table, &plan.filter, params, first_batch)?;
                     match &plan.filter {
                         // Fused (AHL-478): a row the predicate rejects is
                         // tested against borrowed cells and never
@@ -5528,7 +5546,7 @@ impl Engine {
                         .map(Ok),
                 ),
                 (None, None) => Box::new(Decode::new(
-                    self.candidate_bytes(&driving.table, &plan.filter, params)?,
+                    self.candidate_bytes(&driving.table, &plan.filter, params, first_batch)?,
                     &driving_mask,
                 )),
             };
@@ -5724,8 +5742,15 @@ impl Engine {
 
         let driving = &plan.from[0];
         let join = &plan.joins[0];
+        // No filter on this path, so the join consumes at most `limit + offset`
+        // driving rows — see `first_batch` in `run_select_to`.
         let outer: RowStream<'_> = Box::new(Decode::new(
-            self.candidate_bytes(&driving.table, &None, env.params())?,
+            self.candidate_bytes(
+                &driving.table,
+                &None,
+                env.params(),
+                limit.map(|limit| limit.saturating_add(offset)),
+            )?,
             driving_mask,
         ));
         let mut side = self.join_inner(

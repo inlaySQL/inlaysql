@@ -7,7 +7,7 @@
 //! point-lookup claim is counted too, through the same `Storage::scan` wrapper
 //! `primary_key.rs` uses: a prepared `WHERE id = ?` has to seek, not scan.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use inlaysql_core::mem::{LogicalClock, MemIndexFactory, MemStorage};
@@ -15,10 +15,15 @@ use inlaysql_core::row::RowBuf;
 use inlaysql_core::traits::{RowId, Storage};
 use inlaysql_core::{Engine, EngineOptions, Error, Result, Value};
 
-/// `MemStorage` that counts how often the engine falls back to a full scan.
+/// The row count every `scan_batch` call asked for, in call order.
+type BatchSizes = Rc<RefCell<Vec<usize>>>;
+
+/// `MemStorage` that counts how often the engine falls back to a full scan,
+/// and records how many rows each of those scans asked for.
 struct CountingStorage {
     inner: MemStorage,
     scans: Rc<Cell<usize>>,
+    batch_sizes: BatchSizes,
 }
 
 impl Storage for CountingStorage {
@@ -41,6 +46,7 @@ impl Storage for CountingStorage {
         limit: usize,
     ) -> Result<Vec<(RowId, RowBuf)>> {
         self.scans.set(self.scans.get() + 1);
+        self.batch_sizes.borrow_mut().push(limit);
         self.inner.scan_batch(table, after, limit)
     }
 
@@ -78,18 +84,27 @@ fn counting_engine() -> (Engine, Rc<Cell<usize>>) {
 }
 
 fn counting_engine_with_options(options: EngineOptions) -> (Engine, Rc<Cell<usize>>) {
+    let (engine, scans, _) = batch_recording_engine(options);
+    (engine, scans)
+}
+
+/// [`counting_engine_with_options`], also handing back the row count every
+/// `scan_batch` call asked for, in call order.
+fn batch_recording_engine(options: EngineOptions) -> (Engine, Rc<Cell<usize>>, BatchSizes) {
     let scans = Rc::new(Cell::new(0));
+    let batch_sizes = Rc::new(RefCell::new(Vec::new()));
     let engine = Engine::open_with_options(
         Box::new(CountingStorage {
             inner: MemStorage::new(),
             scans: scans.clone(),
+            batch_sizes: batch_sizes.clone(),
         }),
         Box::new(MemIndexFactory),
         Box::new(LogicalClock::new()),
         options,
     )
     .expect("open");
-    (engine, scans)
+    (engine, scans, batch_sizes)
 }
 
 fn seeded_join(cache_bytes: usize) -> (Engine, Rc<Cell<usize>>) {
@@ -289,6 +304,110 @@ fn a_prepared_point_read_still_seeks_rather_than_scans() {
         0,
         "a bound `?` key must pin the row id the way a literal does"
     );
+}
+
+/// AHL-532: a `LIMIT` over an unfiltered scan sizes the scan's first batch
+/// to the rows the statement can consume, not to the default. `LIMIT 3`
+/// reads three rows, not thirty-two it then drops — on the `LIMIT 10` joins
+/// that was a second leaf read and admitted for nothing (`PERF.md`). A
+/// filter puts the default back, because how many rows it will pass is
+/// unknown; the hint is a batch size, never a bound on the answer.
+#[test]
+fn a_limited_unfiltered_scan_asks_for_its_limit_not_the_default_batch() {
+    let (mut engine, _, batch_sizes) = batch_recording_engine(EngineOptions::default());
+    engine
+        .execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)", &[])
+        .unwrap();
+    engine
+        .execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+            &[],
+        )
+        .unwrap();
+    engine
+        .execute(
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT)",
+            &[],
+        )
+        .unwrap();
+    engine
+        .execute(
+            "CREATE INDEX posts_user_id ON posts (user_id) USING BTREE",
+            &[],
+        )
+        .unwrap();
+    for id in 1..=100 {
+        engine
+            .execute(
+                "INSERT INTO kv (id, body) VALUES (?, ?)",
+                &[Value::Integer(id), Value::Text(format!("row-{id}").into())],
+            )
+            .unwrap();
+    }
+    for id in 1..=3 {
+        engine
+            .execute(
+                "INSERT INTO users VALUES (?, ?)",
+                &[Value::Integer(id), Value::Text(format!("user-{id}").into())],
+            )
+            .unwrap();
+    }
+    for id in 1..=9 {
+        engine
+            .execute(
+                "INSERT INTO posts VALUES (?, ?, ?)",
+                &[
+                    Value::Integer(id),
+                    Value::Integer(1 + (id - 1) % 3),
+                    Value::Text(format!("post-{id}").into()),
+                ],
+            )
+            .unwrap();
+    }
+
+    let cases: [(&str, usize, &[usize]); 7] = [
+        // The scan reads exactly the limit.
+        ("SELECT body FROM kv LIMIT 3", 3, &[3]),
+        // ... plus the offset it has to skip past.
+        ("SELECT body FROM kv LIMIT 3 OFFSET 2", 3, &[5]),
+        // A limit past the ceiling is clamped to one full batch, which on a
+        // hundred-row table is also the last.
+        ("SELECT body FROM kv LIMIT 1000", 100, &[512]),
+        // A filter makes the rows needed unknown: the default batch stands,
+        // and it grows as it always did.
+        ("SELECT body FROM kv WHERE body <> '' LIMIT 3", 3, &[32]),
+        (
+            "SELECT body FROM kv WHERE body = 'row-90' LIMIT 3",
+            1,
+            &[32, 64, 128],
+        ),
+        // Both `LIMIT 10` join shapes `bin/profile --suite joins-limit`
+        // times: the driving side is a scan, the inner side a probe, and no
+        // `WHERE` stands between the scan and the limit.
+        (
+            "SELECT posts.id, users.name FROM posts JOIN users \
+             ON posts.user_id = users.id LIMIT 3",
+            3,
+            &[3],
+        ),
+        (
+            "SELECT users.name, posts.title FROM users JOIN posts \
+             ON posts.user_id = users.id LIMIT 3",
+            3,
+            &[3],
+        ),
+    ];
+    for (sql, rows, expected) in cases {
+        let statement = engine.prepare(sql).unwrap();
+        batch_sizes.borrow_mut().clear();
+        let answer = engine.run_query(&statement, &[]).unwrap();
+        assert_eq!(answer.rows.len(), rows, "{sql}");
+        assert_eq!(
+            batch_sizes.borrow().as_slice(),
+            expected,
+            "{sql}: batches asked for"
+        );
+    }
 }
 
 #[test]

@@ -402,6 +402,22 @@ impl<'a> RowScan<'a> {
         }
     }
 
+    /// Size the first batch for a scan that will stop after `rows`.
+    ///
+    /// A `LIMIT 10` over an unfiltered table (or the driving side of an
+    /// unfiltered join) consumes at most ten rows, and a first batch of
+    /// [`FIRST_SCAN_BATCH`] would read, admit and hold twenty-two more —
+    /// often from a second leaf — only to drop them with the scan. The batch
+    /// still doubles after the first, so a consumer that turns out to need
+    /// more (an inner join whose early outer rows found no match, say) pays
+    /// `O(log(rows / hint))` extra descents rather than one per row. Clamped
+    /// to `1..=MAX_SCAN_BATCH`; a hint is a size, never a bound on what the
+    /// scan may return.
+    pub fn with_first_batch(mut self, rows: usize) -> Self {
+        self.size = rows.clamp(1, MAX_SCAN_BATCH);
+        self
+    }
+
     /// The same scan, cancellable.
     ///
     /// This is the single point that makes "stop this statement" reach a table

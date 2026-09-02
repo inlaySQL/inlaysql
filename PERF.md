@@ -3283,6 +3283,112 @@ catching a structurally corrupt trailing column, which `decode_row_masked`'s
 doc promises it does. That is a contract change, not a perf item, and it is
 left where it is.
 
+### A prepared `LIMIT 10` join re-plans on every execution — and that is not where its time goes (AHL-532, 2026-09-02)
+
+`BENCHMARK.md`'s two `LIMIT 10` join rows lose 1.7–1.9x to SQLite (5.75 /
+8.00 µs against 3.54 / 4.79 µs), and the suspicion going in was fixed
+per-execution cost: every run of the prepared statement re-derives
+`scan_shape`, the join strategy (`join_strategy` → `hash_join_key` +
+`join_probe` + `costed_join_decision`, each collecting the `ON`'s keys into a
+fresh `Vec`), `needed_columns`, the `Env`, and the `ResultSet` — a couple of
+microseconds of planning, the theory went, on a 5.75 µs query. The remedy on
+the table was a per-statement plan cache keyed by `(write_version,
+schema_version)`. **Measured first, and the theory is wrong by an order of
+magnitude.**
+
+**The split.** `bin/profile --suite joins-limit --rows 20000` at `e7cc895`,
+release, `sample` over the query phase, 7,401 samples, load 12–19/18 (shares,
+not wall-clock, are the evidence). The tree was walked with a small parser
+over `sample`'s call graph so every frame under `run_select_to` is attributed
+to one side or the other:
+
+| Where | Samples | Share | What it is |
+| --- | --- | --- | --- |
+| **Before the first row** | ~400 | **~5.4%** | `join_inner` 1.8% (of which `join_strategy` 1.3%: `join_probe` 0.5, `costed_join_decision` 0.4, `hash_join_key` 0.3), `check_schema` 0.7%, `run_select_to`'s own setup + allocations ~1.9% (the boxed pipeline, `ResultSet` columns), `scan_shape` 0.15%, `needed_columns` + `slice` 0.25%, `candidate_bytes` 0.2%, `moving_projection` 0.15%, `refresh_snapshot` 0.04% |
+| **After the last row** | ~160 | **~2.2%** | `drop_in_place<Skip<Box<dyn Iterator>>>` — the pipeline's teardown, which is mostly the driving scan's unconsumed batch |
+| **Row work** | ~6,560 | **~89%** | `NestedLoopJoin::next` 87.3% (`JoinInner::prepare` 45.6% — the ten probes: `get_from` 27.7%, `scan_index_row_ids` 7.4%, `decode_row_masked` 5.5%; the driving `Decode::next` 34.8%) plus projection and per-row drops ~1.6% |
+
+`should_swap_leading_join` is not on the path at all: `scan_shape` makes a
+`LIMIT` without an `ORDER BY` non-reorderable, so the two clones the theory
+counted are never paid on these shapes. And the whole of what a plan cache
+could remove — the join decision, 1.3–1.8% — is below §4's floor (7% CoV on a
+quiet machine, ~20% on this one as used). **The cache was not built.** It
+would carry a real risk (a decision surviving an `ANALYZE`, a stale-stats
+write or DDL is a wrong plan, and `Statement` is plain owned data with no
+handle identity to key it on) for a win no A/B here could see. `check_schema`
+at 0.7% stays for the same reason: skipping it on a matching
+`schema_version` would let a statement prepared on one in-memory database run
+against another at the same revision, which is the exact bug class
+`statement.rs`'s doc exists to prevent.
+
+**What the split did show: the driving scan reads 32 rows to answer 10.**
+`Decode::next` at 34.8% is `RowScan::next` pulling one `scan_batch` of
+`FIRST_SCAN_BATCH = 32` rows — a root-to-leaf walk, then `scan_leaf_cells`
+12.5%, `admits_whole_leaf` 4.9% (two edge-key decodes per leaf),
+`RawLeafCache::get` 4.4% — for a pipeline that `take(10)`s and drops the
+other twenty-two `RowBuf`s in the 2.2% teardown. With 64-byte titles a post
+leaf holds a few dozen rows, so a 32-row batch starting mid-leaf reads and
+admits a second leaf much of the time, for nothing.
+
+**Fix.** `RowScan::with_first_batch(rows)`: the first batch is sized to the
+rows the statement can consume. `run_select_to` passes `stop_after` (`LIMIT
++ OFFSET`) as the hint when the plan has no `WHERE` — without a filter every
+driving row reaches the consumer, so the hint is exact for a single table or a
+`LEFT JOIN`, and an upper bound for an `INNER JOIN` (the probe cannot invent
+rows). Under a filter the rows needed is unknown and the default stands. The
+hint is a size, never a bound: the batch still doubles after the first, so an
+inner join whose early outer rows found no match pays `O(log(rows / hint))`
+extra descents, not one per row. Clamped to `1..=MAX_SCAN_BATCH`, so `LIMIT
+1000` starts with one 512-row batch where it used to start at 32 and double
+its way up.
+
+**Measured**, interleaved against `e7cc895`, control re-run in every
+repetition, order alternated per repetition (A/B, B/A, A/B), `--seconds 4`,
+load 4–13/18, another agent benchmarking on the same machine throughout:
+
+| Suite | `e7cc895` | AHL-532 | Verdict |
+| --- | --- | --- | --- |
+| `joins-limit`, 20k | 125.9 / 110.0 / 122.6k ops/s | **161.2 / 156.1 / 132.1k** | **1.2–1.4x, 3/3, non-overlapping** (the third pair's candidate ran under a load spike to 12.8) |
+| `joins`, 20k (full shapes) | 49 / 40 / 47 | 47 / 44 / 48 | flat, mixed sign |
+| `points` | 1.86 / 1.52 / 1.93M | 2.08 / 1.39 / 1.97M | flat, mixed sign — whichever binary ran *second* won, in both orders |
+| `indexed-range` | 71.3 / 70.4 / 66.1k, then 68.8 / 66.4 / 67.4 / 68.0k | 68.2 / 60.4 / 67.2k, then 64.2 / 67.2 / 66.0 / 66.8k | candidate behind 5/7 by a mean 3.5%, inside the floor; the path (`RowBytes::Indexed`, a filtered query) does not take the hint |
+| `aggregate`, 20k | 849 / 838 / 849 | 837 / 795 / 836 | candidate behind 3/3 by 1.5–5%, inside the floor; the streamed aggregate passes `None` and is unchanged |
+
+The last two rows are reported rather than rounded to "flat" because the sign
+is consistent. Neither path executes a changed instruction (`candidate_bytes`
+gained a parameter both pass as `None`), so if it is real it is code
+placement, and the gated `repeat.sh` regeneration is where it would show as
+more than a floor-sized shadow.
+
+**A methodological note, because it produced a wrong table first.** The first
+A/B used the main checkout's `target/release/profile` as the baseline on the
+assumption it was `HEAD`. Its mtime was two and a half hours older than
+`HEAD`, and it "lost" `points` 3/3 to a change that never touches the point
+read — the giveaway. The table above is against a baseline rebuilt from
+`e7cc895` in the same worktree with the same toolchain, and with the order
+alternated so a warm-second effect cannot masquerade as a win: `points`
+swapping sides with the order is what that control is for.
+
+**After** (same command, 7,221 samples): `Decode::next` 34.8% → 22.1%,
+`JoinInner::prepare` 45.6% → 53.7% — a bigger share of a smaller whole — and
+the planning entries are unchanged in absolute terms (`join_inner` 1.5%,
+`check_schema` 0.5%, `scan_shape` 0.1%). What is left is the ten probes: ten
+root-to-leaf descents into `users` (`get_from` with `child_index` and
+`partition_point` beneath it, `memcmp` 18% self) for ten consecutive keys
+that live in one leaf. That is the shape a retained cursor should answer, and
+`PLAN.md` §9a records B3 (a multi-slot cursor) as closed for these shapes; the
+profile shows full descents, so whether the single-slot reseek is reached
+from the probe's `get_row` at all is the next question, not this item's.
+
+**Pinned.** `a_limited_unfiltered_scan_asks_for_its_limit_not_the_default_batch`
+(`crates/inlaysql-core/tests/prepared.rs`) records every `scan_batch` size
+the engine asks the storage for, across seven shapes: `LIMIT 3` asks `[3]`,
+`LIMIT 3 OFFSET 2` asks `[5]`, `LIMIT 1000` asks `[512]`, a filtered `LIMIT
+3` asks `[32]` (and a selective one `[32, 64, 128]`), and both `joins-limit`
+shapes ask `[3]` on the driving side and nothing on the probed one.
+Mutation-checked: with the hint forced to `None` the first case fails with
+`[32]`.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness
