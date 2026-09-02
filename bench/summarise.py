@@ -33,6 +33,7 @@ VALUE = re.compile(r"^[+-]?\d+(?:\.\d+)?(?P<unit>ns|us|µs|ms|s|x|%)?$")
 # in the next is still one metric measured twice. Unitless numbers are left
 # alone — an ops/s figure is not a duration.
 SECONDS = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1.0}
+FRACTION = re.compile(r"^(\d+)/(\d+)$")
 
 # Provenance, which is meant to differ between runs: dropped, because
 # repeat.sh writes its own header for the combined report.
@@ -120,6 +121,19 @@ def split(line: str) -> tuple[str, list[tuple[float, str]], list[tuple[int, int]
         core = token.strip("(),")
         number = VALUE.match(core)
         if not number:
+            # A counter pair such as `20003/20465` is two values, not text:
+            # `compare.sh`'s commits-per-fsync line prints the raw counters
+            # beside their ratio, and every run's counters differ, so
+            # treating them as shape made three otherwise identical runs
+            # "disagree" and refused the whole summary (2026-09-03).
+            pair = FRACTION.match(core)
+            if pair:
+                shape.append(token.replace(core, "<v>/<v>", 1))
+                for group, offset in ((1, 0), (2, len(pair.group(1)) + 1)):
+                    values.append((float(pair.group(group)), ""))
+                    start = match.start() + token.index(core) + offset
+                    spans.append((start, start + len(pair.group(group))))
+                continue
             shape.append(token)
             continue
         unit = number.group("unit") or ""
