@@ -8,6 +8,7 @@
 //! engine run, crash and recover under the simulation harness.
 
 use alloc::rc::Rc;
+use alloc::sync::Arc;
 use core::cell::RefCell;
 
 use crate::btree::PageId;
@@ -83,6 +84,54 @@ pub enum Durability {
 pub trait Device {
     /// Read `buf.len()` bytes starting at `offset`.
     fn read(&self, offset: usize, buf: &mut [u8]) -> Result<()>;
+
+    /// The `len` bytes at `offset` as a buffer this device already holds, or
+    /// `None` when it holds no such buffer.
+    ///
+    /// [`Device::read`] forces a copy by its type: the caller owns the buffer,
+    /// so a device that has the page resident in a cache of its own can only
+    /// `memcpy` it out. The raw leaf scan
+    /// ([`crate::btree::CowBTree`]'s `walk_raw_row_values`) then keeps the
+    /// page behind a shared `Arc<[u8]>` its rows borrow from — a second copy
+    /// of the same bytes. On a full sweep of a table the operating system,
+    /// the device cache and the tree all already held, those two copies were
+    /// the cost: `pread + memmove` at 19.5% of the `GROUP BY` profile after
+    /// AHL-528, and raising the device cache 8 → 64 MiB measured flat
+    /// (`PERF.md`, AHL-536). This method is the seam that removes both: the
+    /// device hands out its own `Arc`, the scan borrows straight from it, and
+    /// nothing is copied.
+    ///
+    /// # Contract
+    ///
+    /// * **`None` means "read it the ordinary way".** That is the default, so
+    ///   every existing device — the simulation disks, the WASM in-memory
+    ///   device, `io_uring` — stays correct by saying nothing: the caller
+    ///   falls back to [`Device::read`] and copies as before.
+    /// * **A `Some` value must be exactly `len` bytes and must equal what
+    ///   [`Device::read`] of the same range would fill at the same moment.**
+    ///   The caller may hold the `Arc` for as long as it likes — rows borrow
+    ///   from it and outlive the scan that read it — so the bytes behind it
+    ///   must never change. A copy-on-write data page is exactly that
+    ///   (`docs/architecture.md` D4: a committed page is immutable) **unless
+    ///   page ids are reused**, which is why a device must answer `None` from
+    ///   the moment [`Device::note_page_reuse_enabled`] is called, the same
+    ///   rule its own cache already lives under. The tree gates its calls the
+    ///   same way it gates its caches (`page_reuse_enabled`, data-area page,
+    ///   not dirtied by the open transaction), so both sides refuse.
+    /// * **Only a resident page is answered.** This is a lookup, not a read:
+    ///   a device must not fetch on a miss, because the caller's fallback
+    ///   reads ahead sixteen pages at a time (AHL-522) and a page-at-a-time
+    ///   fetch here would silently undo that. The cost of a miss is one
+    ///   lookup, and it is paid only where the alternative was a `pread`.
+    ///
+    /// `Arc` rather than `Rc` because a device shared across threads — the
+    /// native file device behind `inlaysql serve` — holds its pages behind
+    /// an `Arc`, and converting would be the copy this exists to remove; the
+    /// atomic refcount is paid once per row and measured flat against the
+    /// `Rc` it replaced (`PERF.md`, AHL-536).
+    fn read_shared(&self, _offset: usize, _len: usize) -> Option<Arc<[u8]>> {
+        None
+    }
 
     /// Write `data` at `offset`. Not necessarily durable until [`Device::sync`].
     fn write(&mut self, offset: usize, data: &[u8]) -> Result<()>;
@@ -422,6 +471,10 @@ pub trait Device {
 impl<T: Device> Device for Rc<RefCell<T>> {
     fn read(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
         self.borrow().read(offset, buf)
+    }
+
+    fn read_shared(&self, offset: usize, len: usize) -> Option<Arc<[u8]>> {
+        self.borrow().read_shared(offset, len)
     }
 
     fn write(&mut self, offset: usize, data: &[u8]) -> Result<()> {

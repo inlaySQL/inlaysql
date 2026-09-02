@@ -508,6 +508,7 @@ impl PageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::sync::Arc;
     use alloc::vec;
 
     #[test]
@@ -544,10 +545,10 @@ mod tests {
 
     fn leaf(key: &[u8]) -> Rc<Node> {
         Rc::new(Node::Leaf {
-            bytes: Rc::from(&[][..]),
+            bytes: Arc::from(&[][..]),
             entries: vec![Entry {
                 key: Key::Owned(key.to_vec()),
-                value: ValueRef::Owned(Rc::from(vec![0u8; 32])),
+                value: ValueRef::Owned(Arc::from(vec![0u8; 32])),
             }],
         })
     }

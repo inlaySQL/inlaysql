@@ -32,6 +32,7 @@
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::string::ToString;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -75,7 +76,7 @@ const RAW_LEAF_CACHE_PAGES: usize = 64;
 
 /// Raw, *undecoded* leaf pages the raw row scan has read, newest last.
 ///
-/// The scan holds each leaf as a shared `Rc<[u8]>` and reads cells straight out
+/// The scan holds each leaf as a shared `Arc<[u8]>` and reads cells straight out
 /// of it (AHL-455's pattern), so it never needs the `entries` a `Node::Leaf`
 /// carries. Caching it *as* a `Node::Leaf` therefore means decoding a page
 /// purely in order to store it — which measured as a 1.42x win on repeated
@@ -92,7 +93,7 @@ const RAW_LEAF_CACHE_PAGES: usize = 64;
 /// Bounded by page count rather than bytes: every entry is exactly one page, so
 /// the two bounds are the same one and the count needs no arithmetic.
 struct RawLeafCache {
-    entries: Vec<(PageId, Rc<[u8]>)>,
+    entries: Vec<(PageId, Arc<[u8]>)>,
 }
 
 impl RawLeafCache {
@@ -107,21 +108,21 @@ impl RawLeafCache {
     /// Linear search, because this holds 64 `u64`s: scanning it costs a
     /// fraction of the `pread` it exists to avoid, and a map would add hashing
     /// and an allocation per insert to save nothing at this size.
-    fn get(&mut self, id: PageId) -> Option<Rc<[u8]>> {
+    fn get(&mut self, id: PageId) -> Option<Arc<[u8]>> {
         let at = self.entries.iter().position(|(page, _)| *page == id)?;
         let entry = self.entries.remove(at);
-        let bytes = Rc::clone(&entry.1);
+        let bytes = Arc::clone(&entry.1);
         self.entries.push(entry);
         Some(bytes)
     }
 
-    fn insert(&mut self, id: PageId, bytes: &Rc<[u8]>) {
+    fn insert(&mut self, id: PageId, bytes: &Arc<[u8]>) {
         if let Some(at) = self.entries.iter().position(|(page, _)| *page == id) {
             self.entries.remove(at);
         } else if self.entries.len() >= RAW_LEAF_CACHE_PAGES {
             self.entries.remove(0);
         }
-        self.entries.push((id, Rc::clone(bytes)));
+        self.entries.push((id, Arc::clone(bytes)));
     }
 
     fn clear(&mut self) {
@@ -214,6 +215,31 @@ impl Readahead {
         let pages = want.min(below_next).max(1);
         self.run_end = id + pages as u64;
         pages
+    }
+
+    /// A page the device served shared, so it never reached
+    /// [`Readahead::plan`]: keep the run bookkeeping exactly as if it had.
+    ///
+    /// The streak measures sequential *access*, not sequential misses.
+    /// Without this the window sees only misses, so a miss after a run of
+    /// resident pages starts a fresh streak, and its first two pages are
+    /// single reads that admit by evicting: new holes in the resident set on
+    /// every execution, until a sweep larger than the device cache has
+    /// fragmented it into single-page reads (measured as a 3/3 loss on the
+    /// 100k-row aggregate before this was added; `PERF.md`, AHL-536). With
+    /// the streak intact that miss is read sixteen wide and admitted only
+    /// while there is room, as before.
+    ///
+    /// Only the device's shared hits are noted. Noting the decoded and
+    /// raw-leaf caches' hits too was measured flat on the same shape and
+    /// left out.
+    fn note_served(&mut self, id: PageId) {
+        self.streak = if id == self.run_end {
+            self.streak.saturating_add(1)
+        } else {
+            0
+        };
+        self.run_end = id + 1;
     }
 
     fn clear(&mut self) {
@@ -2743,8 +2769,41 @@ impl<D: Device> CowBTree<D> {
     }
 
     fn read_committed_node(&self, id: PageId) -> Result<Node> {
+        // A page the device already holds is decoded in place: the node's
+        // borrowed keys index into the device's own buffer, and the page is
+        // copied neither into the scratch buffer nor into a fresh `Arc`.
+        if let Some(shared) = self.shared_page(id, false) {
+            return page::decode_shared(self.page_size, &shared);
+        }
         let offset = crate::wal::data_offset_for(self.page_size, self.format_version, id);
         self.with_page_bytes(offset, page::decode)
+    }
+
+    /// A committed data-area page as the buffer the device itself holds it
+    /// in, if it holds one — [`Device::read_shared`] behind the gates every
+    /// cache on this handle answers under.
+    ///
+    /// The gates are [`CowBTree::cached_raw_leaf`]'s, for the same reasons:
+    /// a page the open transaction has dirtied is not the committed page; a
+    /// device that reuses page ids can hold a stale occupant (and the device
+    /// refuses too — see the method's contract); and nothing outside the data
+    /// area is immutable. The length check is the caller's half of "exactly
+    /// `len` bytes": a device that answered short would otherwise reach the
+    /// page parser as a torn page.
+    fn shared_page(&self, id: PageId, pending: bool) -> Option<Arc<[u8]>> {
+        if pending && self.dirty.contains_key(&id) {
+            return None;
+        }
+        if self.device.page_reuse_enabled() {
+            return None;
+        }
+        if !cache::data_area_page(self.page_size, self.format_version, id) {
+            return None;
+        }
+        let offset = crate::wal::data_offset_for(self.page_size, self.format_version, id);
+        self.device
+            .read_shared(offset, self.page_size)
+            .filter(|bytes| bytes.len() == self.page_size)
     }
 
     /// The cached node for `id`, if this read is allowed to use the cache and
@@ -2776,7 +2835,7 @@ impl<D: Device> CowBTree<D> {
     /// committed page, a device that reuses page ids breaks the "page id is a
     /// stable identity" premise the whole cache rests on (D4), and nothing
     /// outside the data area may be cached at all.
-    fn cached_raw_leaf(&self, id: PageId, pending: bool) -> Option<Rc<[u8]>> {
+    fn cached_raw_leaf(&self, id: PageId, pending: bool) -> Option<Arc<[u8]>> {
         if pending && self.dirty.contains_key(&id) {
             return None;
         }
@@ -2791,7 +2850,7 @@ impl<D: Device> CowBTree<D> {
 
     /// Hold a raw leaf page the scan just read, under the same rule
     /// [`CowBTree::cached_raw_leaf`] reads it back by.
-    fn cache_raw_leaf(&self, id: PageId, pending: bool, bytes: &Rc<[u8]>) {
+    fn cache_raw_leaf(&self, id: PageId, pending: bool, bytes: &Arc<[u8]>) {
         if pending && self.dirty.contains_key(&id) {
             return;
         }
@@ -2831,7 +2890,7 @@ impl<D: Device> CowBTree<D> {
     /// the cells are read the same way and bounded the same way.
     fn scan_leaf_into(
         &self,
-        shared: &Rc<[u8]>,
+        shared: &Arc<[u8]>,
         bounds: &WalkBounds<'_>,
         pending: bool,
         out: &mut Vec<(RowId, RowBuf)>,
@@ -2969,6 +3028,35 @@ impl<D: Device> CowBTree<D> {
         pending: bool,
         f: impl FnOnce(usize, &[u8]) -> Result<T>,
     ) -> Result<T> {
+        // A page the device holds is borrowed, not copied. `shared_page`
+        // already refuses a dirtied page, so the dirty lookup below still
+        // takes precedence over the committed bytes.
+        if let Some(shared) = self.shared_page(id, pending) {
+            self.note_page_served(id);
+            return f(self.page_size, &shared);
+        }
+        self.with_raw_page_from_device(id, pending, f)
+    }
+
+    /// Keep the read-ahead window's run bookkeeping current for a page the
+    /// device served shared — see [`Readahead::note_served`].
+    fn note_page_served(&self, id: PageId) {
+        if let Ok(mut window) = self.readahead.try_borrow_mut() {
+            window.note_served(id);
+        }
+    }
+
+    /// [`CowBTree::with_raw_page`] after the device has said it holds no
+    /// shared copy: the open transaction's page, the read-ahead window, or a
+    /// read into the scratch buffer. Split out so
+    /// [`CowBTree::walk_raw_row_values`], which asks for the shared page
+    /// itself in order to keep the `Arc`, does not ask twice on a miss.
+    fn with_raw_page_from_device<T>(
+        &self,
+        id: PageId,
+        pending: bool,
+        f: impl FnOnce(usize, &[u8]) -> Result<T>,
+    ) -> Result<T> {
         if pending {
             if let Some(bytes) = self.dirty.get(&id) {
                 return f(self.page_size, bytes);
@@ -3018,7 +3106,7 @@ impl<D: Device> CowBTree<D> {
     /// a leaf does.
     fn store_value(&mut self, key: &[u8], value: &[u8]) -> Result<ValueRef> {
         if page::inline_entry_fits(self.page_size, key, value) {
-            return Ok(ValueRef::Owned(Rc::from(value)));
+            return Ok(ValueRef::Owned(Arc::from(value)));
         }
         let payload = page::overflow_payload_size(self.page_size);
         let count = value.len().div_ceil(payload);
@@ -3044,15 +3132,15 @@ impl<D: Device> CowBTree<D> {
     /// enough to overflow lives only there until the commit.
     ///
     /// The inline case is a refcount bump, not a byte copy (`AHL-478`): the
-    /// bytes are already shared out of the cached page via `Rc<[u8]>`, so
+    /// bytes are already shared out of the cached page via `Arc<[u8]>`, so
     /// `RowBuf::Shared` just clones the handle. Only the overflow chain still
     /// allocates and copies — reassembling several pages into one
-    /// contiguous buffer is not something an `Rc` clone can avoid, and it was
+    /// contiguous buffer is not something an `Arc` clone can avoid, and it was
     /// never the common case this file's profile is about (`PERF.md`'s fixed
     /// payload is well under one page).
     fn resolve_value_at(
         &self,
-        node_bytes: Option<&Rc<[u8]>>,
+        node_bytes: Option<&Arc<[u8]>>,
         value: &ValueRef,
         pending: bool,
     ) -> Result<RowBuf> {
@@ -3068,12 +3156,12 @@ impl<D: Device> CowBTree<D> {
                     ));
                 };
                 Ok(RowBuf::Shared {
-                    bytes: Rc::clone(bytes),
+                    bytes: Arc::clone(bytes),
                     range: range.clone(),
                 })
             }
             ValueRef::Owned(bytes) => Ok(RowBuf::Shared {
-                bytes: Rc::clone(bytes),
+                bytes: Arc::clone(bytes),
                 range: 0..bytes.len(),
             }),
             ValueRef::Overflow { first, len } => {
@@ -3440,7 +3528,7 @@ impl<D: Device> CowBTree<D> {
     /// does — they are few, and their separators have to be read to descend.
     /// Leaf pages are *not* decoded into a cached [`Node`]: their cells are
     /// parsed with the key and the value borrowed straight off the page bytes
-    /// ([`page::scan_leaf_cells`]), behind one shared `Rc<[u8]>` per leaf, so a
+    /// ([`page::scan_leaf_cells`]), behind one shared `Arc<[u8]>` per leaf, so a
     /// scan of a leaf allocates no `Rc<Node>`, no `Vec<Entry>` and no per-cell
     /// key `Vec` or value `Rc` — each row's value becomes a [`RowBuf::Shared`]
     /// by a refcount bump (the AHL-455 pattern this scan was the last path not
@@ -3476,11 +3564,11 @@ impl<D: Device> CowBTree<D> {
         let cached = match self.cached_page(id, pending) {
             Some(node) => match &*node {
                 Node::Leaf { bytes, .. } => {
-                    let shared = Rc::clone(bytes);
+                    let shared = Arc::clone(bytes);
                     *last_leaf = Some(RawScanCursorCandidate {
                         low_source: span.low.clone(),
                         high_source: span.high.clone(),
-                        bytes: Rc::clone(&shared),
+                        bytes: Arc::clone(&shared),
                     });
                     self.scan_leaf_into(&shared, bounds, pending, out)?;
                     return Ok(());
@@ -3499,36 +3587,78 @@ impl<D: Device> CowBTree<D> {
                 *last_leaf = Some(RawScanCursorCandidate {
                     low_source: span.low.clone(),
                     high_source: span.high.clone(),
-                    bytes: Rc::clone(&shared),
+                    bytes: Arc::clone(&shared),
                 });
                 self.scan_leaf_into(&shared, bounds, pending, out)?;
                 return Ok(());
             }
         }
 
+        // A page the device itself holds is borrowed from the device's own
+        // buffer: no `pread`, no copy into the read-ahead window, no copy into
+        // a per-leaf `Arc` (AHL-536). The `Arc` the rows and the raw-leaf
+        // cache then hold *is* the device's, kept alive by them for as long
+        // as they need it and immutable for as long as it exists — see
+        // `Device::read_shared`'s contract and `shared_page`'s gates.
+        let cached = match cached {
+            Some(node) => Some(node),
+            None => match self.shared_page(id, pending) {
+                Some(shared) => match shared[page::OFF_KIND] {
+                    page::KIND_LEAF => {
+                        self.note_page_served(id);
+                        *last_leaf = Some(RawScanCursorCandidate {
+                            low_source: span.low.clone(),
+                            high_source: span.high.clone(),
+                            bytes: Arc::clone(&shared),
+                        });
+                        // Deliberately not held in the raw-leaf cache: the
+                        // device holds this buffer, and a second index of it
+                        // here would cost a 64-entry shift per leaf and a
+                        // 64-entry scan per miss on every sweep — measured at
+                        // ~3.7% of the 100k-row aggregate — to answer what
+                        // the device answers from one hash lookup.
+                        self.scan_leaf_into(&shared, bounds, pending, out)?;
+                        return Ok(());
+                    }
+                    page::KIND_INTERNAL => {
+                        self.note_page_served(id);
+                        let node = Rc::new(page::decode_shared(self.page_size, &shared)?);
+                        self.cache_committed(id, pending, &node);
+                        Some(node)
+                    }
+                    other => {
+                        return Err(Error::Corrupt(alloc::format!("unknown node kind {other}")));
+                    }
+                },
+                None => None,
+            },
+        };
+
         // Read the raw bytes once and dispatch on the kind byte: a leaf is
         // parsed in place, an internal node is decoded for navigation.
         let internal = match cached {
             Some(node) => Some(node),
             None => {
-                let decoded = self.with_raw_page(id, pending, |page_size, bytes| {
+                let decoded = self.with_raw_page_from_device(id, pending, |page_size, bytes| {
                     match bytes[page::OFF_KIND] {
                         page::KIND_LEAF => {
-                            // Keep the page bytes behind one shared `Rc<[u8]>`
+                            // Keep the page bytes behind one shared `Arc<[u8]>`
                             // for the whole leaf: `scan_leaf_cells` yields
                             // `ValueRef::Inline` ranges into it (AHL-455's
                             // pattern), so each row's value becomes a
                             // `RowBuf::Shared` via a refcount bump rather than a
-                            // per-cell `Rc::from` copy. The page's `Rc` — not
+                            // per-cell `Arc::from` copy. The page's `Arc` — not
                             // the transient scratch `bytes` — is what the cells
                             // borrow from, and it is kept alive by every
                             // `RowBuf::Shared` that clones it, so the rows can
-                            // safely outlive this callback.
-                            let shared: Rc<[u8]> = Rc::from(bytes);
+                            // safely outlive this callback. This is the one
+                            // copy left on the path, and it is paid only for a
+                            // page the device does not hold.
+                            let shared: Arc<[u8]> = Arc::from(bytes);
                             *last_leaf = Some(RawScanCursorCandidate {
                                 low_source: span.low.clone(),
                                 high_source: span.high.clone(),
-                                bytes: Rc::clone(&shared),
+                                bytes: Arc::clone(&shared),
                             });
                             // Hold the bytes, not a decoded node: the next
                             // execution of this statement wants exactly this
@@ -3853,7 +3983,7 @@ struct RawScanCursor {
     /// Exclusive upper edge of the leaf span, or unbounded for the last leaf.
     high: Option<Vec<u8>>,
     /// Raw page bytes shared by the cursor and any returned [`RowBuf`]s.
-    bytes: Rc<[u8]>,
+    bytes: Arc<[u8]>,
 }
 
 impl RawScanCursor {
@@ -3892,7 +4022,7 @@ struct RangeCursorCandidate {
 struct RawScanCursorCandidate {
     low_source: Option<(Rc<Node>, usize)>,
     high_source: Option<(Rc<Node>, usize)>,
-    bytes: Rc<[u8]>,
+    bytes: Arc<[u8]>,
 }
 
 /// Separator sources describing one child span during a range walk.
@@ -4437,6 +4567,15 @@ mod tests {
         /// Reports page reuse as enabled while set, which is the one switch
         /// that turns read-ahead off without touching anything else.
         reuse_override: Cell<bool>,
+        /// The page size this device hands pages out shared at, once set — a
+        /// stand-in for the native device's shared raw cache: every page a
+        /// `read` fetches becomes resident here, and `read_shared` answers
+        /// from it and from nothing else.
+        share_pages: Cell<Option<usize>>,
+        /// Resident pages by offset, the buffers `read_shared` hands out.
+        shared: RefCell<alloc::collections::BTreeMap<usize, Arc<[u8]>>>,
+        /// `read_shared` calls that found the page resident.
+        shared_hits: Cell<usize>,
     }
 
     impl CountingDisk {
@@ -4449,6 +4588,9 @@ mod tests {
                 read_ceiling: Cell::new(None),
                 reads_past_ceiling: Cell::new(0),
                 reuse_override: Cell::new(false),
+                share_pages: Cell::new(None),
+                shared: RefCell::new(alloc::collections::BTreeMap::new()),
+                shared_hits: Cell::new(0),
             }
         }
     }
@@ -4462,7 +4604,30 @@ mod tests {
                         .set(self.reads_past_ceiling.get() + 1);
                 }
             }
-            Device::read(&self.disk, offset, buf)
+            Device::read(&self.disk, offset, buf)?;
+            // Whole pages a read fetched become resident, one entry each,
+            // the way the native device admits a read-ahead window.
+            if let Some(page) = self.share_pages.get() {
+                if buf.len() >= page && buf.len().is_multiple_of(page) {
+                    let mut shared = self.shared.borrow_mut();
+                    for (i, chunk) in buf.chunks(page).enumerate() {
+                        shared
+                            .entry(offset + i * page)
+                            .or_insert_with(|| Arc::from(chunk));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn read_shared(&self, offset: usize, len: usize) -> Option<Arc<[u8]>> {
+            let page = self.share_pages.get()?;
+            if len != page {
+                return None;
+            }
+            let bytes = Arc::clone(self.shared.borrow().get(&offset)?);
+            self.shared_hits.set(self.shared_hits.get() + 1);
+            Some(bytes)
         }
 
         fn write(&mut self, offset: usize, data: &[u8]) -> Result<()> {
@@ -5540,6 +5705,91 @@ mod tests {
         );
     }
 
+    /// A repeated sweep over a table the device holds performs no device read
+    /// and copies no page: every row borrows the device's own buffer.
+    ///
+    /// The tree's own caches are emptied before the sweep that is measured,
+    /// and the table has more leaves than the raw-leaf cache holds, so the
+    /// only thing that can answer a leaf without a `read` is the device's
+    /// shared page. Zero reads proves the syscall is gone; the pointer
+    /// comparison proves the copy is gone too, which a read count alone
+    /// cannot — a device that copied on every `read_shared` would pass the
+    /// first assertion and fail the second. The rows are then compared with
+    /// both the copying raw path and the decoding path, so sharing changed
+    /// nothing about what a sweep returns.
+    #[test]
+    fn a_sweep_over_pages_the_device_holds_reads_nothing_and_copies_nothing() {
+        let row_key = |id: u64| {
+            let mut key = b"\x01tbl\0".to_vec();
+            key.extend_from_slice(&id.to_be_bytes());
+            key
+        };
+        let prefix = b"\x01tbl\0";
+        let device = Rc::new(RefCell::new(CountingDisk::new(true)));
+        let mut db = CowBTree::create(device, PAGE).unwrap();
+        for id in 0..1_200u64 {
+            db.put(&row_key(id), &id.to_le_bytes()).unwrap();
+        }
+        db.commit().unwrap();
+        db.set_page_cache_bytes(0);
+
+        let expected = db.scan_prefix_row_values_from(prefix, None, 1_200).unwrap();
+        assert_eq!(expected.len(), 1_200);
+
+        // The copying path: the device shares nothing, so every leaf is a
+        // read into the window and a copy into a per-leaf buffer.
+        db.raw_leaves.borrow_mut().clear();
+        db.readahead.borrow_mut().clear();
+        reads_since(&db);
+        let copied = db
+            .scan_prefix_row_values_raw_from(prefix, None, 1_200)
+            .unwrap();
+        assert!(reads_since(&db) > 0, "the copying path must read");
+        assert_eq!(copied, expected);
+
+        // Sharing on. The first sweep still reads — that is what makes the
+        // pages resident — and the second must not.
+        db.device().borrow().share_pages.set(Some(PAGE));
+        db.raw_leaves.borrow_mut().clear();
+        db.readahead.borrow_mut().clear();
+        let first = db
+            .scan_prefix_row_values_raw_from(prefix, None, 1_200)
+            .unwrap();
+        assert_eq!(first, expected);
+        assert!(reads_since(&db) > 0, "the filling sweep must read");
+
+        db.raw_leaves.borrow_mut().clear();
+        db.readahead.borrow_mut().clear();
+        db.device().borrow().shared_hits.set(0);
+        let shared = db
+            .scan_prefix_row_values_raw_from(prefix, None, 1_200)
+            .unwrap();
+        assert_eq!(
+            reads_since(&db),
+            0,
+            "a sweep over resident pages must not read"
+        );
+        let hits = db.device().borrow().shared_hits.get();
+        assert!(
+            hits > RAW_LEAF_CACHE_PAGES,
+            "every leaf and every internal page must have come from the device's shared \
+             pages, not the tree's own {RAW_LEAF_CACHE_PAGES}-page cache: {hits} hits"
+        );
+        assert_eq!(shared, copied, "sharing changed the rows");
+
+        let device = db.device().borrow();
+        let pages = device.shared.borrow();
+        for (row_id, row) in &shared {
+            let RowBuf::Shared { bytes, .. } = row else {
+                panic!("row {row_id} was copied out of its page");
+            };
+            assert!(
+                pages.values().any(|page| Arc::ptr_eq(page, bytes)),
+                "row {row_id} borrows a copy of its page, not the device's buffer"
+            );
+        }
+    }
+
     /// A write is visible to the next scan rather than being masked by a
     /// retained page.
     ///
@@ -5673,7 +5923,7 @@ mod tests {
     fn a_whole_leaf_is_admitted_from_its_edges_alone() {
         let entry = |key: &[u8]| page::Entry {
             key: page::Key::Owned(key.to_vec()),
-            value: page::ValueRef::Owned(Rc::from(&b"v"[..])),
+            value: page::ValueRef::Owned(Arc::from(&b"v"[..])),
         };
         let leaf = page::encode_leaf(PAGE, &[], &[entry(b"b"), entry(b"c"), entry(b"d")]).unwrap();
         let bounds =

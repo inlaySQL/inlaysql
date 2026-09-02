@@ -17,8 +17,8 @@
 //! tag 6  := VECTOR_Q8 (u32 dimension, f32 scale, i8 * dimension)
 //! ```
 
-use alloc::rc::Rc;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::{Deref, Range};
 
@@ -31,9 +31,9 @@ use crate::value::{DataType, Text, Value, ValueRef};
 /// `AHL-478`'s starting point: `CowBTree::resolve_value_at` used to clone the
 /// row bytes out of the cached, `Rc`-held page on *every* read — a `Vec<u8>`
 /// copy paid for a row that might be filtered out a moment later. A page's
-/// inline cell bytes now live behind an `Rc<[u8]>`
+/// inline cell bytes now live behind an `Arc<[u8]>`
 /// (`crate::btree::page::ValueRef::Inline`), so a cache **hit** clones this
-/// instead: an `Rc` refcount bump, not a byte copy. Only the two cases that
+/// instead: an `Arc` refcount bump, not a byte copy. Only the two cases that
 /// were never zero-copy to begin with still allocate — a value spread across
 /// an overflow chain has to be reassembled, and a value read out of an open
 /// transaction's own uncommitted writes is a fresh insert, not a cached page.
@@ -47,10 +47,11 @@ pub enum RowBuf {
     /// Bytes cloned or assembled outside the page cache: an overflow chain,
     /// or a row written by the open transaction and not yet committed.
     Owned(Vec<u8>),
-    /// A byte range into a page's shared buffer, held alive by the `Rc`.
+    /// A byte range into a page's shared buffer, held alive by the `Arc` —
+    /// since AHL-536 the device's own buffer, when the device has one.
     Shared {
         /// The page's shared buffer the row's bytes are a slice of.
-        bytes: Rc<[u8]>,
+        bytes: Arc<[u8]>,
         /// The row's byte range inside `bytes`.
         range: Range<usize>,
     },
@@ -101,8 +102,8 @@ impl From<Vec<u8>> for RowBuf {
     }
 }
 
-impl From<Rc<[u8]>> for RowBuf {
-    fn from(bytes: Rc<[u8]>) -> Self {
+impl From<Arc<[u8]>> for RowBuf {
+    fn from(bytes: Arc<[u8]>) -> Self {
         let range = 0..bytes.len();
         RowBuf::Shared { bytes, range }
     }

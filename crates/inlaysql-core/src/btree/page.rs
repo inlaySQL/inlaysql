@@ -26,8 +26,8 @@
 //! means a split copies the node instead of mutating it, so this "fencepost"
 //! separator stays valid even as keys are inserted and deleted beneath it.
 
-use alloc::rc::Rc;
 use alloc::string::ToString;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Range;
@@ -80,7 +80,7 @@ pub const KIND_OVERFLOW: u8 = 2;
 /// length u64`).
 ///
 /// The inline case is a *borrowed byte range* into the page's shared buffer
-/// when it came from a [`decode`] or the raw-leaf scan, and an owned `Rc<[u8]>`
+/// when it came from a [`decode`] or the raw-leaf scan, and an owned `Arc<[u8]>`
 /// when the write path materialised it. A decoded `Node` is cached behind its
 /// own `Rc` (`btree::cache::PageCache`), and every read that hits the cache
 /// used to clone these bytes byte-for-byte to hand a caller an owned `Vec<u8>`
@@ -95,7 +95,7 @@ pub enum ValueRef {
     Inline(Range<usize>),
     /// The value bytes, owned because the write path had to copy them out of a
     /// transient buffer (see [`ValueRef::Inline`]).
-    Owned(Rc<[u8]>),
+    Owned(Arc<[u8]>),
     /// The value lives in a chain of overflow pages starting at `first`, and is
     /// `len` bytes long in total.
     Overflow {
@@ -177,14 +177,14 @@ pub enum Node {
     Leaf {
         /// The raw page bytes every borrowed key range indexes into, shared by
         /// the page cache so a cache hit is a refcount bump with no re-decode.
-        bytes: Rc<[u8]>,
+        bytes: Arc<[u8]>,
         /// The cells, in key order.
         entries: Vec<Entry>,
     },
     /// An internal node holding the leftmost child and separator cells.
     Internal {
         /// The raw page bytes every borrowed separator key range indexes into.
-        bytes: Rc<[u8]>,
+        bytes: Arc<[u8]>,
         /// The child to the left of every separator.
         leftmost: PageId,
         /// Separator cells, in key order.
@@ -194,7 +194,7 @@ pub enum Node {
 
 impl Node {
     /// The shared page bytes this node's borrowed keys index into.
-    pub fn bytes(&self) -> &Rc<[u8]> {
+    pub fn bytes(&self) -> &Arc<[u8]> {
         match self {
             Node::Leaf { bytes, .. } | Node::Internal { bytes, .. } => bytes,
         }
@@ -233,7 +233,7 @@ pub fn leaf_size(source: &[u8], entries: &[Entry]) -> usize {
 /// makes a split always possible — see `leaf_split_point`'s caller in
 /// `btree/tree.rs`.
 pub fn inline_entry_fits(page_size: usize, key: &[u8], value: &[u8]) -> bool {
-    HEADER_SIZE + SLOT_SIZE + leaf_cell_size(key, &ValueRef::Owned(Rc::from(value)))
+    HEADER_SIZE + SLOT_SIZE + leaf_cell_size(key, &ValueRef::Owned(Arc::from(value)))
         <= page_size / 2
 }
 
@@ -293,8 +293,23 @@ pub fn encode_internal(
     encode_page(page_size, KIND_INTERNAL, leftmost, &contents)
 }
 
-/// Decode any B-tree page.
+/// Decode any B-tree page, copying `bytes` into the node's shared buffer.
 pub fn decode(page_size: usize, bytes: &[u8]) -> Result<Node> {
+    decode_with(page_size, bytes, || Arc::from(bytes))
+}
+
+/// Decode any B-tree page out of a buffer that is already shared, so the
+/// node's borrowed keys and values index straight into it and nothing is
+/// copied. This is what a page handed out by `Device::read_shared` decodes
+/// through (AHL-536); [`decode`] is the same routine over a transient slice.
+pub fn decode_shared(page_size: usize, bytes: &Arc<[u8]>) -> Result<Node> {
+    decode_with(page_size, bytes, || Arc::clone(bytes))
+}
+
+/// The one decoder behind [`decode`] and [`decode_shared`]: every check and
+/// every cell is read from `bytes`, and `share` is asked for the buffer the
+/// node keeps only once the page has proved well-formed.
+fn decode_with(page_size: usize, bytes: &[u8], share: impl FnOnce() -> Arc<[u8]>) -> Result<Node> {
     if bytes.len() != page_size {
         return Err(Error::Corrupt(alloc::format!(
             "page is {} bytes, expected {page_size}",
@@ -327,7 +342,7 @@ pub fn decode(page_size: usize, bytes: &[u8]) -> Result<Node> {
                 entries.push(decode_leaf_cell(bytes, page_size, slot)?);
             }
             Ok(Node::Leaf {
-                bytes: Rc::from(bytes),
+                bytes: share(),
                 entries,
             })
         }
@@ -337,7 +352,7 @@ pub fn decode(page_size: usize, bytes: &[u8]) -> Result<Node> {
                 cells.push(decode_internal_cell(bytes, page_size, slot)?);
             }
             Ok(Node::Internal {
-                bytes: Rc::from(bytes),
+                bytes: share(),
                 leftmost,
                 cells,
             })
@@ -591,7 +606,7 @@ pub fn decode_leaf_cell_ref<'a>(
                 ));
             }
             // Borrow the value's byte range rather than copying it into a fresh
-            // `Rc<[u8]>` per cell. The caller keeps the page's shared buffer
+            // `Arc<[u8]>` per cell. The caller keeps the page's shared buffer
             // alive for the whole scan (see `CowBTree::walk_raw_row_values`),
             // and `resolve_value_at` turns the range into a `RowBuf::Shared`
             // with a single refcount bump — the AHL-455 pattern this scan was
@@ -747,7 +762,7 @@ mod tests {
     fn entry(key: &[u8], value: &[u8]) -> Entry {
         Entry {
             key: Key::Owned(key.to_vec()),
-            value: ValueRef::Owned(Rc::from(value)),
+            value: ValueRef::Owned(Arc::from(value)),
         }
     }
 
