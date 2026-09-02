@@ -158,10 +158,21 @@ jobs:
           git add RUNNER-BENCHMARK.md
           if git diff --cached --quiet; then
             echo "nothing changed"
-          else
-            git commit -m "bench: runner benchmark report, $(date -u +%Y-%m-%d) [skip ci]"
-            git push
+            exit 0
           fi
+          git commit -m "bench: runner benchmark report, $(date -u +%Y-%m-%d) [skip ci]"
+          # main moves without this workflow moving, so the push is
+          # rebase-and-retry: this commit touches only
+          # RUNNER-BENCHMARK.md, and a concurrent push to main must not be
+          # able to lose a report that took an hour to measure.
+          for attempt in 1 2 3; do
+            if git pull --rebase origin main && git push; then
+              exit 0
+            fi
+            echo "attempt $attempt failed; retrying after the next push lands"
+            sleep 20
+          done
+          exit 1
 
       - name: Attach the report
         uses: actions/upload-artifact@v4
