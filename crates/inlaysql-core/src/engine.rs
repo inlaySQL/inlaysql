@@ -4735,12 +4735,18 @@ impl Engine {
                 let values = index_values(table, index, row)?;
                 let range =
                     crate::index::KeyRange::equality(&index.name, &values, &index.collations)?;
-                let keys = self
+                // Row ids straight off the index leaf, the way `indexed_candidates`
+                // and the join probe already read them (AHL-479): the same
+                // range, answered from the retained range cursor when it
+                // covers it, with no owned `Vec<u8>` per matching key and no
+                // resolution of the index's always-empty value. This runs
+                // once per written row per `UNIQUE` group, so it was the
+                // write path's one remaining decoded-entry walk.
+                let ids = self
                     .storage
-                    .scan_index_range(&range.start, range.end.as_deref())?;
-                let mut rows = Vec::with_capacity(keys.len());
-                for key in &keys {
-                    let id = crate::index::row_id_from_entry(key)?;
+                    .scan_index_row_ids(&range.start, range.end.as_deref())?;
+                let mut rows = Vec::with_capacity(ids.len());
+                for id in ids {
                     if let Some(bytes) = self.storage.get_row(&table.name, id)? {
                         rows.push((id, bytes));
                     }
