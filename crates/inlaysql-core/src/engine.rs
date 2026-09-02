@@ -32,8 +32,8 @@ use crate::collation::Collation;
 use crate::error::{Error, Result};
 use crate::eval::{self, Computed, Env, SharedRng, SubqueryRunner};
 use crate::exec::{
-    collect_bounded, fnv1a, mix64, Decode, DecodeFilter, ExecRow, Filter, HashJoin, HashJoinTable,
-    IndexProbe, JoinInner, NestedLoopJoin, ProbeKind, RowBytes, RowStream,
+    collect_bounded, fnv1a, mix64, park, AggregateInput, Decode, DecodeFilter, ExecRow, Filter,
+    HashJoin, HashJoinTable, IndexProbe, JoinInner, NestedLoopJoin, ProbeKind, RowBytes, RowStream,
 };
 use crate::fusion::{reciprocal_rank_fusion, sort_by_score_desc};
 use crate::hnsw::VectorMetric;
@@ -47,8 +47,8 @@ use crate::plan::{
 };
 use crate::planner::{self, JoinDecision, JoinPath, PlannerStats, STATS_META_KEY};
 use crate::row::{
-    decode_row, decode_row_masked, decode_value_at, encode_typed_row, encode_typed_row_into,
-    ColumnMask, RowBuf,
+    decode_row, decode_row_masked, decode_row_ref_masked_into, decode_value_at, encode_typed_row,
+    encode_typed_row_into, ColumnMask, RowBuf,
 };
 use crate::shared::SharedStorage;
 use crate::sql::{self, TableRules};
@@ -57,7 +57,7 @@ use crate::traits::{
     Cancel, Clock, FullTextIndex, IndexFactory, Interrupt, Rng, RowId, RowScan, Scored,
     StatementClock, Storage, VectorIndex, VectorTuning,
 };
-use crate::value::{DataType, Value};
+use crate::value::{DataType, Value, ValueRef};
 
 /// A borrowed projected-row consumer used by the internal push pipeline.
 type RowSink<'a> = dyn FnMut(&[Value]) -> Result<()> + 'a;
@@ -5426,6 +5426,30 @@ impl Engine {
             }
         }
 
+        // A streamed aggregate over one stored table folds straight from the
+        // row bytes: each row is decoded into one borrowed buffer the fold
+        // reuses, and only a row that opens a group is ever materialised. The
+        // other sources — derived, scored, `WITHOUT ROWID`, joined — hand
+        // over decoded rows and take the general stream below.
+        if plan.joins.is_empty()
+            && driving.derived.is_none()
+            && plan.score.is_none()
+            && !driving.table.without_rowid
+            && self.can_stream_aggregate(plan)
+        {
+            let source = self.candidate_bytes(&driving.table, &plan.filter, params)?;
+            let rows = self.stream_aggregate(
+                plan,
+                AggregateInput::Bytes {
+                    source,
+                    mask: &driving_mask,
+                    filter: plan.filter.as_ref(),
+                },
+                env,
+            )?;
+            return self.finish_blocking(plan, rows, env, offset, limit, sink);
+        }
+
         let mut stream: RowStream<'_> = if plan.joins.is_empty() {
             match (&driving.derived, &plan.score, &plan.filter) {
                 // A derived table has no storage to stream from, so it
@@ -5598,8 +5622,8 @@ impl Engine {
         // statement can take the process down and where the per-statement
         // ceiling is applied. See [`collect_bounded`]. The streamed case above
         // is the exception, and everything after this point is shared by both.
-        let mut rows: Vec<ExecRow> = if self.can_stream_aggregate(plan) {
-            self.stream_aggregate(plan, stream, env)?
+        let rows: Vec<ExecRow> = if self.can_stream_aggregate(plan) {
+            self.stream_aggregate(plan, AggregateInput::Rows(stream), env)?
         } else {
             let mut collected =
                 collect_bounded(stream, self.options.query_memory_bytes, &self.interrupt)?;
@@ -5608,7 +5632,25 @@ impl Engine {
             }
             collected
         };
+        self.finish_blocking(plan, rows, env, offset, limit, sink)
+    }
 
+    /// Everything a blocking `SELECT` does once its input is held: windows,
+    /// `DISTINCT`, `ORDER BY`, `OFFSET`/`LIMIT`, projection, and the sink.
+    ///
+    /// Shared by the two ways [`Engine::run_select_to`] arrives at held rows
+    /// — the general stream collected or streamed-aggregated, and the
+    /// bytes-fed aggregate — so the stages after the fold are one piece of
+    /// code whichever produced them.
+    fn finish_blocking(
+        &self,
+        plan: &SelectPlan,
+        mut rows: Vec<ExecRow>,
+        env: &Env<'_>,
+        offset: usize,
+        limit: Option<usize>,
+        mut sink: Option<&mut RowSink<'_>>,
+    ) -> Result<ResultSet> {
         // Window functions run over the rows a `GROUP BY` already folded (or
         // the plain joined rows, for a non-aggregate query) — after
         // `WHERE`/`GROUP BY`/`HAVING`, before `DISTINCT`/`ORDER BY`/`LIMIT`
@@ -6554,7 +6596,7 @@ impl Engine {
     fn stream_aggregate(
         &self,
         plan: &SelectPlan,
-        stream: RowStream<'_>,
+        input: AggregateInput<'_>,
         env: &Env<'_>,
     ) -> Result<Vec<ExecRow>> {
         /// What one aggregate holds for one group while the stream runs.
@@ -6601,139 +6643,223 @@ impl Engine {
             slots: Vec<Slot>,
         }
 
-        let slots = plan.aggregates.len();
-        let collations: Rc<[Collation]> = plan.group_collations.as_slice().into();
-        let mut groups: GroupTable<Accumulator> = GroupTable::new();
-        let budget = self.options.query_memory_bytes;
-        let mut held = 0usize;
+        /// The per-row fold, written once over [`AggregateCells`] so a row
+        /// that arrives as owned `Value`s and one that arrives as cells
+        /// borrowed from its bytes take the same path: same key, same probe,
+        /// same `AggFold::step`. What differs is only where a cell is read
+        /// from — and that a borrowed row which lands in an existing group is
+        /// never materialised at all.
+        struct Folder<'p, 'e, 'v> {
+            plan: &'p SelectPlan,
+            env: &'e Env<'v>,
+            groups: GroupTable<Accumulator>,
+            collations: Rc<[Collation]>,
+            /// One key, refilled per row and reused. Most rows land in a
+            /// group that already exists — that is what grouping *is*, a
+            /// hundred thousand rows into a hundred groups — and such a row
+            /// allocates nothing to find its group: the probe is this buffer,
+            /// cleared and refilled, and the collations are one `Rc` held for
+            /// the whole loop rather than a refcount bump per row. Only a row
+            /// that opens a new group materialises an owned key, and it does
+            /// so by *taking* this buffer rather than copying it, so a key is
+            /// built once per group and never per row.
+            probe: GroupKey,
+            held: usize,
+            budget: usize,
+        }
 
-        // One key, refilled per row and reused. Most rows land in a group that
-        // already exists — that is what grouping *is*, a hundred thousand rows
-        // into a hundred groups — and such a row now allocates nothing to find
-        // its group: the probe is this buffer, cleared and refilled, and the
-        // collations are one `Rc` held for the whole loop rather than a
-        // refcount bump per row. Only a row that opens a new group materialises
-        // an owned key, and it does so by *taking* this buffer rather than
-        // copying it, so a key is built once per group and never per row.
-        let mut probe = GroupKey {
-            values: Vec::with_capacity(plan.group_by.len()),
-            collations: Rc::clone(&collations),
-        };
-
-        for row in stream {
-            let row = row?;
-            self.interrupt.check()?;
-
-            probe.values.clear();
-            for expr in &plan.group_by {
-                probe
-                    .values
-                    .push(eval::evaluate(expr, &row.values, Computed::NONE, env)?);
-            }
-
-            // One hash, one probe, and on a miss the bucket the probe ended
-            // at is where the new group goes: a row that opens a group no
-            // longer descends twice, which the ordered map could not avoid.
-            let hash = hash_group_key(&probe.values, &collations);
-            let index = match groups.find(hash, &probe) {
-                Ok(index) => index,
-                Err(bucket) => {
-                    // A new group keeps this row, because the first row of a
-                    // group is the representative the collecting path projects
-                    // non-aggregate expressions from.
-                    held = held.saturating_add(
-                        row.values
-                            .iter()
-                            .map(|value| value.heap_bytes())
-                            .sum::<usize>(),
-                    );
-                    // The probe *becomes* the stored key rather than being
-                    // copied into one, so a group's key and the probe later
-                    // rows are compared against are the same construction,
-                    // collations included — the hash and the comparison both
-                    // read the collations, so a key whose collations differed
-                    // from the probe's would group one way and search another.
-                    let key = core::mem::replace(
-                        &mut probe,
-                        GroupKey {
-                            values: Vec::with_capacity(plan.group_by.len()),
-                            collations: Rc::clone(&collations),
-                        },
-                    );
-                    groups.insert_at(
-                        bucket,
-                        hash,
-                        key,
-                        Accumulator {
-                            id: row.id,
-                            representative: row.values.clone(),
-                            slots: plan.aggregates.iter().map(Slot::new).collect(),
-                        },
-                    )
+        impl Folder<'_, '_, '_> {
+            fn step<C: AggregateCells + ?Sized>(
+                &mut self,
+                id: crate::traits::RowId,
+                cells: &C,
+            ) -> Result<()> {
+                let plan = self.plan;
+                let env = self.env;
+                self.probe.values.clear();
+                for expr in &plan.group_by {
+                    self.probe.values.push(cells.eval(expr, env)?);
                 }
-            };
-            let group = groups.value_mut(index);
 
-            for (slot, aggregate) in plan.aggregates.iter().enumerate() {
-                // `FILTER (WHERE ...)` narrows what this aggregate folds and
-                // nothing else, exactly as it does on the collecting path —
-                // including for `COUNT(*)`, which is why it runs before the
-                // count rather than after it.
-                if let Some(filter) = &aggregate.filter {
-                    if !eval::is_truthy(&eval::evaluate(filter, &row.values, Computed::NONE, env)?)
-                    {
-                        continue;
+                // One hash, one probe, and on a miss the bucket the probe
+                // ended at is where the new group goes: a row that opens a
+                // group no longer descends twice, which the ordered map could
+                // not avoid.
+                let hash = hash_group_key(&self.probe.values, &self.collations);
+                let index = match self.groups.find(hash, &self.probe) {
+                    Ok(index) => index,
+                    Err(bucket) => {
+                        // A new group keeps this row, because the first row of
+                        // a group is the representative the collecting path
+                        // projects non-aggregate expressions from. This is the
+                        // one place a row is materialised.
+                        let representative = cells.to_owned_row();
+                        self.held = self.held.saturating_add(
+                            representative
+                                .iter()
+                                .map(|value| value.heap_bytes())
+                                .sum::<usize>(),
+                        );
+                        // The probe *becomes* the stored key rather than being
+                        // copied into one, so a group's key and the probe
+                        // later rows are compared against are the same
+                        // construction, collations included — the hash and
+                        // the comparison both read the collations, so a key
+                        // whose collations differed from the probe's would
+                        // group one way and search another.
+                        let key = core::mem::replace(
+                            &mut self.probe,
+                            GroupKey {
+                                values: Vec::with_capacity(plan.group_by.len()),
+                                collations: Rc::clone(&self.collations),
+                            },
+                        );
+                        self.groups.insert_at(
+                            bucket,
+                            hash,
+                            key,
+                            Accumulator {
+                                id,
+                                representative,
+                                slots: plan.aggregates.iter().map(Slot::new).collect(),
+                            },
+                        )
                     }
-                }
-                let Some(arg) = &aggregate.arg else {
-                    // `COUNT(*)` has nothing to evaluate.
-                    if let Slot::Rows(count) = &mut group.slots[slot] {
-                        *count += 1;
-                    }
-                    continue;
                 };
-                let value = eval::evaluate(arg, &row.values, Computed::NONE, env)?;
-                match &mut group.slots[slot] {
-                    Slot::Folding(fold) => {
-                        // Re-read rather than added to: `MIN`/`MAX` *replaces*
-                        // its running value, so the ceiling has to charge for
-                        // the one it now holds and not for every one it ever
-                        // held. Everything else here owns no heap at all.
-                        let before = fold.heap_bytes();
-                        fold.step(value)?;
-                        held = held
-                            .saturating_sub(before)
-                            .saturating_add(fold.heap_bytes());
-                    }
-                    Slot::Collecting(values) => {
-                        held =
-                            held.saturating_add(value.heap_bytes() + core::mem::size_of::<Value>());
-                        values.push(value);
-                    }
-                    // A slot's shape came from this same aggregate, so a row
-                    // counter never has an argument to fold. Counted rather
-                    // than panicked on: a miscount is not worth a process.
-                    Slot::Rows(count) => *count += 1,
-                }
-            }
+                let group = self.groups.value_mut(index);
 
-            // What still grows with the input, and so still meets the same
-            // per-statement ceiling: a `GROUP BY` over many distinct keys holds
-            // one representative row per group, and a `DISTINCT` aggregate
-            // holds one value per row because it cannot know what is a
-            // duplicate until it has them all. `SUM`/`AVG`/`MIN`/`MAX` no
-            // longer do — they fold as the rows arrive, so `MIN(body)` over any
-            // number of rows holds one body — and `COUNT(*)` never did.
-            if budget > 0 && held > budget {
-                return Err(Error::Memory(alloc::format!(
-                    "this statement has to hold one row per group, and one value per row for \
-                     each DISTINCT aggregate, before it can answer, and that is past the \
-                     {budget}-byte per-statement ceiling. Narrow the `WHERE`, or raise \
-                     `EngineOptions::query_memory_bytes`. Nothing was written."
-                )));
+                for (slot, aggregate) in plan.aggregates.iter().enumerate() {
+                    // `FILTER (WHERE ...)` narrows what this aggregate folds
+                    // and nothing else, exactly as it does on the collecting
+                    // path — including for `COUNT(*)`, which is why it runs
+                    // before the count rather than after it.
+                    if let Some(filter) = &aggregate.filter {
+                        if !eval::is_truthy(&cells.eval(filter, env)?) {
+                            continue;
+                        }
+                    }
+                    let Some(arg) = &aggregate.arg else {
+                        // `COUNT(*)` has nothing to evaluate.
+                        if let Slot::Rows(count) = &mut group.slots[slot] {
+                            *count += 1;
+                        }
+                        continue;
+                    };
+                    let value = cells.eval(arg, env)?;
+                    match &mut group.slots[slot] {
+                        Slot::Folding(fold) => {
+                            // Re-read rather than added to: `MIN`/`MAX`
+                            // *replaces* its running value, so the ceiling has
+                            // to charge for the one it now holds and not for
+                            // every one it ever held. Everything else here
+                            // owns no heap at all.
+                            let before = fold.heap_bytes();
+                            fold.step(value)?;
+                            self.held = self
+                                .held
+                                .saturating_sub(before)
+                                .saturating_add(fold.heap_bytes());
+                        }
+                        Slot::Collecting(values) => {
+                            self.held = self
+                                .held
+                                .saturating_add(value.heap_bytes() + core::mem::size_of::<Value>());
+                            values.push(value);
+                        }
+                        // A slot's shape came from this same aggregate, so a
+                        // row counter never has an argument to fold. Counted
+                        // rather than panicked on: a miscount is not worth a
+                        // process.
+                        Slot::Rows(count) => *count += 1,
+                    }
+                }
+
+                // What still grows with the input, and so still meets the same
+                // per-statement ceiling: a `GROUP BY` over many distinct keys
+                // holds one representative row per group, and a `DISTINCT`
+                // aggregate holds one value per row because it cannot know
+                // what is a duplicate until it has them all. `SUM`/`AVG`/
+                // `MIN`/`MAX` no longer do — they fold as the rows arrive, so
+                // `MIN(body)` over any number of rows holds one body — and
+                // `COUNT(*)` never did.
+                if self.budget > 0 && self.held > self.budget {
+                    let budget = self.budget;
+                    return Err(Error::Memory(alloc::format!(
+                        "this statement has to hold one row per group, and one value per row \
+                         for each DISTINCT aggregate, before it can answer, and that is past \
+                         the {budget}-byte per-statement ceiling. Narrow the `WHERE`, or raise \
+                         `EngineOptions::query_memory_bytes`. Nothing was written."
+                    )));
+                }
+                Ok(())
             }
         }
 
+        let slots = plan.aggregates.len();
+        let collations: Rc<[Collation]> = plan.group_collations.as_slice().into();
+        let mut folder = Folder {
+            plan,
+            env,
+            groups: GroupTable::new(),
+            probe: GroupKey {
+                values: Vec::with_capacity(plan.group_by.len()),
+                collations: Rc::clone(&collations),
+            },
+            collations,
+            held: 0,
+            budget: self.options.query_memory_bytes,
+        };
+
+        match input {
+            AggregateInput::Rows(stream) => {
+                for row in stream {
+                    let row = row?;
+                    self.interrupt.check()?;
+                    folder.step(row.id, row.values.as_slice())?;
+                }
+            }
+            AggregateInput::Bytes {
+                source,
+                mask,
+                filter,
+            } => {
+                // One buffer for every row, parked between rows the way
+                // `DecodeFilter` parks its scratch: a row's cells borrow from
+                // that row's bytes, are folded, and are cleared before the
+                // bytes go, so a row that lands in an existing group costs no
+                // allocation at all. `park` is what makes the `'static`
+                // honest — see its doc.
+                let mut scratch: Vec<ValueRef<'static>> = Vec::new();
+                for row in source {
+                    let (id, bytes) = row?;
+                    self.interrupt.check()?;
+                    let mut cells: Vec<ValueRef<'_>> = core::mem::take(&mut scratch);
+                    let outcome = decode_row_ref_masked_into(bytes.as_slice(), mask, &mut cells)
+                        .and_then(|()| {
+                            // The `WHERE`, on the borrowed cells, before any
+                            // fold — the same test and the same three-valued
+                            // truth `DecodeFilter` applies on the general
+                            // path.
+                            if let Some(filter) = filter {
+                                let truth =
+                                    eval::evaluate_ref(filter, &cells, Computed::NONE, env)?;
+                                if !eval::is_truthy(&truth) {
+                                    return Ok(());
+                                }
+                            }
+                            folder.step(id, cells.as_slice())
+                        });
+                    scratch = park(cells);
+                    outcome?;
+                }
+            }
+        }
+
+        let Folder {
+            groups, collations, ..
+        } = folder;
+
+        let mut groups = groups;
         let width = plan.from.iter().map(|item| item.table.columns.len()).sum();
         if groups.is_empty() && plan.group_by.is_empty() {
             // No rows and no `GROUP BY` is still one group: the aggregate of
@@ -9363,6 +9489,57 @@ fn project_row(items: &[SelectItem], row: &ExecRow, env: &Env<'_>) -> Result<Vec
 /// collation question: `'Ada'` and `'ADA'` are one group under `NOCASE` and two
 /// under `BINARY`. Every key in one query shares the same slice, so this is a
 /// refcount bump per group rather than a copy per row.
+/// One row's cells as the streamed aggregate reads them.
+///
+/// Two homes for a cell, one fold: owned `Value`s off an already-decoded
+/// stream, or `ValueRef`s borrowed from the row's own bytes. The fold asks
+/// only these two things of a row — evaluate an expression against it, and
+/// materialise it if it turns out to be the first of its group — so
+/// `Engine::stream_aggregate`'s loop body is written once and never learns
+/// which it was handed.
+trait AggregateCells {
+    /// Evaluate `expr` against this row, with no aggregates or windows
+    /// computed yet — the fold runs before either exists.
+    fn eval(&self, expr: &crate::plan::Expr, env: &Env<'_>) -> Result<Value>;
+    /// This row as owned values: the group representative.
+    fn to_owned_row(&self) -> Vec<Value>;
+}
+
+impl AggregateCells for [Value] {
+    fn eval(&self, expr: &crate::plan::Expr, env: &Env<'_>) -> Result<Value> {
+        // A bare column — the common `GROUP BY n` and `SUM(n)` — is read
+        // straight off the row here; the general evaluator's answer is the
+        // same, this just spares its call and dispatch per row per
+        // expression. It is not spared the bounds check: an ordinal past the
+        // row is the same corruption whichever way it is read.
+        if let crate::plan::Expr::Column(index) = expr {
+            if let Some(value) = self.get(*index) {
+                return Ok(value.clone());
+            }
+        }
+        eval::evaluate(expr, self, Computed::NONE, env)
+    }
+
+    fn to_owned_row(&self) -> Vec<Value> {
+        self.to_vec()
+    }
+}
+
+impl AggregateCells for [ValueRef<'_>] {
+    fn eval(&self, expr: &crate::plan::Expr, env: &Env<'_>) -> Result<Value> {
+        if let crate::plan::Expr::Column(index) = expr {
+            if let Some(cell) = self.get(*index) {
+                return Ok(cell.to_owned_value());
+            }
+        }
+        eval::evaluate_ref(expr, self, Computed::NONE, env)
+    }
+
+    fn to_owned_row(&self) -> Vec<Value> {
+        self.iter().map(ValueRef::to_owned_value).collect()
+    }
+}
+
 struct GroupKey {
     values: Vec<Value>,
     collations: Rc<[Collation]>,

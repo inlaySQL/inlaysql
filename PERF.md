@@ -3139,6 +3139,149 @@ prepared one, and a cached mask that survived the clone would be indexed by
 the pre-swap ordinals — a wrong answer, not a slow one, for a couple of tenths
 of a percent. Making `ColumnMask` free to build was the cheaper half of the
 same win with none of that risk.
+### The streamed aggregate folds from the row bytes, not from a decoded row per row (AHL-528a, 2026-09-02)
+
+Profiled `bin/profile.rs --suite aggregate --rows 100000` at `d1dbe4c` (release,
+`sample` over the query phase, load 5–12/18 so shares are the evidence).
+Inclusive: **`Decode::next` 63%**, of which `walk_raw_row_values` 36.5% (the
+sweep: `scan_leaf_cells` 16%, `WalkBounds::admits` 7.9%, `FileDevice::read`
+10% because a 100k-row table is larger than the 8 MiB shared cache) and
+**`row::decode_row_masked` 19.7%** — a `Vec<Value>` per row —
+**`drop_in_place<ExecRow>` 9.6%**, `GroupTable::find` 7.3%, `run_select_to`'s
+own loop 7.3% self, `eval::evaluate` 4.6%, `skip_value` 4.4%, the allocator
+~10% in total.
+
+**Cause.** AHL-514/515 taught the aggregate to fold from the stream instead of
+holding every row, and AHL-519/520 made the fold itself allocation-free for a
+row that finds its group. What was left was the *stream*: `Decode` turned
+every row's bytes into an owned `ExecRow` — the `Vec`, a `String` for every
+wanted `TEXT` cell — handed it through the boxed iterator, and the fold
+dropped it. `SELECT n, COUNT(*) ... GROUP BY n` keeps the first row of each of
+its hundred groups; the other 99,900 were decoded and freed to be counted.
+
+**Fix.** The single-table read path hands the fold its row *bytes*
+(`exec::AggregateInput::Bytes`), and the fold decodes each row into one
+borrowed buffer it reuses — `decode_row_ref_masked_into`, parked between rows
+the way `DecodeFilter` parks its scratch — applies the `WHERE` on the
+borrowed cells exactly as `DecodeFilter` does, evaluates the group key and the
+aggregate arguments from them, and materialises the row only when it opens a
+group. Every other source — a join, a derived table, a scored retrieval, a
+`WITHOUT ROWID` table — still arrives decoded (`AggregateInput::Rows`) and
+folds exactly as before. The per-row work is written once, in `Folder::step`,
+over a two-impl `AggregateCells` trait (owned `Value`s, borrowed `ValueRef`s),
+and both go through `AggFold::step` — the one-fold rule holds. The tail of a
+blocking `SELECT` (windows, `DISTINCT`, `ORDER BY`, `OFFSET`/`LIMIT`,
+projection) became `finish_blocking`, shared by the two ways `run_select_to`
+now arrives at held rows.
+
+**Measured**, interleaved, control re-run in every repetition. The machine
+was shared with another benchmarking agent throughout (load 12–22/18 for the
+first run, 5–7 for the second), which is why there are two runs of the target
+shape and why `points` is wide.
+
+| Shape | `d1dbe4c` | AHL-528a | Verdict |
+| --- | --- | --- | --- |
+| `aggregate`, 100k rows / 100 groups, `--seconds 5` (load 12–22) | 103 / 89 / 97 ops/s | **156 / 139 / 155** | **1.5x**, 3/3, non-overlapping |
+| the same, re-run (load 5–7) | 102 / 102 / 100 | **151 / 147 / 151** | **1.48x**, 3/3, non-overlapping |
+| `aggregate`, 20k rows (fits the cache) | 531 / 515 / 534 | **797 / 823 / 815** | **1.55x**, 3/3, non-overlapping |
+| `joins`, 20k (full-scan shapes) | 45 / 47 / 45 | 48 / 42 / 46 | flat, mixed sign |
+| `indexed-range`, 20k | 66.4 / 66.1 / 62.9k | 66.6 / 61.2 / 63.5k | flat, mixed sign |
+| `points`, 20k | 1.42 / 0.77 / 1.40M | 0.90 / 0.87 / 1.65M | flat, mixed sign — contention-wide, and the point read does not touch this path |
+
+Stacked on the day: 85 ops/s at the morning's baseline (before AHL-521) to
+~150 now on this shape, 1.76x.
+
+**Pinned.** `a_bytes_fed_aggregate_agrees_with_the_decoded_stream_and_the_collected_fold`
+in `tests/cost_planner.rs` ties the three folds — bytes-fed (`FROM t`),
+decoded-stream (`FROM (SELECT * FROM t)`), collected (`GROUP_CONCAT` forces
+it) — to one answer over the aggregate shapes under six `WHERE` clauses,
+including one through a `NOCASE` column's collation. Removing the `WHERE`
+from the bytes-fed arm fails it on the first filtered shape (checked by
+mutation). Reverting the whole change to the decoded stream is behaviour-
+identical by design and passes; the profile is the only witness to that one.
+
+### A raw scan admits a whole leaf from its edge keys, not cell by cell (AHL-528b, 2026-09-02)
+
+`WalkBounds::admits` was 7.9% inclusive of the aggregate profile above: a
+prefix `memcmp` per cell against the walk's `start`, `end` and `after`, when
+for a full-table sweep nearly every leaf lies entirely inside the range.
+
+**Fix.** A leaf's keys are sorted, and the admitted set is one interval of the
+key space, so if a leaf's first and last keys are both admitted every key
+between them is. `WalkBounds::admits_whole_leaf` reads the two edge cells
+(`page::leaf_edge_keys`, held to the same header checks as the scan and using
+the same cell decoder) and `scan_leaf_into` skips the per-cell check for that
+leaf. `after` is part of the answer, not an exclusion: the leaf a 32–512-row
+batch resumes inside is still checked cell by cell, and every leaf after it in
+the batch is admitted whole. Exactly equivalent — the parity tests between
+the raw and decoded walks (`a_row_values_walk_agrees_with_the_general_walk`,
+the resumed-batch reassembly inside it) stand unchanged, and
+`a_whole_leaf_is_admitted_from_its_edges_alone` walks each bound to the edge
+in turn. Mutating the `&&` to `||` fails both.
+
+**Only the sweep takes the shortcut.** The first cut applied it to the index
+probe's leaf read too (`scan_leaf_row_ids_into`) and the joins suite said no:
+51 / 50 / 49 → 38 / 46 / 48 ops/s. A probe reads one short range inside one
+leaf per outer row, so the two edge decodes were paid per probe to answer
+"no" nearly every time. With the probe path excluded, `joins` 45 / 47 / 45 →
+49 / 43 / 44, flat.
+
+**Measured.** Alone, against the baseline, it is flat — `aggregate` 100k
+102 / 102 / 100 → 99 / 100 / 104 ops/s, mixed sign — because the per-row
+decode AHL-528a removed was hiding it. On top of AHL-528a, interleaved,
+control re-run each rep, load 4–5:
+
+| Shape | AHL-528a | + AHL-528b | Verdict |
+| --- | --- | --- | --- |
+| `aggregate`, 100k rows | 148 / 148 / 156 ops/s | **155 / 156 / 160** | 1.05x, 3/3, touching (156 vs 155) |
+| `aggregate`, 20k rows | 778 / 777 / 784 | **821 / 807 / 823** | **1.05x**, 3/3, non-overlapping |
+| `joins`, 20k | 45 / 47 / 45 | 49 / 43 / 44 | flat |
+| `indexed-range`, 20k | 66.4 / 66.1 / 62.9k | 62.2 / 66.3 / 61.0k | flat, mixed sign |
+
+Kept on the 20k row and the profile (`admits` 7.9% → 1.4% inclusive after),
+and recorded as the small one it is.
+
+### The fold reads a bare column straight off the row (AHL-528c, 2026-09-02)
+
+`GROUP BY n`, `SUM(n)`, `MIN(id)`: the group key and most aggregate arguments
+are a bare `Expr::Column`, and each went through the general evaluator's call
+and dispatch per row per expression (`eval::evaluate` 4.6% of the baseline
+profile). Both `AggregateCells` evaluators now answer that case first — a
+bounds-checked read and a clone (`to_owned_value` for a borrowed cell), the
+same answer the evaluator gives, and the same corruption error for an ordinal
+past the row, which falls through to it.
+
+**Measured** on top of AHL-528a/b, interleaved, control re-run each rep, load
+4–5:
+
+| Shape | AHL-528a+b | + AHL-528c | Verdict |
+| --- | --- | --- | --- |
+| `aggregate`, 100k rows | 155 / 156 / 160 ops/s | **161 / 170 / 167** | **1.04x**, 3/3, non-overlapping by one |
+| `aggregate`, 20k rows | 821 / 807 / 823 | **860 / 847 / 828** | **1.04x**, 3/3, non-overlapping by five |
+
+Small, and said so. No behaviour to pin beyond the tie tests, which cover it.
+
+**What is left, profiled at the end of the three** (7,257 samples, load
+4–5): `stream_aggregate`'s inlined loop 14.1% self, `pread` 10.2% and
+`memmove` 9.3% (the table does not fit the shared cache — a memory-policy
+choice this work does not touch), `decode_row_ref_masked_into` 9.2% self /
+15.0% inclusive with `skip_value` 5.7% beneath it, `scan_leaf_cells` 6.7%
+self / 16.3% inclusive, `GroupTable::find` 6.5%, `resolve_value_at` (the
+per-row `RowBuf::Shared` refcount bump) 3.2%, `hash_group_key` 2.7%. The
+allocator is no longer in the top twenty-five; `decode_row_masked`,
+`drop_in_place<ExecRow>` and the 7.9% `admits` are gone. `WalkBounds::admits`
+is 1.4%.
+
+**Not taken.** The root plan's fourth candidate — the raw scan's per-row
+`Rc` clone and `skip_value` — measures at 3.2% and 5.7% after the above. The
+`Rc` bump is the price of a `RowBuf` that outlives the leaf callback and is
+not removable without turning the batch into a callback. `skip_value` walks
+the columns the mask does not want because the row format has no column
+directory (`docs/architecture.md` D5); an early exit after the last wanted
+ordinal would spare the scalar shape three skips per row but would stop
+catching a structurally corrupt trailing column, which `decode_row_masked`'s
+doc promises it does. That is a contract change, not a perf item, and it is
+left where it is.
 
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 

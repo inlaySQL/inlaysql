@@ -2836,11 +2836,12 @@ impl<D: Device> CowBTree<D> {
         pending: bool,
         out: &mut Vec<(RowId, RowBuf)>,
     ) -> Result<()> {
+        let whole = bounds.admits_whole_leaf(shared, self.page_size)?;
         page::scan_leaf_cells(shared, self.page_size, |key, value| {
             if out.len() >= bounds.limit {
                 return Ok(());
             }
-            if !bounds.admits(key) {
+            if !whole && !bounds.admits(key) {
                 return Ok(());
             }
             let value = self.resolve_value_at(Some(shared), &value, pending)?;
@@ -2856,6 +2857,11 @@ impl<D: Device> CowBTree<D> {
         bounds: &WalkBounds<'_>,
         out: &mut Vec<RowId>,
     ) -> Result<()> {
+        // No whole-leaf shortcut here, deliberately: this is the index
+        // *probe*'s leaf read — one short range inside one leaf, per outer row
+        // of a join or per indexed `WHERE` — so the two edge decodes would be
+        // paid on every probe to answer "no" nearly every time. The sweep in
+        // `scan_leaf_into` is where a leaf is usually admitted whole.
         page::scan_leaf_cells(bytes, self.page_size, |key, _value| {
             if out.len() >= bounds.limit {
                 return Ok(());
@@ -3670,6 +3676,25 @@ impl WalkBounds<'_> {
             Some(after) => key > after,
             None => true,
         }
+    }
+
+    /// Whether every cell of the raw leaf `bytes` is admitted, decided from
+    /// its two edge keys alone.
+    ///
+    /// The admitted set is one interval of the key space — at or above
+    /// `start`, above `after`, below `end` — and a leaf's cells are stored in
+    /// key order, so if its first and last keys both fall inside that interval
+    /// every key between them does too. A scan that learns this here reads
+    /// the leaf without comparing each cell against the bounds, which for a
+    /// full-table sweep is every leaf but the two at the ends of a batch; the
+    /// per-cell `admits` was 8% of the aggregate profile before this
+    /// (`PERF.md`, AHL-528). An empty leaf has nothing to admit, and a leaf
+    /// with one cell is decided by that cell twice, both of which fall out of
+    /// the same test. `limit` is not part of the answer: the caller still
+    /// counts what it keeps.
+    fn admits_whole_leaf(&self, bytes: &[u8], page_size: usize) -> Result<bool> {
+        Ok(page::leaf_edge_keys(bytes, page_size)?
+            .is_some_and(|(first, last)| self.admits(first) && self.admits(last)))
     }
 
     /// Whether a subtree bounded above by `edge` (exclusive) can still hold a
@@ -5635,6 +5660,74 @@ mod tests {
             assert_eq!(row_id, expected_id);
             assert_eq!(value.as_slice(), expected_value.as_slice());
         }
+    }
+
+    /// A leaf is admitted whole exactly when both its edge keys are — and
+    /// only then. Each bound is pushed to the edge in turn: `start` above
+    /// the first key, `end` at the last, `after` at the first, and each one
+    /// alone has to turn the answer off, because a leaf that is skipped past
+    /// the per-cell check under any of them returns rows outside the range.
+    /// Mutating the `&&` to `||` in `admits_whole_leaf` fails this test, and
+    /// `a_row_values_walk_agrees_with_the_general_walk` with it.
+    #[test]
+    fn a_whole_leaf_is_admitted_from_its_edges_alone() {
+        let entry = |key: &[u8]| page::Entry {
+            key: page::Key::Owned(key.to_vec()),
+            value: page::ValueRef::Owned(Rc::from(&b"v"[..])),
+        };
+        let leaf = page::encode_leaf(PAGE, &[], &[entry(b"b"), entry(b"c"), entry(b"d")]).unwrap();
+        let bounds =
+            |start: &'static [u8], end: Option<&'static [u8]>, after: Option<&'static [u8]>| {
+                WalkBounds {
+                    start,
+                    end,
+                    after,
+                    limit: usize::MAX,
+                }
+            };
+
+        // Inside on both edges, with every combination of the bounds present.
+        assert!(bounds(b"a", None, None)
+            .admits_whole_leaf(&leaf, PAGE)
+            .unwrap());
+        assert!(bounds(b"b", None, None)
+            .admits_whole_leaf(&leaf, PAGE)
+            .unwrap());
+        assert!(bounds(b"b", Some(b"e"), None)
+            .admits_whole_leaf(&leaf, PAGE)
+            .unwrap());
+        assert!(bounds(b"b", Some(b"d\0"), None)
+            .admits_whole_leaf(&leaf, PAGE)
+            .unwrap());
+        assert!(bounds(b"a", Some(b"e"), Some(b"a"))
+            .admits_whole_leaf(&leaf, PAGE)
+            .unwrap());
+
+        // `start` past the first key: the first cell is out, the last in.
+        assert!(!bounds(b"c", None, None)
+            .admits_whole_leaf(&leaf, PAGE)
+            .unwrap());
+        // `end` at the last key (exclusive): the last cell is out, the first in.
+        assert!(!bounds(b"a", Some(b"d"), None)
+            .admits_whole_leaf(&leaf, PAGE)
+            .unwrap());
+        // `after` at the first key (exclusive): the resume cuts into the leaf.
+        assert!(!bounds(b"a", None, Some(b"b"))
+            .admits_whole_leaf(&leaf, PAGE)
+            .unwrap());
+        // Wholly outside, both ways.
+        assert!(!bounds(b"e", None, None)
+            .admits_whole_leaf(&leaf, PAGE)
+            .unwrap());
+        assert!(!bounds(b"a", Some(b"b"), None)
+            .admits_whole_leaf(&leaf, PAGE)
+            .unwrap());
+
+        // An empty leaf has nothing to admit whole.
+        let empty = page::encode_leaf(PAGE, &[], &[]).unwrap();
+        assert!(!bounds(b"a", None, None)
+            .admits_whole_leaf(&empty, PAGE)
+            .unwrap());
     }
 
     /// The row-values walk has to see the open transaction's uncommitted rows

@@ -740,6 +740,87 @@ fn an_aggregate_streams_to_the_same_answer_it_collects() {
     );
 }
 
+/// The aggregate now folds from three places, and all three have to agree.
+///
+/// A single stored table feeds the fold its row *bytes*, decoded per row into
+/// one reused borrowed buffer (AHL-528); a derived table feeds it decoded
+/// rows, the path every other source takes; and `GROUP_CONCAT` forces the
+/// collecting path. The bytes-fed path is the one with a new responsibility:
+/// it applies the `WHERE` itself, on borrowed cells, before anything is
+/// folded — so every shape here runs under a filter too, including one whose
+/// comparison goes through a `NOCASE` column's collation and one whose
+/// operand is the column the aggregate reads. Removing the filter from the
+/// bytes-fed arm fails this test; so does folding a borrowed cell with a
+/// different expression evaluator than the owned one.
+#[test]
+fn a_bytes_fed_aggregate_agrees_with_the_decoded_stream_and_the_collected_fold() {
+    let mut engine = aggregate_engine();
+
+    let shapes = [
+        "COUNT(*)",
+        "COUNT(n), SUM(n), AVG(r)",
+        MIXED_SUM,
+        "MIN(s), MAX(s), MIN(nc), MAX(nc)",
+        "COUNT(DISTINCT n), SUM(DISTINCT n)",
+        "COUNT(*) FILTER (WHERE n > 0), MAX(nc) FILTER (WHERE id < 4)",
+        "s, COUNT(*)",
+        "id, n, MIN(s)",
+    ];
+    let filters = [
+        "",
+        " WHERE n > 0",
+        " WHERE s IS NOT NULL",
+        " WHERE nc = 'apple'",
+        " WHERE id <> 5 AND r IS NOT NULL",
+        " WHERE n IS NULL OR g = 3",
+    ];
+
+    for projection in shapes {
+        for filter in filters {
+            for group in ["", " GROUP BY g", " GROUP BY g HAVING COUNT(*) > 1"] {
+                let from_bytes = outcome(
+                    &mut engine,
+                    &format!("SELECT {projection} FROM t{filter}{group}"),
+                );
+                let from_rows = outcome(
+                    &mut engine,
+                    &format!("SELECT {projection} FROM (SELECT * FROM t){filter}{group}"),
+                );
+                assert_eq!(
+                    from_bytes, from_rows,
+                    "bytes-fed and decoded-stream folds disagree on: \
+                     SELECT {projection} FROM t{filter}{group}"
+                );
+                assert_streamed_matches_collected(
+                    &mut engine,
+                    projection,
+                    &format!("t{filter}{group}"),
+                );
+            }
+        }
+    }
+
+    // The filter is applied to the row the fold never materialises: a `WHERE`
+    // that rejects everything leaves the ungrouped answer at its empty-input
+    // shape and the grouped answer empty, on the bytes path as on the others.
+    assert_eq!(
+        answer(
+            &mut engine,
+            "SELECT COUNT(*), SUM(n), MIN(s) FROM t WHERE n > 100"
+        ),
+        vec![vec![
+            "Integer(0)".to_string(),
+            "Null".to_string(),
+            "Null".to_string()
+        ]]
+    );
+    assert!(answer(
+        &mut engine,
+        "SELECT g, COUNT(*) FROM t WHERE n > 100 GROUP BY g"
+    )
+    .is_empty());
+}
+
 /// What the two paths agree *on*.
 ///
 /// Since they fold through one step function, a step that is wrong is wrong on
