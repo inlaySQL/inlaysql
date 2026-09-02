@@ -2048,6 +2048,75 @@ impl<D: Device> CowBTree<D> {
         Ok(out)
     }
 
+    /// Visit every leaf page whose key range can intersect `[start, end)`, in
+    /// key order, handing `f` the page's raw, undecoded bytes.
+    ///
+    /// `AHL-537`'s batch-executor prototype (`crates/inlaysql-bench/src/bin/
+    /// batch_proto.rs`) needs to run its own decode over a whole leaf at once
+    /// — a `Vec<i64>` column plus a validity bitmap, per the R3 brief — and
+    /// compare that against today's row-at-a-time loop on the *same* page
+    /// format, before anyone builds a batch executor for real. Every existing
+    /// walk above hands back rows already resolved into a [`RowBuf`] one at a
+    /// time; none hands out a leaf's bytes whole. This is that one minimal
+    /// seam, not a second production read path: internal nodes are decoded
+    /// and navigated exactly as [`CowBTree::walk_raw_row_values`] does, and
+    /// only a leaf's bytes are handed out undecoded, for the prototype to run
+    /// [`crate::btree::page::scan_leaf_cells`] over itself. A leaf at either
+    /// edge of the range may carry cells outside `[start, end)` — the same
+    /// leaf-granularity a caller of any range walk here already has to
+    /// account for — so `f` is expected to bound-check each cell's key the
+    /// way [`WalkBounds::admits`] does; the prototype does this itself rather
+    /// than gaining a second copy of that check here.
+    pub fn scan_leaves_raw(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        mut f: impl FnMut(&Rc<[u8]>) -> Result<()>,
+    ) -> Result<()> {
+        if end.is_some_and(|end| end <= start) {
+            return Ok(());
+        }
+        self.scan_leaves_raw_at(self.read_root(), start, end, self.has_pending, &mut f)
+    }
+
+    fn scan_leaves_raw_at(
+        &self,
+        id: PageId,
+        start: &[u8],
+        end: Option<&[u8]>,
+        pending: bool,
+        f: &mut impl FnMut(&Rc<[u8]>) -> Result<()>,
+    ) -> Result<()> {
+        if id == 0 {
+            return Ok(());
+        }
+        let node = self.node_at(id, pending)?;
+        match &*node {
+            Node::Leaf { bytes, .. } => f(bytes),
+            Node::Internal {
+                leftmost, cells, ..
+            } => {
+                if cells.is_empty() || start < node.key(&cells[0].key) {
+                    self.scan_leaves_raw_at(*leftmost, start, end, pending, f)?;
+                }
+                for (i, separator) in cells.iter().enumerate() {
+                    let below_upper = match end {
+                        Some(end) => node.key(&separator.key) < end,
+                        None => true,
+                    };
+                    let above_lower = match cells.get(i + 1) {
+                        Some(next) => start < node.key(&next.key),
+                        None => true,
+                    };
+                    if below_upper && above_lower {
+                        self.scan_leaves_raw_at(separator.child, start, end, pending, f)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     // -------------------------------------------------------------- internals
 
     fn write_state(&mut self) -> Result<()> {
