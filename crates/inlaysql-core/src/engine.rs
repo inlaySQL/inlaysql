@@ -32,8 +32,8 @@ use crate::collation::Collation;
 use crate::error::{Error, Result};
 use crate::eval::{self, Computed, Env, SharedRng, SubqueryRunner};
 use crate::exec::{
-    collect_bounded, Decode, DecodeFilter, ExecRow, Filter, HashJoin, HashJoinTable, IndexProbe,
-    JoinInner, NestedLoopJoin, ProbeKind, RowBytes, RowStream,
+    collect_bounded, fnv1a, mix64, Decode, DecodeFilter, ExecRow, Filter, HashJoin, HashJoinTable,
+    IndexProbe, JoinInner, NestedLoopJoin, ProbeKind, RowBytes, RowStream,
 };
 use crate::fusion::{reciprocal_rank_fusion, sort_by_score_desc};
 use crate::hnsw::VectorMetric;
@@ -6575,7 +6575,7 @@ impl Engine {
 
         let slots = plan.aggregates.len();
         let collations: Rc<[Collation]> = plan.group_collations.as_slice().into();
-        let mut groups: BTreeMap<GroupKey, Accumulator> = BTreeMap::new();
+        let mut groups: GroupTable<Accumulator> = GroupTable::new();
         let budget = self.options.query_memory_bytes;
         let mut held = 0usize;
 
@@ -6603,9 +6603,13 @@ impl Engine {
                     .push(eval::evaluate(expr, &row.values, Computed::NONE, env)?);
             }
 
-            let group = match groups.get_mut(&probe) {
-                Some(group) => group,
-                None => {
+            // One hash, one probe, and on a miss the bucket the probe ended
+            // at is where the new group goes: a row that opens a group no
+            // longer descends twice, which the ordered map could not avoid.
+            let hash = hash_group_key(&probe.values, &collations);
+            let index = match groups.find(hash, &probe) {
+                Ok(index) => index,
+                Err(bucket) => {
                     // A new group keeps this row, because the first row of a
                     // group is the representative the collecting path projects
                     // non-aggregate expressions from.
@@ -6618,11 +6622,9 @@ impl Engine {
                     // The probe *becomes* the stored key rather than being
                     // copied into one, so a group's key and the probe later
                     // rows are compared against are the same construction,
-                    // collations included. Both sides are consulted — a lookup
-                    // makes the probe the receiver of `GroupKey::cmp` and an
-                    // insertion makes the owned key the receiver — so a key
-                    // whose collations differed from the probe's would group
-                    // one way and search another.
+                    // collations included — the hash and the comparison both
+                    // read the collations, so a key whose collations differed
+                    // from the probe's would group one way and search another.
                     let key = core::mem::replace(
                         &mut probe,
                         GroupKey {
@@ -6630,13 +6632,19 @@ impl Engine {
                             collations: Rc::clone(&collations),
                         },
                     );
-                    groups.entry(key).or_insert(Accumulator {
-                        id: row.id,
-                        representative: row.values.clone(),
-                        slots: plan.aggregates.iter().map(Slot::new).collect(),
-                    })
+                    groups.insert_at(
+                        bucket,
+                        hash,
+                        key,
+                        Accumulator {
+                            id: row.id,
+                            representative: row.values.clone(),
+                            slots: plan.aggregates.iter().map(Slot::new).collect(),
+                        },
+                    )
                 }
             };
+            let group = groups.value_mut(index);
 
             for (slot, aggregate) in plan.aggregates.iter().enumerate() {
                 // `FILTER (WHERE ...)` narrows what this aggregate folds and
@@ -6703,21 +6711,27 @@ impl Engine {
             // No rows and no `GROUP BY` is still one group: the aggregate of
             // nothing. With a `GROUP BY` it is no groups, which is what an
             // empty map already means.
-            groups.insert(
-                GroupKey {
-                    values: Vec::new(),
-                    collations: Rc::clone(&collations),
-                },
-                Accumulator {
-                    id: 0,
-                    representative: alloc::vec![Value::Null; width],
-                    slots: plan.aggregates.iter().map(Slot::new).collect(),
-                },
-            );
+            let key = GroupKey {
+                values: Vec::new(),
+                collations: Rc::clone(&collations),
+            };
+            let hash = hash_group_key(&key.values, &collations);
+            if let Err(bucket) = groups.find(hash, &key) {
+                groups.insert_at(
+                    bucket,
+                    hash,
+                    key,
+                    Accumulator {
+                        id: 0,
+                        representative: alloc::vec![Value::Null; width],
+                        slots: plan.aggregates.iter().map(Slot::new).collect(),
+                    },
+                );
+            }
         }
 
         let mut out = Vec::with_capacity(groups.len());
-        for (_, group) in groups {
+        for group in groups.into_values() {
             self.interrupt.check()?;
             let Accumulator {
                 id,
@@ -6799,29 +6813,33 @@ impl Engine {
             // `quicksort`** and much of the `memmove` beside it (`PERF.md`,
             // 2026-09-01). Both servers this loses to hash-aggregate instead.
             //
-            // A `BTreeMap` makes it `O(n log g)` — 100 groups is seven
-            // comparisons per row rather than seventeen — and moves no rows at
-            // all. Ordered rather than hashed on purpose: iteration order is
-            // group-key order, which is exactly the order the sort produced, so
-            // a query with no `ORDER BY` sees the rows it saw before. Switching
-            // to a hash map would be faster still and would change that order,
-            // which is a separate decision with its own output-order argument
-            // to make (see D6's, for joins).
+            // A hash table makes it `O(n)` and moves no rows at all. Its
+            // iteration order is first-seen order, and that is not what a
+            // query without an `ORDER BY` observes anyway: `sort_rows` runs
+            // after the aggregate and orders groups by representative rowid,
+            // so the map's order survives only as the stable sort's tie-break
+            // — joined rows sharing a driving rowid, and the synthetic
+            // empty-input group. (This used to be a `BTreeMap`, kept ordered
+            // on the belief that its order was the output order; it was not,
+            // see the root plan's B4a notes, 2026-09-02.)
             let collations: Rc<[Collation]> = plan.group_collations.as_slice().into();
-            let mut buckets: BTreeMap<GroupKey, Vec<ExecRow>> = BTreeMap::new();
+            let mut buckets: GroupTable<Vec<ExecRow>> = GroupTable::new();
             for row in rows {
                 self.interrupt.check()?;
                 let mut keys = Vec::with_capacity(plan.group_by.len());
                 for expr in &plan.group_by {
                     keys.push(eval::evaluate(expr, &row.values, Computed::NONE, env)?);
                 }
-                buckets
-                    .entry(GroupKey {
-                        values: keys,
-                        collations: Rc::clone(&collations),
-                    })
-                    .or_default()
-                    .push(row);
+                let hash = hash_group_key(&keys, &collations);
+                let key = GroupKey {
+                    values: keys,
+                    collations: Rc::clone(&collations),
+                };
+                let index = match buckets.find(hash, &key) {
+                    Ok(index) => index,
+                    Err(bucket) => buckets.insert_at(bucket, hash, key, Vec::new()),
+                };
+                buckets.value_mut(index).push(row);
             }
             groups.extend(buckets.into_values());
         }
@@ -9311,21 +9329,175 @@ struct GroupKey {
 
 impl PartialEq for GroupKey {
     fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == core::cmp::Ordering::Equal
+        compare_group_keys(&self.values, &other.values, &self.collations)
+            == core::cmp::Ordering::Equal
     }
 }
 
 impl Eq for GroupKey {}
 
-impl PartialOrd for GroupKey {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
+/// The hash of a `GROUP BY` key, agreeing with [`compare_group_keys`]: two
+/// keys that compare `Equal` hash the same.
+///
+/// That agreement is the whole contract, and every arm below is one case of
+/// it. Numbers compare across classes — `1` and `1.0` are one group — so an
+/// integer hashes through the same `f64` funnel a real does, with the sign
+/// of zero normalised (`-0.0 == 0.0`) and every `NaN` folded to one pattern.
+/// The funnel is lossy above 2^53 exactly as the comparison is, which is the
+/// point: a hash more precise than the comparison would put equal keys in
+/// different groups. Text hashes what its collation *compares*, through
+/// `Collation::fold`, so `'Ada'` and `'ADA'` are one bucket under `NOCASE`
+/// and `'a'` and `'a  '` are under `RTRIM`. A vector compares by length
+/// alone, so it hashes by length alone. `NULL`s are one group.
+///
+/// One case has no consistent answer: the comparison calls `NaN` equal to
+/// every number, which no equivalence — and no hash — can honour. Under the
+/// ordered map that made a `NaN` key's group depend on insertion order;
+/// here a `NaN` forms its own group unless it collides. Both are arbitrary;
+/// this one is at least stable.
+fn hash_group_key(values: &[Value], collations: &[Collation]) -> u64 {
+    const NULL: u64 = 0x9E37_79B9_7F4A_7C15;
+    const TEXT: u64 = 0x2545_F491_4F6C_DD1D;
+    const BLOB: u64 = 0x6A09_E667_F3BC_C909;
+    const VECTOR: u64 = 0xBB67_AE85_84CA_A73B;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for (position, value) in values.iter().enumerate() {
+        let collation = crate::collation::at(collations, position);
+        let part = match value {
+            Value::Null => NULL,
+            Value::Integer(integer) => numeric_bits(*integer as f64),
+            Value::Real(real) => numeric_bits(*real),
+            Value::Text(text) => fnv1a(&collation.fold(text.as_bytes())) ^ TEXT,
+            Value::Blob(bytes) => fnv1a(bytes) ^ BLOB,
+            Value::Vector(vector) => (vector.len() as u64) ^ VECTOR,
+        };
+        hash = mix64(hash ^ part);
+    }
+    hash
+}
+
+/// The bit pattern a number hashes by: sign of zero normalised, `NaN`
+/// canonical. See [`hash_group_key`].
+fn numeric_bits(real: f64) -> u64 {
+    if real.is_nan() {
+        f64::NAN.to_bits()
+    } else {
+        (real + 0.0).to_bits()
     }
 }
 
-impl Ord for GroupKey {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        compare_group_keys(&self.values, &other.values, &self.collations)
+/// Groups found by hash and confirmed by [`compare_group_keys`], iterated in
+/// the order they were opened.
+///
+/// Open addressing over a bucket array of entry indices, linear probing, load
+/// held at or under one half; entries live in a `Vec` in insertion order and
+/// are never removed, so there is no deletion to get right. The stored hash
+/// is compared before the key is, so a full key comparison happens once per
+/// hit and almost never per collision. `alloc` only, no `unsafe`.
+///
+/// The profile that motivated this (`PERF.md`, 2026-09-02): the ordered map's
+/// `get_mut` was 10% of a `GROUP BY` over 100k rows in 100 groups, with the
+/// `mem_cmp` beneath it another 5% — seven key comparisons per row where one
+/// suffices.
+struct GroupTable<V> {
+    /// Entry index per bucket, or [`GROUP_EMPTY`].
+    buckets: Vec<u32>,
+    /// `(hash, key, value)` in the order the groups were opened.
+    entries: Vec<(u64, GroupKey, V)>,
+}
+
+/// A vacant bucket.
+const GROUP_EMPTY: u32 = u32::MAX;
+
+impl<V> GroupTable<V> {
+    fn new() -> Self {
+        Self {
+            buckets: Vec::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[inline]
+    fn bucket_of(&self, hash: u64) -> usize {
+        // The hash is already mixed; take the top bits, which are the ones
+        // the last multiply spread the most.
+        let bits = self.buckets.len().trailing_zeros();
+        (hash >> (64 - bits)) as usize
+    }
+
+    /// The entry holding `probe`, or the vacant bucket it would go in.
+    ///
+    /// The `Err` bucket is only valid until the next insertion, which may
+    /// grow the table; [`GroupTable::insert_at`] re-derives it in that case.
+    fn find(&self, hash: u64, probe: &GroupKey) -> core::result::Result<usize, usize> {
+        if self.buckets.is_empty() {
+            return Err(0);
+        }
+        let mask = self.buckets.len() - 1;
+        let mut at = self.bucket_of(hash);
+        loop {
+            let index = self.buckets[at];
+            if index == GROUP_EMPTY {
+                return Err(at);
+            }
+            let (stored_hash, key, _) = &self.entries[index as usize];
+            if *stored_hash == hash
+                && compare_group_keys(&probe.values, &key.values, &probe.collations)
+                    == core::cmp::Ordering::Equal
+            {
+                return Ok(index as usize);
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    /// Open a group at the bucket [`GroupTable::find`] returned, or wherever
+    /// it lands after the table has grown. Returns the entry index.
+    fn insert_at(&mut self, bucket: usize, hash: u64, key: GroupKey, value: V) -> usize {
+        let index = self.entries.len();
+        let bucket = if self.buckets.is_empty() || (index + 1) * 2 > self.buckets.len() {
+            self.grow();
+            self.vacant_bucket(hash)
+        } else {
+            bucket
+        };
+        self.buckets[bucket] = index as u32;
+        self.entries.push((hash, key, value));
+        index
+    }
+
+    fn vacant_bucket(&self, hash: u64) -> usize {
+        let mask = self.buckets.len() - 1;
+        let mut at = self.bucket_of(hash);
+        while self.buckets[at] != GROUP_EMPTY {
+            at = (at + 1) & mask;
+        }
+        at
+    }
+
+    fn grow(&mut self) {
+        let capacity = (self.buckets.len() * 2).max(64);
+        self.buckets = alloc::vec![GROUP_EMPTY; capacity];
+        for (index, (hash, _, _)) in self.entries.iter().enumerate() {
+            let at = self.vacant_bucket(*hash);
+            self.buckets[at] = index as u32;
+        }
+    }
+
+    fn value_mut(&mut self, index: usize) -> &mut V {
+        &mut self.entries[index].2
+    }
+
+    fn into_values(self) -> impl Iterator<Item = V> {
+        self.entries.into_iter().map(|(_, _, value)| value)
     }
 }
 
@@ -9716,6 +9888,125 @@ fn needed_columns(plan: &SelectPlan) -> ColumnMask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every pair `compare_group_keys` calls `Equal` hashes the same — the
+    /// one contract `hash_group_key` has — checked on the pairs where the
+    /// two could most plausibly disagree.
+    #[test]
+    fn group_key_hash_agrees_with_group_key_comparison() {
+        use crate::value::Text;
+        let text = |s: &str| Value::Text(Text::from(s));
+        let same = |a: Value, b: Value, collation: Collation| {
+            let collations = [collation];
+            assert_eq!(
+                compare_group_keys(
+                    core::slice::from_ref(&a),
+                    core::slice::from_ref(&b),
+                    &collations
+                ),
+                core::cmp::Ordering::Equal,
+                "{a:?} vs {b:?} should compare equal"
+            );
+            assert_eq!(
+                hash_group_key(core::slice::from_ref(&a), &collations),
+                hash_group_key(core::slice::from_ref(&b), &collations),
+                "{a:?} vs {b:?} compare equal but hash differently"
+            );
+        };
+        let differ = |a: Value, b: Value, collation: Collation| {
+            let collations = [collation];
+            assert_ne!(
+                compare_group_keys(
+                    core::slice::from_ref(&a),
+                    core::slice::from_ref(&b),
+                    &collations
+                ),
+                core::cmp::Ordering::Equal
+            );
+            assert_ne!(
+                hash_group_key(core::slice::from_ref(&a), &collations),
+                hash_group_key(core::slice::from_ref(&b), &collations),
+                "{a:?} vs {b:?} should not collide"
+            );
+        };
+        same(Value::Integer(1), Value::Real(1.0), Collation::Binary);
+        same(Value::Real(0.0), Value::Real(-0.0), Collation::Binary);
+        same(Value::Integer(0), Value::Real(-0.0), Collation::Binary);
+        same(Value::Null, Value::Null, Collation::NoCase);
+        same(
+            Value::Integer(1 << 53 | 1),
+            Value::Real((1u64 << 53) as f64),
+            Collation::Binary,
+        );
+        same(text("Ada"), text("ADA"), Collation::NoCase);
+        same(text("a"), text("a   "), Collation::RTrim);
+        same(
+            Value::Vector(alloc::vec![1.0, 2.0]),
+            Value::Vector(alloc::vec![3.0, 4.0]),
+            Collation::Binary,
+        );
+        same(
+            Value::Real(f64::NAN),
+            Value::Real(-f64::NAN),
+            Collation::Binary,
+        );
+        differ(text("Ada"), text("ADA"), Collation::Binary);
+        differ(text("a"), text("a "), Collation::Binary);
+        differ(text("1"), Value::Integer(1), Collation::Binary);
+        differ(text("ab"), Value::Blob(b"ab".to_vec()), Collation::Binary);
+        differ(Value::Integer(1), Value::Integer(2), Collation::Binary);
+        // Positional: the same values in the other order are another key.
+        let collations = [Collation::Binary, Collation::Binary];
+        assert_ne!(
+            hash_group_key(&[Value::Integer(1), Value::Integer(2)], &collations),
+            hash_group_key(&[Value::Integer(2), Value::Integer(1)], &collations)
+        );
+    }
+
+    /// The table finds what it stored across growth, keeps first-seen order,
+    /// and never confuses two keys whose hashes collide.
+    #[test]
+    fn the_group_table_survives_growth_and_hash_collisions() {
+        let collations: Rc<[Collation]> = [Collation::NoCase].as_slice().into();
+        let key = |n: i64| GroupKey {
+            values: alloc::vec![Value::Integer(n)],
+            collations: Rc::clone(&collations),
+        };
+        let mut table: GroupTable<i64> = GroupTable::new();
+        for n in 0..5_000 {
+            // Deliberately only 16 distinct hashes, so probe runs are long
+            // and the key comparison is what separates entries.
+            let probe = key(n % 1_000);
+            let hash = ((n % 1_000) % 16) as u64;
+            match table.find(hash, &probe) {
+                Ok(index) => *table.value_mut(index) += 1,
+                Err(bucket) => {
+                    table.insert_at(bucket, hash, probe, 1);
+                }
+            }
+        }
+        assert_eq!(table.len(), 1_000);
+        for n in 0..1_000 {
+            let index = table
+                .find((n % 16) as u64, &key(n))
+                .expect("every key was inserted");
+            assert_eq!(table.entries[index].2, 5);
+        }
+        let opened: Vec<i64> = table
+            .entries
+            .iter()
+            .map(|(_, k, _)| match k.values[0] {
+                Value::Integer(n) => n,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            opened,
+            (0..1_000).collect::<Vec<_>>(),
+            "not first-seen order"
+        );
+        assert_eq!(table.into_values().sum::<i64>(), 5_000);
+    }
     use alloc::vec;
     use alloc::vec::Vec;
     use core::cmp::Ordering;
