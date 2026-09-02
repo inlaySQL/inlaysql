@@ -938,10 +938,10 @@ impl<D: Device> CowBTree<D> {
         // the bound on that side exactly as its own parent left it, so most
         // levels touch neither: kept this way, a descent that never reaches
         // `retain_cursor` (every write, and every probe once `reseek` starts
-        // hitting) allocates nothing for it. Only whichever bound is still
-        // active once a leaf is actually reached gets cloned, in
-        // `retain_cursor` — at most two small clones no matter how deep the
-        // tree is, not one pair per level.
+        // hitting) allocates nothing for it. Whichever bound is still active
+        // once a leaf is actually reached is kept in that same form by
+        // `retain_cursor` — two refcount bumps, no key bytes copied, no
+        // matter how deep the tree is.
         let mut low_source: Option<(Rc<Node>, usize)> = None;
         let mut high_source: Option<(Rc<Node>, usize)> = None;
         loop {
@@ -1068,8 +1068,9 @@ impl<D: Device> CowBTree<D> {
 
     /// Retain `leaf` — reached under `root`, with its key span still named by
     /// `low_source`/`high_source` — as the cursor to reseek from next time,
-    /// replacing whatever was there. This is the one place the span's key
-    /// bytes are actually cloned, at most once per side.
+    /// replacing whatever was there. The span's bytes are not copied: each
+    /// side is kept as the [`BoundSource`] naming the separator it came from,
+    /// so a point lookup that walks from the root allocates nothing here.
     ///
     /// Best-effort: if the cursor is somehow already borrowed, the retained
     /// leaf is simply not updated rather than panic — the next lookup falls
@@ -1081,8 +1082,8 @@ impl<D: Device> CowBTree<D> {
         low_source: Option<(Rc<Node>, usize)>,
         high_source: Option<(Rc<Node>, usize)>,
     ) {
-        let low = bound_key(low_source);
-        let high = bound_key(high_source);
+        let low = BoundSource::new(low_source);
+        let high = BoundSource::new(high_source);
         if let Ok(mut slot) = self.cursor.try_borrow_mut() {
             *slot = Some(ReadCursor {
                 root,
@@ -3698,26 +3699,78 @@ struct ReadCursor {
     /// Inclusive lower bound of the key span `leaf` answers for — the
     /// cumulative bound [`CowBTree::get_from`] tracked while descending to
     /// it, not just its immediate parent's. `None` is unbounded.
-    low: Option<Vec<u8>>,
+    low: Option<BoundSource>,
     /// Exclusive upper bound, on the same terms.
-    high: Option<Vec<u8>>,
+    high: Option<BoundSource>,
 }
 
 impl ReadCursor {
     /// Whether `key` falls inside `leaf`'s span, and so is guaranteed to
     /// resolve on `leaf` — found or not — without walking from the root.
+    ///
+    /// A bound that will not resolve is treated as "cannot answer" rather than
+    /// as unbounded: refusing the reseek only costs a descent from the root,
+    /// while widening the span would answer from the wrong leaf.
     fn admits(&self, key: &[u8]) -> bool {
         if let Some(low) = &self.low {
-            if key < low.as_slice() {
-                return false;
+            match low.key() {
+                Some(low) if key >= low => {}
+                _ => return false,
             }
         }
         if let Some(high) = &self.high {
-            if key >= high.as_slice() {
-                return false;
+            match high.key() {
+                Some(high) if key < high => {}
+                _ => return false,
             }
         }
         true
+    }
+}
+
+/// One edge of a retained point cursor's span, held as the separator that
+/// defines it rather than as a copy of its bytes.
+///
+/// [`CowBTree::retain_cursor`] runs on every committed point lookup that walks
+/// from the root — which, for a random-key workload, is nearly every one — so
+/// the two `Vec<u8>` clones it used to make were two allocations and two frees
+/// per query for bounds that are usually compared once and then thrown away.
+/// An `Rc<Node>` bump costs neither: the node is already decoded and already
+/// shared with [`super::cache::PageCache`], and holding it only keeps a page
+/// that the cache would very likely have kept anyway. At most two internal
+/// nodes are retained at a time, no matter how deep the tree is.
+struct BoundSource {
+    /// The internal node whose cells carry the separator.
+    node: Rc<Node>,
+    /// Which of its cells. Checked in range by [`BoundSource::new`], so the
+    /// node being immutable for its lifetime keeps it in range forever.
+    idx: usize,
+}
+
+impl BoundSource {
+    /// Adopt the separator `source` names, if it names one.
+    ///
+    /// `None` — no bound on this side, or a source that does not resolve to a
+    /// separator — reads as "unbounded", exactly as [`bound_key`]'s `None`
+    /// did. [`CowBTree::get_from`] only ever records a source while looking at
+    /// an `Internal` node's own cells, so the non-separator cases are
+    /// unreachable rather than merely unlikely.
+    fn new(source: Option<(Rc<Node>, usize)>) -> Option<Self> {
+        let (node, idx) = source?;
+        match &*node {
+            Node::Internal { cells, .. } if idx < cells.len() => Some(Self { node, idx }),
+            _ => None,
+        }
+    }
+
+    /// The separator's key bytes, borrowed straight out of the retained page.
+    fn key(&self) -> Option<&[u8]> {
+        match &*self.node {
+            Node::Internal { cells, .. } => cells
+                .get(self.idx)
+                .map(|cell| cell.key.resolve(self.node.bytes())),
+            Node::Leaf { .. } => None,
+        }
     }
 }
 

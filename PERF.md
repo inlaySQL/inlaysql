@@ -3033,6 +3033,113 @@ Stacked with AHL-521/522 on the same shape: 85 → 122 ops/s since the
 morning's baseline, 1.44x, and the 10.28 ms scan-and-decode floor B4 owns is
 now the majority of what is left.
 
+### The point read stops allocating for its own bookkeeping (AHL-527, 2026-09-02)
+
+`profile --suite points --rows 20000` at `d1dbe4c`, sampled over the query
+phase (7,139 samples): `_platform_memcmp` 21.8% self, the allocator
+(`_xzm_xzone_malloc_tiny` + `_xzm_free_main` + `_malloc_zone_malloc` +
+`_free`) 18.4% self between them, and five inclusive entries that were the
+statement paying for structures it did not use —
+
+| Site | Inclusive | What it allocated |
+| --- | --- | --- |
+| `btree::tree::bound_key` | 7.5% | two `Vec<u8>` per lookup, for the retained cursor's span |
+| `drop_in_place<Option<ReadCursor>>` | 1.4% | freeing the previous lookup's pair |
+| `engine::needed_columns` | 2.4% | `vec![false; width]`, plus a second from `ColumnMask::slice` |
+| `eval::Env::new` | 1.6% | `Rc<RefCell<BTreeMap>>` for a subquery memo the query has no subquery for |
+| `SystemClock::now_micros` | 2.2% | nothing — a clock call on a statement that cannot observe the time |
+
+`SELECT body FROM kv WHERE id = ?` over random keys reseeks successfully
+almost never (20k rows, one leaf's worth of them per hit), so nearly every
+lookup walks from the root and pays `retain_cursor` on the way out. That made
+the first two rows of that table a per-query malloc/free pair each.
+
+**Four fixes, all of them the same shape: stop building the thing eagerly.**
+
+1. **`ReadCursor`'s span is the separator, not a copy of it.** A new
+   `BoundSource` holds `(Rc<Node>, index)` — the internal node the bound came
+   from and which of its cells — and `admits` resolves the key bytes out of the
+   retained page when it compares. `get_from` already tracked exactly that pair
+   while descending ("the internal node and the index into its cells, not the
+   key bytes themselves"); `retain_cursor` used to be where it finally copied
+   them, and now it does not. A bound that will not resolve reads as "cannot
+   answer" rather than "unbounded": refusing the reseek costs one descent,
+   widening the span would answer from the wrong leaf. Two internal nodes stay
+   alive between lookups, pages the `PageCache` was overwhelmingly likely to be
+   holding anyway.
+2. **The clock is read by whoever asks, not by every statement.** A new
+   `traits::StatementClock` wraps the injected `Clock` with the statement's
+   reading in a `Cell<Option<i64>>`. `run_refreshed` calls `begin_statement()`,
+   which only *forgets* the last reading; the first `datetime('now')` in the
+   statement is what samples, and every later one in the same statement gets
+   that same value — the `sqlite3StmtCurrentTime` property, unchanged. `Env`
+   holds the `Rc<StatementClock>` instead of an `i64`, so building one is a
+   refcount bump. Replay keeps its own path: `replay_transaction_up_to` pins
+   the logged instant before re-running, and the transaction log forces a
+   reading when it writes an entry, so a `ROLLBACK TO SAVEPOINT` still cannot
+   move a row's `'now'`.
+3. **`ColumnMask` is a bitmap.** `everything: bool` + `width` + an inline
+   `u128` + a `Vec<bool>` tail that stays empty below 128 columns. `none()`
+   and `slice()` were the two allocations `needed_columns` made per statement
+   for a two-column table; below 128 columns neither allocates now, and
+   `wants()` on the decode walk is a shift and a test rather than a bounds
+   check. Above 128 the spill keeps the old behaviour.
+4. **`Env`'s subquery memo is built on first use.** `OnceCell<SubqueryMemo>`,
+   initialised by the first `Env::memo()` call — which only the subquery
+   evaluator and a nested environment make. A statement without a subquery
+   never allocates the map or the `Rc` around it.
+
+**What the profile says afterwards** (same command, 6,706 samples):
+`bound_key`, `drop_in_place<Option<ReadCursor>>`, `needed_columns`,
+`Env::new` and `now_micros` are all gone from the inclusive table — not
+smaller, absent. Allocator self time 18.4% → 17.0%, and the work that
+remains under `get_from` is the descent itself: `memcmp` is now 28.5% self,
+a bigger share of a smaller whole.
+
+What is left allocating is the answer itself: `drop_in_place<ResultSet>` at
+9.2% and `ValueRef::to_owned_value` at 2.1% are the `Vec<Vec<Value>>` and the
+`String` for `body` that `query_prepared` hands the caller. That is the public
+API's cost, not the statement's bookkeeping, and it does not come off without
+a borrowing result API. So the honest claim is narrower than the ticket's
+title: the point read no longer allocates for *itself*, only for what it
+returns.
+
+**Measured**, interleaved against `d1dbe4c`, control re-run every repetition,
+`--rows 20000 --seconds 4`, load 3.2–7.0:
+
+| Suite | `d1dbe4c` (ops/s) | AHL-527 | Verdict |
+| --- | --- | --- | --- |
+| `points` | 1.68 / 1.62 / 1.52 / 1.43 / 1.49 / 1.48 / 1.42 / 1.57M | **2.13 / 1.85 / 1.85 / 1.83 / 1.77 / 1.67 / 1.92 / 1.92M** | **1.23x**, 8/8 |
+| `indexed` | 434 / 437 / 440 / 417 / 434k | 440 / 455 / 446 / 439 / 389k | flat, 4/5 |
+| `indexed-range` | 63.2 / 57.6 / 70.2 / 66.2 / 68.0k | 63.3 / 70.4 / 69.1 / 68.9 / 68.1k | flat, mixed sign |
+| `joins-limit` | 133 / 132 / 135 / 134 / 123k | 136 / 138 / 139 / 138 / 125k | +2–3%, 5/5 |
+
+The first `points` A/B of the session was mixed sign and looked like nothing;
+it was taken while a DST sweep was running on the same machine. Re-run once
+the machine was quiet it is 8/8, with the two ranges touching only at their
+edges. That is the discipline section 6 asks for, failed once and then obeyed:
+a mixed-sign result on a loaded machine is not evidence of flat, it is absence
+of evidence.
+
+**Tests.** `only_a_statement_that_asks_for_the_time_reads_the_clock`
+(`crates/inlaysql-core/tests/nondeterminism.rs`) injects a clock that counts
+its reads: sixteen point reads must not move the counter, and three time
+functions in one statement must move it exactly once and agree. Mutation-checked
+— forcing a reading in `run_refreshed` fails it.
+`a_mask_wider_than_its_inline_word_still_answers_per_ordinal` (`row.rs`) walks
+the seam at ordinal 128 in both directions; mutation-checked with an
+off-by-one in `add`'s spill index. The cursor and memo changes have no
+observable behaviour to pin — they are covered by the existing reseek and
+subquery tests, which pass unchanged, and by both DST sweeps.
+
+**Dropped:** caching `needed_columns` on the `SelectPlan` behind a
+`OnceCell`. It would have removed the walk as well as the allocations, but the
+plan `run_select_to` masks against is sometimes a *reordered clone* of the
+prepared one, and a cached mask that survived the clone would be indexed by
+the pre-swap ordinals — a wrong answer, not a slow one, for a couple of tenths
+of a percent. Making `ColumnMask` free to build was the cheaper half of the
+same win with none of that risk.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness

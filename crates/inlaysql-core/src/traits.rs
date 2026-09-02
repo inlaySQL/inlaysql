@@ -19,6 +19,7 @@
 //! slower open.
 
 use alloc::boxed::Box;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 use crate::btree::{BackupSummary, Device};
@@ -811,6 +812,84 @@ pub trait IndexFactory {
 pub trait Clock {
     /// Microseconds since an implementation-defined epoch, monotonic.
     fn now_micros(&self) -> i64;
+}
+
+/// One statement's reading of the [`Clock`], taken at most once and only if
+/// something actually asks for it.
+///
+/// Every time function in a statement must see one instant — SQLite caches the
+/// same way, in `sqlite3StmtCurrentTime` — but almost no statement contains a
+/// time function at all, and on a point read the clock call was measurable
+/// (`PERF.md`, AHL-527). So the reading is *deferred* rather than taken up
+/// front: [`StatementClock::begin_statement`] only forgets the previous one,
+/// and the first [`StatementClock::now_micros`] of the statement is what pays
+/// for it. A statement that never reads the time never reads the clock.
+///
+/// [`StatementClock::pin`] is the replay case: a statement re-run by
+/// `ROLLBACK TO SAVEPOINT` must reproduce the reading its first run captured,
+/// not sample a fresh one.
+pub struct StatementClock {
+    clock: Rc<dyn Clock>,
+    /// The reading for the statement in flight, or `None` before it is taken.
+    now: core::cell::Cell<Option<i64>>,
+}
+
+impl StatementClock {
+    /// Wrap an injected clock. No reading is taken here.
+    pub fn new(clock: Rc<dyn Clock>) -> Self {
+        Self {
+            clock,
+            now: core::cell::Cell::new(None),
+        }
+    }
+
+    /// The clock underneath, for a host that wants the same time source.
+    pub fn clock(&self) -> &dyn Clock {
+        self.clock.as_ref()
+    }
+
+    /// This statement's instant, sampling the clock the first time it is asked
+    /// and returning that same value for the rest of the statement.
+    pub fn now_micros(&self) -> i64 {
+        match self.now.get() {
+            Some(now) => now,
+            None => {
+                let now = self.clock.now_micros();
+                self.now.set(Some(now));
+                now
+            }
+        }
+    }
+
+    /// Start a new statement: forget the previous reading so the next ask
+    /// takes a fresh one.
+    pub fn begin_statement(&self) {
+        self.now.set(None);
+    }
+
+    /// Start a statement whose instant is already decided — a replay.
+    pub fn pin(&self, now: i64) {
+        self.now.set(Some(now));
+    }
+
+    /// A statement clock stuck at one instant, for a caller that already knows
+    /// it and has no [`Clock`] to hand.
+    pub fn fixed(now: i64) -> Self {
+        let clock = Self::new(Rc::new(FixedClock) as Rc<dyn Clock>);
+        clock.pin(now);
+        clock
+    }
+}
+
+/// The clock behind [`StatementClock::fixed`]. Never read: the reading is
+/// pinned before anything can ask, and only a `begin_statement` that never
+/// comes could unpin it.
+struct FixedClock;
+
+impl Clock for FixedClock {
+    fn now_micros(&self) -> i64 {
+        0
+    }
 }
 
 /// Why a statement was stopped before it finished.

@@ -23,7 +23,7 @@ use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::cell::{OnceCell, RefCell};
 use core::cmp::Ordering;
 
 use crate::collation::Collation;
@@ -33,7 +33,7 @@ use crate::plan::{
     AggFunc, Aggregate, BinaryOp, CastType, CompareAffinity, Expr, ScalarFunc, Subquery,
     SubqueryBody, SubqueryOp, UnaryOp,
 };
-use crate::traits::Rng;
+use crate::traits::{Rng, StatementClock};
 use crate::value::{Value, ValueRef};
 
 /// Everything an expression needs that is not the row it is evaluated over.
@@ -46,14 +46,17 @@ use crate::value::{Value, ValueRef};
 /// host. Anything else would break the deterministic simulation, where the
 /// whole point is that a workload replays byte for byte.
 ///
-/// `now_micros` is captured **once per statement**, not once per row. SQLite
-/// does the same (`sqlite3StmtCurrentTime` caches for the statement), so a
-/// query that reads `'now'` in two places sees one instant.
+/// The instant is captured **once per statement**, not once per row, and not
+/// at all unless the statement asks: SQLite does the same
+/// (`sqlite3StmtCurrentTime` caches for the statement), so a query that reads
+/// `'now'` in two places sees one instant, and a query that never mentions the
+/// time never reads the clock. See [`StatementClock`].
 pub struct Env<'a> {
     params: &'a [Value],
-    /// Microseconds since the Unix epoch, as the injected clock reported them
-    /// when the statement started.
-    now_micros: i64,
+    /// This statement's instant, deferred: the clock is read by the first time
+    /// function that asks and by nothing else. Shared with the engine that
+    /// built this environment and with every nested one, so all of them agree.
+    now: Rc<StatementClock>,
     /// Shared rather than borrowed so that an environment can be built while
     /// the engine holding the generator is borrowed mutably — which is every
     /// write statement.
@@ -67,7 +70,13 @@ pub struct Env<'a> {
     runner: Option<&'a dyn SubqueryRunner>,
     /// Uncorrelated subquery results, by [`Subquery::id`], shared with every
     /// nested environment so that one statement evaluates each of them once.
-    memo: SubqueryMemo,
+    ///
+    /// Built on first use, not on construction: the map itself is empty until
+    /// a subquery is evaluated, but the `Rc` around it is a heap allocation,
+    /// and an `Env` is built once per statement — so a statement with no
+    /// subquery in it, which is nearly every statement on the hot path, used
+    /// to pay a malloc and a free for a map it never read. See [`Env::memo`].
+    memo: OnceCell<SubqueryMemo>,
     /// The current step's newly produced rows, while evaluating a recursive
     /// CTE's recursive term — what a [`crate::plan::SubqueryBody::RecursiveSelf`]
     /// reference resolves to. `None` everywhere else, including while
@@ -117,15 +126,27 @@ pub trait SubqueryRunner {
 }
 
 impl<'a> Env<'a> {
-    /// Build an environment for one statement execution.
+    /// Build an environment for one statement execution against an instant
+    /// that is already decided.
+    #[cfg(test)]
     pub fn new(params: &'a [Value], now_micros: i64, rng: SharedRng) -> Self {
+        Self::with_statement_clock(params, Rc::new(StatementClock::fixed(now_micros)), rng)
+    }
+
+    /// Build an environment whose `'now'` is `clock`'s — read lazily, at most
+    /// once, and only if the statement asks for it.
+    pub fn with_statement_clock(
+        params: &'a [Value],
+        now: Rc<StatementClock>,
+        rng: SharedRng,
+    ) -> Self {
         Self {
             params,
-            now_micros,
+            now,
             rng,
             outer: &[],
             runner: None,
-            memo: Rc::new(RefCell::new(BTreeMap::new())),
+            memo: OnceCell::new(),
             recursive_frontier: None,
         }
     }
@@ -151,11 +172,11 @@ impl<'a> Env<'a> {
     {
         Env {
             params: self.params,
-            now_micros: self.now_micros,
+            now: Rc::clone(&self.now),
             rng: Rc::clone(&self.rng),
             outer: self.outer,
             runner: self.runner,
-            memo: Rc::clone(&self.memo),
+            memo: OnceCell::from(Rc::clone(self.memo())),
             recursive_frontier: Some(frontier),
         }
     }
@@ -181,11 +202,11 @@ impl<'a> Env<'a> {
     {
         Env {
             params: self.params,
-            now_micros: self.now_micros,
+            now: Rc::clone(&self.now),
             rng: Rc::clone(&self.rng),
             outer,
             runner: self.runner,
-            memo: Rc::clone(&self.memo),
+            memo: OnceCell::from(Rc::clone(self.memo())),
             recursive_frontier: self.recursive_frontier,
         }
     }
@@ -193,6 +214,16 @@ impl<'a> Env<'a> {
     /// The bound parameters, which the planner's index-probe rules also read.
     pub fn params(&self) -> &[Value] {
         self.params
+    }
+
+    /// The statement's uncorrelated-subquery memo, created on first ask.
+    ///
+    /// Every environment that shares this statement's memo goes through here,
+    /// so the first subquery evaluated anywhere under it is what allocates the
+    /// map — and a statement without one never does.
+    fn memo(&self) -> &SubqueryMemo {
+        self.memo
+            .get_or_init(|| Rc::new(RefCell::new(BTreeMap::new())))
     }
 
     /// The next pseudo-random word, from the injected generator.
@@ -1021,7 +1052,7 @@ fn subquery_rows(
 ) -> Result<SubqueryRows> {
     let uncorrelated = query.captures.is_empty();
     if uncorrelated {
-        if let Some(cached) = env.memo.borrow().get(&query.id) {
+        if let Some(cached) = env.memo().borrow().get(&query.id) {
             return Ok(Rc::clone(cached));
         }
     }
@@ -1043,7 +1074,7 @@ fn subquery_rows(
     let rows = Rc::new(runner.run(&query.body, &env.nested(&captured), max_rows)?);
 
     if uncorrelated {
-        env.memo.borrow_mut().insert(query.id, Rc::clone(&rows));
+        env.memo().borrow_mut().insert(query.id, Rc::clone(&rows));
     }
     Ok(rows)
 }
@@ -2288,10 +2319,12 @@ fn call(
         | ScalarFunc::Time
         | ScalarFunc::DateTime
         | ScalarFunc::Strftime
-        | ScalarFunc::UnixEpoch => datetime::call(func, &values, env.now_micros),
-        ScalarFunc::CurrentTimestamp => datetime::call(ScalarFunc::DateTime, &[], env.now_micros),
-        ScalarFunc::CurrentDate => datetime::call(ScalarFunc::Date, &[], env.now_micros),
-        ScalarFunc::CurrentTime => datetime::call(ScalarFunc::Time, &[], env.now_micros),
+        | ScalarFunc::UnixEpoch => datetime::call(func, &values, env.now.now_micros()),
+        ScalarFunc::CurrentTimestamp => {
+            datetime::call(ScalarFunc::DateTime, &[], env.now.now_micros())
+        }
+        ScalarFunc::CurrentDate => datetime::call(ScalarFunc::Date, &[], env.now.now_micros()),
+        ScalarFunc::CurrentTime => datetime::call(ScalarFunc::Time, &[], env.now.now_micros()),
         ScalarFunc::Json => json_fn(&values[0]),
         ScalarFunc::JsonValid => Ok(json_valid_fn(&values[0])),
         ScalarFunc::JsonType => json_type_fn(&values),

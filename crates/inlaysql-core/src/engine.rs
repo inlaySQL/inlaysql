@@ -54,8 +54,8 @@ use crate::shared::SharedStorage;
 use crate::sql::{self, TableRules};
 use crate::statement::Statement;
 use crate::traits::{
-    Cancel, Clock, FullTextIndex, IndexFactory, Interrupt, Rng, RowId, RowScan, Scored, Storage,
-    VectorIndex, VectorTuning,
+    Cancel, Clock, FullTextIndex, IndexFactory, Interrupt, Rng, RowId, RowScan, Scored,
+    StatementClock, Storage, VectorIndex, VectorTuning,
 };
 use crate::value::{DataType, Value};
 
@@ -583,7 +583,6 @@ struct SavepointFrame {
 pub struct Engine {
     storage: SharedStorage,
     factory: Box<dyn IndexFactory>,
-    clock: Box<dyn Clock>,
     /// Where `random()` comes from.
     ///
     /// `inlaysql-core` cannot draw a random number itself, so this is the only
@@ -595,17 +594,21 @@ pub struct Engine {
     /// Shared rather than owned outright so that an [`Env`] can hold it while
     /// the engine is borrowed mutably, which every write statement does.
     rng: SharedRng,
-    /// The clock reading the statement in flight started from, so that every
-    /// `'now'` in one statement sees one instant — as SQLite's
-    /// `sqlite3StmtCurrentTime` does.
-    statement_now: Cell<i64>,
+    /// The injected clock, plus the statement in flight's reading of it, so
+    /// that every `'now'` in one statement sees one instant — as SQLite's
+    /// `sqlite3StmtCurrentTime` does. The reading is *deferred*: a statement
+    /// that contains no time function never takes one. Shared with every
+    /// [`Env`] built for the statement, which is why it is an [`Rc`] rather
+    /// than owned outright — an environment outlives the borrow of the engine
+    /// that made it.
+    statement_clock: Rc<StatementClock>,
     /// Where "stop this statement" is noticed.
     ///
     /// Empty unless a host installs a signal ([`Engine::set_cancel`]), and a
     /// null branch per few thousand rows when it does not — the core cannot
     /// time a statement out or hear a `KILL` on its own, so this is the seam
     /// that lets whoever can say so. Armed once per statement, beside
-    /// `statement_now`, so a deadline covers exactly one statement.
+    /// `statement_clock`, so a deadline covers exactly one statement.
     interrupt: Interrupt,
     /// Where the candidate-list size a session chose for its vector searches is
     /// read from.
@@ -860,6 +863,7 @@ impl Engine {
 
         // Seeded from the clock, which is itself injected: in the simulation
         // that is a logical counter, so the stream is reproducible.
+        let clock: Rc<dyn Clock> = Rc::from(clock);
         let seed = clock.now_micros() as u64;
         let mut engine = Engine {
             storage,
@@ -867,10 +871,9 @@ impl Engine {
             rng: Rc::new(RefCell::new(
                 Box::new(crate::mem::SeededRng::new(seed)) as Box<dyn Rng>
             )),
-            statement_now: Cell::new(0),
+            statement_clock: Rc::new(StatementClock::new(clock)),
             interrupt: Interrupt::none(),
             vector_tuning: None,
-            clock,
             catalog,
             rules: BTreeMap::new(),
             hash_join_cache: RefCell::new(None),
@@ -914,7 +917,7 @@ impl Engine {
     /// The injected clock, exposed so callers can see the same time the engine
     /// would.
     pub fn clock(&self) -> &dyn Clock {
-        self.clock.as_ref()
+        self.statement_clock.clock()
     }
 
     /// Replace the generator `random()` draws from.
@@ -974,11 +977,16 @@ impl Engine {
 
     /// The expression environment for the statement in flight.
     ///
-    /// Reads the clock once per statement rather than once per row: `'now'`
+    /// Reads the clock at most once per statement, never once per row: `'now'`
     /// must not move underneath a query, and a logical clock that ticks on
-    /// every read would make it.
+    /// every read would make it. "At most" because the reading is deferred to
+    /// the first time function that asks — see [`StatementClock`].
     fn env<'a>(&self, params: &'a [Value]) -> Env<'a> {
-        Env::new(params, self.statement_now.get(), Rc::clone(&self.rng))
+        Env::with_statement_clock(
+            params,
+            Rc::clone(&self.statement_clock),
+            Rc::clone(&self.rng),
+        )
     }
 
     /// The same environment, able to evaluate subqueries.
@@ -990,7 +998,12 @@ impl Engine {
     /// refused in the planner (`sql::reject_write_subqueries`) rather than
     /// reaching an environment that could not run it.
     pub(crate) fn read_env<'a>(&'a self, params: &'a [Value]) -> Env<'a> {
-        Env::new(params, self.statement_now.get(), Rc::clone(&self.rng)).with_subqueries(self)
+        Env::with_statement_clock(
+            params,
+            Rc::clone(&self.statement_clock),
+            Rc::clone(&self.rng),
+        )
+        .with_subqueries(self)
     }
 
     /// The row id of the last row this handle inserted *without being told the
@@ -1083,15 +1096,17 @@ impl Engine {
     /// one statement.
     fn run_refreshed(&mut self, statement: &Statement, params: &[Value]) -> Result<Outcome> {
         statement.validate(&self.catalog, params)?;
-        // One clock reading per statement, taken before anything runs, so
-        // every `'now'` inside it agrees. A replayed statement (see
-        // `rollback_to_savepoint`) must reproduce the exact reading its first
-        // run captured instead: sampling a fresh one here would let a
-        // `ROLLBACK TO SAVEPOINT` change a row that used `'now'` or similar,
-        // which is exactly the kind of divergence "replay" is supposed to
-        // rule out.
+        // At most one clock reading per statement, and it is taken by the
+        // first `'now'` that asks rather than here, so every `'now'` inside
+        // the statement agrees and a statement without one — nearly all of
+        // them — never touches the clock at all. A replayed statement (see
+        // `rollback_to_savepoint`) arrives with its instant already pinned by
+        // `replay_transaction_up_to` and must keep it: sampling a fresh one
+        // here would let a `ROLLBACK TO SAVEPOINT` change a row that used
+        // `'now'` or similar, which is exactly the kind of divergence
+        // "replay" is supposed to rule out.
         if !self.replaying {
-            self.statement_now.set(self.clock.now_micros());
+            self.statement_clock.begin_statement();
         }
         // And one arming of the cancellation signal, in the same place and for
         // the same reason: a deadline has to cover exactly one statement, and a
@@ -1149,7 +1164,10 @@ impl Engine {
             self.transaction_log.push(LoggedStatement {
                 statement: statement.clone(),
                 params: params.to_vec(),
-                now: self.statement_now.get(),
+                // Forces the reading if the statement never took one: the
+                // log entry has to name an instant for the replay to pin,
+                // and a statement that ignored the time will ignore it again.
+                now: self.statement_clock.now_micros(),
             });
         }
         if self.must_discard(statement, &outcome) {
@@ -1237,7 +1255,7 @@ impl Engine {
         }
         self.refresh_snapshot()?;
         statement.validate(&self.catalog, params)?;
-        self.statement_now.set(self.clock.now_micros());
+        self.statement_clock.begin_statement();
         self.interrupt.begin_statement();
 
         let Plan::Select(select) = statement.plan() else {
@@ -1498,7 +1516,7 @@ impl Engine {
         self.replaying = true;
         let result = (|| -> Result<()> {
             for entry in &prefix {
-                self.statement_now.set(entry.now);
+                self.statement_clock.pin(entry.now);
                 self.run_refreshed(&entry.statement, &entry.params)?;
             }
             Ok(())
@@ -3817,7 +3835,7 @@ impl Engine {
         // The same arming every statement gets, in the same place, so a host
         // that installed a deadline covers this call too — it is exactly the
         // call a host is most likely to want to put one on.
-        self.statement_now.set(self.clock.now_micros());
+        self.statement_clock.begin_statement();
         self.interrupt.begin_statement();
         let scope = match table {
             None => Reindex::Everything,

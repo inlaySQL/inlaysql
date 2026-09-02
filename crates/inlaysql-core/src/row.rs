@@ -193,6 +193,10 @@ pub fn decode_row(bytes: &[u8]) -> Result<Vec<Value>> {
     decode_row_masked(bytes, &ColumnMask::ALL)
 }
 
+/// How many ordinals fit in a mask without touching the heap. A table wider
+/// than this is possible but rare enough that the spill is the cold path.
+const INLINE_COLUMNS: usize = 128;
+
 /// Which columns of a row a statement can actually observe.
 ///
 /// The row format is a tag walk with no column directory, so "decode column 7"
@@ -210,25 +214,43 @@ pub fn decode_row(bytes: &[u8]) -> Result<Vec<Value>> {
 /// whenever it cannot enumerate what a statement reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnMask {
-    /// `true` when every column is wanted, whatever `needed` says.
+    /// `true` when every column is wanted, whatever the bits say.
     everything: bool,
-    /// Wanted-ness by ordinal. Ordinals past the end are wanted, so that a row
-    /// wider than the mask is never silently truncated to nulls.
-    needed: Vec<bool>,
+    /// How many ordinals the mask covers. Ordinals past it are wanted, so that
+    /// a row wider than the mask is never silently truncated to nulls.
+    width: usize,
+    /// Wanted-ness of the first [`INLINE_COLUMNS`] ordinals, one bit each.
+    ///
+    /// A bitmap rather than a `Vec<bool>` because a mask is built once per
+    /// statement and thrown away, and on a primary-key point read that
+    /// `alloc::vec![false; width]` (plus the one [`ColumnMask::slice`] makes)
+    /// was two mallocs and two frees for two columns' worth of information
+    /// (`PERF.md`, AHL-527).
+    inline: u128,
+    /// Ordinals from [`INLINE_COLUMNS`] up. Empty for any narrower table,
+    /// which is the only reason the inline word is worth having.
+    spilled: Vec<bool>,
 }
 
 impl ColumnMask {
     /// Decode every column. The behaviour the engine had before masks existed.
     pub const ALL: Self = Self {
         everything: true,
-        needed: Vec::new(),
+        width: 0,
+        inline: 0,
+        spilled: Vec::new(),
     };
 
     /// A mask over `width` columns that wants none of them yet.
     pub fn none(width: usize) -> Self {
         Self {
             everything: false,
-            needed: alloc::vec![false; width],
+            width,
+            inline: 0,
+            spilled: match width.checked_sub(INLINE_COLUMNS) {
+                Some(over) => alloc::vec![false; over],
+                None => Vec::new(),
+            },
         }
     }
 
@@ -242,16 +264,25 @@ impl ColumnMask {
         if self.everything {
             return;
         }
-        match self.needed.get_mut(ordinal) {
-            Some(slot) => *slot = true,
-            None => self.widen(),
+        if ordinal >= self.width {
+            self.widen();
+            return;
+        }
+        match ordinal.checked_sub(INLINE_COLUMNS) {
+            Some(over) => self.spilled[over] = true,
+            None => self.inline |= 1u128 << ordinal,
         }
     }
 
     /// Give up on narrowing and decode every column.
+    ///
+    /// Leaves the mask byte-identical to [`ColumnMask::ALL`], so equality
+    /// between a widened mask and the constant still holds.
     pub fn widen(&mut self) {
         self.everything = true;
-        self.needed = Vec::new();
+        self.width = 0;
+        self.inline = 0;
+        self.spilled = Vec::new();
     }
 
     /// Whether the mask is the trivial "everything" one.
@@ -261,7 +292,13 @@ impl ColumnMask {
 
     /// Whether column `ordinal` has to be decoded.
     pub fn wants(&self, ordinal: usize) -> bool {
-        self.everything || self.needed.get(ordinal).copied().unwrap_or(true)
+        if self.everything || ordinal >= self.width {
+            return true;
+        }
+        match ordinal.checked_sub(INLINE_COLUMNS) {
+            Some(over) => self.spilled[over],
+            None => self.inline & (1u128 << ordinal) != 0,
+        }
     }
 
     /// The mask covering ordinals `start..start + width` of a joined row,
@@ -713,6 +750,32 @@ mod tests {
         mask.add(5);
         assert!(mask.is_all());
         assert!(mask.wants(0));
+    }
+
+    /// A table wider than one inline word keeps working, and the seam between
+    /// the inline bits and the spilled tail is where an off-by-one would live.
+    #[test]
+    fn a_mask_wider_than_its_inline_word_still_answers_per_ordinal() {
+        let width = INLINE_COLUMNS * 2 + 3;
+        let mut mask = ColumnMask::none(width);
+        // The last inline ordinal, the first spilled one, and the far end.
+        for ordinal in [0, INLINE_COLUMNS - 1, INLINE_COLUMNS, width - 1] {
+            mask.add(ordinal);
+        }
+        assert!(!mask.is_all());
+        for ordinal in 0..width {
+            let wanted = matches!(ordinal, 0 | INLINE_COLUMNS)
+                || ordinal == INLINE_COLUMNS - 1
+                || ordinal == width - 1;
+            assert_eq!(mask.wants(ordinal), wanted, "ordinal {ordinal}");
+        }
+        // Ordinals past the width are wanted, never silently null.
+        assert!(mask.wants(width));
+        // And a slice that straddles the seam rebases onto the inline word.
+        let across = mask.slice(INLINE_COLUMNS - 1, 2);
+        assert!(across.wants(0));
+        assert!(across.wants(1));
+        assert!(!across.is_all());
     }
 
     /// A joined row's ordinals are offsets into the concatenation, so the mask

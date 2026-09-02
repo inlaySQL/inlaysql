@@ -16,8 +16,11 @@
 //!
 //! So these tests assert the property directly: same environment, same answer.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use inlaysql_core::mem::{LogicalClock, MemIndexFactory, MemStorage, SeededRng};
-use inlaysql_core::{Engine, Value};
+use inlaysql_core::{Clock, Engine, Value};
 
 /// An engine over the in-memory environment, with the clock started at a fixed
 /// instant and a chosen generator.
@@ -184,4 +187,81 @@ fn random_never_returns_the_value_whose_negation_is_itself() {
 
 fn alloc_debug(value: &Value) -> String {
     format!("{value:?}")
+}
+
+/// A clock that counts how many times it was read, so a test can assert not
+/// just what a statement saw but whether it looked at all.
+struct CountingClock {
+    reads: Rc<Cell<usize>>,
+}
+
+impl Clock for CountingClock {
+    fn now_micros(&self) -> i64 {
+        self.reads.set(self.reads.get() + 1);
+        // A moving value, so a statement that took two readings would show two
+        // different instants rather than accidentally agreeing.
+        self.reads.get() as i64 * 1_000_000
+    }
+}
+
+/// The clock is read once per statement *at most*, and only by a statement
+/// that asks for the time.
+///
+/// Both halves matter. Reading it eagerly on every statement put a clock call
+/// on the primary-key point read, which does not mention the time and cannot
+/// observe it (AHL-527). Reading it more than once inside one statement would
+/// let two `'now'`s in the same query disagree, which is the property
+/// `sqlite3StmtCurrentTime` exists to hold.
+#[test]
+fn only_a_statement_that_asks_for_the_time_reads_the_clock() {
+    let reads = Rc::new(Cell::new(0usize));
+    let mut engine = Engine::open(
+        Box::new(MemStorage::new()),
+        Box::new(MemIndexFactory),
+        Box::new(CountingClock {
+            reads: Rc::clone(&reads),
+        }),
+    )
+    .expect("open");
+    engine
+        .execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)", &[])
+        .unwrap();
+    engine
+        .execute("INSERT INTO kv (id, body) VALUES (1, 'a')", &[])
+        .unwrap();
+
+    // Whatever opening and populating the database cost, it is behind us.
+    let before = reads.get();
+    for _ in 0..16 {
+        assert_eq!(
+            engine
+                .query("SELECT body FROM kv WHERE id = ?", &[Value::Integer(1)])
+                .expect("query")
+                .rows
+                .len(),
+            1
+        );
+    }
+    assert_eq!(
+        reads.get(),
+        before,
+        "a point read that never mentions the time must not read the clock"
+    );
+
+    // And one that does ask reads it exactly once, however many times it asks.
+    let row = engine
+        .query(
+            "SELECT unixepoch('now'), unixepoch('now'), unixepoch(datetime('now'))",
+            &[],
+        )
+        .expect("query")
+        .rows
+        .remove(0);
+    assert_eq!(
+        reads.get(),
+        before + 1,
+        "three time functions in one statement must share one reading"
+    );
+    assert_eq!(row[0], row[1]);
+    assert_eq!(row[1], row[2]);
 }
