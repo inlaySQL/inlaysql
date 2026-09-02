@@ -103,6 +103,18 @@ impl Storage for SharedStorage {
         self.inner.borrow().scan_batch(table, after, limit)
     }
 
+    fn scan_batch_with(
+        &self,
+        table: &str,
+        after: Option<RowId>,
+        limit: usize,
+        row: &mut dyn FnMut(RowId, &[u8]) -> Result<()>,
+    ) -> Result<(usize, Option<RowId>)> {
+        self.inner
+            .borrow()
+            .scan_batch_with(table, after, limit, row)
+    }
+
     fn put_row_keyed(&mut self, table: &str, key: &[u8], bytes: &[u8]) -> Result<()> {
         self.inner.borrow_mut().put_row_keyed(table, key, bytes)
     }

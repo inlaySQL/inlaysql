@@ -263,6 +263,22 @@ impl<D: Device> Storage for TreeStorage<D> {
             .scan_prefix_row_values_raw_from(&table_prefix(table), resume, limit)
     }
 
+    /// The same raw-leaf walk as [`Storage::scan_batch`] above, into the
+    /// caller's callback instead of a `Vec` — see
+    /// `CowBTree::scan_prefix_row_values_raw_with`.
+    fn scan_batch_with(
+        &self,
+        table: &str,
+        after: Option<RowId>,
+        limit: usize,
+        row: &mut dyn FnMut(RowId, &[u8]) -> Result<()>,
+    ) -> Result<(usize, Option<RowId>)> {
+        let mut resume = RowKeyBuf::new();
+        let resume = after.map(|id| resume.key(table, id));
+        self.tree
+            .scan_prefix_row_values_raw_with(&table_prefix(table), resume, limit, row)
+    }
+
     fn put_row_keyed(&mut self, table: &str, key: &[u8], bytes: &[u8]) -> Result<()> {
         let mut full = table_prefix(table);
         full.extend_from_slice(key);

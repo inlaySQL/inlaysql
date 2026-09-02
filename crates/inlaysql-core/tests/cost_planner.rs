@@ -1,6 +1,8 @@
 //! R4's first costed access-path slice: explicit ANALYZE, safe fallback and
 //! the same choice in EXPLAIN and execution.
 
+use inlaysql_core::sim::SimDisk;
+use inlaysql_core::storage::TreeStorage;
 use inlaysql_core::{mem, Engine, Error, SharedStorage, Storage, Value};
 
 fn engine() -> Engine {
@@ -631,7 +633,23 @@ fn a_streamed_group_key_finds_the_same_groups_a_collected_one_does() {
 /// The table both aggregate tie tests run over: `NULL`s in every position that
 /// matters, three groups of two, a `NOCASE` column beside a `BINARY` one.
 fn aggregate_engine() -> Engine {
-    let mut engine = engine();
+    aggregate_engine_on(engine())
+}
+
+/// The same aggregate table on a page-backed tree, which is where the
+/// streamed aggregate's callback scan (`Storage::scan_batch_with`) actually
+/// runs; the memory backend takes the trait's collect-and-replay default.
+fn tree_aggregate_engine() -> Engine {
+    let engine = Engine::open(
+        Box::new(TreeStorage::open_on(SimDisk::new(64 * 1024 * 1024)).unwrap()),
+        Box::new(mem::MemIndexFactory),
+        Box::new(mem::LogicalClock::new()),
+    )
+    .unwrap();
+    aggregate_engine_on(engine)
+}
+
+fn aggregate_engine_on(mut engine: Engine) -> Engine {
     run(
         &mut engine,
         "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, n INTEGER, r REAL, s TEXT, \
@@ -651,6 +669,89 @@ fn aggregate_engine() -> Engine {
         );
     }
     engine
+}
+
+/// The streamed aggregate over a page-backed tree — where the rows reach the
+/// fold by callback straight from the leaf, across several resumed batches —
+/// answers what it answers over the memory backend, which replays a collected
+/// batch, and what the collected fold answers. AHL-538 moved the tree's rows
+/// out of a `Vec<(RowId, RowBuf)>` and into a callback; this is the tie at
+/// the SQL level, on the small table with every shape and filter, and on a
+/// table wide enough to be read in more than one batch.
+#[test]
+fn a_tree_backed_streamed_aggregate_agrees_with_the_memory_backed_one() {
+    let mut on_tree = tree_aggregate_engine();
+    let mut in_memory = aggregate_engine();
+
+    let shapes = [
+        "COUNT(*)",
+        "COUNT(n), SUM(n), AVG(r)",
+        MIXED_SUM,
+        "MIN(s), MAX(s), MIN(nc), MAX(nc)",
+        "COUNT(*) FILTER (WHERE n > 0), MAX(nc) FILTER (WHERE id < 4)",
+        "s, COUNT(*)",
+    ];
+    let filters = [
+        "",
+        " WHERE n > 0",
+        " WHERE nc = 'apple'",
+        " WHERE id <> 5 AND r IS NOT NULL",
+    ];
+    for projection in shapes {
+        for filter in filters {
+            for group in ["", " GROUP BY g", " GROUP BY g HAVING COUNT(*) > 1"] {
+                let sql = format!("SELECT {projection} FROM t{filter}{group}");
+                assert_eq!(
+                    outcome(&mut on_tree, &sql),
+                    outcome(&mut in_memory, &sql),
+                    "tree-backed and memory-backed folds disagree on: {sql}"
+                );
+                assert_streamed_matches_collected(
+                    &mut on_tree,
+                    projection,
+                    &format!("t{filter}{group}"),
+                );
+            }
+        }
+    }
+
+    // Wide enough for the scan to resume: the first batch is 32 rows and
+    // doubles to 512, so 1,200 rows are at least four batches.
+    for engine in [&mut on_tree, &mut in_memory] {
+        run(
+            engine,
+            "CREATE TABLE big (id INTEGER PRIMARY KEY, g INTEGER, n INTEGER, s TEXT)",
+        );
+        for id in 1..=1_200 {
+            run(
+                engine,
+                &format!(
+                    "INSERT INTO big VALUES ({id}, {}, {}, '{}')",
+                    id % 7,
+                    (id * 31) % 101 - 50,
+                    if id % 5 == 0 { "z" } else { "a" }
+                ),
+            );
+        }
+    }
+    for sql in [
+        "SELECT g, COUNT(*), SUM(n), MIN(s), MAX(n) FROM big GROUP BY g ORDER BY g",
+        "SELECT COUNT(*), SUM(n), AVG(n) FROM big",
+        "SELECT COUNT(*), MIN(id), MAX(id) FROM big WHERE s = 'z'",
+        "SELECT g, COUNT(*) FROM big WHERE n > 0 GROUP BY g HAVING COUNT(*) > 80 ORDER BY g",
+    ] {
+        assert_eq!(
+            outcome(&mut on_tree, sql),
+            outcome(&mut in_memory, sql),
+            "tree-backed and memory-backed folds disagree on: {sql}"
+        );
+    }
+    assert_streamed_matches_collected(
+        &mut on_tree,
+        "g, COUNT(*), SUM(n), MIN(s), MAX(n)",
+        "big GROUP BY g",
+    );
+    assert_streamed_matches_collected(&mut on_tree, "COUNT(*), SUM(n), AVG(n)", "big");
 }
 
 /// A `SUM` whose values arrive as integers and then as reals, in that order —

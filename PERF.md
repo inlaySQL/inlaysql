@@ -3691,6 +3691,175 @@ page, `None` for a wrong length, a miss, an offset below the data area, a
 read-only handle, and after reuse is enabled. The raw-vs-decoded parity tests
 and both DST sweeps pass unchanged.
 
+### The streamed aggregate takes its rows by callback, and stops walking at the last column it reads (AHL-538, 2026-09-03)
+
+The R3 brief (`docs/research/batch-executor-r3.md`, AHL-537) re-scoped B4's
+first slice away from the fold — 0.3–5 ns/row however it is folded — and onto
+the per-row cell scan and decode, which it measured at 46–124 ns/row
+*including* the page fetch. This is that slice: the split first, then the two
+changes the split supported, then what it did not support.
+
+**The split.** `bin/profile --suite aggregate --rows 100000` at `52c74bb`
+(main, after AHL-536), 7,260 samples, load 9–11 so shares are the evidence.
+The suite alternates `SELECT n, COUNT(*) FROM users GROUP BY n` (`n` is the
+*last* of four columns) with `SELECT COUNT(*), MIN(id), MAX(id) FROM users`
+(`id` is the first). Per row, in order of cost:
+
+| Stage | Self, summed | What it is |
+| --- | ---: | --- |
+| the fold loop | ~29% | `stream_aggregate` 14.1% self (`Folder::step` inlined, and the `RowBuf`'s `Arc` release), `GroupTable::find` 6.0%, `mem_cmp` 2.7%, `hash_group_key` 2.2%, `to_owned_value` 2.1%, `AggFold::step` 2.0% |
+| the column walk | ~19% | `decode_row_ref_masked_into` 11.8% self, `skip_value` 5.3%, `Cursor::count` 1.6% — four columns per row, wanted or not |
+| the cell iteration | ~19% | `scan_leaf_cells` 7.0% self, `decode_leaf_cell_ref` 3.6%, `get_u16` 2.0%, `trailing_row_id` 1.3%, `admits_whole_leaf` 4.7% inclusive |
+| the fetch | ~14% | `pread` 8.6%, `memmove` 5.0% (`FileDevice::read` 8.7% inclusive: the fifth of the table the 8 MiB cache does not hold) |
+| the batch plumbing | ~7% | `resolve_value_at` 4.0% (the per-row `Arc` bump into a `RowBuf::Shared`), `RowScan::next` 2.3%, `RowBytes::next` 0.6% — plus the release counted under the fold loop |
+
+So the per-row cost is not one thing. The fold loop is the largest share and
+was out of scope (it is hash, probe, and compare, not decode); of the rest,
+the column walk and the batch plumbing were the two the row format allows
+something to be done about without a format change, and the cell iteration
+and the fetch were not.
+
+**Change one: the walk stops at the last wanted column** (`row.rs`,
+`decode_row_ref_wanted_into`, `ColumnMask::walk_len`). The row format has no
+column directory (`docs/architecture.md` D5) and its values are
+length-prefixed inline, so column *k* is reached by stepping over `0..k` —
+but nothing past the last wanted column needs stepping over at all. The
+scalar shape wants ordinal 0 of four and was paying three `skip_value`s and
+three `ValueRef::Null` pushes per row for columns it would never read; the
+`GROUP BY n` shape wants ordinal 3 and gains nothing, which is why the
+suite's number moves less than the scalar shape does. `walk_len` is one
+`leading_zeros` on the mask's inline word; a row wider than the mask, or an
+`ALL` mask, walks to the end as before.
+
+*The contract this trades, and where it is gated.* `decode_row_masked`'s doc
+promises that a structurally corrupt trailing column — a `TEXT` whose length
+runs past the row — is still caught, because it walks every column. The
+wanted decode does not see such a column, so it is used **only by the
+streamed aggregate**, which folds a row and drops it and never hands it on;
+every path that returns rows keeps `decode_row_ref_masked_into` and the
+promise. The row's column count is still checked against its length, and
+every column up to the last wanted one is walked under the same checks.
+`a_corrupt_trailing_column_is_caught_by_the_full_walk_and_not_the_wanted_one`
+pins both sides of that: the full walk errors, the wanted walk answers with
+the trailing column `NULL`, and a corrupt column *at or before* the last
+wanted one fails both. `the_wanted_decode_ties_the_masked_decode_on_every_mask`
+ties the two decoders over all 64 masks of a six-column row of every type,
+and over a mask narrower than the row. Mutation-checked: dropping the
+trailing-`NULL` padding fails the tie on width; making `walk_len` always
+answer `count` fails the corruption pin.
+
+Alone, interleaved, control re-run each repetition, load 4–6: `aggregate`
+100k 167 / 169 / 173 → 174 / 172 / 178 ops/s (+3%, 3/3, touching);
+20k 943 / 974 / 973 → 982 / 1,000 / 1,005 (+3%, 3/3, non-overlapping by 8).
+Small, and expected to be: half the suite cannot use it.
+
+**Change two: the rows reach the fold by callback, not by batch**
+(`RowSink` in `tree.rs`; `Storage::scan_batch_with`; `RowScan::for_each_row`;
+`RowBytes::for_each_row`). A table scan has always been
+`Vec<(RowId, RowBuf)>` batches of 32–512 rows: `scan_leaf_into` wrapped each
+admitted cell in a `RowBuf::Shared` — an `Arc` bump on the leaf — pushed the
+forty-byte tuple into the batch, `RowScan::next` moved it back out through
+two iterator layers, and the fold released the `Arc` after decoding. For a
+consumer that reads each row once and moves on, all of that is overhead
+between the leaf and the decoder. The raw walk is now generic over a
+`RowSink`: the `Vec` sink is exactly what it was (`ScannedRow::into_buf` is
+the same `Arc::clone`), and a `RowCallback` sink hands `&[u8]` — the row's
+range of the borrowed leaf — straight to the caller and keeps nothing. Both
+sinks drive the one `walk_raw_row_values`, so they admit the same rows in
+the same order by construction, and `scan_row_values_from_cursor` learned to
+send a leaf straight to the sink when the range is known to end inside it
+and to hold-then-replay only when it has to. `Storage::scan_batch_with`
+carries it through the trait with a default that collects and replays, so
+the memory backend, the temp-table router's temp side and every other
+backend are unchanged; `TreeStorage` and `SharedStorage` override it.
+`RowScan::for_each_row` keeps the batch loop's semantics — same first size,
+same doubling, same per-batch cancellation check, a short batch is the end —
+and the streamed aggregate's `Bytes` arm is the same code inside a closure.
+No on-disk change; `FORMAT_VERSION` stays 5.
+
+*Dropped on the way: the first cut measured flat, and the profile said why.*
+`aggregate` 100k 164 / 170 / 168 vs 164 / 179 / 173, 20k 926 / 906 / 915 vs
+955 / 893 / 886 — mixed. The profile showed `Storage::scan_batch_with`, the
+*default*, above `TreeStorage::scan_batch`: the engine's storage is a
+`TempTableRouter` around the shared tree, and the router had taken the trait
+default, so the callback was fed from the same collected batch as before
+plus one more indirect call. Routing `scan_batch_with` like `scan_batch`
+turned the mixed result into the numbers below. Recorded because "a
+defaulted trait method is a fallback nobody notices" is a cheap way to
+measure nothing.
+
+**Measured**, the final binary against `52c74bb`'s, interleaved, control
+re-run every repetition, order alternated, `--seconds 5` for the 100k shape
+and `4` for the rest, two other agents benchmarking on the same machine
+(load in the notes):
+
+| Shape | `52c74bb` | AHL-538 | Verdict |
+| --- | --- | --- | --- |
+| `aggregate`, 100k rows, payload 64 (does not fit the caches) | 177 / 178 / 152 ops/s | **199 / 199 / 181** | **1.12x**, 3/3, non-overlapping by 3 (load 6–12) |
+| `aggregate`, 100k rows, `--payload 16` | 191 / 196 / 196 | **217 / 218 / 211** | **1.11x**, 3/3, non-overlapping (load 2.2–2.4) |
+| `aggregate`, 100k rows, `--payload 256` | 115 / 126 / 124 | **132 / 137 / 129** | **1.08x**, 3/3, non-overlapping by 3 (load 2.1–2.2) |
+| `aggregate`, 20k rows (fits) | 985 / 985 / 931 | **1,096 / 1,084 / 1,090** | **1.12x**, 3/3, non-overlapping (load 2.0–3.2) |
+| `joins`, 20k (full-scan shapes) | 47 / 45 / 41 | 48 / 48 / 44 | flat, +5% inside §4's floor (load 2.3–3.6) |
+| `points`, 20k | 3.23 / 3.29 / 3.27M | 3.28 / 3.18 / 3.31M | flat, mixed sign (load 2.7–2.9) |
+| `indexed-range`, 20k | 99.7 / 102.1 / 100.9k | 99.7 / 102.6 / 100.4k | flat, mixed sign (load 2.7–2.9) |
+| `joins-limit`, 20k | 160.3 / 163.9 / 161.9k | 163.3 / 163.2 / 156.8k | flat, mixed sign (load 2.4–2.9) |
+
+Two passes were thrown away and are recorded: the first `aggregate` 20k
+pass ran into a load spike to 14.5 (932 / 518 / 494 vs 758 / 744 / 576, both
+sides collapsing mid-series) and was re-run on a quieter machine, which is
+the row above; `joins` was run three times — 47 / 55 / 55 vs 45 / 55 / 35
+under the same spike, then 51 / 41 / 40 vs 43 / 42 / 48 mixed at load 3,
+then the row above. Per row, at payload 64: 5.6 ms → 5.0 ms per query,
+56 → 50 ns/row.
+
+**What the payload widths say.** The base falls 196 → 177 → 122 ops/s from
+payload 16 to 256 and the gain is a near-constant +20 ops/s at every width,
+which is what removing a fixed per-row cost looks like. The width scaling
+itself is the fetch: at payload 256 the table is ~33 MB against an 8 MiB
+cache, and `pread` + `memmove` are the frames that grow. The column walk to
+`n` is three length reads however long `body` is, so the brief's "decode
+scales with row width" was fetch, not parse — the separation the brief asked
+for before believing the 46–124 ns/row.
+
+**Profile after** (7,706 samples, 176 ops/s under load 4–6): the batch
+plumbing is gone — `resolve_value_at`, `RowScan::next` and `RowBytes::next`
+are not in the profile, and `RowCallback::push` (the one indirect call per
+row) is 3.3%; the cell iteration is 11.5% (`scan_leaf_cells` 3.3% self,
+`decode_leaf_cell_ref` 3.0%, `get_u16` 1.9%, `resolve_scanned_at` 2.2%);
+the column walk is 20.6% (`decode_row_ref_wanted_into` 10.9%,
+`decode_value_ref` 3.9%, `skip_value` 3.3%, `Cursor::count` 2.5%); the fold
+closure is 18.7% self with `GroupTable::find` 7.7%, `hash_group_key` 2.9%,
+`to_owned_value` 3.3%, `AggFold::step` 2.7% beneath it; `pread` 8.9%,
+`memmove` 3.4%. The column walk is now the largest decode-side item, and
+what is left of it is the per-row `Vec<ValueRef>` bookkeeping for a
+positional row (`clear`, `reserve`, four pushes) rather than the skips.
+
+**Not built: the leaf → column batch** (the brief's candidate (b)). The split
+does not support it on this shape: the per-row costs a batch decode would
+remove — the `RowBuf`, its `Arc`, the batch `Vec` — are the ones the callback
+sink removed for less code, and the fold's per-row hash-and-probe costs the
+same over a column vector as over a scalar. What a batch would add is a
+second decode path to keep tied to the first. It stays on the plan as the
+shape to reach for if a vectorised fold is ever justified, which this
+measurement says it is not yet.
+
+**Pinned.** `a_callback_scan_hands_out_the_rows_a_batch_returns` (`tree.rs`,
+on a commit-counting disk so the retained cursor is live) ties the callback
+walk to the batch walk row for row over the whole range, a limited batch, a
+resumed batch reassembled from the reported last id, both branches of the
+cursor path, and stops at the callback's first error. Mutation-checked:
+`RowCallback::push` forgetting `last` fails the resume; dropping the
+cursor's hold-then-replay fails the repeated short read; dropping its direct
+branch fails the repeated tail read. `a_callback_scan_hands_out_what_the_iterator_yields`
+(`traits.rs`) ties `RowScan::for_each_row` to `Iterator::next` across
+doubling batches, after a partial pull, and under an error.
+`a_tree_backed_streamed_aggregate_agrees_with_the_memory_backed_one`
+(`tests/cost_planner.rs`) ties the streamed aggregate over a page-backed
+tree — the callback path, across resumed batches on a 1,200-row table — to
+the memory backend's collect-and-replay default and to the collected fold,
+under every shape and filter the existing bytes-fed tie uses. The raw-vs-
+decoded parity tests and both DST sweeps pass unchanged.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness

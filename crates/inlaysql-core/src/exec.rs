@@ -214,6 +214,37 @@ impl<'a> RowBytes<'a> {
             interrupt,
         }
     }
+
+    /// Run `row` over every row's bytes, in the order [`Iterator::next`]
+    /// would yield them, without handing any row out.
+    ///
+    /// A scan goes through [`RowScan::for_each_row`], which is where the
+    /// saving is — the rows reach `row` straight from the leaf. A point read
+    /// and an index probe fetch each row the same way `next` does and hand
+    /// it on; they were never batched, so there is nothing to spare.
+    pub fn for_each_row(self, row: &mut dyn FnMut(RowId, &[u8]) -> Result<()>) -> Result<()> {
+        match self {
+            RowBytes::Scan(scan) => scan.for_each_row(row),
+            RowBytes::Point(point) => match point {
+                Some((id, bytes)) => row(id, bytes.as_slice()),
+                None => Ok(()),
+            },
+            RowBytes::Indexed {
+                storage,
+                table,
+                ids,
+                interrupt,
+            } => {
+                for id in ids {
+                    interrupt.check()?;
+                    if let Some(bytes) = storage.get_row(&table, id)? {
+                        row(id, bytes.as_slice())?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 impl Iterator for RowBytes<'_> {

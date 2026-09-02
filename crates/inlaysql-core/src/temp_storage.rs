@@ -106,6 +106,23 @@ impl Storage for TempTableRouter {
         }
     }
 
+    // Routed like `scan_batch`, and not left to the trait's default: the
+    // default collects through `scan_batch` and replays, which would hand the
+    // durable side's callback walk back the batch it exists to avoid.
+    fn scan_batch_with(
+        &self,
+        table: &str,
+        after: Option<RowId>,
+        limit: usize,
+        row: &mut dyn FnMut(RowId, &[u8]) -> Result<()>,
+    ) -> Result<(usize, Option<RowId>)> {
+        if self.is_temp(table) {
+            self.temp.scan_batch_with(table, after, limit, row)
+        } else {
+            self.durable.scan_batch_with(table, after, limit, row)
+        }
+    }
+
     // A `WITHOUT ROWID` temporary table is a real combination — nothing about
     // the two features conflicts — so the keyed methods route exactly like
     // the row-id ones above, by the same table name and the same flag.
