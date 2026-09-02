@@ -1035,7 +1035,7 @@ fn keys_equal(outer: &Value, inner: &Value, collation: Collation) -> bool {
 /// Measured, before this was here: a 2,000-row `REAL` join built a hash table
 /// whose keys all landed in one bucket and ran at 78 ms — indistinguishable
 /// from the `Materialise` plan it had just replaced. With the mix, 464 µs.
-fn mix64(mut z: u64) -> u64 {
+pub(crate) fn mix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
@@ -1043,7 +1043,7 @@ fn mix64(mut z: u64) -> u64 {
 
 /// FNV-1a, chosen because it is deterministic and `no_std`: the hash only has
 /// to be stable and well-spread, not cryptographic.
-fn fnv1a(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &byte in bytes {
         hash ^= byte as u64;

@@ -2992,6 +2992,46 @@ Both full shapes now run the same users-driving plan and land at ~3.3 ms —
 below the 4.82 ms `2eeced7` had, because AHL-521/522's descent and syscall
 savings apply on top. The `LIMIT` rows do not move: a `LIMIT` shape is
 never reordered.
+### `GROUP BY` finds its group by hash, not by walking an ordered map (AHL-523, 2026-09-02)
+
+The aggregate profile (above, under AHL-522) had `BTreeMap::get_mut` at
+10.0% of `SELECT n, COUNT(*) ... GROUP BY n` over 100k rows in 100 groups,
+with `eval::mem_cmp` beneath it another 4.8%: seven key comparisons per row,
+each a full `compare_values` under the column's collation, where one would do.
+The root plan's B4a notes had already established that the ordered map was
+not load-bearing for output order — `sort_rows` orders groups by
+representative rowid afterwards, and the map's order survived only as the
+stable sort's tie-break in two edge cases no test pins.
+
+**Fix.** `GroupTable` in `engine.rs`: open addressing over entry indices,
+entries in first-seen order, no deletion, load at or under one half; the
+stored hash is compared before the key is. Both aggregate paths use it, so
+the two still find the same groups. `hash_group_key` agrees with
+`compare_group_keys` by construction — that is its whole contract, and a test
+walks the pairs where the two could disagree: `1` and `1.0` are one group, so
+integers hash through the same `f64` funnel reals do (lossy above 2^53
+exactly as the comparison is); `-0.0` normalises; text hashes what its
+collation *compares*, through `Collation::fold`, so `'Ada'`/`'ADA'` share a
+bucket under `NOCASE` and `'a'`/`'a  '` under `RTRIM`; a vector compares by
+length alone and hashes by length alone; `NULL`s are one group. A miss no
+longer descends twice: the probe ends at the bucket the new group goes in.
+
+Recorded divergence: the comparison calls `NaN` equal to every number, which
+no hash can honour. Under the ordered map a `NaN` key's group depended on
+insertion order; now it forms its own group unless it collides. Both
+arbitrary; this one is stable.
+
+**Measured**, interleaved against `7b20175`, control re-run every repetition:
+
+| Shape | `7b20175` | AHL-523 | Verdict |
+| --- | --- | --- | --- |
+| `aggregate`, 100k rows / 100 groups | 110 / 108 / 110 ops/s | **122 / 128 / 116** | **1.12x**, 3/3 |
+| `aggregate`, 20k rows | 484 / 547 ops/s (one 186 outlier) | 543 / 597 / 636 | ~1.15x |
+| `points` | 1.64 / 1.68 / 1.57M | 1.75 / 1.75 / 1.48M | flat, mixed sign |
+
+Stacked with AHL-521/522 on the same shape: 85 → 122 ops/s since the
+morning's baseline, 1.44x, and the 10.28 ms scan-and-decode floor B4 owns is
+now the majority of what is left.
 
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
