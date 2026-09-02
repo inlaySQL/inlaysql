@@ -3094,6 +3094,47 @@ from the bytes-fed arm fails it on the first filtered shape (checked by
 mutation). Reverting the whole change to the decoded stream is behaviour-
 identical by design and passes; the profile is the only witness to that one.
 
+### A raw scan admits a whole leaf from its edge keys, not cell by cell (AHL-528b, 2026-09-02)
+
+`WalkBounds::admits` was 7.9% inclusive of the aggregate profile above: a
+prefix `memcmp` per cell against the walk's `start`, `end` and `after`, when
+for a full-table sweep nearly every leaf lies entirely inside the range.
+
+**Fix.** A leaf's keys are sorted, and the admitted set is one interval of the
+key space, so if a leaf's first and last keys are both admitted every key
+between them is. `WalkBounds::admits_whole_leaf` reads the two edge cells
+(`page::leaf_edge_keys`, held to the same header checks as the scan and using
+the same cell decoder) and `scan_leaf_into` skips the per-cell check for that
+leaf. `after` is part of the answer, not an exclusion: the leaf a 32–512-row
+batch resumes inside is still checked cell by cell, and every leaf after it in
+the batch is admitted whole. Exactly equivalent — the parity tests between
+the raw and decoded walks (`a_row_values_walk_agrees_with_the_general_walk`,
+the resumed-batch reassembly inside it) stand unchanged, and
+`a_whole_leaf_is_admitted_from_its_edges_alone` walks each bound to the edge
+in turn. Mutating the `&&` to `||` fails both.
+
+**Only the sweep takes the shortcut.** The first cut applied it to the index
+probe's leaf read too (`scan_leaf_row_ids_into`) and the joins suite said no:
+51 / 50 / 49 → 38 / 46 / 48 ops/s. A probe reads one short range inside one
+leaf per outer row, so the two edge decodes were paid per probe to answer
+"no" nearly every time. With the probe path excluded, `joins` 45 / 47 / 45 →
+49 / 43 / 44, flat.
+
+**Measured.** Alone, against the baseline, it is flat — `aggregate` 100k
+102 / 102 / 100 → 99 / 100 / 104 ops/s, mixed sign — because the per-row
+decode AHL-528a removed was hiding it. On top of AHL-528a, interleaved,
+control re-run each rep, load 4–5:
+
+| Shape | AHL-528a | + AHL-528b | Verdict |
+| --- | --- | --- | --- |
+| `aggregate`, 100k rows | 148 / 148 / 156 ops/s | **155 / 156 / 160** | 1.05x, 3/3, touching (156 vs 155) |
+| `aggregate`, 20k rows | 778 / 777 / 784 | **821 / 807 / 823** | **1.05x**, 3/3, non-overlapping |
+| `joins`, 20k | 45 / 47 / 45 | 49 / 43 / 44 | flat |
+| `indexed-range`, 20k | 66.4 / 66.1 / 62.9k | 62.2 / 66.3 / 61.0k | flat, mixed sign |
+
+Kept on the 20k row and the profile (`admits` 7.9% → 1.4% inclusive after),
+and recorded as the small one it is.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness

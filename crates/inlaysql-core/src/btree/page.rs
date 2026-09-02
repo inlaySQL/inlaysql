@@ -620,18 +620,32 @@ pub fn decode_leaf_cell_ref<'a>(
     }
 }
 
-/// Run `f` over every leaf cell of `bytes`, in key order, with each cell's key
-/// borrowed from the page.
+/// The first and last keys of a leaf page, borrowed from it; `None` for an
+/// empty leaf.
 ///
-/// The header checks [`decode`] performs — page length, the slot directory not
-/// overlapping the cell area — are repeated here, so a raw scan is held to the
-/// same corruption standard as a decoded one. `f` is called while `bytes` is
-/// borrowed, so it may not outlive the call.
-pub fn scan_leaf_cells<'a>(
-    bytes: &'a [u8],
-    page_size: usize,
-    mut f: impl FnMut(&'a [u8], ValueRef) -> Result<()>,
-) -> Result<()> {
+/// What a raw scan asks before it walks the cells: a leaf's keys are sorted,
+/// so when both edges fall inside a walk's bounds every cell between them does
+/// too, and the per-cell bound check can be skipped for the whole page
+/// (`CowBTree::scan_leaf_into`). Held to the same header checks
+/// [`scan_leaf_cells`] makes, and to the same cell decoder, so a page that
+/// would fail the scan fails here first.
+pub fn leaf_edge_keys(bytes: &[u8], page_size: usize) -> Result<Option<(&[u8], &[u8])>> {
+    let count = check_leaf_header(bytes, page_size)?;
+    if count == 0 {
+        return Ok(None);
+    }
+    let first = get_u16(bytes, HEADER_SIZE)? as usize;
+    let last = get_u16(bytes, HEADER_SIZE + SLOT_SIZE * (count - 1))? as usize;
+    Ok(Some((
+        decode_leaf_cell_ref(bytes, page_size, first)?.key,
+        decode_leaf_cell_ref(bytes, page_size, last)?.key,
+    )))
+}
+
+/// The header checks a raw leaf read repeats from [`decode`]: page length,
+/// and the slot directory not overlapping the cell area. Returns the cell
+/// count.
+fn check_leaf_header(bytes: &[u8], page_size: usize) -> Result<usize> {
     if bytes.len() != page_size {
         return Err(Error::Corrupt(alloc::format!(
             "page is {} bytes, expected {page_size}",
@@ -648,6 +662,22 @@ pub fn scan_leaf_cells<'a>(
             "slot directory overlaps cell area".to_string(),
         ));
     }
+    Ok(count)
+}
+
+/// Run `f` over every leaf cell of `bytes`, in key order, with each cell's key
+/// borrowed from the page.
+///
+/// The header checks [`decode`] performs — page length, the slot directory not
+/// overlapping the cell area — are repeated here, so a raw scan is held to the
+/// same corruption standard as a decoded one. `f` is called while `bytes` is
+/// borrowed, so it may not outlive the call.
+pub fn scan_leaf_cells<'a>(
+    bytes: &'a [u8],
+    page_size: usize,
+    mut f: impl FnMut(&'a [u8], ValueRef) -> Result<()>,
+) -> Result<()> {
+    let count = check_leaf_header(bytes, page_size)?;
     for i in 0..count {
         let slot = get_u16(bytes, HEADER_SIZE + SLOT_SIZE * i)? as usize;
         let cell = decode_leaf_cell_ref(bytes, page_size, slot)?;
@@ -916,6 +946,35 @@ mod tests {
                 "the two parsers disagree on a well-formed page"
             );
         }
+    }
+
+    /// The edge keys are the first and last cells, in slot order — what the
+    /// whole-leaf admission check reads instead of every cell.
+    #[test]
+    fn leaf_edge_keys_are_the_first_and_last_cells() {
+        let empty = encode_leaf(512, &[], &[]).unwrap();
+        assert_eq!(leaf_edge_keys(&empty, 512).unwrap(), None);
+
+        let one = encode_leaf(512, &[], &[entry(b"only", b"v")]).unwrap();
+        assert_eq!(
+            leaf_edge_keys(&one, 512).unwrap(),
+            Some((&b"only"[..], &b"only"[..]))
+        );
+
+        let three = encode_leaf(
+            512,
+            &[],
+            &[entry(b"a", b"1"), entry(b"b", b"2"), entry(b"c", b"3")],
+        )
+        .unwrap();
+        assert_eq!(
+            leaf_edge_keys(&three, 512).unwrap(),
+            Some((&b"a"[..], &b"c"[..]))
+        );
+
+        // Held to the scan's header checks: a page of the wrong length is
+        // refused here exactly as `scan_leaf_cells` refuses it.
+        assert!(leaf_edge_keys(&three[..511], 512).is_err());
     }
 
     /// And they must *fail* together too. A parser that accepts a corrupt page
