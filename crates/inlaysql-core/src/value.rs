@@ -300,14 +300,19 @@ impl From<Vec<f32>> for Value {
 /// variable-length ones borrowed from the row bytes they were decoded out of:
 /// `row::decode_row_ref_masked` builds these by slicing, not allocating.
 ///
-/// **This is an internal type.** It never crosses the public API —
-/// [`Value`] is what every caller of [`crate::Statement`]/[`crate::Engine`]
-/// sees, prepared or not. `ValueRef` exists for the hot read path inside
+/// This began as an internal type for the hot read path inside
 /// `exec.rs`/`eval.rs`: a row that a filter rejects can be built, tested and
-/// dropped without a single heap allocation for its text or blob columns: a
-/// [`Value`] is only materialised for a row that survives, at the point it is
-/// copied into the result — "a projected row allocates once at the
-/// boundary," in `PERF.md`'s words.
+/// dropped without a single heap allocation for its text or blob columns, and
+/// a [`Value`] is only materialised for a row that survives — "a projected row
+/// allocates once at the boundary," in `PERF.md`'s words.
+///
+/// **Since AHL-535 it also crosses the public API**, in exactly one place:
+/// [`crate::Engine::run_query_each_ref`]'s callback, where the boundary is the
+/// caller's rather than the engine's. A consumer that only reads a row can now
+/// read it without the engine allocating an owned copy first. [`Value`] is
+/// still what every other API — [`crate::Engine::run_query`],
+/// [`crate::Engine::run_query_each`], every bound parameter — hands back, and
+/// a borrowed cell is only valid for the callback call it arrived in.
 ///
 /// [`DataType::Vector`]/[`DataType::QuantizedVector`] are the deliberate
 /// exception: the row codec stores a vector as little-endian `f32` bytes, and

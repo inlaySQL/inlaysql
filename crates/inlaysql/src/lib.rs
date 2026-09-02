@@ -93,7 +93,7 @@ pub use inlaysql_core::TreeStorage;
 pub use inlaysql_core::{
     is_reserved_table_name, Cancel, Catalog, Change, ChangeKind, Changes, Collation, Column,
     ColumnInfo, DataType, Durability, Error, Index, IndexKind, Outcome, Reindexed, Result,
-    ResultSet, Stopped, Table, TableAccess, Value, VectorTuning, RESERVED_TABLE_PREFIX,
+    ResultSet, Stopped, Table, TableAccess, Value, ValueRef, VectorTuning, RESERVED_TABLE_PREFIX,
 };
 pub use statement::Statement;
 pub use storage::RedbStorage;
@@ -432,6 +432,61 @@ impl Database {
         self.check_writable_statement(statement)?;
         self.engine
             .run_query_each(statement.as_core(), params, each)
+    }
+
+    /// [`Database::query_prepared_each`], but the callback is handed
+    /// **borrowed** cells rather than owned [`Value`]s.
+    ///
+    /// This is the API SQLite's `sqlite3_step`/`sqlite3_column_*` shape
+    /// corresponds to: the engine steps a row into place and the caller reads
+    /// the columns it wants out of it, without a copy of the row being made on
+    /// the way. A [`ValueRef::Text`] is a `&str` into the page the row was
+    /// decoded from; reading it, measuring it, hashing it or writing it to a
+    /// socket allocates nothing at all. [`ValueRef::to_owned_value`] is the
+    /// explicit copy, for the columns you actually want to keep.
+    ///
+    /// [`Database::query_prepared`] and [`Database::query_prepared_each`] are
+    /// unchanged and still right for a caller that wants the whole answer, or
+    /// wants owned values without thinking about lifetimes.
+    ///
+    /// A single stored table with `WHERE`, `LIMIT` and `OFFSET`, projected as
+    /// bare columns, runs a pipeline that allocates nothing per row. Every
+    /// other shape — `ORDER BY`, `GROUP BY`, `DISTINCT`, windows, joins,
+    /// derived tables, retrieval scoring, and projections holding an
+    /// expression — **falls back to the owned path** and borrows out of the
+    /// row it built, because those operators cannot emit a row before they
+    /// have seen the whole input. Same rows, same order, either way; only the
+    /// allocations differ. See [`inlaysql_core::Engine::run_query_each_ref`].
+    ///
+    /// Read-only statements only, for the same reason
+    /// [`Database::query_prepared_each`] refuses writes.
+    ///
+    /// ```
+    /// use inlaysql::{Database, Value};
+    ///
+    /// let mut db = Database::open_in_memory()?;
+    /// db.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)", &[])?;
+    /// db.execute("INSERT INTO kv VALUES (1, 'one'), (2, 'two')", &[])?;
+    /// let query = db.prepare("SELECT id, body FROM kv WHERE id >= ?")?;
+    ///
+    /// // Reading every row's text costs no allocation at all.
+    /// let mut bytes = 0usize;
+    /// let rows = db.query_prepared_each_ref(&query, &[Value::Integer(1)], |row| {
+    ///     bytes += row[1].as_str().map_or(0, str::len);
+    ///     Ok(())
+    /// })?;
+    /// assert_eq!((rows, bytes), (2, 6));
+    /// # Ok::<(), inlaysql::Error>(())
+    /// ```
+    pub fn query_prepared_each_ref(
+        &mut self,
+        statement: &Statement,
+        params: &[Value],
+        each: impl FnMut(&[ValueRef<'_>]) -> Result<()>,
+    ) -> Result<usize> {
+        self.check_writable_statement(statement)?;
+        self.engine
+            .run_query_each_ref(statement.as_core(), params, each)
     }
 
     /// How many statements this handle has parsed since it was opened.

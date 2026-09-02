@@ -62,6 +62,19 @@ use crate::value::{DataType, Value, ValueRef};
 /// A borrowed projected-row consumer used by the internal push pipeline.
 type RowSink<'a> = dyn FnMut(&[Value]) -> Result<()> + 'a;
 
+/// The reusable buffers of [`Engine::run_borrowed_select`]. See
+/// [`Engine::borrow_scratch`] for why they outlive the call.
+#[derive(Default)]
+struct BorrowScratch {
+    /// Which decoded column each output cell comes from, from
+    /// [`borrowed_projection`].
+    projection: Vec<usize>,
+    /// The row currently decoded, one cell per column of the driving table.
+    cells: Vec<ValueRef<'static>>,
+    /// The projected row handed to the callback.
+    out: Vec<ValueRef<'static>>,
+}
+
 /// Metadata key holding the next row id to hand out.
 const NEXT_ROW_ID_KEY: &str = "next_row_id";
 
@@ -637,6 +650,20 @@ pub struct Engine {
     /// the exact physical build shape; [`Engine::hash_join_table`] owns the
     /// validity and budget checks.
     hash_join_cache: RefCell<Option<CachedHashJoin>>,
+    /// The buffers [`Engine::run_borrowed_select`] re-lends to every row it
+    /// pushes into a borrowing consumer.
+    ///
+    /// They live on the handle rather than on the call because a **point
+    /// read** is one row and one query: buffers scoped to the call would
+    /// allocate three vectors per lookup, which is most of what
+    /// [`Engine::run_query_each_ref`] exists to remove. Held here, a handle
+    /// pays for them once in its life and every lookup after the first
+    /// allocates nothing at all.
+    ///
+    /// Empty whenever they are parked — see [`park`] — so the `'static` is
+    /// honest: nothing borrowed from a page is ever stored across a row, let
+    /// alone across a statement.
+    borrow_scratch: RefCell<BorrowScratch>,
     /// Keyed by table name and the index's *full* column list, in the order
     /// the index declared it — not by a single column. A single-column index
     /// (still, by far, the common case) keys under a one-element list, which
@@ -877,6 +904,7 @@ impl Engine {
             catalog,
             rules: BTreeMap::new(),
             hash_join_cache: RefCell::new(None),
+            borrow_scratch: RefCell::new(BorrowScratch::default()),
             text_indexes: BTreeMap::new(),
             vector_indexes: BTreeMap::new(),
             dirty_tables: BTreeSet::new(),
@@ -1248,6 +1276,95 @@ impl Engine {
         params: &[Value],
         mut each: impl FnMut(&[Value]) -> Result<()>,
     ) -> Result<usize> {
+        self.begin_row_callback(statement, params)?;
+        self.each_owned_row(statement, params, &mut each)
+    }
+
+    /// Run a prepared query and visit each final row as **borrowed** cells.
+    /// Returns the number of rows delivered.
+    ///
+    /// [`Engine::run_query_each`] already reuses the projected row's `Vec`, but
+    /// the cells inside it are owned [`Value`]s: a `TEXT` column is a `String`
+    /// allocated out of the page's bytes and freed again before the next row.
+    /// This hands the callback [`ValueRef`]s instead, which for
+    /// `NULL`/`INTEGER`/`REAL` are the value itself and for `TEXT`/`BLOB` are a
+    /// slice of the page the row was decoded from. A consumer that reads a row
+    /// — sums a column, writes it to a socket, copies one field — allocates
+    /// nothing per row at all. That is what `PERF.md` measured as the last
+    /// remaining cost of a point read after AHL-527: `drop_in_place<ResultSet>`
+    /// at 9% and `ValueRef::to_owned_value` at 2% were the answer being
+    /// materialised, not the statement doing its work.
+    ///
+    /// # Which shapes actually borrow, and which fall back
+    ///
+    /// The borrowing pipeline reads one stored table and projects bare
+    /// columns. `WHERE` (evaluated on the borrowed cells, exactly as
+    /// [`crate::exec::DecodeFilter`] does), `LIMIT` and `OFFSET` are all part of
+    /// it. Everything else — `ORDER BY`, `GROUP BY`/aggregates, window
+    /// functions, `DISTINCT`, joins, derived tables, scored retrieval,
+    /// `WITHOUT ROWID` tables, and any projection holding an expression —
+    /// **falls back to the owned path** and borrows the callback's cells out of
+    /// the owned row it built. The answer is identical either way; only the
+    /// allocations differ. The blocking operators cannot do otherwise: none of
+    /// them can emit a first row before it has seen the last input row, so the
+    /// rows have to exist somewhere while they are sorted or folded.
+    ///
+    /// Same refusal as [`Engine::run_query_each`]: read-only statements only,
+    /// because a callback may fail after rows have been delivered and that
+    /// consumer error should not look like a failed statement after a mutation
+    /// has already committed.
+    ///
+    /// The slice, and every cell in it, is valid only for that one call — the
+    /// page it borrows from is released as the scan moves on. Copy what you
+    /// need to keep with [`ValueRef::to_owned_value`].
+    pub fn run_query_each_ref(
+        &mut self,
+        statement: &Statement,
+        params: &[Value],
+        mut each: impl FnMut(&[ValueRef<'_>]) -> Result<()>,
+    ) -> Result<usize> {
+        self.begin_row_callback(statement, params)?;
+
+        if let Plan::Select(select) = statement.plan() {
+            // Taken out for the length of the statement and put back
+            // afterwards. A re-entrant call — a correlated subquery inside the
+            // `WHERE` — finds empty buffers and allocates its own, which costs
+            // it the reuse and nothing else.
+            let mut scratch = self.borrow_scratch.take();
+            if borrowed_projection(select, &mut scratch.projection) {
+                self.refresh_indexes()?;
+                let env = self.read_env(params);
+                let delivered = self.run_borrowed_select(select, &env, &mut scratch, &mut each);
+                self.borrow_scratch.replace(scratch);
+                return delivered;
+            }
+            self.borrow_scratch.replace(scratch);
+        }
+
+        // The fallback. The rows are built owned by the ordinary pipeline and
+        // borrowed for the callback, so this consumer sees one API whatever
+        // the query turned out to be — an `ORDER BY` costs what it always did
+        // rather than being refused.
+        let mut parked: Vec<ValueRef<'static>> = Vec::new();
+        let mut borrowing = |row: &[Value]| -> Result<()> {
+            let mut cells: Vec<ValueRef<'_>> = core::mem::take(&mut parked);
+            cells.extend(row.iter().map(ValueRef::from));
+            let outcome = each(&cells);
+            parked = park(cells);
+            outcome
+        };
+        self.each_owned_row(statement, params, &mut borrowing)
+    }
+
+    /// The checks and per-statement resets every row-callback API makes before
+    /// it runs anything.
+    ///
+    /// Split out so [`Engine::run_query_each`] and
+    /// [`Engine::run_query_each_ref`] cannot drift: a statement that is refused
+    /// by one has to be refused by the other, and a clock or interrupt reset
+    /// missed on one path would be a difference in behaviour between two APIs
+    /// that are supposed to answer identically.
+    fn begin_row_callback(&mut self, statement: &Statement, params: &[Value]) -> Result<()> {
         if !statement.is_read_only() {
             return Err(Error::Unsupported(
                 "row callbacks require a read-only statement".to_string(),
@@ -1257,7 +1374,20 @@ impl Engine {
         statement.validate(&self.catalog, params)?;
         self.statement_clock.begin_statement();
         self.interrupt.begin_statement();
+        Ok(())
+    }
 
+    /// Deliver every final row to `each` as owned `Value`s, counting them.
+    ///
+    /// The tail of [`Engine::run_query_each`], and the fallback
+    /// [`Engine::run_query_each_ref`] borrows from for the shapes that have to
+    /// materialise.
+    fn each_owned_row(
+        &mut self,
+        statement: &Statement,
+        params: &[Value],
+        each: &mut RowSink<'_>,
+    ) -> Result<usize> {
         let Plan::Select(select) = statement.plan() else {
             let result = self.run_refreshed(statement, params)?.into_rows()?;
             let count = result.rows.len();
@@ -1277,6 +1407,125 @@ impl Engine {
         };
         self.run_select_to(select, &env, None, Some(&mut counted))?;
         Ok(count)
+    }
+
+    /// Push one stored table's rows into a borrowing consumer without
+    /// materialising any of them.
+    ///
+    /// The shape [`borrowed_projection`] admitted: one stored table, bare
+    /// columns out, and optionally a `WHERE`, a `LIMIT` and an `OFFSET`. It is
+    /// deliberately the same sequence of decisions
+    /// [`Engine::run_select_to`]'s non-blocking single-table arm makes — the
+    /// same [`scan_shape`], the same [`needed_columns`] mask, the same
+    /// [`Engine::candidate_bytes`] access-path choice, the same
+    /// borrowed-cell predicate test [`crate::exec::DecodeFilter`] runs — with
+    /// one difference at the end: where that path turns the surviving cells
+    /// into owned `Value`s "once, at the boundary", this one hands them
+    /// straight to the callback and never crosses the boundary at all.
+    ///
+    /// Two buffers live across the whole scan and are re-lent to each row:
+    /// the decoded cells and the projected row. Both are [`park`]ed between
+    /// rows — cleared, so nothing borrowed outlives the page it came from —
+    /// which is what makes "allocates nothing per row" true rather than
+    /// aspirational. `a_borrowing_scan_allocates_nothing_per_row` counts it.
+    fn run_borrowed_select(
+        &self,
+        plan: &SelectPlan,
+        env: &Env<'_>,
+        scratch: &mut BorrowScratch,
+        sink: &mut dyn FnMut(&[ValueRef<'_>]) -> Result<()>,
+    ) -> Result<usize> {
+        let ScanShape {
+            limit,
+            offset,
+            stop_after,
+            ..
+        } = scan_shape(plan, env, None)?;
+
+        // `LIMIT 0` reads nothing. The owned path expresses this as `take(0)`
+        // on the stream; here the emit-then-test loop below would deliver one
+        // row before it noticed, so it is answered before the scan opens.
+        if limit == Some(0) {
+            return Ok(0);
+        }
+
+        let driving = &plan.from[0];
+        let mask = needed_columns(plan);
+        let driving_mask = mask.slice(0, driving.table.columns.len());
+        // Same rule as `run_select_to`: without a `WHERE` every scanned row
+        // reaches the consumer, so a first batch the size of the `LIMIT` reads
+        // exactly what it needs. Under a filter the count is unknown.
+        let first_batch = if plan.filter.is_none() {
+            stop_after
+        } else {
+            None
+        };
+        let source =
+            self.candidate_bytes(&driving.table, &plan.filter, env.params(), first_batch)?;
+
+        // Whether a projected cell can be *moved* out of the decoded row or has
+        // to be cloned. Only `ValueRef::Vector` owns anything, so this is about
+        // one column type — but that one would allocate a `Vec<f32>` per row
+        // per repeat, which is exactly what this API promises not to do.
+        let projection = &scratch.projection;
+        let mut moving = true;
+        for (at, index) in projection.iter().enumerate() {
+            if projection[..at].contains(index) {
+                moving = false;
+                break;
+            }
+        }
+
+        let mut parked_cells = core::mem::take(&mut scratch.cells);
+        let mut parked_out = core::mem::take(&mut scratch.out);
+        let mut skipped = 0usize;
+        let mut delivered = 0usize;
+
+        for row in source {
+            let (_, bytes) = row?;
+            // The parked buffer is empty, so lending it to this row's cells
+            // only shortens `'static`; `park` empties it again before it is
+            // stored back. Same argument as `DecodeFilter::next`.
+            let mut cells: Vec<ValueRef<'_>> = core::mem::take(&mut parked_cells);
+            let verdict = decode_row_ref_masked_into(bytes.as_slice(), &driving_mask, &mut cells)
+                .and_then(|()| match &plan.filter {
+                    Some(filter) => eval::evaluate_ref(filter, &cells, Computed::NONE, env)
+                        .map(|truth| eval::is_truthy(&truth)),
+                    None => Ok(true),
+                });
+            // A failure ends the scan, so the buffer is dropped rather than
+            // parked: there is no next row to lend it to.
+            let admitted = verdict?;
+            // `OFFSET` counts rows the `WHERE` admitted, then `LIMIT` counts
+            // what is left — the order `finish_blocking` and the streamed path
+            // both apply.
+            if !admitted || skipped < offset {
+                skipped += usize::from(admitted);
+                parked_cells = park(cells);
+                continue;
+            }
+
+            let mut out: Vec<ValueRef<'_>> = core::mem::take(&mut parked_out);
+            for &index in projection.iter() {
+                out.push(match cells.get_mut(index) {
+                    Some(cell) if moving => core::mem::replace(cell, ValueRef::Null),
+                    Some(cell) => cell.clone(),
+                    None => ValueRef::Null,
+                });
+            }
+            let outcome = sink(&out);
+            parked_out = park(out);
+            parked_cells = park(cells);
+            outcome?;
+
+            delivered += 1;
+            if Some(delivered) == limit {
+                break;
+            }
+        }
+        scratch.cells = parked_cells;
+        scratch.out = parked_out;
+        Ok(delivered)
     }
 
     /// Plan and run one SQL statement.
@@ -10041,6 +10290,68 @@ fn project_one(item: &SelectItem, row: &ExecRow, env: &Env<'_>) -> Result<Value>
 /// Anything not in this set decodes as `NULL`, so the rule for changing it is
 /// blunt: if a new construct can read a stored column, it is walked here or the
 /// query returns the wrong answer.
+/// Whether [`Engine::run_query_each_ref`] can answer this `SELECT` without
+/// materialising a row, filling `projection` with which column of the decoded
+/// row each output cell comes from when it can.
+///
+/// `projection` is a buffer the handle keeps
+/// ([`Engine::borrow_scratch`]) rather than a returned `Vec`, so deciding this
+/// costs no allocation on a point read — which is one query per row and would
+/// otherwise pay for the decision as often as for the answer.
+///
+/// The admitted shape is one stored table projected as bare columns. The
+/// exclusions are not arbitrary — each one names something the borrowed cells
+/// cannot survive:
+///
+/// * **`ORDER BY`, `GROUP BY`/aggregates, windows, `DISTINCT`.** Every one of
+///   them has to see the last input row before it can emit the first output
+///   row, so the rows have to be held; a cell borrowed from a page cannot be,
+///   because the scan moves on. These materialise, and say so.
+/// * **A join, a derived table, a scored retrieval.** Their rows are assembled
+///   from more than one source, and the assembly is where an owned row already
+///   exists. `run_single_join_to` is the borrowed-row join, and it borrows a
+///   reusable `Vec<Value>` rather than page bytes.
+/// * **A `WITHOUT ROWID` table.** Its scan is a different source
+///   ([`Engine::without_rowid_stream`]) that yields decoded rows.
+/// * **A projection with an expression in it.** `a + 1` and `upper(body)`
+///   produce a *new* value that has to live somewhere; borrowing it would mean
+///   borrowing from a buffer this function would have to invent, which is the
+///   owned path with extra steps.
+///
+/// Anything excluded here still answers — [`Engine::run_query_each_ref`] falls
+/// back to the owned pipeline — so this is a performance decision, never a
+/// correctness one, which is what
+/// `the_borrowing_path_ties_the_owned_one_row_for_row` checks across both
+/// sides of every one of these conditions.
+fn borrowed_projection(plan: &SelectPlan, projection: &mut Vec<usize>) -> bool {
+    projection.clear();
+    if !plan.joins.is_empty() || plan.from.len() != 1 {
+        return false;
+    }
+    let driving = &plan.from[0];
+    if driving.derived.is_some() || plan.score.is_some() || driving.table.without_rowid {
+        return false;
+    }
+    if !plan.group_by.is_empty()
+        || !plan.aggregates.is_empty()
+        || !plan.windows.is_empty()
+        || plan.distinct
+        || !plan.order.is_empty()
+    {
+        return false;
+    }
+    for item in &plan.items {
+        match item {
+            SelectItem::Column { index, .. } => projection.push(*index),
+            SelectItem::Expr { .. } | SelectItem::Score { .. } => {
+                projection.clear();
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn needed_columns(plan: &SelectPlan) -> ColumnMask {
     let width: usize = plan.from.iter().map(|item| item.table.columns.len()).sum();
     let mut mask = ColumnMask::none(width);

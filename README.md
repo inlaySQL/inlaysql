@@ -181,6 +181,28 @@ let count = db.query_prepared_each(&scan, &[], |row| {
 The callback's slice is borrowed for that call only. Copy values you need to
 keep; otherwise the engine reuses its projected-row allocation as it streams.
 
+The cells in that slice are still owned `Value`s, so a `TEXT` column is a
+`String` allocated and freed per row. `query_prepared_each_ref` hands the
+callback borrowed cells instead — a `ValueRef::Text` is a `&str` into the page
+the row was decoded from — so a consumer that only reads allocates nothing at
+all:
+
+```rust
+let scan = db.prepare("SELECT id, body FROM docs WHERE id >= ?")?;
+let mut bytes = 0;
+let count = db.query_prepared_each_ref(&scan, &[Value::Integer(1)], |row| {
+    bytes += row[1].as_str().map_or(0, str::len);
+    Ok(())
+})?;
+```
+
+`to_owned_value()` is the explicit copy, for the columns you do want to keep.
+One stored table with `WHERE`, `LIMIT` and `OFFSET`, projected as bare columns,
+runs a pipeline that allocates nothing per row; `ORDER BY`, `GROUP BY`,
+`DISTINCT`, windows, joins and projections holding an expression all fall back
+to building the row and borrowing out of it, because none of them can emit a
+row before it has seen the whole input. The answer is identical either way.
+
 The same statement works on `AsyncDatabase` (`prepare(...).await`,
 `execute_prepared`, `query_prepared`); the handle is reference-counted, so
 holding one and sharing clones between tasks is free.
