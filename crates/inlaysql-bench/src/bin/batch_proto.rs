@@ -63,13 +63,35 @@
 //! ```sh
 //! cargo run --release -p inlaysql-bench --bin batch_proto -- --rows 100000 --payload 64 --reps 20
 //! ```
+//!
+//! # `--cells`: the leaf cell walk on its own (AHL-541)
+//!
+//! `docs/research/leaf-offset-table.md` asked whether a per-leaf cell offset
+//! table would make cell iteration cheaper. The page already has one — the
+//! slot directory at `HEADER_SIZE` — so the question reduces to how much of
+//! `scan_leaf_cells`'s per-cell cost is the *decoder* rather than the
+//! layout. `--cells` runs the same leaves through four walks, `--reps` times
+//! each, interleaved, and reports ns/cell:
+//!
+//! * **E0** — today's [`scan_leaf_cells`], with a callback that reads the
+//!   trailing row id and the inline value's length.
+//! * **E1** — the same slot-directory layout, walked by a decoder written as
+//!   tight as the layout allows: the header checked once per leaf, then per
+//!   cell one slot read, one `get` per length field, no `Result`-returning
+//!   helpers. Same callback. If E1 is not clearly below E0, the format has
+//!   nothing left to give the walk; if it is, the gap is decoder overhead
+//!   and needs no format change to collect.
+//! * **F0** — today's [`leaf_edge_keys`] per leaf (what `admits_whole_leaf`
+//!   pays), reported per *leaf*.
+//! * **F1** — the same two edge keys read without decoding the values.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use inlaysql::{Database, TreeStorage, Value};
-use inlaysql_core::btree::page::scan_leaf_cells;
+use inlaysql_core::btree::page::{leaf_edge_keys, scan_leaf_cells};
 use inlaysql_core::row::decode_value_at;
 use inlaysql_core::storage::table_prefix;
 
@@ -85,6 +107,8 @@ struct Config {
     payload: usize,
     reps: usize,
     seed: u64,
+    /// Run only the cell-walk shapes (E0/E1/F0/F1); see the module doc.
+    cells: bool,
 }
 
 impl Config {
@@ -94,8 +118,19 @@ impl Config {
             payload: 64,
             reps: 20,
             seed: 42,
+            cells: false,
         };
-        let args: Vec<String> = std::env::args().skip(1).collect();
+        let args: Vec<String> = std::env::args()
+            .skip(1)
+            .filter(|arg| {
+                if arg == "--cells" {
+                    config.cells = true;
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
         for pair in args.chunks(2) {
             let [flag, value] = pair else {
                 eprintln!("ignoring trailing argument {pair:?}");
@@ -165,10 +200,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let load_before = uptime();
     println!(
-        "batch_proto: rows={} payload={} reps={} pid={}",
+        "batch_proto: rows={} payload={} reps={} cells={} pid={}",
         config.rows,
         config.payload,
         config.reps,
+        config.cells,
         std::process::id()
     );
     println!("load before: {load_before}");
@@ -199,6 +235,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     db.commit()?;
     db.execute("CREATE INDEX users_email ON users (email) USING BTREE", &[])?;
     db.execute("ANALYZE", &[])?;
+
+    if config.cells {
+        drop(db);
+        run_cells(&config, &path)?;
+        println!("load after:  {}", uptime());
+        let _ = std::fs::remove_file(&path);
+        return Ok(());
+    }
 
     let group = db.prepare("SELECT n, COUNT(*) FROM users GROUP BY n")?;
     db.query_prepared(&group, &[])?; // warm
@@ -375,6 +419,214 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("load after:  {load_after}");
     let _ = std::fs::remove_file(&path);
     Ok(())
+}
+
+/// The `--cells` shapes: every leaf of `users` collected once, then E0/E1
+/// and F0/F1 run over the same `Vec<Arc<[u8]>>` interleaved, so the fetch and
+/// the tree walk are out of the number entirely and only the cell walk is
+/// timed.
+fn run_cells(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = TreeStorage::open_on(inlaysql::FileDevice::open(path)?)?;
+    let tree = storage.tree();
+    let start = table_prefix("users");
+    let mut end = start.clone();
+    *end.last_mut().expect("table_prefix is never empty") += 1;
+
+    let mut leaves: Vec<std::sync::Arc<[u8]>> = Vec::new();
+    tree.scan_leaves_raw(&start, Some(&end), |leaf| {
+        leaves.push(std::sync::Arc::clone(leaf));
+        Ok(())
+    })?;
+    let cells: usize = leaves
+        .iter()
+        .map(|leaf| u16::from_le_bytes([leaf[2], leaf[3]]) as usize)
+        .sum();
+    println!(
+        "leaves={} cells={} cells/leaf={:.1} page={}",
+        leaves.len(),
+        cells,
+        cells as f64 / leaves.len().max(1) as f64,
+        leaves.first().map_or(0, |l| l.len())
+    );
+
+    // The reference: what E0 computes, so E1 is checked to agree cell for
+    // cell on every repetition.
+    let reference = walk_today(&leaves)?;
+
+    let mut e0 = Timing::new("E0: scan_leaf_cells (today)", cells);
+    let mut e1 = Timing::new("E1: tight walk, same layout", cells);
+    let mut f0 = Timing::new("F0: leaf_edge_keys (today)", leaves.len());
+    let mut f1 = Timing::new("F1: edge keys, key-only", leaves.len());
+    for rep in 0..config.reps {
+        // Alternate the order each repetition so neither shape always runs
+        // with the leaves warm from the other.
+        let order: [u8; 2] = if rep % 2 == 0 { [0, 1] } else { [1, 0] };
+        for shape in order {
+            if shape == 0 {
+                let started = Instant::now();
+                let got = walk_today(&leaves)?;
+                e0.push(started.elapsed());
+                assert_eq!(got, reference, "E0 drifted from itself");
+            } else {
+                let started = Instant::now();
+                let got = walk_tight(&leaves)?;
+                e1.push(started.elapsed());
+                assert_eq!(got, reference, "E1 disagrees with E0");
+            }
+        }
+        let started = Instant::now();
+        let mut acc = 0u64;
+        for leaf in &leaves {
+            if let Some((first, last)) = leaf_edge_keys(leaf, leaf.len())? {
+                acc = acc
+                    .wrapping_add(row_id_of(first))
+                    .wrapping_add(row_id_of(last));
+            }
+        }
+        f0.push(started.elapsed());
+        let f0_acc = acc;
+        let started = Instant::now();
+        let mut acc = 0u64;
+        for leaf in &leaves {
+            if let Some((first, last)) = edge_keys_only(leaf)? {
+                acc = acc
+                    .wrapping_add(row_id_of(first))
+                    .wrapping_add(row_id_of(last));
+            }
+        }
+        f1.push(started.elapsed());
+        assert_eq!(acc, f0_acc, "F1 disagrees with F0");
+    }
+    e0.report();
+    e1.report();
+    f0.report();
+    f1.report();
+    Ok(())
+}
+
+/// The row id a table key ends in — the same eight big-endian bytes
+/// `CowBTree`'s scan reads per cell (`trailing_row_id`).
+fn row_id_of(key: &[u8]) -> u64 {
+    let tail = &key[key.len() - 8..];
+    u64::from_be_bytes(tail.try_into().expect("eight bytes"))
+}
+
+/// What both walks fold per cell: the row id and the inline value length,
+/// which is what the streamed aggregate's scan needs from a cell before it
+/// hands the row on.
+fn fold_cell(acc: &mut (u64, u64, u64), key: &[u8], value: Range<usize>) {
+    acc.0 = acc.0.wrapping_add(row_id_of(key));
+    acc.1 = acc.1.wrapping_add(value.len() as u64);
+    acc.2 += 1;
+}
+
+/// E0: today's decoder.
+fn walk_today(leaves: &[std::sync::Arc<[u8]>]) -> Result<(u64, u64, u64), inlaysql::Error> {
+    let mut acc = (0u64, 0u64, 0u64);
+    for leaf in leaves {
+        scan_leaf_cells(leaf, leaf.len(), |key, value| {
+            match value {
+                inlaysql_core::btree::page::ValueRef::Inline(range) => {
+                    fold_cell(&mut acc, key, range);
+                }
+                other => panic!("batch_proto does not follow overflow chains: {other:?}"),
+            }
+            Ok(())
+        })?;
+    }
+    Ok(acc)
+}
+
+/// E1: the same slot-directory layout, walked as tightly as it allows. Every
+/// check today's decoder makes is still made — a slot, key or value running
+/// past the page is refused — but as a `get` on the slice rather than a call
+/// into a `Result`-returning helper per field.
+fn walk_tight(leaves: &[std::sync::Arc<[u8]>]) -> Result<(u64, u64, u64), inlaysql::Error> {
+    let mut acc = (0u64, 0u64, 0u64);
+    for leaf in leaves {
+        tight_leaf_cells(leaf, |key, value| fold_cell(&mut acc, key, value))?;
+    }
+    Ok(acc)
+}
+
+fn corrupt(what: &str) -> inlaysql::Error {
+    inlaysql::Error::Corrupt(what.to_string())
+}
+
+/// Layout constants, copied from `btree/page.rs` (they are private there and
+/// this binary is a measurement, not a second reader of the format).
+const HEADER_SIZE: usize = 16;
+const OFF_CELL_COUNT: usize = 2;
+const OFF_FREE_START: usize = 4;
+
+fn tight_leaf_cells(
+    bytes: &[u8],
+    mut f: impl FnMut(&[u8], Range<usize>),
+) -> Result<(), inlaysql::Error> {
+    let page_size = bytes.len();
+    let count = u16::from_le_bytes([bytes[OFF_CELL_COUNT], bytes[OFF_CELL_COUNT + 1]]) as usize;
+    let free_start =
+        u16::from_le_bytes([bytes[OFF_FREE_START], bytes[OFF_FREE_START + 1]]) as usize;
+    if free_start > page_size || HEADER_SIZE + 2 * count > free_start {
+        return Err(corrupt("slot directory overlaps cell area"));
+    }
+    let slots = &bytes[HEADER_SIZE..HEADER_SIZE + 2 * count];
+    for slot in slots.chunks_exact(2) {
+        let slot = u16::from_le_bytes([slot[0], slot[1]]) as usize;
+        let Some(head) = bytes.get(slot..slot + 2) else {
+            return Err(corrupt("leaf cell runs past end of page"));
+        };
+        let key_len = u16::from_le_bytes([head[0], head[1]]) as usize;
+        let key_end = slot + 2 + key_len;
+        let Some(key) = bytes.get(slot + 2..key_end) else {
+            return Err(corrupt("leaf key runs past end of page"));
+        };
+        match bytes.get(key_end) {
+            Some(0) => {
+                let Some(len) = bytes.get(key_end + 1..key_end + 5) else {
+                    return Err(corrupt("leaf value length runs past end of page"));
+                };
+                let value_len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
+                let value_end = key_end + 5 + value_len;
+                if value_end > page_size {
+                    return Err(corrupt("leaf value runs past end of page"));
+                }
+                f(key, key_end + 5..value_end);
+            }
+            Some(1) => panic!("batch_proto does not follow overflow chains"),
+            _ => return Err(corrupt("unknown leaf value tag")),
+        }
+    }
+    Ok(())
+}
+
+/// The two edge keys of a leaf, borrowed from it; `None` for an empty leaf.
+type EdgeKeys<'a> = Option<(&'a [u8], &'a [u8])>;
+
+/// F1: the first and last keys, read without decoding either cell's value.
+fn edge_keys_only(bytes: &[u8]) -> Result<EdgeKeys<'_>, inlaysql::Error> {
+    let page_size = bytes.len();
+    let count = u16::from_le_bytes([bytes[OFF_CELL_COUNT], bytes[OFF_CELL_COUNT + 1]]) as usize;
+    let free_start =
+        u16::from_le_bytes([bytes[OFF_FREE_START], bytes[OFF_FREE_START + 1]]) as usize;
+    if free_start > page_size || HEADER_SIZE + 2 * count > free_start {
+        return Err(corrupt("slot directory overlaps cell area"));
+    }
+    if count == 0 {
+        return Ok(None);
+    }
+    let key_at = |slot_index: usize| -> Result<&[u8], inlaysql::Error> {
+        let at = HEADER_SIZE + 2 * slot_index;
+        let slot = u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
+        let Some(head) = bytes.get(slot..slot + 2) else {
+            return Err(corrupt("leaf cell runs past end of page"));
+        };
+        let key_len = u16::from_le_bytes([head[0], head[1]]) as usize;
+        bytes
+            .get(slot + 2..slot + 2 + key_len)
+            .ok_or_else(|| corrupt("leaf key runs past end of page"))
+    };
+    Ok(Some((key_at(0)?, key_at(count - 1)?)))
 }
 
 /// The reference answer, from today's engine — every other shape's group
