@@ -459,6 +459,16 @@ impl ReadCache {
         if (offset as usize) < boundary || self.pages.contains_key(&offset) {
             return false;
         }
+        // Only whole single pages are held: a lookup is keyed by offset and
+        // answers only a buffer of the same length, so a wider read — the
+        // raw scan's read-ahead window — could never be hit again, and
+        // would only evict pages that could.
+        if self
+            .layout
+            .is_some_and(|(page_size, _)| page.len() != page_size)
+        {
+            return false;
+        }
         while self.bytes + page.len() > self.budget {
             let Some(evict) = self.order.pop_front() else {
                 break;
@@ -474,6 +484,20 @@ impl ReadCache {
         self.order.push_back(offset);
         self.bytes += page.len();
         true
+    }
+
+    /// Make `page` resident at `offset` only if it fits without evicting
+    /// anything. This is the admission rule for pages a sweep read ahead: a
+    /// table that fits becomes resident on its first pass and is served
+    /// from memory on every later one, while a sweep larger than the budget
+    /// stops at the budget instead of evicting, re-reading and re-copying
+    /// every page it touches on every execution — which measured as most
+    /// of the read-ahead's win given back (`PERF.md`, 2026-09-02).
+    fn insert_if_room(&mut self, offset: u64, page: &[u8]) -> bool {
+        if self.bytes + page.len() > self.budget {
+            return false;
+        }
+        self.insert(offset, page)
     }
 
     /// Record the layout observed in a header, forgetting resident pages if it
@@ -1040,6 +1064,31 @@ impl FileDevice {
         if offset < boundary {
             return false;
         }
+        // A read wider than one page — the raw scan's read-ahead window — is
+        // served only when every page of it is resident, and then page by
+        // page; the cache holds single pages and nothing else. One page
+        // missing means one device read for the whole window, which then
+        // fills every page of it below.
+        let page_size = cache.layout.map(|(page_size, _)| page_size);
+        if let Some(page_size) = page_size.filter(|&ps| buf.len() > ps && buf.len().is_multiple_of(ps)) {
+            // Copied under the read lock rather than collected first: the
+            // lock is shared, the copy is bounded by the window, and a
+            // per-read `Vec` of `Arc`s measured as the difference between
+            // flat and a 2% loss on a table that fits the cache.
+            for (i, chunk) in buf.chunks_mut(page_size).enumerate() {
+                let Some(bytes) = cache.pages.get(&((offset + i * page_size) as u64)) else {
+                    cache.misses.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                };
+                if bytes.len() != page_size {
+                    cache.misses.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                chunk.copy_from_slice(bytes);
+            }
+            cache.hits.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         let Some(bytes) = cache.get(offset as u64, buf) else {
             cache.misses.fetch_add(1, Ordering::Relaxed);
             return false;
@@ -1065,11 +1114,23 @@ impl FileDevice {
         if coordinator.reuse_enabled.load(Ordering::Acquire) || buf.is_empty() {
             return;
         }
-        coordinator
+        let mut cache = coordinator
             .read_cache
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(offset as u64, buf);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A wide read is a run of whole pages; each becomes resident on its
+        // own, so a later one-page read — or the same window again — finds
+        // them. Admitted only while there is room: see `insert_if_room`.
+        match cache.layout.map(|(page_size, _)| page_size) {
+            Some(page_size) if buf.len() > page_size && buf.len().is_multiple_of(page_size) => {
+                for (i, page) in buf.chunks(page_size).enumerate() {
+                    cache.insert_if_room((offset + i * page_size) as u64, page);
+                }
+            }
+            _ => {
+                cache.insert(offset as u64, buf);
+            }
+        }
     }
 
     /// Teach the shared cache the on-disk layout just observed in a header.
@@ -2421,6 +2482,34 @@ mod shared_read_cache_tests {
 
     fn boundary(cache: &ReadCache) -> usize {
         cache.boundary().expect("layout must be set")
+    }
+
+    #[test]
+    fn only_whole_single_pages_are_admitted() {
+        let mut cache = cache_with_budget(1 << 16);
+        let at = boundary(&cache) as u64;
+        assert!(!cache.insert(at, &[7u8; 2 * DEFAULT_PAGE_SIZE]));
+        assert!(!cache.insert(at, &[7u8; DEFAULT_PAGE_SIZE / 2]));
+        assert!(cache.insert(at, &[7u8; DEFAULT_PAGE_SIZE]));
+        assert_eq!(cache.bytes, DEFAULT_PAGE_SIZE);
+    }
+
+    #[test]
+    fn a_page_is_admitted_with_room_but_never_by_evicting() {
+        let mut cache = cache_with_budget(2 * DEFAULT_PAGE_SIZE);
+        let at = boundary(&cache) as u64;
+        let page = DEFAULT_PAGE_SIZE as u64;
+        assert!(cache.insert_if_room(at, &[1u8; DEFAULT_PAGE_SIZE]));
+        assert!(cache.insert_if_room(at + page, &[2u8; DEFAULT_PAGE_SIZE]));
+        assert!(!cache.insert_if_room(at + 2 * page, &[3u8; DEFAULT_PAGE_SIZE]));
+        assert!(
+            cache.get(at, &[0u8; DEFAULT_PAGE_SIZE]).is_some(),
+            "an evict happened"
+        );
+        assert!(cache.get(at + page, &[0u8; DEFAULT_PAGE_SIZE]).is_some());
+        assert!(cache
+            .get(at + 2 * page, &[0u8; DEFAULT_PAGE_SIZE])
+            .is_none());
     }
 
     #[test]

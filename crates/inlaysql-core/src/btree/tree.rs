@@ -129,6 +129,100 @@ impl RawLeafCache {
     }
 }
 
+/// How many pages one sequential read-ahead fetches at most.
+///
+/// Sixteen 4 KiB pages is one 64 KiB read, which is where the per-call cost
+/// of `pread` stops being the story and the copy itself takes over. Larger
+/// buys nothing measurable and holds more memory per handle for nothing.
+const READAHEAD_PAGES: usize = 16;
+
+/// The raw scan's read-ahead window: the last run of consecutive committed
+/// pages it fetched in one device read, plus how sequential its misses have
+/// been.
+///
+/// A sweep over a table larger than any cache reads every leaf from the
+/// device once per execution, and on a warm operating-system page cache the
+/// cost of that is the *syscall*, not the disk: the aggregate profile put
+/// `pread` at 19.7% of the query (`PERF.md`, 2026-09-02) for a table the OS
+/// already held in memory. Fetching sixteen consecutive pages per call
+/// divides that by sixteen.
+///
+/// Why it is safe to read pages the caller did not ask for: every page id
+/// below the handle's committed `next_page_id` was allocated by a committed
+/// transaction and, the tree being copy-on-write, is never rewritten — the
+/// same argument the decoded page cache rests on. The window is clamped to
+/// that bound at fetch time, so it never holds a page another writer could
+/// still be filling, and it is dropped wherever the caches are dropped when
+/// page reuse makes ids reissuable. Nothing above the leaf reads through it:
+/// point descents go through the decoded cache, which already answers them.
+struct Readahead {
+    /// First page id held in `buf`.
+    first: PageId,
+    /// How many pages from `first` are held; `0` when the window is empty.
+    pages: usize,
+    /// The pages, `pages * page_size` bytes of them.
+    buf: Vec<u8>,
+    /// The page id just past the last run fetched, held or not. A miss on
+    /// exactly this id continues the run.
+    run_end: PageId,
+    /// How many misses in a row continued the previous run. One page is
+    /// read for the first two, four at the third, the full window from the
+    /// fourth — so a random probe never pays for pages it will not use, and
+    /// a short range that happens to span two adjacent leaves does not
+    /// either (widening on the second leaf measured as a 2–8% loss on the
+    /// 50-row `indexed-range` shape; from the third it is flat).
+    streak: u8,
+}
+
+impl Readahead {
+    fn new() -> Self {
+        Self {
+            first: 0,
+            pages: 0,
+            buf: Vec::new(),
+            run_end: 0,
+            streak: 0,
+        }
+    }
+
+    /// The held bytes of page `id`, if the window covers it.
+    fn get(&self, id: PageId, page_size: usize) -> Option<&[u8]> {
+        if self.pages == 0 || id < self.first || id >= self.first + self.pages as u64 {
+            return None;
+        }
+        let at = (id - self.first) as usize * page_size;
+        self.buf.get(at..at + page_size)
+    }
+
+    /// How many pages to fetch for a miss on `id`, given that only ids below
+    /// `committed_next` may be read ahead. Always at least one. Records the
+    /// run as `[id, id + n)` whether or not the caller ends up holding it.
+    fn plan(&mut self, id: PageId, committed_next: PageId) -> usize {
+        self.streak = if id == self.run_end {
+            self.streak.saturating_add(1)
+        } else {
+            0
+        };
+        let want = match self.streak {
+            0 | 1 => 1,
+            2 => 4,
+            _ => READAHEAD_PAGES,
+        };
+        let below_next = committed_next
+            .saturating_sub(id)
+            .min(READAHEAD_PAGES as u64) as usize;
+        let pages = want.min(below_next).max(1);
+        self.run_end = id + pages as u64;
+        pages
+    }
+
+    fn clear(&mut self) {
+        self.pages = 0;
+        self.run_end = 0;
+        self.streak = 0;
+    }
+}
+
 // ------------------------------------------------------------- header (block 0)
 
 /// The header is written once, at create, and never overwritten. It is the one
@@ -278,6 +372,8 @@ pub struct CowBTree<D: Device> {
     /// filled only by [`CowBTree::walk_raw_row_values`]; see [`RawLeafCache`]
     /// for why these are held undecoded and what that avoids.
     raw_leaves: RefCell<RawLeafCache>,
+    /// The raw scan's sequential read-ahead window. See [`Readahead`].
+    readahead: RefCell<Readahead>,
     /// Whether [`CowBTree::alloc_page`] may hand out a page id the free list
     /// (Phase 2 item 6) has recorded as reclaimable. `false` by default and
     /// for every existing caller: with this off, allocation is exactly the
@@ -524,6 +620,7 @@ impl<D: Device> CowBTree<D> {
             range_cursor: RefCell::new(None),
             row_scan_cursor: RefCell::new(None),
             raw_leaves: RefCell::new(RawLeafCache::new()),
+            readahead: RefCell::new(Readahead::new()),
             reuse_enabled: false,
             durability: Durability::Full,
             free_candidates: Vec::new(),
@@ -661,6 +758,7 @@ impl<D: Device> CowBTree<D> {
         if self.reuse_enabled || self.device.page_reuse_enabled() {
             self.cache.borrow_mut().clear();
             self.raw_leaves.borrow_mut().clear();
+            self.readahead.borrow_mut().clear();
             *self.cursor.borrow_mut() = None;
             *self.range_cursor.borrow_mut() = None;
             *self.row_scan_cursor.borrow_mut() = None;
@@ -2870,6 +2968,35 @@ impl<D: Device> CowBTree<D> {
             }
         }
         let offset = crate::wal::data_offset_for(self.page_size, self.format_version, id);
+
+        // Read ahead only where the caches would have been allowed to hold
+        // the page: a committed data-area page, ids not reissuable. The
+        // `try_borrow_mut` is for re-entrancy — `f` never reads another raw
+        // page today, but if it ever does, it gets an ordinary read rather
+        // than a panic.
+        if !self.device.page_reuse_enabled()
+            && cache::data_area_page(self.page_size, self.format_version, id)
+        {
+            if let Ok(mut window) = self.readahead.try_borrow_mut() {
+                if let Some(bytes) = window.get(id, self.page_size) {
+                    return f(self.page_size, bytes);
+                }
+                let pages = window.plan(id, self.next_page_id);
+                if pages > 1 {
+                    window.buf.resize(pages * self.page_size, 0);
+                    // A failed wide read falls back to the one-page read below,
+                    // so an error surfaces exactly as it would have without
+                    // read-ahead; the window is emptied first so a torn fill
+                    // is never served.
+                    window.pages = 0;
+                    if self.device.read(offset, &mut window.buf).is_ok() {
+                        window.first = id;
+                        window.pages = pages;
+                        return f(self.page_size, &window.buf[..self.page_size]);
+                    }
+                }
+            }
+        }
         self.with_page_bytes(offset, f)
     }
 
@@ -4224,6 +4351,14 @@ mod tests {
         reads: Cell<usize>,
         generation: Cell<u64>,
         counts_commits: bool,
+        /// When set, every read whose end lies past this offset is counted
+        /// in `reads_past_ceiling` — how a test pins that read-ahead stays
+        /// below the committed next page.
+        read_ceiling: Cell<Option<usize>>,
+        reads_past_ceiling: Cell<usize>,
+        /// Reports page reuse as enabled while set, which is the one switch
+        /// that turns read-ahead off without touching anything else.
+        reuse_override: Cell<bool>,
     }
 
     impl CountingDisk {
@@ -4233,6 +4368,9 @@ mod tests {
                 reads: Cell::new(0),
                 generation: Cell::new(0),
                 counts_commits,
+                read_ceiling: Cell::new(None),
+                reads_past_ceiling: Cell::new(0),
+                reuse_override: Cell::new(false),
             }
         }
     }
@@ -4240,6 +4378,12 @@ mod tests {
     impl Device for CountingDisk {
         fn read(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
             self.reads.set(self.reads.get() + 1);
+            if let Some(ceiling) = self.read_ceiling.get() {
+                if offset + buf.len() > ceiling {
+                    self.reads_past_ceiling
+                        .set(self.reads_past_ceiling.get() + 1);
+                }
+            }
             Device::read(&self.disk, offset, buf)
         }
 
@@ -4265,7 +4409,7 @@ mod tests {
         }
 
         fn page_reuse_enabled(&self) -> bool {
-            false
+            self.reuse_override.get()
         }
     }
 
@@ -5216,6 +5360,105 @@ mod tests {
             again,
             db.scan_prefix_row_values_from(prefix, None, 200).unwrap(),
             "the raw scan and the decoding scan disagree"
+        );
+    }
+
+    /// A sweep over many leaves reaches the device far fewer times than it
+    /// has leaves, and returns exactly what the decoding scan returns.
+    ///
+    /// Both caches are off, so every leaf is a miss and the only thing that
+    /// can make the read count drop below the leaf count is the read-ahead
+    /// window. The leaf count is taken from the same scan with read-ahead
+    /// disabled by the page-reuse gate, which is the one switch that turns it
+    /// off without touching anything else on the path.
+    #[test]
+    fn a_sweep_reads_ahead_and_answers_exactly_as_a_page_at_a_time_scan() {
+        let row_key = |id: u64| {
+            let mut key = b"\x01tbl\0".to_vec();
+            key.extend_from_slice(&id.to_be_bytes());
+            key
+        };
+        let prefix = b"\x01tbl\0";
+        let device = Rc::new(RefCell::new(CountingDisk::new(true)));
+        let mut db = CowBTree::create(device, PAGE).unwrap();
+        // One commit, so the leaves land in consecutive pages the way a bulk
+        // load's do; leaves rewritten across many small commits scatter, and
+        // a sweep over those never forms the run read-ahead keys on.
+        for id in 0..1_200u64 {
+            db.put(&row_key(id), &id.to_le_bytes()).unwrap();
+        }
+        db.commit().unwrap();
+        db.set_page_cache_bytes(0);
+
+        let expected = db.scan_prefix_row_values_from(prefix, None, 1_200).unwrap();
+        assert_eq!(expected.len(), 1_200);
+
+        // Page-at-a-time: the raw leaf cache is emptied so nothing is
+        // resident, and read-ahead is disabled through the reuse gate.
+        db.raw_leaves.borrow_mut().clear();
+        db.readahead.borrow_mut().clear();
+        db.device().borrow().reuse_override.set(true);
+        reads_since(&db);
+        let one_at_a_time = db
+            .scan_prefix_row_values_raw_from(prefix, None, 1_200)
+            .unwrap();
+        let reads_without = reads_since(&db);
+        db.device().borrow().reuse_override.set(false);
+        assert_eq!(one_at_a_time, expected);
+
+        db.raw_leaves.borrow_mut().clear();
+        db.readahead.borrow_mut().clear();
+        reads_since(&db);
+        let read_ahead = db
+            .scan_prefix_row_values_raw_from(prefix, None, 1_200)
+            .unwrap();
+        let reads_with = reads_since(&db);
+        assert_eq!(read_ahead, expected, "read-ahead changed the rows");
+        assert!(
+            reads_with * 4 < reads_without,
+            "read-ahead should cut device reads by well over 4x on a sweep: {reads_with} vs {reads_without}"
+        );
+    }
+
+    /// Read-ahead never fetches a page at or beyond the committed next-free
+    /// id, whatever the window size — those pages belong to no committed
+    /// snapshot and another writer may still be filling them.
+    #[test]
+    fn read_ahead_never_reads_past_the_committed_next_page() {
+        let row_key = |id: u64| {
+            let mut key = b"\x01tbl\0".to_vec();
+            key.extend_from_slice(&id.to_be_bytes());
+            key
+        };
+        let prefix = b"\x01tbl\0";
+        let device = Rc::new(RefCell::new(CountingDisk::new(true)));
+        let mut db = CowBTree::create(device, PAGE).unwrap();
+        for id in 0..1_200u64 {
+            db.put(&row_key(id), &id.to_le_bytes()).unwrap();
+        }
+        db.commit().unwrap();
+        db.set_page_cache_bytes(0);
+        let next = db.next_page_id;
+        let end_of_committed = crate::wal::data_offset_for(db.page_size, db.format_version, next);
+        db.device()
+            .borrow()
+            .read_ceiling
+            .set(Some(end_of_committed));
+
+        db.raw_leaves.borrow_mut().clear();
+        db.readahead.borrow_mut().clear();
+        let rows = db
+            .scan_prefix_row_values_raw_from(prefix, None, 1_200)
+            .unwrap();
+        assert_eq!(rows.len(), 1_200);
+        assert!(
+            db.readahead.borrow().pages > 1,
+            "the sweep should have widened its reads"
+        );
+        assert_eq!(
+            db.device().borrow().reads_past_ceiling.get(),
+            0,
+            "a read reached past the committed next page"
         );
     }
 

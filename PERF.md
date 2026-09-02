@@ -2876,6 +2876,67 @@ The full-join shape is flat because its cost is elsewhere (it is the
 wall-clock tables in `BENCHMARK.md` owe this the same regeneration they owe
 AHL-512 through 520.
 
+### A sweep reads sixteen pages per syscall, not one (AHL-522, 2026-09-02)
+
+Profiled `bin/profile.rs --suite aggregate --rows 100000` on the AHL-521
+binary (release, `sample` over the query phase, 9,656 samples, load 8–12/18
+so shares are the evidence). Inclusive: **`FileDevice::read` 30.6%** of the
+query — `pread` 19.7% self, `memmove` 8.3% — for a table the operating
+system already held in memory. The 100k-row table is ~10 MB of leaves, over
+the 8 MiB default of both the decoded page cache and the shared raw cache,
+so every execution of the prepared statement re-read every leaf, one 4 KiB
+`pread` per page, ~2,500 syscalls per query. The remaining top frames were
+`BTreeMap::get_mut` 10.0% (the `GROUP BY` probe — separate item), the
+allocator ~8%, `run_select_to` 5.3%, `mem_cmp` 4.8%.
+
+**Fix, in the tree.** `CowBTree::with_raw_page` — the raw scan's only read
+path — now keeps a read-ahead window: on a miss whose page id continues the
+previous run it fetches four pages, and from the fourth consecutive miss
+sixteen (64 KiB) in one `Device::read`, then serves the following pages from
+the window. Two rules make it safe: only ids below the handle's committed
+`next_page_id` are ever fetched (a committed copy-on-write page is immutable;
+anything above that bound may still be being written by another handle —
+pinned by a test with a device that counts reads past that offset, and the
+test fails when the clamp is removed), and the window is dropped exactly where
+the caches are dropped under page reuse. A failed wide read falls back to the
+one-page read, so errors surface as before.
+
+**And in the device.** The shared raw cache keyed one entry per read and
+answered only a buffer of the same length, so a 64 KiB read was a miss and
+a 64 KiB insert. Now: a wide read is served page by page when every page is
+resident (copied under the read lock — collecting `Arc`s first cost a `Vec`
+per read and measured as a 2% loss on a table that fits), and after a wide
+device read each page is admitted **only while there is room, never by
+evicting**. That last rule is the one that mattered: admitting by eviction
+gave back most of the win (1.26x → 1.08x), because a sweep larger than the
+budget then allocated, copied, evicted and freed every page it touched on
+every execution.
+
+**Widening only from the third sequential miss** is also measured, not
+chosen: widening on the second leaf cost the 50-row `indexed-range` shape
+2–8% (3/3) — a short range spanning two adjacent leaves paid a 16 KiB read
+for its second leaf. From the third it is flat.
+
+**Measured**, interleaved against the AHL-521 binary, control re-run in
+every repetition, `--seconds 4..5`:
+
+| Shape | AHL-521 | AHL-522 | Verdict |
+| --- | --- | --- | --- |
+| `aggregate`, 100k rows (does not fit the caches) | 85 / 83 / 85 ops/s | **109 / 99 / 110** | **1.26x**, 3/3, non-overlapping |
+| `joins`, 20k rows (full-scan shapes) | 66 / 63 / 65 ops/s | **77 / 72 / 73** | **1.17x**, 3/3, non-overlapping |
+| `aggregate`, 20k rows (fits the shared cache) | 579 / 555 / 567 | 571 / 573 / 526 | flat, mixed sign |
+| `indexed-range` | 61.9 / 66.3 / 63.7k | 63.3 / 66.9 / 63.7k | flat |
+| `indexed` | 403 / 405 / 401k | 403 / 405 / 407k | flat |
+| `joins-limit` | 129.8 / 129.8 / 130.9k | 130.0 / 129.4 / 130.9k | flat |
+| `points` | 1.64 / 1.72 / 1.61M | 1.69 / 1.58 / 1.66M | flat, mixed sign — the point read did not move |
+
+**What it does not do.** Leaves rewritten across many small commits scatter
+(copy-on-write moves a touched leaf to a fresh id), and a sweep over those
+never forms a run, so it reads one page at a time as before — no loss, no
+gain. A bulk-loaded or freshly rebuilt table is the sequential case. The
+`memmove` share stays: the window's bytes are still copied once into the
+per-leaf `Rc<[u8]>` the cells borrow from.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness
