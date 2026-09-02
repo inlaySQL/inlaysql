@@ -65,6 +65,18 @@
 //! [`CDC_WARMUP_ROWS`] so the timed window is steady state, not the first
 //! 4,096 commits before the change-log retention window fills.
 //!
+//! And `batch-insert` (AHL-542), the multi-row sibling of `writes`: one
+//! prepared `INSERT INTO batch (id, n) VALUES (?, ?), ... x100` per
+//! auto-committed transaction, which is the shape
+//! `bench/external/batch_driver.py` drives MySQL and PostgreSQL with and
+//! `crates/inlaysql-bench/src/bin/sql_shapes.rs --mode batch` measures
+//! wall-clock. `writes` cannot stand in for it: at one row per commit ~95% of
+//! that loop is the fsync, so the per-row *structural* cost this suite exists
+//! to show — the root-to-leaf path re-decoded, deep-cloned and re-encoded once
+//! per row — is invisible there and is ~99% of the work here. Same table,
+//! same `Durability::Full` (the engine default, one barrier per statement) and
+//! the same `--batch` rows per statement the external driver uses.
+//!
 //! And `retrieval`, 2026-08-30: `PERF.md`'s vector-kernel section named this
 //! the missing piece — "`bin/profile.rs` does not cover the retrieval suite
 //! yet, and adding it is the first step" — because everything downstream of
@@ -129,6 +141,11 @@ struct Config {
     /// `retrieval` only: `VECTOR(dim, INT8)` instead of `VECTOR(dim)`, to
     /// profile the int8 path in isolation.
     quantized: bool,
+    /// `batch-insert` only: rows per `INSERT` statement. The default is the
+    /// 100 `bench/external/batch_driver.py` uses against MySQL and
+    /// PostgreSQL, so this suite profiles the shape the published batch cell
+    /// compares.
+    batch: usize,
 }
 
 impl Config {
@@ -144,6 +161,7 @@ impl Config {
             dim: 384,
             query: "vector".to_string(),
             quantized: false,
+            batch: 100,
         };
         let args: Vec<String> = std::env::args().skip(1).collect();
         for pair in args.chunks(2) {
@@ -165,6 +183,7 @@ impl Config {
                     }))
                 }
                 "--dim" => config.dim = value.parse().unwrap_or(config.dim),
+                "--batch" => config.batch = value.parse().unwrap_or(config.batch).max(1),
                 "--query" => match value.as_str() {
                     "vector" | "bm25" | "hybrid" => config.query = value.clone(),
                     other => {
@@ -224,11 +243,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "joins" => run_joins(&config, &path, Shapes::All),
         "joins-limit" => run_joins(&config, &path, Shapes::LimitOnly),
         "writes" => run_writes(&config, &path),
+        "batch-insert" => run_batch_insert(&config, &path),
         "retrieval" => run_retrieval(&config, &path),
         other => {
             eprintln!(
                 "unknown suite `{other}`, expected points, indexed, indexed-range, aggregate, \
-                 joins, joins-limit, writes or retrieval"
+                 joins, joins-limit, writes, batch-insert or retrieval"
             );
             std::process::exit(2);
         }
@@ -738,6 +758,70 @@ fn words(rng: &mut SeededRng, count: usize) -> String {
 /// `body` and `embedding`) and the same corpus generator. See the module note
 /// for why `--query` measures one shape at a time instead of cycling all
 /// three, and for `--quantized`.
+/// The batch-insert shape (AHL-542): `--batch` rows in one prepared
+/// multi-row `INSERT`, one auto-committed transaction per statement.
+///
+/// The timed loop checks the clock every statement rather than every
+/// [`CLOCK_CHECK_BATCH`], because one iteration here is a hundred rows and a
+/// durable commit — coarse batching would overshoot `--seconds` by minutes,
+/// not milliseconds.
+///
+/// Setup pre-loads past [`CDC_WARMUP_ROWS`] for the reason `run_writes` does:
+/// the change-log retention window has to be full before the window is steady
+/// state.
+fn run_batch_insert(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut db = config.open(path)?;
+    db.execute(
+        "CREATE TABLE batch (id INTEGER PRIMARY KEY, n INTEGER)",
+        &[],
+    )?;
+    let placeholders = vec!["(?, ?)"; config.batch].join(",");
+    let insert = db.prepare(&format!("INSERT INTO batch (id, n) VALUES {placeholders}"))?;
+
+    let mut next_id: i64 = 1;
+    let bind = |first: i64| {
+        let mut params = Vec::with_capacity(config.batch * 2);
+        for id in first..first + config.batch as i64 {
+            params.push(Value::Integer(id));
+            params.push(Value::Integer(id % 1000));
+        }
+        params
+    };
+
+    // Warm past the change-log retention window in one batched transaction,
+    // exactly as `run_writes` does: setup, not the loop being profiled.
+    let warmup = CDC_WARMUP_ROWS.max(1);
+    db.begin()?;
+    while (next_id as usize) <= warmup {
+        let params = bind(next_id);
+        if let Err(inlaysql::Error::Transaction(_)) = db.execute_prepared(&insert, &params) {
+            db.commit()?;
+            db.begin()?;
+            db.execute_prepared(&insert, &params)?;
+        }
+        next_id += config.batch as i64;
+    }
+    db.commit()?;
+
+    announce_query_phase();
+    let budget = Duration::from_secs(config.seconds);
+    let started = Instant::now();
+    let mut statements: u64 = 0;
+    while started.elapsed() < budget {
+        db.execute_prepared(&insert, &bind(next_id))?;
+        next_id += config.batch as i64;
+        statements += 1;
+    }
+    let elapsed = started.elapsed();
+    report("batch-insert statements", statements, elapsed);
+    report(
+        "batch-insert rows",
+        statements * config.batch as u64,
+        elapsed,
+    );
+    Ok(())
+}
+
 fn run_retrieval(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut db = config.open(path)?;
     let vector_type = if config.quantized {
@@ -914,6 +998,7 @@ mod tests {
                 dim: 384,
                 query: "vector".to_string(),
                 quantized: false,
+                batch: 100,
             };
 
             let mut db = config.open(&path).unwrap();

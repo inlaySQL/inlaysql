@@ -294,6 +294,118 @@ fn retain_commit_buf(buf: Vec<u8>) -> Vec<u8> {
     }
 }
 
+/// A page this transaction has written, in whichever form it is currently
+/// held.
+///
+/// Before AHL-542 this was always `Vec<u8>`, and that is what made a
+/// hundred-row `INSERT` quadratic in the wrong place: every row re-decoded
+/// (`page::decode`, a fresh `Arc<[u8]>` page copy plus a `Vec` of cells),
+/// deep-cloned (`read_node`) and re-encoded (`page::encode_leaf` /
+/// `page::encode_internal`, another whole page) every node on its root-to-leaf
+/// path, so a path page was serialised ~100 times to be read back 99 of them.
+/// Only the page *ids* were amortised, by [`CowBTree::slot_for`].
+///
+/// Holding the decoded [`Node`] instead makes the write path mutate cells in
+/// place and encode once, at commit ([`CowBTree::materialize_dirty`]). Nothing
+/// about the page *format* changes: the same encoder runs over the same cells
+/// and produces the same bytes — later rather than repeatedly.
+///
+/// Overflow pages stay [`DirtyPage::Encoded`]: they are written once and never
+/// modified, so there is nothing to amortise and no [`Node`] to hold them as.
+enum DirtyPage {
+    /// The page as it will be written — the only form the commit path reads.
+    Encoded(Vec<u8>),
+    /// The page as cells the write path can still change. `Rc` so a read of
+    /// this transaction's own writes ([`CowBTree::node_at`]) is a refcount
+    /// bump instead of a decode, and so
+    /// [`CowBTree::take_node_for_write`] can usually reclaim the node by
+    /// value rather than cloning it.
+    Decoded(Rc<Node>),
+}
+
+impl DirtyPage {
+    /// The encoded bytes, for a page that has them.
+    ///
+    /// `None` means the page is still held as a [`Node`].
+    /// [`CowBTree::materialize_dirty`] runs before anything in the commit path
+    /// asks, so `None` is unreachable there — and
+    /// [`CowBTree::write_dirty_pages`], which runs before the commit record is
+    /// appended, reports it as a storage error rather than writing a page that
+    /// is not there.
+    fn bytes(&self) -> Option<&[u8]> {
+        match self {
+            DirtyPage::Encoded(bytes) => Some(bytes),
+            DirtyPage::Decoded(_) => None,
+        }
+    }
+
+    /// How many bytes this page will occupy in the commit record.
+    ///
+    /// Exact for both forms: [`page::encode_leaf`] and
+    /// [`page::encode_internal`] always fill a whole page, so a node that has
+    /// not been encoded yet is `page_size` bytes and
+    /// [`CowBTree::pending_record_len`] stays the exact answer its callers
+    /// depend on.
+    fn encoded_len(&self, page_size: usize) -> usize {
+        match self {
+            DirtyPage::Encoded(bytes) => bytes.len(),
+            DirtyPage::Decoded(_) => page_size,
+        }
+    }
+}
+
+/// Encode `node` back into a page, dispatching on its kind.
+///
+/// The one place a decoded dirty page turns back into bytes. It calls exactly
+/// the encoders the write path always called, with the node's own source
+/// buffer as the bytes its borrowed keys index into — so the page image is the
+/// one the old code produced, only built once instead of once per row.
+fn encode_node(page_size: usize, node: &Node) -> Result<Vec<u8>> {
+    match node {
+        Node::Leaf { bytes, entries } => page::encode_leaf(page_size, bytes, entries),
+        Node::Internal {
+            bytes,
+            leftmost,
+            cells,
+        } => page::encode_internal(page_size, bytes, *leftmost, cells),
+    }
+}
+
+/// Where a descent through one page goes next.
+///
+/// The write path reads this *before* it takes the page out of `dirty`, and
+/// that ordering is load-bearing. A page lifted out of the dirty set is a hole
+/// in the pending tree, and the work underneath a descent reads that tree:
+/// [`CowBTree::alloc_page`] scans the free list from `pending_root`, and
+/// `store_value`/`free_overflow_chain` walk overflow chains through it. An
+/// ancestor held out across its own child recursion would therefore serve the
+/// *committed* version of itself — or, for a page this transaction allocated,
+/// nothing at all — to its own transaction, which is how a heavy-churn
+/// free-list sweep handed out a live page id and built a cycle.
+///
+/// So AHL-542's rule is: a page is missing from `dirty` only across code that
+/// performs no pending read. This enum is what moves the internal-node window
+/// to after the recursion; [`CowBTree::reserve_split_page`] is what keeps the
+/// one remaining allocation inside a window from seeing a half-split page.
+enum Descent {
+    /// The page is a leaf; the key belongs in it.
+    Leaf,
+    /// The page is internal: descend into `child`, which is child slot `idx`.
+    Internal { idx: usize, child: PageId },
+}
+
+/// The error for a page that answered [`CowBTree::descend`] as one kind and
+/// decoded as the other.
+///
+/// Unreachable through the tree's own paths — nothing between the two reads
+/// can change a page's kind — so this exists to keep the write path free of
+/// `unreachable!`/`expect` rather than to describe a state anybody has seen.
+fn kind_changed(id: PageId) -> Error {
+    Error::Corrupt(alloc::format!(
+        "page {id} changed kind between the descent and the write"
+    ))
+}
+
 /// The result of inserting into a subtree: either the subtree was replaced by
 /// one new page, or it split into two new pages around a separator.
 enum InsertOutcome {
@@ -331,8 +443,20 @@ pub struct CowBTree<D: Device> {
     next_seq: u64,
     /// The highest sequence number persisted in the state block.
     checkpoint_seq: u64,
-    /// Newly allocated pages of the open transaction, keyed by page id.
-    dirty: BTreeMap<PageId, Vec<u8>>,
+    /// Newly allocated pages of the open transaction, keyed by page id, each
+    /// held either as cells or as bytes — see [`DirtyPage`].
+    dirty: BTreeMap<PageId, DirtyPage>,
+    /// How many pages this handle has run through [`page::decode`] /
+    /// [`page::decode_shared`], so a test can assert *how often* a page is
+    /// decoded rather than only that the answer is right.
+    ///
+    /// That is the property AHL-542 actually changed: the row count of a
+    /// multi-row `INSERT` used to multiply the decodes on its root-to-leaf
+    /// path, and nothing but a count can tell a fixed version from a version
+    /// that got the right answer the slow way. `Cell` because the read paths
+    /// that decode take `&self`.
+    #[cfg(test)]
+    decodes: core::cell::Cell<u64>,
     /// The encoded commit record, kept between commits so the write path does
     /// not allocate a fresh ~26 KiB buffer every time it commits.
     ///
@@ -634,6 +758,8 @@ impl<D: Device> CowBTree<D> {
             next_seq: checkpoint_seq + 1,
             checkpoint_seq,
             dirty: BTreeMap::new(),
+            #[cfg(test)]
+            decodes: core::cell::Cell::new(0),
             record_buf: Vec::new(),
             run_buf: Vec::new(),
             pending_root: 0,
@@ -870,7 +996,7 @@ impl<D: Device> CowBTree<D> {
             + self
                 .dirty
                 .values()
-                .map(|bytes| 8 + 4 + bytes.len())
+                .map(|page| 8 + 4 + page.encoded_len(self.page_size))
                 .sum::<usize>()
     }
 
@@ -1182,7 +1308,11 @@ impl<D: Device> CowBTree<D> {
                 // Every key is owned, so no shared page buffer is indexed here.
                 self.dirty.insert(
                     id,
-                    page::encode_internal(self.page_size, &[], left, &cells)?,
+                    DirtyPage::Decoded(Rc::new(Node::Internal {
+                        bytes: Arc::from(&[][..]),
+                        leftmost: left,
+                        cells,
+                    })),
                 );
                 self.pending_root = id;
             }
@@ -1261,6 +1391,12 @@ impl<D: Device> CowBTree<D> {
             // free-list rows before the record below is built, so they ride
             // the same commit — see `CowBTree::finalize_free_list`.
             self.finalize_free_list(seq)?;
+            // Every page this transaction touched is still held as cells (see
+            // [`DirtyPage`]); this is where it becomes bytes, once each. It
+            // has to happen after `finalize_free_list`, which writes free-list
+            // rows through the ordinary `put`/`delete` paths and so dirties
+            // pages of its own.
+            self.materialize_dirty()?;
             // Borrowed out of the handle and put back below, because the
             // encoder writes into it while `self.dirty` is being read: two
             // fields, one `&mut self`. An early `?` between here and the
@@ -1280,7 +1416,14 @@ impl<D: Device> CowBTree<D> {
                     root: self.pending_root,
                     next: self.pending_next,
                 },
-                self.dirty.iter().map(|(&id, bytes)| (id, &bytes[..])),
+                // `materialize_dirty` above left every page encoded, so
+                // `bytes()` answers for all of them. A page that somehow is
+                // not encoded contributes nothing here and makes
+                // `write_dirty_pages` — which runs *before* this record is
+                // appended — fail the commit instead.
+                self.dirty
+                    .iter()
+                    .map(|(&id, page)| (id, page.bytes().unwrap_or(&[]))),
             );
             if encoded.len() > crate::wal::max_record_len(self.page_size) {
                 return Err(Error::Storage(alloc::format!(
@@ -2401,7 +2544,8 @@ impl<D: Device> CowBTree<D> {
         Ok(())
     }
 
-    /// The page id to write this transaction's next version of `source` into.
+    /// The page id to write this transaction's next version of `source` into,
+    /// given whether [`CowBTree::take_node_for_write`] found it in `dirty`.
     ///
     /// Copy-on-write's rule is that a page a *reader* could be looking at is
     /// never overwritten — that is what makes a snapshot a snapshot, and what
@@ -2424,8 +2568,13 @@ impl<D: Device> CowBTree<D> {
     /// which is the ordinary path and the one every reader depends on. It is
     /// recorded via [`CowBTree::supersede`] so the free list can eventually
     /// reclaim it, when this handle has opted into the free list at all.
-    fn page_slot(&mut self, source: PageId) -> PageId {
-        if self.dirty.contains_key(&source) {
+    ///
+    /// The answer arrives as a flag rather than as a `dirty.contains_key`
+    /// lookup because AHL-542's write path lifts the page out of `dirty`
+    /// before it gets here: by this point the entry is gone, and the only
+    /// thing that still knows is the caller that took it.
+    fn slot_for(&mut self, source: PageId, was_dirty: bool) -> PageId {
+        if was_dirty {
             source
         } else {
             self.supersede(source);
@@ -2569,7 +2718,13 @@ impl<D: Device> CowBTree<D> {
         run.reserve(self.dirty.len() * page_size);
         let mut run_start: PageId = 0;
         let mut run_end: PageId = 0;
-        for (&id, bytes) in &self.dirty {
+        for (&id, page) in &self.dirty {
+            let Some(bytes) = page.bytes() else {
+                return Err(Error::Storage(alloc::format!(
+                    "page {id} reached the data-area write still decoded — \
+                     `materialize_dirty` did not run"
+                )));
+            };
             if bytes.len() != page_size {
                 // Not a whole page, so nothing can be adjacent to it. Flush
                 // whatever run is pending and write this one on its own.
@@ -2617,77 +2772,43 @@ impl<D: Device> CowBTree<D> {
             }];
             let new_id = self.alloc_page();
             // Every key is owned, so no shared page buffer is indexed here.
-            self.dirty
-                .insert(new_id, page::encode_leaf(self.page_size, &[], &entries)?);
+            self.dirty.insert(
+                new_id,
+                DirtyPage::Decoded(Rc::new(Node::Leaf {
+                    bytes: Arc::from(&[][..]),
+                    entries,
+                })),
+            );
             return Ok(InsertOutcome::Replaced { id: new_id });
         }
 
-        match self.read_node(id)? {
-            Node::Leaf { bytes, mut entries } => {
-                match entries.binary_search_by(|e| e.key.resolve(&bytes).cmp(key)) {
-                    Ok(i) => {
-                        let new_value = self.store_value(key, value)?;
-                        let old_value = core::mem::replace(&mut entries[i].value, new_value);
-                        if let ValueRef::Overflow { first, .. } = old_value {
-                            self.free_overflow_chain(first)?;
-                        }
-                    }
-                    Err(i) => entries.insert(
-                        i,
-                        Entry {
-                            key: Key::Owned(key.to_vec()),
-                            value: self.store_value(key, value)?,
-                        },
-                    ),
-                }
-                if page::leaf_size(&bytes, &entries) <= self.page_size {
-                    let new_id = self.page_slot(id);
-                    self.dirty
-                        .insert(new_id, page::encode_leaf(self.page_size, &bytes, &entries)?);
-                    Ok(InsertOutcome::Replaced { id: new_id })
-                } else {
-                    let mid = leaf_split_point(&bytes, &entries, self.page_size);
-                    let right = entries.split_off(mid);
-                    // The promoted separator is copied out of the leaf's bytes:
-                    // the parent's page is a different buffer, so the key cannot
-                    // stay borrowed across the boundary.
-                    let separator = right[0].key.resolve(&bytes).to_vec();
-                    let left_id = self.page_slot(id);
-                    let right_id = self.alloc_page();
-                    self.dirty.insert(
-                        left_id,
-                        page::encode_leaf(self.page_size, &bytes, &entries)?,
-                    );
-                    self.dirty
-                        .insert(right_id, page::encode_leaf(self.page_size, &bytes, &right)?);
-                    Ok(InsertOutcome::Split {
-                        left: left_id,
-                        right: right_id,
-                        separator,
-                    })
-                }
-            }
-            Node::Internal {
-                bytes,
-                leftmost,
-                cells,
-            } => {
-                let idx = child_index(&bytes, &cells, key);
-                let child = child_pointer(&bytes, &cells, leftmost, key);
-                match self.insert_into(child, key, value)? {
+        match self.descend(id, key)? {
+            Descent::Internal { idx, child } => {
+                // The child first, and only then this page: see [`Descent`]
+                // for why the page must stay in `dirty` across the recursion.
+                let outcome = self.insert_into(child, key, value)?;
+                let (node, was_dirty) = self.take_node_for_write(id)?;
+                let Node::Internal {
+                    bytes,
+                    leftmost,
+                    cells,
+                } = node
+                else {
+                    return Err(kind_changed(id));
+                };
+                match outcome {
                     InsertOutcome::Replaced { id: new_child } => {
                         let mut new_leftmost = leftmost;
                         let mut new_cells = cells;
                         replace_child(&mut new_cells, &mut new_leftmost, idx, new_child);
-                        let new_id = self.page_slot(id);
+                        let new_id = self.slot_for(id, was_dirty);
                         self.dirty.insert(
                             new_id,
-                            page::encode_internal(
-                                self.page_size,
-                                &bytes,
-                                new_leftmost,
-                                &new_cells,
-                            )?,
+                            DirtyPage::Decoded(Rc::new(Node::Internal {
+                                bytes,
+                                leftmost: new_leftmost,
+                                cells: new_cells,
+                            })),
                         );
                         Ok(InsertOutcome::Replaced { id: new_id })
                     }
@@ -2717,46 +2838,62 @@ impl<D: Device> CowBTree<D> {
                                 },
                             );
                         }
+                        // The size the encoder would produce, computed from
+                        // the cells without producing it — which is what lets
+                        // the page stay decoded until commit (AHL-542) without
+                        // making a single split decision approximate.
                         if page::internal_size(&bytes, &new_cells) <= self.page_size {
-                            let new_id = self.page_slot(id);
+                            let new_id = self.slot_for(id, was_dirty);
                             self.dirty.insert(
                                 new_id,
-                                page::encode_internal(
-                                    self.page_size,
-                                    &bytes,
-                                    new_leftmost,
-                                    &new_cells,
-                                )?,
+                                DirtyPage::Decoded(Rc::new(Node::Internal {
+                                    bytes,
+                                    leftmost: new_leftmost,
+                                    cells: new_cells,
+                                })),
                             );
                             Ok(InsertOutcome::Replaced { id: new_id })
                         } else {
                             // Split the internal node. With the entry-size
                             // guard in `put`, `new_cells` always has at least
                             // two cells here, so both halves are non-empty.
+                            let left_id = self.slot_for(id, was_dirty);
+                            let (right_id, node) = self.reserve_split_page(
+                                left_id,
+                                Node::Internal {
+                                    bytes,
+                                    leftmost: new_leftmost,
+                                    cells: new_cells,
+                                },
+                            )?;
+                            let Node::Internal {
+                                bytes,
+                                leftmost: new_leftmost,
+                                cells: mut new_cells,
+                            } = node
+                            else {
+                                return Err(kind_changed(left_id));
+                            };
                             let mid = internal_split_point(&bytes, &new_cells, self.page_size);
                             let right_cells = new_cells.split_off(mid);
                             let promoted = right_cells[0].key.resolve(&bytes).to_vec();
                             let right_leftmost = right_cells[0].child;
                             let right_rest = right_cells[1..].to_vec();
-                            let left_id = self.page_slot(id);
-                            let right_id = self.alloc_page();
                             self.dirty.insert(
                                 left_id,
-                                page::encode_internal(
-                                    self.page_size,
-                                    &bytes,
-                                    new_leftmost,
-                                    &new_cells,
-                                )?,
+                                DirtyPage::Decoded(Rc::new(Node::Internal {
+                                    bytes: Arc::clone(&bytes),
+                                    leftmost: new_leftmost,
+                                    cells: new_cells,
+                                })),
                             );
                             self.dirty.insert(
                                 right_id,
-                                page::encode_internal(
-                                    self.page_size,
-                                    &bytes,
-                                    right_leftmost,
-                                    &right_rest,
-                                )?,
+                                DirtyPage::Decoded(Rc::new(Node::Internal {
+                                    bytes,
+                                    leftmost: right_leftmost,
+                                    cells: right_rest,
+                                })),
                             );
                             Ok(InsertOutcome::Split {
                                 left: left_id,
@@ -2767,22 +2904,171 @@ impl<D: Device> CowBTree<D> {
                     }
                 }
             }
+            Descent::Leaf => {
+                // Stored before the page is taken: `store_value` allocates an
+                // overflow chain for a value too large to inline, and
+                // `alloc_page` reads the pending tree — see [`Descent`].
+                let new_value = self.store_value(key, value)?;
+                let (node, was_dirty) = self.take_node_for_write(id)?;
+                let Node::Leaf { bytes, mut entries } = node else {
+                    return Err(kind_changed(id));
+                };
+                // The chain an overwritten value used, freed once the page is
+                // back in `dirty`: `free_overflow_chain` walks the chain
+                // through the pending tree.
+                let mut superseded_chain = None;
+                match entries.binary_search_by(|e| e.key.resolve(&bytes).cmp(key)) {
+                    Ok(i) => {
+                        let old_value = core::mem::replace(&mut entries[i].value, new_value);
+                        if let ValueRef::Overflow { first, .. } = old_value {
+                            superseded_chain = Some(first);
+                        }
+                    }
+                    Err(i) => entries.insert(
+                        i,
+                        Entry {
+                            key: Key::Owned(key.to_vec()),
+                            value: new_value,
+                        },
+                    ),
+                }
+                let outcome = if page::leaf_size(&bytes, &entries) <= self.page_size {
+                    let new_id = self.slot_for(id, was_dirty);
+                    self.dirty.insert(
+                        new_id,
+                        DirtyPage::Decoded(Rc::new(Node::Leaf { bytes, entries })),
+                    );
+                    InsertOutcome::Replaced { id: new_id }
+                } else {
+                    let left_id = self.slot_for(id, was_dirty);
+                    let (right_id, node) =
+                        self.reserve_split_page(left_id, Node::Leaf { bytes, entries })?;
+                    let Node::Leaf {
+                        bytes,
+                        entries: mut left,
+                    } = node
+                    else {
+                        return Err(kind_changed(left_id));
+                    };
+                    let mid = leaf_split_point(&bytes, &left, self.page_size);
+                    let right = left.split_off(mid);
+                    // The promoted separator is copied out of the leaf's bytes:
+                    // the parent's page is a different buffer, so the key cannot
+                    // stay borrowed across the boundary.
+                    let separator = right[0].key.resolve(&bytes).to_vec();
+                    // Both halves keep the page they were split out of as the
+                    // buffer their borrowed keys index into, so neither has to
+                    // own a copy of the other's keys.
+                    self.dirty.insert(
+                        left_id,
+                        DirtyPage::Decoded(Rc::new(Node::Leaf {
+                            bytes: Arc::clone(&bytes),
+                            entries: left,
+                        })),
+                    );
+                    self.dirty.insert(
+                        right_id,
+                        DirtyPage::Decoded(Rc::new(Node::Leaf {
+                            bytes,
+                            entries: right,
+                        })),
+                    );
+                    InsertOutcome::Split {
+                        left: left_id,
+                        right: right_id,
+                        separator,
+                    }
+                };
+                if let Some(first) = superseded_chain {
+                    self.free_overflow_chain(first)?;
+                }
+                Ok(outcome)
+            }
         }
+    }
+
+    /// Where a descent through page `id` goes next, read without taking the
+    /// page out of the dirty set.
+    ///
+    /// See [`Descent`] for why that distinction is the whole of the hazard.
+    fn descend(&self, id: PageId, key: &[u8]) -> Result<Descent> {
+        Ok(match &*self.node_at(id, true)? {
+            Node::Leaf { .. } => Descent::Leaf,
+            Node::Internal {
+                bytes,
+                leftmost,
+                cells,
+            } => Descent::Internal {
+                idx: child_index(bytes, cells, key),
+                child: child_pointer(bytes, cells, *leftmost, key),
+            },
+        })
+    }
+
+    /// Reserve the page id the right half of a split will live in, with the
+    /// page being split put back into `dirty` for the length of the call.
+    ///
+    /// [`CowBTree::alloc_page`] reads the pending tree — it scans the free
+    /// list through `pending_root` — so the window it runs in may not contain
+    /// a hole. Handing it the *unsplit* node is what keeps that read honest:
+    /// the page is exactly the one this transaction has written so far, whole,
+    /// merely larger than a page will hold, and nothing encodes it while it
+    /// sits there. Splitting first and allocating second would show that read
+    /// half a leaf instead.
+    ///
+    /// The node comes straight back out by value: the map held the only
+    /// handle, so the round trip is two `BTreeMap` operations and no copy.
+    fn reserve_split_page(&mut self, left_id: PageId, node: Node) -> Result<(PageId, Node)> {
+        self.dirty
+            .insert(left_id, DirtyPage::Decoded(Rc::new(node)));
+        let right_id = self.alloc_page();
+        let (node, _) = self.take_node_for_write(left_id)?;
+        Ok((right_id, node))
     }
 
     fn delete_from(&mut self, id: PageId, key: &[u8]) -> Result<PageId> {
         if id == 0 {
             return Ok(0);
         }
-        match self.read_node(id)? {
-            Node::Leaf { bytes, mut entries } => {
+        match self.descend(id, key)? {
+            Descent::Internal { idx, child } => {
+                let new_child = self.delete_from(child, key)?;
+                let (node, was_dirty) = self.take_node_for_write(id)?;
+                let Node::Internal {
+                    bytes,
+                    leftmost,
+                    cells,
+                } = node
+                else {
+                    return Err(kind_changed(id));
+                };
+                let mut new_leftmost = leftmost;
+                let mut new_cells = cells;
+                replace_child(&mut new_cells, &mut new_leftmost, idx, new_child);
+                let new_id = self.slot_for(id, was_dirty);
+                self.dirty.insert(
+                    new_id,
+                    DirtyPage::Decoded(Rc::new(Node::Internal {
+                        bytes,
+                        leftmost: new_leftmost,
+                        cells: new_cells,
+                    })),
+                );
+                Ok(new_id)
+            }
+            Descent::Leaf => {
+                let (node, was_dirty) = self.take_node_for_write(id)?;
+                let Node::Leaf { bytes, mut entries } = node else {
+                    return Err(kind_changed(id));
+                };
+                let mut superseded_chain = None;
                 if let Ok(i) = entries.binary_search_by(|e| e.key.resolve(&bytes).cmp(key)) {
                     let removed = entries.remove(i);
                     if let ValueRef::Overflow { first, .. } = removed.value {
-                        self.free_overflow_chain(first)?;
+                        superseded_chain = Some(first);
                     }
                 }
-                if entries.is_empty() {
+                let new_id = if entries.is_empty() {
                     // The page is now unreachable. `supersede` drops it from
                     // `dirty` without a free-list row if this transaction is
                     // what allocated it (nothing outside the transaction has
@@ -2790,31 +3076,22 @@ impl<D: Device> CowBTree<D> {
                     // data area or copy into the commit record); otherwise it
                     // records it as freed, which this exact case never used
                     // to do — see `docs/recovery.md`'s "Space reclamation".
-                    self.supersede(id);
-                    Ok(0)
+                    self.supersede_taken(id, was_dirty);
+                    0
                 } else {
-                    let new_id = self.page_slot(id);
-                    self.dirty
-                        .insert(new_id, page::encode_leaf(self.page_size, &bytes, &entries)?);
-                    Ok(new_id)
+                    let new_id = self.slot_for(id, was_dirty);
+                    self.dirty.insert(
+                        new_id,
+                        DirtyPage::Decoded(Rc::new(Node::Leaf { bytes, entries })),
+                    );
+                    new_id
+                };
+                // After the page is settled, for the reason `insert_into`
+                // defers the same call: the chain is walked through the
+                // pending tree.
+                if let Some(first) = superseded_chain {
+                    self.free_overflow_chain(first)?;
                 }
-            }
-            Node::Internal {
-                bytes,
-                leftmost,
-                cells,
-            } => {
-                let idx = child_index(&bytes, &cells, key);
-                let child = child_pointer(&bytes, &cells, leftmost, key);
-                let new_child = self.delete_from(child, key)?;
-                let mut new_leftmost = leftmost;
-                let mut new_cells = cells;
-                replace_child(&mut new_cells, &mut new_leftmost, idx, new_child);
-                let new_id = self.page_slot(id);
-                self.dirty.insert(
-                    new_id,
-                    page::encode_internal(self.page_size, &bytes, new_leftmost, &new_cells)?,
-                );
                 Ok(new_id)
             }
         }
@@ -2830,11 +3107,77 @@ impl<D: Device> CowBTree<D> {
         }
     }
 
-    /// An owned node, for the write paths that decode a page in order to
-    /// change it. Copy-on-write means the result is about to be superseded by
-    /// a freshly allocated page, so it cannot be shared.
-    fn read_node(&self, id: PageId) -> Result<Node> {
-        Ok((*self.node_at(id, true)?).clone())
+    /// Take page `id` as an owned [`Node`] to change, and say whether it came
+    /// out of this transaction's dirty set.
+    ///
+    /// This is the read half of AHL-542. A page this transaction has already
+    /// written is *moved* out of `dirty` rather than decoded and deep-cloned:
+    /// the transaction owns it, nothing outside can see it, and the caller is
+    /// about to put it straight back under [`CowBTree::slot_for`]'s id — which,
+    /// for a page already dirty, is the same id. So the second and every later
+    /// row of a multi-row `INSERT` pays nothing at all for the pages on its
+    /// path, where before it paid a `page::decode` (a whole-page `Arc` copy
+    /// plus a `Vec` of cells) and a `Node::clone` (another `Vec` of cells, each
+    /// owned key copied) per page per row.
+    ///
+    /// A committed page is still decoded and cloned: it belongs to the page
+    /// cache and to every snapshot reader, so copy-on-write requires a copy.
+    /// That happens once per page per transaction, not once per row.
+    ///
+    /// Removing the entry is why the caller must carry `was_dirty` on to
+    /// [`CowBTree::slot_for`] or [`CowBTree::supersede_taken`]: both used to
+    /// decide from `dirty.contains_key`, and by then the entry is gone.
+    fn take_node_for_write(&mut self, id: PageId) -> Result<(Node, bool)> {
+        let page_size = self.page_size;
+        // Decoded before the entry is removed, so a page that fails to parse
+        // leaves the transaction holding exactly what it held before rather
+        // than losing a dirty page on the way out.
+        if let Some(DirtyPage::Encoded(bytes)) = self.dirty.get(&id) {
+            self.note_decode();
+            let node = page::decode(page_size, bytes)?;
+            self.dirty.remove(&id);
+            return Ok((node, true));
+        }
+        if let Some(DirtyPage::Decoded(node)) = self.dirty.remove(&id) {
+            // Unique in the ordinary case — the map held the only handle — so
+            // this is a move. A read of this transaction's own writes that is
+            // still holding the node makes it a clone, which is what the old
+            // code did unconditionally.
+            return Ok((
+                Rc::try_unwrap(node).unwrap_or_else(|shared| (*shared).clone()),
+                true,
+            ));
+        }
+        Ok(((*self.committed_node(id)?).clone(), false))
+    }
+
+    /// [`CowBTree::supersede`] for a page [`CowBTree::take_node_for_write`]
+    /// has already lifted out of `dirty`.
+    ///
+    /// `supersede`'s first act is to drop the page from `dirty` and stop —
+    /// this transaction allocated it, so there is nothing for the free list to
+    /// reclaim. Taking the node already did that, so `was_dirty` is exactly
+    /// the case that must record nothing.
+    fn supersede_taken(&mut self, id: PageId, was_dirty: bool) {
+        if !was_dirty {
+            self.supersede(id);
+        }
+    }
+
+    /// Encode every page this transaction is still holding as cells.
+    ///
+    /// Called once per commit, after [`CowBTree::finalize_free_list`] and
+    /// before anything reads bytes out of the dirty set. This is where AHL-542
+    /// spends what it saved: one `page::encode_leaf`/`page::encode_internal`
+    /// per *page*, where the old write path spent one per page per row.
+    fn materialize_dirty(&mut self) -> Result<()> {
+        let page_size = self.page_size;
+        for page in self.dirty.values_mut() {
+            if let DirtyPage::Decoded(node) = page {
+                *page = DirtyPage::Encoded(encode_node(page_size, node)?);
+            }
+        }
+        Ok(())
     }
 
     /// Decode page `id`, taking the open transaction's copy when `pending` is
@@ -2848,8 +3191,15 @@ impl<D: Device> CowBTree<D> {
     /// yet, and a conflict throws them away.
     fn node_at(&self, id: PageId, pending: bool) -> Result<Rc<Node>> {
         if pending {
-            if let Some(bytes) = self.dirty.get(&id) {
-                return Ok(Rc::new(page::decode(self.page_size, bytes)?));
+            match self.dirty.get(&id) {
+                // A page held as cells answers with a refcount bump: reading
+                // this transaction's own writes costs no decode at all.
+                Some(DirtyPage::Decoded(node)) => return Ok(Rc::clone(node)),
+                Some(DirtyPage::Encoded(bytes)) => {
+                    self.note_decode();
+                    return Ok(Rc::new(page::decode(self.page_size, bytes)?));
+                }
+                None => {}
             }
         }
         self.committed_node(id)
@@ -2883,6 +3233,7 @@ impl<D: Device> CowBTree<D> {
     }
 
     fn read_committed_node(&self, id: PageId) -> Result<Node> {
+        self.note_decode();
         // A page the device already holds is decoded in place: the node's
         // borrowed keys index into the device's own buffer, and the page is
         // copied neither into the scratch buffer nor into a fresh `Arc`.
@@ -2891,6 +3242,20 @@ impl<D: Device> CowBTree<D> {
         }
         let offset = crate::wal::data_offset_for(self.page_size, self.format_version, id);
         self.with_page_bytes(offset, page::decode)
+    }
+
+    /// Record one page decode — see the `decodes` field. Compiled away
+    /// outside tests.
+    #[cfg_attr(not(test), allow(unused_variables))]
+    fn note_decode(&self) {
+        #[cfg(test)]
+        self.decodes.set(self.decodes.get() + 1);
+    }
+
+    /// How many pages this handle has decoded so far.
+    #[cfg(test)]
+    fn decodes(&self) -> u64 {
+        self.decodes.get()
     }
 
     /// A committed data-area page as the buffer the device itself holds it
@@ -3181,8 +3546,19 @@ impl<D: Device> CowBTree<D> {
         f: impl FnOnce(usize, &[u8]) -> Result<T>,
     ) -> Result<T> {
         if pending {
-            if let Some(bytes) = self.dirty.get(&id) {
-                return f(self.page_size, bytes);
+            match self.dirty.get(&id) {
+                Some(DirtyPage::Encoded(bytes)) => return f(self.page_size, bytes),
+                // A page the write path is still holding as cells has no bytes
+                // to lend, so it is encoded for this one caller. Raw-byte
+                // reads of a page the same transaction just wrote are the
+                // scan-your-own-writes path, not the insert path AHL-542 is
+                // about, and falling through to the device here would serve
+                // the page as it was *before* this transaction.
+                Some(DirtyPage::Decoded(node)) => {
+                    let bytes = encode_node(self.page_size, node)?;
+                    return f(self.page_size, &bytes);
+                }
+                None => {}
             }
         }
         let offset = crate::wal::data_offset_for(self.page_size, self.format_version, id);
@@ -3240,7 +3616,9 @@ impl<D: Device> CowBTree<D> {
         for (i, chunk) in value.chunks(payload).enumerate() {
             let next = ids.get(i + 1).copied().unwrap_or(0);
             let bytes = page::encode_overflow(self.page_size, next, chunk)?;
-            self.dirty.insert(ids[i], bytes);
+            // Written once and never changed, so there is nothing to hold it
+            // decoded for — see [`DirtyPage`].
+            self.dirty.insert(ids[i], DirtyPage::Encoded(bytes));
         }
         Ok(ValueRef::Overflow {
             first: ids[0],
@@ -3340,8 +3718,19 @@ impl<D: Device> CowBTree<D> {
     /// page per chain link.
     fn read_overflow_page(&self, id: PageId, pending: bool) -> Result<(PageId, Vec<u8>)> {
         if pending {
-            if let Some(bytes) = self.dirty.get(&id) {
-                return page::decode_overflow(self.page_size, bytes);
+            // An overflow page is only ever `Encoded` (see [`DirtyPage`]), so
+            // a decoded entry under this id is a leaf or internal page and
+            // `decode_overflow` is entitled to refuse it — which it does, by
+            // kind, exactly as it would for the same page read off the device.
+            match self.dirty.get(&id) {
+                Some(DirtyPage::Encoded(bytes)) => {
+                    return page::decode_overflow(self.page_size, bytes)
+                }
+                Some(DirtyPage::Decoded(node)) => {
+                    let bytes = encode_node(self.page_size, node)?;
+                    return page::decode_overflow(self.page_size, &bytes);
+                }
+                None => {}
             }
         }
         let offset = crate::wal::data_offset_for(self.page_size, self.format_version, id);
@@ -5191,11 +5580,16 @@ mod tests {
                 prev_root: db.root,
                 root: db.pending_root,
                 next: db.pending_next,
-                pages: db
-                    .dirty
-                    .iter()
-                    .map(|(&id, bytes)| (id, bytes.clone()))
-                    .collect(),
+                // The record is built from the same bytes the commit path
+                // would write, so the dirty set is encoded first — exactly
+                // what `CowBTree::commit` does before it asks.
+                pages: {
+                    db.materialize_dirty().unwrap();
+                    db.dirty
+                        .iter()
+                        .map(|(&id, page)| (id, page.bytes().unwrap().to_vec()))
+                        .collect()
+                },
             };
             assert_eq!(
                 db.pending_record_len(),
@@ -5583,14 +5977,14 @@ mod tests {
         // transaction, forcing copy-on-write leaf and internal pages.
         db.put(&entry(20, 1), b"updated").unwrap();
         db.put(&entry(500, 0), &[]).unwrap();
-        assert!(db
-            .dirty
-            .values()
-            .any(|bytes| matches!(page::decode(PAGE, bytes), Ok(Node::Leaf { .. }))));
-        assert!(db
-            .dirty
-            .values()
-            .any(|bytes| matches!(page::decode(PAGE, bytes), Ok(Node::Internal { .. }))));
+        assert!(db.dirty.values().any(|page| matches!(
+            page,
+            DirtyPage::Decoded(node) if matches!(**node, Node::Leaf { .. })
+        )));
+        assert!(db.dirty.values().any(|page| matches!(
+            page,
+            DirtyPage::Decoded(node) if matches!(**node, Node::Internal { .. })
+        )));
 
         let dirty_raw = db
             .scan_range_row_ids_from(prefix, upper.as_deref(), None, usize::MAX)
@@ -7102,6 +7496,200 @@ mod tests {
         alloc::rc::Rc::new(core::cell::RefCell::new(SimDisk::with_block_size(
             512, CAPACITY,
         )))
+    }
+
+    /// The tie AHL-542 has to pass: holding a transaction's pages as cells
+    /// until commit must produce the *same file* as encoding each page the
+    /// moment it changed.
+    ///
+    /// One tree is left to do what the new write path does — every page stays
+    /// a `Node` until `commit` runs `materialize_dirty`. The other is forced
+    /// through the old shape by materialising after every single `put`, so its
+    /// next `put` finds a `DirtyPage::Encoded` and takes
+    /// `take_node_for_write`'s decode branch, exactly as the pre-AHL-542 code
+    /// did on every row. The two devices are then compared byte for byte:
+    /// page images, page ids, WAL records, state block and all.
+    ///
+    /// The workload is chosen to reach the parts where the two
+    /// representations could plausibly diverge — leaf splits, internal splits,
+    /// overwrites of existing keys, deletes, and overflow values — because a
+    /// tie on inserts alone would prove very little.
+    #[test]
+    fn a_transaction_writes_the_same_bytes_whether_its_pages_were_held_decoded_or_encoded() {
+        let mut lazy = CowBTree::open_or_create(disk(), PAGE).unwrap();
+        let mut eager = CowBTree::open_or_create(disk(), PAGE).unwrap();
+
+        let big = alloc::vec![0xa5u8; PAGE * 3];
+        for round in 0..6u32 {
+            for i in 0..40u32 {
+                let key = format!("key-{:04}", (i * 7 + round) % 240).into_bytes();
+                let value = if i % 11 == 0 {
+                    big.clone()
+                } else {
+                    format!("v{round}-{i}").into_bytes()
+                };
+                lazy.put(&key, &value).unwrap();
+                eager.put(&key, &value).unwrap();
+                // What the old write path effectively did after every row.
+                eager.materialize_dirty().unwrap();
+
+                if i % 5 == 4 {
+                    let gone = format!("key-{:04}", (i * 3 + round) % 240).into_bytes();
+                    lazy.delete(&gone).unwrap();
+                    eager.delete(&gone).unwrap();
+                    eager.materialize_dirty().unwrap();
+                }
+            }
+            assert_eq!(lazy.commit().unwrap(), CommitOutcome::Committed);
+            assert_eq!(eager.commit().unwrap(), CommitOutcome::Committed);
+            assert_eq!(
+                lazy.device().durable(),
+                eager.device().durable(),
+                "round {round}: the two representations wrote different bytes"
+            );
+        }
+
+        // And the contents are what the workload actually asked for, so the
+        // tie above is a tie on the right file rather than on two identically
+        // wrong ones.
+        assert!(!lazy.scan().unwrap().is_empty());
+        assert_eq!(lazy.scan().unwrap(), eager.scan().unwrap());
+    }
+
+    /// A hundred rows in one transaction decode the pages on their path a
+    /// handful of times, not a hundred times each.
+    ///
+    /// This is the whole of AHL-542 as a number. Before it, every row
+    /// re-decoded (and deep-cloned, and re-encoded) every page from the root
+    /// to its leaf, so the decode count grew with `rows x depth`. After it, a
+    /// page is decoded when the transaction first copies it out of the
+    /// committed tree and never again, so the count is bounded by the number
+    /// of *pages* the transaction touches — which cannot exceed the number of
+    /// pages it commits.
+    #[test]
+    fn a_hundred_row_transaction_decodes_its_path_once_per_page_not_once_per_row() {
+        let mut db = CowBTree::open_or_create(disk(), PAGE).unwrap();
+        // A committed tree several levels deep, so there is a real path to
+        // re-walk and the count below is not trivially small.
+        for i in 0..400u32 {
+            db.put(&format!("key-{i:04}").into_bytes(), b"seed")
+                .unwrap();
+        }
+        db.commit().unwrap();
+
+        const ROWS: u32 = 100;
+        let before = db.decodes();
+        for i in 0..ROWS {
+            db.put(&format!("key-{:04}", 1000 + i).into_bytes(), b"batch")
+                .unwrap();
+        }
+        let decodes = db.decodes() - before;
+        let dirty = db.dirty.len() as u64;
+        assert_eq!(db.commit().unwrap(), CommitOutcome::Committed);
+
+        assert!(
+            decodes <= dirty,
+            "{decodes} decodes for {ROWS} rows over {dirty} pages — a page is \
+             being decoded more than once per transaction"
+        );
+        // The interesting half of the assertion: it is nowhere near per-row.
+        // It is 3 as this is written — the depth of the committed path, each
+        // page copied out once — so a tenth of the row count is a ceiling with
+        // room for the tree to get deeper, and still an order of magnitude
+        // below the `rows x depth` the old write path paid.
+        assert!(
+            decodes <= ROWS as u64 / 10,
+            "{decodes} decodes for {ROWS} rows — the per-row page round trip is back"
+        );
+        // ...and the rows are all there.
+        for i in 0..ROWS {
+            assert_eq!(
+                db.get(&format!("key-{:04}", 1000 + i).into_bytes())
+                    .unwrap(),
+                Some(RowBuf::Owned(b"batch".to_vec()))
+            );
+        }
+    }
+
+    /// A transaction whose pages are held as cells rebases onto another
+    /// writer's commit exactly as one holding bytes did.
+    ///
+    /// `rebase_pending` throws the dirty set away and replays `pending_ops`
+    /// against the winner's root, so the representation of what it threw away
+    /// should not matter — but "should not" is why this is a test. The
+    /// transaction here is large enough to have split pages and to be holding
+    /// several decoded nodes at the moment the other writer wins.
+    #[test]
+    fn a_decoded_transaction_rebases_onto_another_writers_disjoint_commit() {
+        let disk = shared_disk();
+        let mut writer_a = CowBTree::create(disk.clone(), PAGE).unwrap();
+        writer_a.put(b"seed", b"0").unwrap();
+        writer_a.commit().unwrap();
+
+        let mut writer_b = CowBTree::open(disk.clone()).unwrap();
+        for i in 0..60u32 {
+            writer_b
+                .put(&format!("b-{i:04}").into_bytes(), b"from-b")
+                .unwrap();
+        }
+        // B is mid-transaction and holding decoded pages.
+        assert!(writer_b
+            .dirty
+            .values()
+            .any(|page| matches!(page, DirtyPage::Decoded(_))));
+
+        // A commits a disjoint key first.
+        writer_a.put(b"a-only", b"from-a").unwrap();
+        assert_eq!(writer_a.commit().unwrap(), CommitOutcome::Committed);
+
+        // B rebases rather than conflicting, and both writers' rows survive.
+        assert_eq!(writer_b.commit().unwrap(), CommitOutcome::Committed);
+        let rows: Vec<Vec<u8>> = writer_b
+            .scan()
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(rows.len(), 62, "{rows:?}");
+        assert!(rows.contains(&b"a-only".to_vec()));
+        assert!(rows.contains(&b"b-0059".to_vec()));
+        assert_eq!(
+            writer_b.get(b"a-only").unwrap(),
+            Some(RowBuf::Owned(b"from-a".to_vec()))
+        );
+    }
+
+    /// The same shape, but the two writers touch the same key: B's decoded
+    /// dirty set is discarded and B adopts the winner.
+    #[test]
+    fn a_decoded_transaction_conflicts_and_drops_every_decoded_page() {
+        let disk = shared_disk();
+        let mut writer_a = CowBTree::create(disk.clone(), PAGE).unwrap();
+        writer_a.put(b"k", b"v1").unwrap();
+        writer_a.commit().unwrap();
+
+        let mut writer_b = CowBTree::open(disk.clone()).unwrap();
+        for i in 0..60u32 {
+            writer_b
+                .put(&format!("b-{i:04}").into_bytes(), b"from-b")
+                .unwrap();
+        }
+        writer_b.put(b"k", b"v3").unwrap();
+        assert!(writer_b.dirty.len() > 1);
+
+        writer_a.put(b"k", b"v2").unwrap();
+        assert_eq!(writer_a.commit().unwrap(), CommitOutcome::Committed);
+
+        assert_eq!(writer_b.commit().unwrap(), CommitOutcome::Conflict);
+        assert!(writer_b.dirty.is_empty());
+        assert!(!writer_b.is_dirty());
+        assert_eq!(
+            writer_b.get(b"k").unwrap(),
+            Some(RowBuf::Owned(b"v2".to_vec()))
+        );
+        // None of the 60 discarded rows survived the abort.
+        assert_eq!(writer_b.get(b"b-0000").unwrap(), None);
+        assert_eq!(writer_b.scan().unwrap().len(), 1);
     }
 
     #[test]
