@@ -47,8 +47,8 @@ use crate::plan::{
 };
 use crate::planner::{self, JoinDecision, JoinPath, PlannerStats, STATS_META_KEY};
 use crate::row::{
-    decode_row, decode_row_masked, decode_row_ref_masked_into, decode_value_at, encode_typed_row,
-    encode_typed_row_into, ColumnMask, RowBuf,
+    decode_row, decode_row_masked, decode_row_ref_masked_into, decode_row_ref_wanted_into,
+    decode_value_at, encode_typed_row, encode_typed_row_into, ColumnMask, RowBuf,
 };
 use crate::shared::SharedStorage;
 use crate::sql::{self, TableRules};
@@ -7103,13 +7103,22 @@ impl Engine {
                 // bytes go, so a row that lands in an existing group costs no
                 // allocation at all. `park` is what makes the `'static`
                 // honest — see its doc.
+                //
+                // The rows arrive by callback rather than by iterator
+                // (`RowBytes::for_each_row`): a scan hands each row's bytes
+                // over while its leaf is borrowed, so no row is ever wrapped
+                // in a `RowBuf`, refcounted, or written into a batch `Vec` on
+                // its way here (`PERF.md`, AHL-538).
                 let mut scratch: Vec<ValueRef<'static>> = Vec::new();
-                for row in source {
-                    let (id, bytes) = row?;
+                source.for_each_row(&mut |id, bytes| {
                     self.interrupt.check()?;
                     let mut cells: Vec<ValueRef<'_>> = core::mem::take(&mut scratch);
-                    let outcome = decode_row_ref_masked_into(bytes.as_slice(), mask, &mut cells)
-                        .and_then(|()| {
+                    // The row is folded and dropped, never returned, so the
+                    // walk stops at the last column the fold reads — see
+                    // `decode_row_ref_wanted_into` for the contract that
+                    // trades.
+                    let outcome =
+                        decode_row_ref_wanted_into(bytes, mask, &mut cells).and_then(|()| {
                             // The `WHERE`, on the borrowed cells, before any
                             // fold — the same test and the same three-valued
                             // truth `DecodeFilter` applies on the general
@@ -7124,8 +7133,8 @@ impl Engine {
                             folder.step(id, cells.as_slice())
                         });
                     scratch = park(cells);
-                    outcome?;
-                }
+                    outcome
+                })?;
             }
         }
 

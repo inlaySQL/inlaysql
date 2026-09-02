@@ -122,6 +122,33 @@ pub trait Storage {
         limit: usize,
     ) -> Result<Vec<(RowId, RowBuf)>>;
 
+    /// [`Storage::scan_batch`], handing each row's bytes to `row` as it is
+    /// read instead of collecting the batch.
+    ///
+    /// The same rows, in the same order, under the same three obligations;
+    /// the answer is how many rows `row` was given and the last row id among
+    /// them, which is all a [`RowScan`] needs to stop and resume. A consumer
+    /// that reads each row once and moves on — the streamed aggregate — is
+    /// spared what a returned batch costs per row: a shared buffer's refcount
+    /// bump and release, and a `(RowId, RowBuf)` written into a `Vec` and read
+    /// back out (`PERF.md`, AHL-538). The default collects and replays, so a
+    /// backend that has no cheaper way to do it behaves exactly as before; a
+    /// backend that has one overrides it.
+    fn scan_batch_with(
+        &self,
+        table: &str,
+        after: Option<RowId>,
+        limit: usize,
+        row: &mut dyn FnMut(RowId, &[u8]) -> Result<()>,
+    ) -> Result<(usize, Option<RowId>)> {
+        let batch = self.scan_batch(table, after, limit)?;
+        let last = batch.last().map(|(id, _)| *id);
+        for (id, bytes) in &batch {
+            row(*id, bytes.as_slice())?;
+        }
+        Ok((batch.len(), last))
+    }
+
     /// Write (or overwrite) a `WITHOUT ROWID` table's row, addressed by its
     /// primary key's encoded bytes rather than a [`RowId`] — there is no
     /// row id on such a table at all.
@@ -432,6 +459,40 @@ impl<'a> RowScan<'a> {
             interrupt: Some(interrupt),
             ..Self::new(storage, table)
         }
+    }
+
+    /// Run `row` over every remaining row, in order, without handing any of
+    /// them out.
+    ///
+    /// The same batches [`Iterator::next`] would pull — same first size, same
+    /// doubling, same cancellation check per batch, same "a short batch is the
+    /// end" — through [`Storage::scan_batch_with`], so the rows reach `row`
+    /// straight from the leaf rather than through a collected `Vec`. Rows
+    /// already pulled into the current batch are drained first, so a scan that
+    /// was partly iterated continues rather than repeats. Stops at the first
+    /// error, which is the pipeline's contract.
+    pub fn for_each_row(mut self, row: &mut dyn FnMut(RowId, &[u8]) -> Result<()>) -> Result<()> {
+        for (id, bytes) in self.batch.by_ref() {
+            self.after = Some(id);
+            row(id, bytes.as_slice())?;
+        }
+        while !self.finished {
+            if let Some(interrupt) = self.interrupt {
+                interrupt.check_rows(self.size)?;
+            }
+            let (count, last) =
+                self.storage
+                    .scan_batch_with(&self.table, self.after, self.size, row)?;
+            if count < self.size {
+                self.finished = true;
+            }
+            if count == 0 {
+                break;
+            }
+            self.after = last;
+            self.size = self.size.saturating_mul(2).min(MAX_SCAN_BATCH);
+        }
+        Ok(())
     }
 }
 
@@ -1133,4 +1194,74 @@ pub trait VectorTuning {
 pub trait Rng {
     /// Next pseudo-random 64-bit word.
     fn next_u64(&mut self) -> u64;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Error;
+    use crate::mem::MemStorage;
+    use alloc::string::ToString;
+    use alloc::{format, vec};
+
+    fn seeded(rows: u64) -> MemStorage {
+        let mut storage = MemStorage::new();
+        for id in 1..=rows {
+            storage
+                .put_row("t", id, format!("row-{id}").as_bytes())
+                .unwrap();
+        }
+        storage.commit().unwrap();
+        storage
+    }
+
+    /// `for_each_row` hands out what `next` would: the same rows in the same
+    /// order over many doubling batches, the rest of a batch that was partly
+    /// pulled first, and nothing after the first error. (Draining the pulled
+    /// batch before asking for more is a saving, not a behaviour: `after` is
+    /// the last row handed out either way, so skipping the drain re-reads
+    /// the same rows and this test cannot tell — checked by mutation.)
+    #[test]
+    fn a_callback_scan_hands_out_what_the_iterator_yields() {
+        let storage = seeded(1_500);
+        let expected: Vec<(RowId, Vec<u8>)> = RowScan::new(&storage, "t")
+            .map(|row| row.map(|(id, bytes)| (id, bytes.into_vec())))
+            .collect::<Result<_>>()
+            .unwrap();
+        assert_eq!(expected.len(), 1_500);
+
+        let mut handed = Vec::new();
+        RowScan::new(&storage, "t")
+            .for_each_row(&mut |id, bytes| {
+                handed.push((id, bytes.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(handed, expected);
+
+        // Partly iterated, then drained: the rest of the pulled batch first,
+        // then the batches after it, with no row repeated or skipped.
+        let mut scan = RowScan::new(&storage, "t");
+        let pulled: Vec<RowId> = scan.by_ref().take(3).map(|row| row.unwrap().0).collect();
+        assert_eq!(pulled, vec![1, 2, 3]);
+        let mut rest = Vec::new();
+        scan.for_each_row(&mut |id, bytes| {
+            rest.push((id, bytes.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rest, expected[3..]);
+
+        let mut seen = 0;
+        let stopped = RowScan::new(&storage, "t").for_each_row(&mut |id, _| {
+            seen += 1;
+            if id == 40 {
+                Err(Error::Corrupt("stop".to_string()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(stopped, Err(Error::Corrupt(_))));
+        assert_eq!(seen, 40);
+    }
 }

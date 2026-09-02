@@ -36,6 +36,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::ops::Range;
 
 use crate::error::{Error, Result};
 use crate::row::RowBuf;
@@ -2021,6 +2022,35 @@ impl<D: Device> CowBTree<D> {
         self.scan_range_row_values_raw_from(prefix, upper.as_deref(), after, limit)
     }
 
+    /// [`CowBTree::scan_prefix_row_values_raw_from`], handing each row's bytes
+    /// to `row` instead of returning them.
+    ///
+    /// The same walk, the same admitted rows in the same order, and the same
+    /// resume — [`RowSink`] is what makes that provable: both forms drive one
+    /// `walk_raw_row_values`, and only the sink differs. What a consumer that
+    /// reads each row once and moves on saves is everything a returned batch
+    /// costs per row: the `Arc` refcount bump and its release, the forty-byte
+    /// `(RowId, RowBuf)` written into a `Vec` and read back out of its
+    /// iterator (`PERF.md`, AHL-538). Returns how many rows `row` was given
+    /// and the last row id among them, which is what a batched scan needs to
+    /// stop and to resume.
+    pub(crate) fn scan_prefix_row_values_raw_with(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+        row: &mut dyn FnMut(RowId, &[u8]) -> Result<()>,
+    ) -> Result<(usize, Option<RowId>)> {
+        let upper = prefix_upper_bound(prefix);
+        let mut sink = RowCallback {
+            accepted: 0,
+            last: None,
+            row,
+        };
+        self.scan_range_row_values_raw_into(prefix, upper.as_deref(), after, limit, &mut sink)?;
+        Ok((sink.accepted, sink.last))
+    }
+
     /// The raw-leaf form of `scan_range_row_values_from`.
     pub(crate) fn scan_range_row_values_raw_from(
         &self,
@@ -2030,8 +2060,23 @@ impl<D: Device> CowBTree<D> {
         limit: usize,
     ) -> Result<Vec<(RowId, RowBuf)>> {
         let mut out = Vec::new();
+        self.scan_range_row_values_raw_into(start, end, after, limit, &mut out)?;
+        Ok(out)
+    }
+
+    /// The one raw range walk behind both [`CowBTree::scan_range_row_values_raw_from`]
+    /// and [`CowBTree::scan_prefix_row_values_raw_with`]: the sink is the only
+    /// difference between them.
+    fn scan_range_row_values_raw_into<S: RowSink>(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        after: Option<&[u8]>,
+        limit: usize,
+        out: &mut S,
+    ) -> Result<()> {
         if limit == 0 || end.is_some_and(|end| end <= start) {
-            return Ok(out);
+            return Ok(());
         }
         let bounds = WalkBounds {
             start,
@@ -2050,9 +2095,9 @@ impl<D: Device> CowBTree<D> {
                     if cursor.root == root
                         && cursor.generation == generation
                         && cursor.lower_is_in_leaf(&bounds)
-                        && self.scan_row_values_from_cursor(cursor, &bounds, &mut out)?
+                        && self.scan_row_values_from_cursor(cursor, &bounds, out)?
                     {
-                        return Ok(out);
+                        return Ok(());
                     }
                 }
             }
@@ -2062,7 +2107,7 @@ impl<D: Device> CowBTree<D> {
             root,
             &bounds,
             pending,
-            &mut out,
+            out,
             RangeSpanSources::default(),
             &mut candidate,
         )?;
@@ -2071,7 +2116,7 @@ impl<D: Device> CowBTree<D> {
                 self.retain_raw_scan_cursor(root, generation, candidate);
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Visit every leaf page whose key range can intersect `[start, end)`, in
@@ -2957,12 +3002,12 @@ impl<D: Device> CowBTree<D> {
     /// [`CowBTree::walk_raw_row_values`] so the two provably admit the same
     /// rows: whether the bytes came from the device or from a resident node,
     /// the cells are read the same way and bounded the same way.
-    fn scan_leaf_into(
+    fn scan_leaf_into<S: RowSink>(
         &self,
         shared: &Arc<[u8]>,
         bounds: &WalkBounds<'_>,
         pending: bool,
-        out: &mut Vec<(RowId, RowBuf)>,
+        out: &mut S,
     ) -> Result<()> {
         let whole = bounds.admits_whole_leaf(shared, self.page_size)?;
         page::scan_leaf_cells(shared, self.page_size, |key, value| {
@@ -2972,9 +3017,8 @@ impl<D: Device> CowBTree<D> {
             if !whole && !bounds.admits(key) {
                 return Ok(());
             }
-            let value = self.resolve_value_at(Some(shared), &value, pending)?;
-            out.push((trailing_row_id(key)?, value));
-            Ok(())
+            let row = self.resolve_scanned_at(Some(shared), &value, pending)?;
+            out.push(trailing_row_id(key)?, row)
         })
     }
 
@@ -3043,16 +3087,26 @@ impl<D: Device> CowBTree<D> {
     /// result is committed only if the caller's limit was filled. Otherwise
     /// the caller still needs a later leaf and the normal walk must start from
     /// the original bounds without any partial rows having been appended.
-    fn scan_row_values_from_cursor(
+    fn scan_row_values_from_cursor<S: RowSink>(
         &self,
         cursor: &RawScanCursor,
         bounds: &WalkBounds<'_>,
-        out: &mut Vec<(RowId, RowBuf)>,
+        out: &mut S,
     ) -> Result<bool> {
+        // Whether the range ends in this leaf is known before it is read, and
+        // then the rows can go straight to the sink. Otherwise they are held
+        // until the leaf has proved it fills the limit, because a callback
+        // sink cannot take a row back.
+        if cursor.end_is_in_leaf(bounds.end) {
+            self.scan_leaf_into(&cursor.bytes, bounds, false, out)?;
+            return Ok(true);
+        }
         let mut rows = Vec::new();
         self.scan_leaf_into(&cursor.bytes, bounds, false, &mut rows)?;
-        if cursor.end_is_in_leaf(bounds.end) || rows.len() >= bounds.limit {
-            out.extend(rows);
+        if rows.len() >= bounds.limit {
+            for (id, row) in rows {
+                out.push_buf(id, row)?;
+            }
             return Ok(true);
         }
         Ok(false)
@@ -3213,6 +3267,20 @@ impl<D: Device> CowBTree<D> {
         value: &ValueRef,
         pending: bool,
     ) -> Result<RowBuf> {
+        self.resolve_scanned_at(node_bytes, value, pending)
+            .map(ScannedRow::into_buf)
+    }
+
+    /// [`CowBTree::resolve_value_at`] without the refcount bump: the row as a
+    /// borrow of the page it lives in, for a [`RowSink`] to keep or to read
+    /// and let go. Only an overflow chain is assembled into owned bytes here,
+    /// exactly as before.
+    fn resolve_scanned_at<'a>(
+        &self,
+        node_bytes: Option<&'a Arc<[u8]>>,
+        value: &'a ValueRef,
+        pending: bool,
+    ) -> Result<ScannedRow<'a>> {
         match value {
             ValueRef::Inline(range) => {
                 // The decoded-node path passes the node's shared buffer; the
@@ -3224,13 +3292,13 @@ impl<D: Device> CowBTree<D> {
                         "borrowed inline value outside a decoded page".to_string(),
                     ));
                 };
-                Ok(RowBuf::Shared {
-                    bytes: Arc::clone(bytes),
+                Ok(ScannedRow::Shared {
+                    bytes,
                     range: range.clone(),
                 })
             }
-            ValueRef::Owned(bytes) => Ok(RowBuf::Shared {
-                bytes: Arc::clone(bytes),
+            ValueRef::Owned(bytes) => Ok(ScannedRow::Shared {
+                bytes,
                 range: 0..bytes.len(),
             }),
             ValueRef::Overflow { first, len } => {
@@ -3257,7 +3325,7 @@ impl<D: Device> CowBTree<D> {
                     out.extend_from_slice(&data[..take]);
                     id = next;
                 }
-                Ok(RowBuf::Owned(out))
+                Ok(ScannedRow::Owned(out))
             }
         }
     }
@@ -3607,12 +3675,12 @@ impl<D: Device> CowBTree<D> {
     /// point lookup / `get` still decodes once and serves from the cache, where
     /// the owned key is already paid for and re-reading raw bytes would be
     /// strictly worse (`PERF.md`, AHL-493's cache-resident regression).
-    fn walk_raw_row_values(
+    fn walk_raw_row_values<S: RowSink>(
         &self,
         id: PageId,
         bounds: &WalkBounds<'_>,
         pending: bool,
-        out: &mut Vec<(RowId, RowBuf)>,
+        out: &mut S,
         span: RangeSpanSources,
         last_leaf: &mut Option<RawScanCursorCandidate>,
     ) -> Result<()> {
@@ -3810,6 +3878,111 @@ impl<D: Device> CowBTree<D> {
             }
         }
         Ok(())
+    }
+}
+
+/// Where a raw row scan puts the rows it admits.
+///
+/// [`CowBTree::walk_raw_row_values`] is one walk with two consumers. A
+/// `Vec<(RowId, RowBuf)>` keeps every row: each becomes a [`RowBuf::Shared`]
+/// holding the leaf's `Arc`, which is what a batch handed up through
+/// [`crate::traits::Storage::scan_batch`] has always been. A [`RowCallback`]
+/// reads each row while the leaf is borrowed and keeps nothing, which is what
+/// a consumer that folds a row and moves on wants — no refcount bump per row,
+/// no forty-byte tuple written and read back (`PERF.md`, AHL-538). The walk
+/// itself cannot tell them apart, so the two admit the same rows in the same
+/// order by construction; `a_callback_scan_hands_out_the_rows_a_batch_returns`
+/// checks it anyway.
+pub(crate) trait RowSink {
+    /// Rows accepted so far. The walk stops at the bounds' limit.
+    fn len(&self) -> usize;
+
+    /// Take one admitted row, borrowed from the leaf it lives in.
+    fn push(&mut self, id: RowId, row: ScannedRow<'_>) -> Result<()>;
+
+    /// Take one admitted row that was already held — the cursor path buffers
+    /// a leaf before it knows whether to commit it.
+    fn push_buf(&mut self, id: RowId, row: RowBuf) -> Result<()>;
+}
+
+/// One admitted row, as the leaf scan sees it: a byte range of the page's
+/// shared buffer, or an overflow chain reassembled into owned bytes.
+pub(crate) enum ScannedRow<'a> {
+    /// A range of a page buffer the scan is borrowing.
+    Shared {
+        /// The page's shared buffer.
+        bytes: &'a Arc<[u8]>,
+        /// The row's byte range inside it.
+        range: Range<usize>,
+    },
+    /// Bytes assembled from an overflow chain.
+    Owned(Vec<u8>),
+}
+
+impl ScannedRow<'_> {
+    /// The row's bytes.
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            ScannedRow::Shared { bytes, range } => &bytes[range.clone()],
+            ScannedRow::Owned(bytes) => bytes,
+        }
+    }
+
+    /// Keep the row: the refcount bump the `Vec` sink pays and the callback
+    /// sink does not.
+    fn into_buf(self) -> RowBuf {
+        match self {
+            ScannedRow::Shared { bytes, range } => RowBuf::Shared {
+                bytes: Arc::clone(bytes),
+                range,
+            },
+            ScannedRow::Owned(bytes) => RowBuf::Owned(bytes),
+        }
+    }
+}
+
+impl RowSink for Vec<(RowId, RowBuf)> {
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+
+    fn push(&mut self, id: RowId, row: ScannedRow<'_>) -> Result<()> {
+        Vec::push(self, (id, row.into_buf()));
+        Ok(())
+    }
+
+    fn push_buf(&mut self, id: RowId, row: RowBuf) -> Result<()> {
+        Vec::push(self, (id, row));
+        Ok(())
+    }
+}
+
+/// The [`RowSink`] that hands each row to a caller's callback and keeps none.
+pub(crate) struct RowCallback<'f> {
+    /// Rows handed out so far — the sink's `len`, kept because the callback
+    /// keeps nothing to count.
+    accepted: usize,
+    /// The last row id handed out, for the caller's resume.
+    last: Option<RowId>,
+    /// The caller.
+    row: &'f mut dyn FnMut(RowId, &[u8]) -> Result<()>,
+}
+
+impl RowSink for RowCallback<'_> {
+    fn len(&self) -> usize {
+        self.accepted
+    }
+
+    fn push(&mut self, id: RowId, row: ScannedRow<'_>) -> Result<()> {
+        self.accepted += 1;
+        self.last = Some(id);
+        (self.row)(id, row.as_slice())
+    }
+
+    fn push_buf(&mut self, id: RowId, row: RowBuf) -> Result<()> {
+        self.accepted += 1;
+        self.last = Some(id);
+        (self.row)(id, row.as_slice())
     }
 }
 
@@ -5979,6 +6152,121 @@ mod tests {
             assert_eq!(row_id, expected_id);
             assert_eq!(value.as_slice(), expected_value.as_slice());
         }
+    }
+
+    /// The callback walk (`scan_prefix_row_values_raw_with`) hands out
+    /// exactly the rows the batch walk returns — the whole range, a limited
+    /// batch, a resumed batch, a batch answered from the retained cursor
+    /// through either of its branches — with the same count and the same
+    /// last row id, and it stops at the callback's first error. The two share
+    /// one walk and differ only in the sink, so this is the check that the
+    /// sink is the only difference.
+    #[test]
+    fn a_callback_scan_hands_out_the_rows_a_batch_returns() {
+        const PREFIX: &[u8] = b"\x01tbl\0";
+        let row_key = |id: u64| {
+            let mut key = PREFIX.to_vec();
+            key.extend_from_slice(&id.to_be_bytes());
+            key
+        };
+        // A device that counts commits, so the retained raw-scan cursor is
+        // live and both of its branches below are really taken.
+        let device = Rc::new(RefCell::new(CountingDisk::new(true)));
+        let mut db = CowBTree::create(device, PAGE).unwrap();
+        for id in 1..=900u64 {
+            db.put(&row_key(id), format!("row-{id}").as_bytes())
+                .unwrap();
+            db.put(
+                &[b"\x01tblz\0".to_vec(), id.to_be_bytes().to_vec()].concat(),
+                b"noise",
+            )
+            .unwrap();
+            db.commit().unwrap();
+        }
+
+        /// Both walks over the same bounds, tied row for row.
+        fn tie(
+            db: &CowBTree<Rc<RefCell<CountingDisk>>>,
+            after: Option<&[u8]>,
+            limit: usize,
+        ) -> Vec<(RowId, RowBuf)> {
+            let batch = db
+                .scan_prefix_row_values_raw_from(PREFIX, after, limit)
+                .unwrap();
+            let mut handed: Vec<(RowId, Vec<u8>)> = Vec::new();
+            let (count, last) = db
+                .scan_prefix_row_values_raw_with(PREFIX, after, limit, &mut |id, bytes| {
+                    handed.push((id, bytes.to_vec()));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(count, batch.len(), "after {after:?}, limit {limit}");
+            assert_eq!(last, batch.last().map(|(id, _)| *id));
+            assert_eq!(handed.len(), batch.len());
+            for ((id, bytes), (batch_id, batch_bytes)) in handed.iter().zip(batch.iter()) {
+                assert_eq!(id, batch_id);
+                assert_eq!(bytes.as_slice(), batch_bytes.as_slice());
+            }
+            batch
+        }
+
+        let everything = tie(&db, None, usize::MAX);
+        assert_eq!(everything.len(), 900);
+        assert_eq!(tie(&db, None, 5).len(), 5);
+        assert!(tie(&db, None, 0).is_empty());
+
+        // A resumed, batched read through the callback alone reassembles the
+        // whole range, resuming from the last id it reported.
+        let mut resumed: Vec<(RowId, Vec<u8>)> = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let (count, last) = db
+                .scan_prefix_row_values_raw_with(PREFIX, after.as_deref(), 7, &mut |id, bytes| {
+                    resumed.push((id, bytes.to_vec()));
+                    Ok(())
+                })
+                .unwrap();
+            if count == 0 {
+                break;
+            }
+            assert!(count <= 7);
+            after = Some(row_key(last.unwrap()));
+        }
+        assert_eq!(resumed.len(), everything.len());
+        for ((id, bytes), (expected_id, expected)) in resumed.iter().zip(everything.iter()) {
+            assert_eq!(id, expected_id);
+            assert_eq!(bytes.as_slice(), expected.as_slice());
+        }
+
+        // The retained cursor's two branches. A short read inside a leaf is
+        // repeated: the second is answered from the leaf the first retained,
+        // held until it fills the limit and then replayed. A read whose range
+        // ends in the last leaf goes to the sink directly.
+        let short = tie(&db, Some(&row_key(100)), 3);
+        assert!(db.row_scan_cursor.borrow().is_some());
+        assert_eq!(tie(&db, Some(&row_key(100)), 3), short);
+        // Every tail short enough to sit inside the last row leaf takes the
+        // direct branch; the ones that straddle a leaf edge fall back.
+        for from in 890..900u64 {
+            let tail = tie(&db, Some(&row_key(from)), 100);
+            assert_eq!(tail.len(), (900 - from) as usize);
+            assert!(db.row_scan_cursor.borrow().is_some());
+            assert_eq!(tie(&db, Some(&row_key(from)), 100), tail);
+        }
+
+        // The callback's error is the walk's error, and nothing after it is
+        // handed out.
+        let mut seen = 0;
+        let stopped = db.scan_prefix_row_values_raw_with(PREFIX, None, usize::MAX, &mut |id, _| {
+            seen += 1;
+            if id == 10 {
+                Err(Error::Corrupt("stop".to_string()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(stopped, Err(Error::Corrupt(_))));
+        assert_eq!(seen, 10);
     }
 
     /// A leaf is admitted whole exactly when both its edge keys are — and
