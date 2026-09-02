@@ -198,3 +198,10 @@ No format change means no version-dispatch tests. What has to hold:
   `indexed`, `indexed-range`, `joins-limit`, `writes`. `points` must be flat
   or better; it decodes one leaf through `decode`, not this path, so it is
   the control.
+
+## Outcome
+
+Landed as the decoder change above, no format change (`PERF.md`,
+2026-09-03, AHL-541). Interleaved against `48b4ef5`, 3/3 non-overlapping:
+`aggregate` 100k 1.05x, 20k 1.06x; `indexed` 1.09x; `indexed-range` 1.04x;
+`joins-limit` 1.04x; `points`, `joins`, `writes` flat. Both DST sweeps pass.

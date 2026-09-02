@@ -4064,6 +4064,104 @@ the memory backend's collect-and-replay default and to the collected fold,
 under every shape and filter the existing bytes-fed tie uses. The raw-vs-
 decoded parity tests and both DST sweeps pass unchanged.
 
+### The leaf already had a cell offset table; the walk's cost was the decoder (AHL-541, 2026-09-03)
+
+B4's next slice after AHL-538 was the cell iteration — 11.5% of the
+aggregate profile (`scan_leaf_cells` 3.3% self, `decode_leaf_cell_ref` 3.0%,
+`get_u16` 1.9%, `resolve_scanned_at` 2.2%), with `admits_whole_leaf` at 4.7%
+inclusive before that. The hypothesis was a format change: a SQLite-style
+per-leaf cell offset table, fixed-width offsets at the page head and cells
+packed from the tail, so cell *i* is arithmetic rather than a walk over
+variable-length headers, the last key is O(1), and in-leaf binary search is
+cheap. The design brief is `docs/research/leaf-offset-table.md`; this is
+what it found and what was landed instead.
+
+**Refuted by reading.** `btree/page.rs` has had exactly that layout since
+the tree was written: a 16-byte header (`kind`, `cell_count`, `free_start`,
+`leftmost`), a u16 slot directory from byte 16, cells written from
+`page_size` backwards. Cell *i* was already `get_u16(16 + 2i)`;
+`leaf_edge_keys` already read the first and last slots and decoded two
+cells, not `count`; `child_index` was already a `partition_point`. There
+was no sequential header walk anywhere in the leaf reader to remove, and so
+no layout to propose: the only tweak that changes the per-cell arithmetic
+at all (storing cell ends as well as starts) saves two length loads that
+are needed anyway to split key from value.
+
+**Measured before building.** `batch_proto --cells` (AHL-537's binary)
+collects the 3,730 leaves of the 100k-row table once and walks them 40
+times each through today's `scan_leaf_cells` (E0) and through a decoder
+written as tight as the same layout allows (E1: header checked once, then
+one bounds-checked `get` per field, no `Result`-returning helper per field,
+every refusal kept), order alternated, an identical callback asserted equal
+per repetition. Three runs at load 42: E0 10.7 / 4.7 / 3.8 ns per cell, E1
+5.9 / 2.4 / 2.1 — 0.51–0.55x. The key-only edge read (F1) against
+`leaf_edge_keys` (F0): 0.35–0.43x per leaf. So the *whole* walk was ~4 ns
+per cell at its quietest — 8% of the 50 ns/row query, which is the ceiling
+for anything any layout could remove — and half of it was function calls
+and `Result` constructions on the same bytes. A format bump, a second
+decoder kept alive for v3..=5 pages, a migration path and a recovery audit
+to chase at most that: rejected. `FORMAT_VERSION` stays 5.
+
+**What was landed** (`page.rs`, no format change, no page a writer emits
+differs): one `#[inline(always)]` `parse_leaf_cell` behind
+`decode_leaf_cell` (the cached `Node`), `decode_leaf_cell_ref` and
+`scan_leaf_cells` (the raw scan) — the slot, key length, tag, value length
+and overflow pointer each read through one `get` on the page slice, the
+slot directory walked as `chunks_exact(2)` over its own slice rather than a
+`get_u16` call per slot. `leaf_edge_keys` reads its two keys through a
+key-only `leaf_key_at` that does not decode the values the answer never
+needed. The little-endian getters are `#[inline]` — the release profile has
+no LTO, and `get_u16`'s own frame in the profile was a cross-codegen-unit
+call standing between the scan and a two-byte load. `get_u32` had no
+remaining caller and is gone.
+
+*The contract this keeps, and where it is now pinned.* Every refusal the
+old per-field decoder made — a slot, key, value length, value or overflow
+pointer running past the page, an unknown tag — is still made, by the one
+parser. `both_leaf_parsers_agree_on_corrupt_pages` still ties `decode` to
+`scan_leaf_cells` byte-flip by byte-flip; but since both now reach one
+parser, a check dropped from it would be dropped from both and that tie
+would still hold. `a_corrupt_leaf_cell_is_refused_by_both_parsers` is the
+new pin that fails when one goes: each of the four refusals, constructed on
+a real page, refused by both paths. `leaf_edge_keys_are_the_first_and_last_cells`
+gains the key-only path's two sides: an edge key running past the page is
+refused there, before the scan; an edge *value* running past the page is
+not — the answer does not need it — and the scan that always follows
+refuses it. Mutation-checked, each in turn: dropping the `value_end` check
+fails the new pin and the edge test; dropping the overflow pointer's bound
+fails the pin and both agreement tests; accepting an unknown tag or a
+missing key fails the pin, the edge test and the corrupt-page tie; a
+`leaf_key_at` that clamps instead of refusing fails the edge test.
+
+**Measured**, `48b4ef5` (main) against this branch, both built from source
+in separate worktrees, interleaved, order alternated and control re-run
+every repetition, `--seconds 5` for the 100k shape and `4` for the rest,
+two other agents on the machine (load 3–17 across the run, noted per suite
+below):
+
+| Shape | `48b4ef5` | AHL-541 | Verdict |
+| --- | --- | --- | --- |
+| `aggregate`, 100k rows, payload 64 (does not fit the caches) | 199 / 199 / 199 ops/s | **210 / 210 / 209** | **1.05x**, 3/3, non-overlapping by 10 (load 10–14) |
+| `aggregate`, 20k rows (fits) | 1,115 / 1,099 / 1,107 | **1,170 / 1,173 / 1,179** | **1.06x**, 3/3, non-overlapping by 55 (load 8–13) |
+| `indexed`, 20k | 430 / 463 / 469k | **503 / 505 / 512k** | **1.09x**, 3/3, non-overlapping by 34k (load 8–12) |
+| `indexed-range`, 20k | 102.3 / 100.6 / 101.4k | **105.4 / 105.4 / 105.9k** | **1.04x**, 3/3, non-overlapping by 3k (load 7–11) |
+| `joins-limit`, 20k | 159.8 / 158.5 / 162.8k | **169.4 / 169.9 / 167.8k** | **1.04x**, 3/3, non-overlapping by 5k (load 4–11) |
+| `joins`, 20k (full-scan shapes) | 46 / 50 / 49 | 51 / 43 / 53 | flat, mixed sign, inside §4's floor (load 8–17) |
+| `points`, 20k | 3.29 / 3.27 / 3.20M | 3.31 / 3.30 / 3.19M | flat, mixed sign — the control (load 12–17) |
+| `writes`, 20k | 140 / 139 / 138 | 139 / 140 / 136 | flat, mixed sign (load 3–10) |
+
+The `aggregate` gain is the ~2 ns/row the prototype predicted, on a 50
+ns/row query: +5–6%, a little above the prototype's arithmetic because
+`resolve_scanned_at`'s `Range` clone and the `LeafCellRef` move sat on the
+same path. `indexed` and `indexed-range` were not on the brief's target
+list and gain the most: an index probe reads its leaf through
+`scan_leaf_row_ids_into` — the same `scan_leaf_cells`, without the
+whole-leaf shortcut, on a short range where the per-cell overhead was a
+larger share of a much shorter walk. `points` decodes its leaf through
+`decode`, which reaches the same parser, and is flat: the point read's cost
+is the descent and the cache, not one cell's parse (§2). Both DST sweeps
+pass unchanged.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness

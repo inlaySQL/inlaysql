@@ -339,7 +339,7 @@ fn decode_with(page_size: usize, bytes: &[u8], share: impl FnOnce() -> Arc<[u8]>
         KIND_LEAF => {
             let mut entries = Vec::with_capacity(count);
             for slot in slots {
-                entries.push(decode_leaf_cell(bytes, page_size, slot)?);
+                entries.push(decode_leaf_cell(bytes, slot)?);
             }
             Ok(Node::Leaf {
                 bytes: share(),
@@ -484,54 +484,99 @@ fn encode_page(
 
 // ---------------------------------------------------------------- decoding
 
-fn decode_leaf_cell(bytes: &[u8], page_size: usize, slot: usize) -> Result<Entry> {
-    if slot + 3 > page_size {
+/// The one leaf-cell parser behind [`decode_leaf_cell`] (the cached
+/// [`Node`]), [`decode_leaf_cell_ref`] and [`scan_leaf_cells`] (the raw
+/// scan): the key's byte range and the value, every field read through one
+/// bounds-checked `get` on the page rather than a `Result`-returning helper
+/// per field.
+///
+/// This is where a raw scan's per-cell cost lives, and all of it (AHL-541,
+/// `docs/research/leaf-offset-table.md`): the page is already a slot
+/// directory, so reaching cell *i* is one load and what a cell then costs is
+/// what this function does. Written per field through `get_u16`/`get_u32`
+/// and a check per bound, the walk was ~4 ns/cell; written this way it is
+/// half that on the same bytes. The refusals are the same as before — a
+/// slot, key, length or value running past the page, or an unknown tag —
+/// and `both_leaf_parsers_agree_on_corrupt_pages` holds this parser to
+/// [`decode`]'s verdict byte-flip by byte-flip. `bytes` is the whole page:
+/// every caller has checked its length against the page size, so
+/// `bytes.len()` is the bound here.
+#[inline(always)]
+fn parse_leaf_cell(bytes: &[u8], slot: usize) -> Result<(Range<usize>, ValueRef)> {
+    let Some(head) = bytes.get(slot..slot + 2) else {
         return Err(Error::Corrupt(
             "leaf cell runs past end of page".to_string(),
         ));
-    }
-    let key_len = get_u16(bytes, slot)? as usize;
-    let key_end = slot + 2 + key_len;
-    if key_end + 1 > page_size {
-        return Err(Error::Corrupt("leaf key runs past end of page".to_string()));
-    }
-    let key = Key::Borrowed(slot + 2..key_end);
-    match bytes[key_end] {
-        VALUE_INLINE => {
-            if key_end + 5 > page_size {
+    };
+    let key_len = u16::from_le_bytes([head[0], head[1]]) as usize;
+    let key_start = slot + 2;
+    let key_end = key_start + key_len;
+    match bytes.get(key_end) {
+        Some(&VALUE_INLINE) => {
+            let Some(len) = bytes.get(key_end + 1..key_end + 5) else {
                 return Err(Error::Corrupt(
                     "leaf value length runs past end of page".to_string(),
                 ));
-            }
-            let value_len = get_u32(bytes, key_end + 1)? as usize;
+            };
+            let value_len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
             let value_end = key_end + 5 + value_len;
-            if value_end > page_size {
+            if value_end > bytes.len() {
                 return Err(Error::Corrupt(
                     "leaf value runs past end of page".to_string(),
                 ));
             }
-            Ok(Entry {
-                key,
-                value: ValueRef::Inline(key_end + 5..value_end),
-            })
+            Ok((key_start..key_end, ValueRef::Inline(key_end + 5..value_end)))
         }
-        VALUE_OVERFLOW => {
-            if key_end + 17 > page_size {
+        Some(&VALUE_OVERFLOW) => {
+            let Some(pointer) = bytes.get(key_end + 1..key_end + 17) else {
                 return Err(Error::Corrupt(
                     "overflow pointer runs past end of page".to_string(),
                 ));
-            }
-            let first = get_u64(bytes, key_end + 1)?;
-            let len = get_u64(bytes, key_end + 9)? as usize;
-            Ok(Entry {
-                key,
-                value: ValueRef::Overflow { first, len },
-            })
+            };
+            let mut first = [0u8; 8];
+            first.copy_from_slice(&pointer[..8]);
+            let mut len = [0u8; 8];
+            len.copy_from_slice(&pointer[8..]);
+            Ok((
+                key_start..key_end,
+                ValueRef::Overflow {
+                    first: u64::from_le_bytes(first),
+                    len: u64::from_le_bytes(len) as usize,
+                },
+            ))
         }
-        other => Err(Error::Corrupt(alloc::format!(
+        Some(&other) => Err(Error::Corrupt(alloc::format!(
             "unknown leaf value tag {other}"
         ))),
+        None => Err(Error::Corrupt("leaf key runs past end of page".to_string())),
     }
+}
+
+/// The key of the cell whose slot-directory entry is at `at`, without
+/// decoding the cell's value: what [`leaf_edge_keys`] reads, twice per leaf,
+/// to decide whether a whole leaf is admitted. Held to the slot and key
+/// checks [`parse_leaf_cell`] makes; the value's are left to the scan that
+/// always follows.
+#[inline(always)]
+fn leaf_key_at(bytes: &[u8], at: usize) -> Result<&[u8]> {
+    let slot = get_u16(bytes, at)? as usize;
+    let Some(head) = bytes.get(slot..slot + 2) else {
+        return Err(Error::Corrupt(
+            "leaf cell runs past end of page".to_string(),
+        ));
+    };
+    let key_len = u16::from_le_bytes([head[0], head[1]]) as usize;
+    bytes
+        .get(slot + 2..slot + 2 + key_len)
+        .ok_or_else(|| Error::Corrupt("leaf key runs past end of page".to_string()))
+}
+
+fn decode_leaf_cell(bytes: &[u8], slot: usize) -> Result<Entry> {
+    let (key, value) = parse_leaf_cell(bytes, slot)?;
+    Ok(Entry {
+        key: Key::Borrowed(key),
+        value,
+    })
 }
 
 fn decode_internal_cell(bytes: &[u8], page_size: usize, slot: usize) -> Result<Separator> {
@@ -570,69 +615,19 @@ pub struct LeafCellRef<'a> {
     pub value: ValueRef,
 }
 
-/// Parse one leaf cell, borrowing the key.
+/// Parse one leaf cell of a whole page, borrowing the key.
 ///
 /// The same corruption checks as [`decode_leaf_cell`] — a slot or key or value
-/// running past the end of the page is corruption, never a silent truncation —
-/// only the key is a slice into `bytes` instead of an owned copy.
-pub fn decode_leaf_cell_ref<'a>(
-    bytes: &'a [u8],
-    page_size: usize,
-    slot: usize,
-) -> Result<LeafCellRef<'a>> {
-    if slot + 3 > page_size {
-        return Err(Error::Corrupt(
-            "leaf cell runs past end of page".to_string(),
-        ));
-    }
-    let key_len = get_u16(bytes, slot)? as usize;
-    let key_end = slot + 2 + key_len;
-    if key_end + 1 > page_size {
-        return Err(Error::Corrupt("leaf key runs past end of page".to_string()));
-    }
-    let key = &bytes[slot + 2..key_end];
-    match bytes[key_end] {
-        VALUE_INLINE => {
-            if key_end + 5 > page_size {
-                return Err(Error::Corrupt(
-                    "leaf value length runs past end of page".to_string(),
-                ));
-            }
-            let value_len = get_u32(bytes, key_end + 1)? as usize;
-            let value_end = key_end + 5 + value_len;
-            if value_end > page_size {
-                return Err(Error::Corrupt(
-                    "leaf value runs past end of page".to_string(),
-                ));
-            }
-            // Borrow the value's byte range rather than copying it into a fresh
-            // `Arc<[u8]>` per cell. The caller keeps the page's shared buffer
-            // alive for the whole scan (see `CowBTree::walk_raw_row_values`),
-            // and `resolve_value_at` turns the range into a `RowBuf::Shared`
-            // with a single refcount bump — the AHL-455 pattern this scan was
-            // the last path not yet converted to.
-            Ok(LeafCellRef {
-                key,
-                value: ValueRef::Inline(key_end + 5..value_end),
-            })
-        }
-        VALUE_OVERFLOW => {
-            if key_end + 17 > page_size {
-                return Err(Error::Corrupt(
-                    "overflow pointer runs past end of page".to_string(),
-                ));
-            }
-            let first = get_u64(bytes, key_end + 1)?;
-            let len = get_u64(bytes, key_end + 9)? as usize;
-            Ok(LeafCellRef {
-                key,
-                value: ValueRef::Overflow { first, len },
-            })
-        }
-        other => Err(Error::Corrupt(alloc::format!(
-            "unknown leaf value tag {other}"
-        ))),
-    }
+/// running past the end of the page is corruption, never a silent truncation
+/// — because it is the same parser; only the key is a slice into `bytes`
+/// instead of a range. `bytes` must be the whole page, as it is for every
+/// caller of the raw scan; the cell is bounded by its length.
+pub fn decode_leaf_cell_ref(bytes: &[u8], slot: usize) -> Result<LeafCellRef<'_>> {
+    let (key, value) = parse_leaf_cell(bytes, slot)?;
+    Ok(LeafCellRef {
+        key: &bytes[key],
+        value,
+    })
 }
 
 /// The first and last keys of a leaf page, borrowed from it; `None` for an
@@ -642,18 +637,19 @@ pub fn decode_leaf_cell_ref<'a>(
 /// so when both edges fall inside a walk's bounds every cell between them does
 /// too, and the per-cell bound check can be skipped for the whole page
 /// (`CowBTree::scan_leaf_into`). Held to the same header checks
-/// [`scan_leaf_cells`] makes, and to the same cell decoder, so a page that
-/// would fail the scan fails here first.
+/// [`scan_leaf_cells`] makes and to the same slot and key checks per cell, so
+/// a page whose edge *keys* would fail the scan fails here first. The edge
+/// cells' values are not decoded: the answer does not need them, reading
+/// their lengths was most of this function's cost (AHL-541), and the scan
+/// that always follows refuses a corrupt value on the same cell.
 pub fn leaf_edge_keys(bytes: &[u8], page_size: usize) -> Result<Option<(&[u8], &[u8])>> {
     let count = check_leaf_header(bytes, page_size)?;
     if count == 0 {
         return Ok(None);
     }
-    let first = get_u16(bytes, HEADER_SIZE)? as usize;
-    let last = get_u16(bytes, HEADER_SIZE + SLOT_SIZE * (count - 1))? as usize;
     Ok(Some((
-        decode_leaf_cell_ref(bytes, page_size, first)?.key,
-        decode_leaf_cell_ref(bytes, page_size, last)?.key,
+        leaf_key_at(bytes, HEADER_SIZE)?,
+        leaf_key_at(bytes, HEADER_SIZE + SLOT_SIZE * (count - 1))?,
     )))
 }
 
@@ -693,10 +689,13 @@ pub fn scan_leaf_cells<'a>(
     mut f: impl FnMut(&'a [u8], ValueRef) -> Result<()>,
 ) -> Result<()> {
     let count = check_leaf_header(bytes, page_size)?;
-    for i in 0..count {
-        let slot = get_u16(bytes, HEADER_SIZE + SLOT_SIZE * i)? as usize;
-        let cell = decode_leaf_cell_ref(bytes, page_size, slot)?;
-        f(cell.key, cell.value)?;
+    // In bounds by the header check: the directory ends at or before
+    // `free_start`, which is at or before the page's end.
+    let slots = &bytes[HEADER_SIZE..HEADER_SIZE + SLOT_SIZE * count];
+    for slot in slots.chunks_exact(SLOT_SIZE) {
+        let slot = u16::from_le_bytes([slot[0], slot[1]]) as usize;
+        let (key, value) = parse_leaf_cell(bytes, slot)?;
+        f(&bytes[key], value)?;
     }
     Ok(())
 }
@@ -732,6 +731,7 @@ fn write_u64(buf: &mut [u8], value: u64) {
     buf.copy_from_slice(&value.to_le_bytes());
 }
 
+#[inline]
 fn get_u16(bytes: &[u8], offset: usize) -> Result<u16> {
     let slice = bytes
         .get(offset..offset + 2)
@@ -739,13 +739,7 @@ fn get_u16(bytes: &[u8], offset: usize) -> Result<u16> {
     Ok(u16::from_le_bytes([slice[0], slice[1]]))
 }
 
-fn get_u32(bytes: &[u8], offset: usize) -> Result<u32> {
-    let slice = bytes
-        .get(offset..offset + 4)
-        .ok_or_else(|| Error::Corrupt("short read for u32".to_string()))?;
-    Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
-}
-
+#[inline]
 fn get_u64(bytes: &[u8], offset: usize) -> Result<u64> {
     let slice = bytes
         .get(offset..offset + 8)
@@ -894,9 +888,11 @@ mod tests {
     /// Read one leaf page both ways and return what each made of it.
     ///
     /// [`decode`] materialises a whole [`Node`] through [`decode_leaf_cell`];
-    /// [`scan_leaf_cells`] walks the same page through
-    /// [`decode_leaf_cell_ref`]. Two independent implementations of one parse,
-    /// which is only safe while they agree.
+    /// [`scan_leaf_cells`] walks the same page through the raw-scan path.
+    /// Since AHL-541 both reach one cell parser (`parse_leaf_cell`), but the
+    /// header checks and the slot walk that lead to it are still two
+    /// implementations — `decode_with`'s and `check_leaf_header`'s — and
+    /// this is what keeps them agreeing.
     fn both_ways(page_size: usize, bytes: &[u8]) -> (Parsed, Parsed) {
         let decoded = decode(page_size, bytes).and_then(|node| match &node {
             Node::Leaf { entries, .. } => Ok(entries
@@ -990,6 +986,69 @@ mod tests {
         // Held to the scan's header checks: a page of the wrong length is
         // refused here exactly as `scan_leaf_cells` refuses it.
         assert!(leaf_edge_keys(&three[..511], 512).is_err());
+
+        // And to the cell's slot and key checks: an edge key that runs past
+        // the page is refused here, before the scan would refuse it.
+        let last_slot = HEADER_SIZE + SLOT_SIZE * 2;
+        let last_cell = get_u16(&three, last_slot).unwrap() as usize;
+        let mut long_key = three.clone();
+        long_key[last_cell..last_cell + 2].copy_from_slice(&0xffffu16.to_le_bytes());
+        assert!(leaf_edge_keys(&long_key, 512).is_err());
+        assert!(scan_leaf_cells(&long_key, 512, |_, _| Ok(())).is_err());
+
+        // The edge cells' *values* are not decoded here — the answer does not
+        // need them — so a corrupt value length on an edge cell is left to the
+        // scan that always follows, which does refuse it.
+        let mut long_value = three.clone();
+        let value_len_at = last_cell + 2 + 1 + 1;
+        long_value[value_len_at..value_len_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            leaf_edge_keys(&long_value, 512).unwrap(),
+            Some((&b"a"[..], &b"c"[..]))
+        );
+        assert!(scan_leaf_cells(&long_value, 512, |_, _| Ok(())).is_err());
+    }
+
+    /// Each refusal the shared cell parser makes, pinned on its own.
+    ///
+    /// `both_leaf_parsers_agree_on_corrupt_pages` below ties the two *paths*
+    /// together, but since AHL-541 they share `parse_leaf_cell`, so a check
+    /// dropped from the parser would be dropped from both and the tie would
+    /// still hold. This is the test that fails when one goes: a key length,
+    /// an inline value length, an overflow pointer that runs past the page,
+    /// and an unknown tag, each refused by `decode` and by `scan_leaf_cells`.
+    #[test]
+    fn a_corrupt_leaf_cell_is_refused_by_both_parsers() {
+        let clean = encode_leaf(512, &[], &[entry(b"k", b"v")]).unwrap();
+        let cell = get_u16(&clean, HEADER_SIZE).unwrap() as usize;
+        // `key_len u16 | key (1) | tag | value_len u32 | value (1)`
+        let tag_at = cell + 2 + 1;
+        let value_len_at = tag_at + 1;
+
+        let mut long_key = clean.clone();
+        long_key[cell..cell + 2].copy_from_slice(&0xffffu16.to_le_bytes());
+        let mut long_value = clean.clone();
+        long_value[value_len_at..value_len_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        // The cell sits at the page's tail with five bytes after its tag, so
+        // an overflow pointer (sixteen) cannot fit.
+        let mut short_pointer = clean.clone();
+        short_pointer[tag_at] = VALUE_OVERFLOW;
+        let mut bad_tag = clean.clone();
+        bad_tag[tag_at] = 7;
+
+        for (what, page) in [
+            ("key past the page", long_key),
+            ("value past the page", long_value),
+            ("overflow pointer past the page", short_pointer),
+            ("unknown tag", bad_tag),
+        ] {
+            let (decoded, scanned) = both_ways(512, &page);
+            assert!(decoded.is_err(), "{what}: decode accepted the page");
+            assert!(
+                scanned.is_err(),
+                "{what}: scan_leaf_cells accepted the page"
+            );
+        }
     }
 
     /// And they must *fail* together too. A parser that accepts a corrupt page
