@@ -2937,6 +2937,62 @@ gain. A bulk-loaded or freshly rebuilt table is the sequential case. The
 `memmove` share stays: the window's bytes are still copied once into the
 per-leaf `Rc<[u8]>` the cells borrow from.
 
+### The reorder swapped the fast join into the slow one; the bench caught it (AHL-524, 2026-09-02)
+
+The first full `REPEATS=3 ./bench/repeat.sh` since 2026-08-30 landed at
+`7b20175` (three runs, load 0.82–4.04/18 throughout, none `CONTAMINATED`;
+`bench/results/20260902T022325Z-repeat.txt`). The PK-inner full join, published
+as ~1.15x slower, now wins 1.17x. But the secondary-index full join — 5.85 ms
+on 08-30, 3.71 ms on 09-01 at `2eeced7`, published as 7.5x faster — read
+**14.03 ms**. A 3.8x regression on a published winning row.
+
+**Bisected**, `SUITE=joins` single runs, gate off, same sitting (so relative,
+not publishable; the gap is 3x and survives the noise):
+
+| Commit | PK inner p50 | Secondary inner p50 |
+| --- | --- | --- |
+| `2eeced7` (published table) | 13.72 ms | **4.82 ms** |
+| `894ecef` AHL-512, join reorder | 17.74 ms | **30.15 ms** |
+| `1dbe18c` allocation diet | 12.60 ms | 18.24 ms |
+| `7b20175` AHL-521/522 | 9.34 ms | 14.52 ms |
+
+AHL-512 is the cause. Its cost function priced an outer row at one unit and
+a hash-built inner row at two — `hash = 2·inner + outer` — so it preferred to
+build the smaller table and drive from the larger one. For `users JOIN posts`
+(20k × 160k, eight posts per user) that swapped the query into posts-driving:
+160k outer rows, 160k hash probes, a 20k-row build. Written order was 20k
+outer rows, 20k probes each yielding eight, a 160k-row build. Same 160k
+output rows either way; the probes are what differ, and 140k extra probes at
+~70 ns each is the 10 ms. Its "1.31x on the joins suite" was measured on
+`bin/profile`'s `joins` suite, which cycles all four shapes in one number, so
+the PK-inner win hid the secondary-inner loss. The lesson is the one
+`BENCHMARK.md` already states: a suite-level number is not a per-shape one.
+
+**Fix.** `OUTER_ROW_COST = 4` charged per outer row on both paths (so the
+hash-versus-probe choice does not move on its own): `hash = 2·inner +
+5·outer`, `probe = outer·(12 + group + 4)`. With that, driving from the
+smaller table costs less, which is what the measurement says, and the reorder
+now moves the *PK-inner* written order into users-driving rather than the
+other way round. The three EXPLAIN pins in `tests/cost_planner.rs` that
+asserted the inverted swap now assert the corrected one; a planner unit test
+pins that users-driving costs less than posts-driving for the benchmark's
+sizes.
+
+**Measured**, `SUITE=joins`, gate off, single run at the fix (the gated
+`REPEATS=3` regeneration is owed and follows):
+
+| Shape | `7b20175` | AHL-524 | SQLite journal |
+| --- | --- | --- | --- |
+| PK inner, full | 9.34 ms | **3.21 ms** | 10.12 ms |
+| Secondary-index inner, full | 14.52 ms | **3.47 ms** | 29.98 ms |
+| PK inner, LIMIT 10 | 5.25 µs | 5.50 µs | 3.50 µs |
+| Secondary-index inner, LIMIT 10 | 7.79 µs | 8.08 µs | 4.42 µs |
+
+Both full shapes now run the same users-driving plan and land at ~3.3 ms —
+below the 4.82 ms `2eeced7` had, because AHL-521/522's descent and syscall
+savings apply on top. The `LIMIT` rows do not move: a `LIMIT` shape is
+never reordered.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness

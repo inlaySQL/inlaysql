@@ -290,9 +290,31 @@ pub(crate) fn choose_join(
     // full secondary-index shape on the existing hash path while a limited
     // query still wins with probes.
     const PROBE_DESCENT_COST: u64 = 12;
-    let probe_cost = group_size
-        .map(|group| outer_rows.saturating_mul(PROBE_DESCENT_COST.saturating_add(group.max(1))));
-    let hash_cost = hash_available.then(|| inner_rows.saturating_mul(2).saturating_add(outer_rows));
+    // Every outer row pays the join loop itself — decode, key evaluation,
+    // the per-row probe machinery, output assembly — whichever inner path
+    // answers it, and that is several units, not one. This is what the
+    // first costing got wrong: with the outer row priced at one unit and a
+    // hash-built inner row at two, the model preferred to build the smaller
+    // table and drive from the larger one, and AHL-512 duly swapped the
+    // 20k-users × 160k-posts join into posts-driving. Measured, that plan
+    // is ~3x slower (4.8 ms → 14.5 ms, `PERF.md` 2026-09-02): the same
+    // 160k rows come out either way, but one order pays 160k probes and the
+    // other 20k. The outer side should be the *smaller* table, and this
+    // constant is what makes the arithmetic say so. It applies to both
+    // paths, so it does not move the hash-versus-probe choice on its own.
+    const OUTER_ROW_COST: u64 = 4;
+    let probe_cost = group_size.map(|group| {
+        outer_rows.saturating_mul(
+            PROBE_DESCENT_COST
+                .saturating_add(group.max(1))
+                .saturating_add(OUTER_ROW_COST),
+        )
+    });
+    let hash_cost = hash_available.then(|| {
+        inner_rows
+            .saturating_mul(2)
+            .saturating_add(outer_rows.saturating_mul(1 + OUTER_ROW_COST))
+    });
 
     match (hash_cost, probe_cost) {
         (None, None) => None,
@@ -360,6 +382,24 @@ mod tests {
         assert_eq!(secondary.path, JoinPath::Hash);
         let limited = choose_join(10, 160_000, Some(8), true).unwrap();
         assert_eq!(limited.path, JoinPath::Probe);
+    }
+
+    /// The same join written both ways round: driving from the smaller
+    /// table must cost less, because that is what the measurement says
+    /// (`PERF.md`, 2026-09-02 — 4.8 ms users-driving against 14.5 ms
+    /// posts-driving for the same 160k output rows). The first costing had
+    /// this backwards and the reorder swapped the fast order into the slow
+    /// one.
+    #[test]
+    fn driving_from_the_smaller_table_costs_less() {
+        let users_driving = choose_join(20_000, 160_000, Some(8), true).unwrap();
+        let posts_driving = choose_join(160_000, 20_000, Some(1), true).unwrap();
+        assert!(
+            users_driving.cost < posts_driving.cost,
+            "users-driving {} should be cheaper than posts-driving {}",
+            users_driving.cost,
+            posts_driving.cost
+        );
     }
 
     #[test]

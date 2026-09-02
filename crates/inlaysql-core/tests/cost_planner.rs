@@ -141,20 +141,25 @@ fn analyze_costs_existing_join_paths_and_explain_matches_execution() {
 
     run(&mut engine, "ANALYZE");
 
+    // Written `posts JOIN users`, planned `users JOIN posts`: with statistics
+    // the cost model is allowed to choose which side drives, and driving from
+    // the smaller table is what the measurement says is cheaper — every
+    // outer row pays the join loop, so 20k users driving beats 160k posts
+    // driving for the same output. (The first costing pinned the opposite
+    // swap here, and the benchmark caught it: `PERF.md`, 2026-09-02.)
     let pk = details(
         &mut engine,
         "EXPLAIN SELECT posts.id, users.name FROM posts \
          JOIN users ON posts.user_id = users.id",
     );
-    assert!(pk
-        .iter()
-        .any(|detail| detail.contains("HASH JOIN users") && detail.contains("COSTED")));
+    assert!(
+        pk.iter()
+            .any(|detail| detail.contains("HASH JOIN posts") && detail.contains("COSTED")),
+        "expected the reordered plan, got {pk:?}"
+    );
 
-    // Written `users JOIN posts`, planned `posts JOIN users`: with statistics
-    // the cost model is now allowed to choose which side drives, and building
-    // the smaller side is cheaper than building the larger one. The assertion
-    // moved with the behaviour rather than being relaxed — it still pins a
-    // costed hash join, on the side the model actually picks.
+    // Written `users JOIN posts` is already the cheaper order and stays as
+    // written — costed, not swapped.
     let secondary = details(
         &mut engine,
         "EXPLAIN SELECT users.name, posts.title FROM users \
@@ -163,8 +168,8 @@ fn analyze_costs_existing_join_paths_and_explain_matches_execution() {
     assert!(
         secondary
             .iter()
-            .any(|detail| { detail.contains("HASH JOIN users") && detail.contains("COSTED") }),
-        "expected the reordered plan, got {secondary:?}"
+            .any(|detail| { detail.contains("HASH JOIN posts") && detail.contains("COSTED") }),
+        "expected the written order, costed, got {secondary:?}"
     );
 
     let limited = details(
@@ -247,15 +252,15 @@ fn analyzed_stats_survive_reopening_the_engine() {
     let mut reopened = shared_engine(shared);
     let plan = details(
         &mut reopened,
-        "EXPLAIN SELECT users.name, posts.title FROM users \
-         JOIN posts ON posts.user_id = users.id",
+        "EXPLAIN SELECT posts.id, users.name FROM posts \
+         JOIN users ON posts.user_id = users.id",
     );
-    // `HASH JOIN users` from a query written `users JOIN posts`: the stats
+    // `HASH JOIN posts` from a query written `posts JOIN users`: the stats
     // survived the reopen, so the cost model is live and reorders — which is
     // what this test is really asserting.
     assert!(
         plan.iter()
-            .any(|detail| { detail.contains("HASH JOIN users") && detail.contains("COSTED") }),
+            .any(|detail| { detail.contains("HASH JOIN posts") && detail.contains("COSTED") }),
         "expected costed, reordered plan after reopening, got {plan:?}"
     );
 }

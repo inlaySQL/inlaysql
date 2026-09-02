@@ -106,6 +106,15 @@ this decision used to defer:
 * Two stored tables, `INNER`, no derived source and no retrieval score. An
   outer join is not commutative and a scored query answers from its driving
   table by definition.
+* **The smaller table drives (AHL-524, 2026-09-02).** The first costing
+  priced an outer row at one unit and a hash-built inner row at two, so it
+  preferred to build the smaller table and drive from the larger one — and
+  swapped the 20k-users × 160k-posts join into posts-driving, which measured
+  3x slower (4.8 ms → 14.5 ms) for the same 160k output rows. Every outer
+  row pays the join loop itself, whichever inner path answers it; the cost
+  model now charges that (`OUTER_ROW_COST` in `planner.rs`), and both
+  written orders of that join run users-driving at ~3.3 ms. `PERF.md`,
+  2026-09-02, has the bisect.
 * The rewrite is a plan rewrite: sources are exchanged and every column
   ordinal in the plan is remapped, producing exactly the plan the same query
   written the other way round would have produced. What executes is a shape

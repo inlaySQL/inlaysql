@@ -1070,7 +1070,9 @@ impl FileDevice {
         // missing means one device read for the whole window, which then
         // fills every page of it below.
         let page_size = cache.layout.map(|(page_size, _)| page_size);
-        if let Some(page_size) = page_size.filter(|&ps| buf.len() > ps && buf.len().is_multiple_of(ps)) {
+        if let Some(page_size) =
+            page_size.filter(|&ps| buf.len() > ps && buf.len().is_multiple_of(ps))
+        {
             // Copied under the read lock rather than collected first: the
             // lock is shared, the copy is bounded by the window, and a
             // per-read `Vec` of `Arc`s measured as the difference between
