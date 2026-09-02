@@ -4064,6 +4064,132 @@ the memory backend's collect-and-replay default and to the collected fold,
 under every shape and filter the existing bytes-fed tie uses. The raw-vs-
 decoded parity tests and both DST sweeps pass unchanged.
 
+### A hundred-row `INSERT` re-encoded every page on its path a hundred times (AHL-542, 2026-09-03)
+
+**Shape.** `bin/profile --suite batch-insert` (new here): one prepared
+`INSERT INTO batch (id, n) VALUES (?, ?), ... x100`, one auto-committed
+transaction per statement, `Durability::Full`. That is exactly what
+`bench/external/batch_driver.py` drives MySQL and PostgreSQL with and what
+`sql_shapes --mode batch` times, and it is the shape the published 1.6x/3.1x
+batch-insert loss is measured on. `--suite writes` cannot stand in for it:
+at one row per commit ~95% of that loop is the fsync, so the per-row
+*structural* cost is invisible there.
+
+**The split, 25s of `sample` at 48b4ef5, 16,625 samples.**
+
+| Where | Inclusive | What |
+| --- | --- | --- |
+| `sync_commit` | 60.8% | one `F_FULLFSYNC` per statement — the floor C1 owns, not this |
+| `put`/`insert_into` | 32.1% | the per-row root-to-leaf round trip |
+| — `encode_internal` | 12.7% | |
+| — `encode_leaf` | 10.0% | |
+| — `node_at`/`read_node` | 6.6% / 5.8% | `page::decode` 5.0%, the `Node` clone the rest |
+| `write_dirty_pages` + `device::write` | ~0.9% | |
+| `wal::encode_record_into` | 0.6% | WAL record encoding is *not* where this shape's time goes |
+
+So the audit's finding, measured: the per-row page round trip is 32% of the
+whole statement and ~77% of everything that is not the fsync. WAL record
+encoding, the other suspect, is 0.6%.
+
+**Why it was quadratic in the wrong place.** `dirty` was
+`BTreeMap<PageId, Vec<u8>>`, so a page only ever existed as bytes between
+rows. `read_node` was `(*self.node_at(id, true)?).clone()` — a `page::decode`
+(a fresh whole-page `Arc<[u8]>` plus a `Vec` of cells) followed by a deep
+clone of that `Vec` — *even for a page this transaction had dirtied three
+microseconds earlier*, and `insert_into` re-serialised the mutated page back
+into `dirty` on the way up. A hundred-row statement therefore decoded,
+cloned and re-encoded each of its ~3 path pages ~100 times to write them
+once. Only the page *ids* were amortised, by `page_slot`.
+
+**Fix.** `dirty` holds `enum DirtyPage { Encoded(Vec<u8>), Decoded(Rc<Node>) }`.
+The write path takes the node by value (`take_node_for_write`: a `BTreeMap`
+removal and, in the ordinary case, an `Rc::try_unwrap` that moves rather than
+clones), mutates cells in place, and puts it back — no decode, no clone, no
+encode. `commit` runs `materialize_dirty` once, after `finalize_free_list`,
+which encodes each dirty page exactly once. Reads of the transaction's own
+writes (`node_at`) become a refcount bump instead of a decode. Split
+decisions are unaffected and stay exact: `page::leaf_size`/
+`page::internal_size` already computed the encoded size from the cells
+without encoding them. Overflow pages stay `Encoded` — written once, never
+modified. No on-disk change; `FORMAT_VERSION` stays 5.
+
+**What the DST caught, and it was not subtle.** The first cut took the page
+out of `dirty` at the top of `insert_into`/`delete_from` and put it back at
+the bottom. `free_list_reuse_dst`'s heavy-churn seed died on a *stack
+overflow* within a minute. A page lifted out of `dirty` is a **hole in the
+pending tree**, and the code inside that window reads the pending tree:
+`alloc_page` scans the free list from `pending_root`, and
+`store_value`/`free_overflow_chain` walk overflow chains through it. An
+internal node held out across its own child recursion served the *committed*
+version of itself — or, for a page this transaction had allocated, nothing at
+all — to its own transaction, and the free-list scan that read through the
+hole handed out a live page id, which built a cycle, which made the recursive
+descent infinite.
+
+The rule that came out of it, and is now written on `Descent`: **a page is
+missing from `dirty` only across code that performs no pending read.**
+`descend` reads the node's kind and child pointer *without* taking it, so the
+internal-node window starts after the recursion rather than before it;
+`store_value` is hoisted above the take and `free_overflow_chain` deferred
+below it; and `reserve_split_page` puts the whole unsplit page back into
+`dirty` for the length of the one `alloc_page` that still has to happen
+inside a window, so that read sees a page rather than half a leaf.
+
+**After, 25s, 16,176 samples.** `sync_commit` 85.2%, `put` 5.3%,
+`insert_into` 4.5%. `encode_leaf` and `encode_internal` are gone from the top
+thirty entirely; `page::decode` is gone from the self-time table. `put` fell
+from 5,336 samples to 850 — 84% of the work removed, on a machine where the
+fsync did not move.
+
+**Measured.** Interleaved A/B against 48b4ef5, both binaries built from the
+same harness, control re-run every repetition, `--seconds 10`, two other
+agents building on the same machine (load 5.2 falling to 1.5):
+
+| Suite | Base | New | |
+| --- | --- | --- | --- |
+| batch-insert (rows/s) | 19,487 / 19,508 / 16,835 | 25,123 / 26,110 / 24,289 | **1.29–1.44x, 3/3, non-overlapping** |
+| writes | 227 / 283 / 248 | 224 / 289 / 253 | flat |
+| points | 3.30 / 3.27 / 3.40 M | 3.25 / 3.30 / 3.37 M | flat |
+| aggregate 20k | 1110 / 1103 / 1121 | 1084 / 1097 / 1106 | overlapping; see below |
+| joins-limit | 161.3 / 163.3 / 164.4 k | 162.8 / 160.8 / 165.1 k | flat |
+| indexed-range | 99.6 / 102.4 / 102.7 k | 99.9 / 102.6 / 96.1 k | flat |
+
+In statements rather than rows, batch-insert is ~195 → ~250 statements per
+second. The aggregate shape was re-run three more times because its sign was
+consistent: base 1124 / 1114 / 1121, new 1099 / 1088 / 1118 — six repetitions
+whose ranges overlap (base min 1103, new max 1118), a ~1.7% median gap with
+no mechanism in the diff. The timed window is read-only, and the only read
+path this commit touches is `node_at`'s dirty lookup, which a read with no
+open transaction never reaches. Recorded as flat-within-noise, not claimed as
+either.
+
+**Pinned.**
+`a_transaction_writes_the_same_bytes_whether_its_pages_were_held_decoded_or_encoded`
+is the tie the whole change rests on: two trees take the same six rounds of
+inserts, overwrites, deletes and overflow values, one left to hold its pages
+as cells and the other forced through the old shape by calling
+`materialize_dirty` after every single `put` — so its next `put` takes
+`take_node_for_write`'s decode branch exactly as the pre-AHL-542 code did on
+every row — and the two devices are compared **byte for byte** after every
+commit: page images, page ids, WAL records, state block and all.
+`a_hundred_row_transaction_decodes_its_path_once_per_page_not_once_per_row`
+counts decodes on the handle: 3 for 100 rows over a 400-row committed tree
+(the depth of the path, each page copied out once), asserted at or below a
+tenth of the row count and at or below the number of pages committed.
+`a_decoded_transaction_rebases_onto_another_writers_disjoint_commit` and
+`a_decoded_transaction_conflicts_and_drops_every_decoded_page` put a
+60-row transaction holding decoded, split pages against another writer's
+commit both ways. Both release DST sweeps pass, plus `free_list_reuse_dst`,
+`backup_dst`, `durability_dst` and `tests/batch_insert.rs`.
+
+**The cache promotion, bounded and declined.** The audit's second half — a
+write-only workload is a 100% decoded-page-cache miss, because committed
+pages are dropped rather than promoted — is real but is no longer worth a
+commit on this shape. After the fix, `committed_node` is 1.2% inclusive and
+`pread` 0.4% of self time on batch-insert; promotion can remove at most that,
+which is under the measurement floor of §4. It stays available if a
+write-then-read shape ever makes it visible.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness
