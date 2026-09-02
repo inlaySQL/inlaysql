@@ -43,6 +43,16 @@ current execution order without relying on local conversation history.
   1.5x** on top of the morning's 1.44x). A third agent found the range
   shape's row ids were already fetched in rowid order and that a multi-slot
   point cursor measures *negative* on the published shapes — B3 is closed.
+- Late evening: AHL-532 (a limited scan's first batch is the limit, not
+  32; `joins-limit` 1.2–1.4x). Three ideas were built, measured and dropped
+  with the numbers recorded in `PERF.md`/root plan §9a: a per-statement
+  join-plan cache (planning is 1.3–1.8% of the query), a dense-rowid leaf
+  walk for range scans (the retained cursor already makes sorted ids one
+  descent), a covering-index scan (owned index keys cost more than the
+  fetch it removes; kept on `ahl-533-covering-index-wip`), and a 64 MiB
+  shared read cache (the cost is the page copy, not the syscall). The
+  range-scan and point-read remainders now point at one item: **A7, a
+  borrowing result API / borrowed-entry index walk.**
 - Earlier in the day: the allocation diet (AHL-517–520 plus four read-path
   commits) and aggregate streaming (AHL-513/514/515).
 - **Still stale:** every `compare.sh`-sourced table (MySQL/PostgreSQL OLTP
