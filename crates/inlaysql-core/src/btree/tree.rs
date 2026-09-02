@@ -2097,7 +2097,7 @@ impl<D: Device> CowBTree<D> {
         &self,
         start: &[u8],
         end: Option<&[u8]>,
-        mut f: impl FnMut(&Rc<[u8]>) -> Result<()>,
+        mut f: impl FnMut(&Arc<[u8]>) -> Result<()>,
     ) -> Result<()> {
         if end.is_some_and(|end| end <= start) {
             return Ok(());
@@ -2111,7 +2111,7 @@ impl<D: Device> CowBTree<D> {
         start: &[u8],
         end: Option<&[u8]>,
         pending: bool,
-        f: &mut impl FnMut(&Rc<[u8]>) -> Result<()>,
+        f: &mut impl FnMut(&Arc<[u8]>) -> Result<()>,
     ) -> Result<()> {
         if id == 0 {
             return Ok(());
