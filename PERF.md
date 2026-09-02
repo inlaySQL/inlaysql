@@ -3033,6 +3033,67 @@ Stacked with AHL-521/522 on the same shape: 85 → 122 ops/s since the
 morning's baseline, 1.44x, and the 10.28 ms scan-and-decode floor B4 owns is
 now the majority of what is left.
 
+### The streamed aggregate folds from the row bytes, not from a decoded row per row (AHL-528a, 2026-09-02)
+
+Profiled `bin/profile.rs --suite aggregate --rows 100000` at `d1dbe4c` (release,
+`sample` over the query phase, load 5–12/18 so shares are the evidence).
+Inclusive: **`Decode::next` 63%**, of which `walk_raw_row_values` 36.5% (the
+sweep: `scan_leaf_cells` 16%, `WalkBounds::admits` 7.9%, `FileDevice::read`
+10% because a 100k-row table is larger than the 8 MiB shared cache) and
+**`row::decode_row_masked` 19.7%** — a `Vec<Value>` per row —
+**`drop_in_place<ExecRow>` 9.6%**, `GroupTable::find` 7.3%, `run_select_to`'s
+own loop 7.3% self, `eval::evaluate` 4.6%, `skip_value` 4.4%, the allocator
+~10% in total.
+
+**Cause.** AHL-514/515 taught the aggregate to fold from the stream instead of
+holding every row, and AHL-519/520 made the fold itself allocation-free for a
+row that finds its group. What was left was the *stream*: `Decode` turned
+every row's bytes into an owned `ExecRow` — the `Vec`, a `String` for every
+wanted `TEXT` cell — handed it through the boxed iterator, and the fold
+dropped it. `SELECT n, COUNT(*) ... GROUP BY n` keeps the first row of each of
+its hundred groups; the other 99,900 were decoded and freed to be counted.
+
+**Fix.** The single-table read path hands the fold its row *bytes*
+(`exec::AggregateInput::Bytes`), and the fold decodes each row into one
+borrowed buffer it reuses — `decode_row_ref_masked_into`, parked between rows
+the way `DecodeFilter` parks its scratch — applies the `WHERE` on the
+borrowed cells exactly as `DecodeFilter` does, evaluates the group key and the
+aggregate arguments from them, and materialises the row only when it opens a
+group. Every other source — a join, a derived table, a scored retrieval, a
+`WITHOUT ROWID` table — still arrives decoded (`AggregateInput::Rows`) and
+folds exactly as before. The per-row work is written once, in `Folder::step`,
+over a two-impl `AggregateCells` trait (owned `Value`s, borrowed `ValueRef`s),
+and both go through `AggFold::step` — the one-fold rule holds. The tail of a
+blocking `SELECT` (windows, `DISTINCT`, `ORDER BY`, `OFFSET`/`LIMIT`,
+projection) became `finish_blocking`, shared by the two ways `run_select_to`
+now arrives at held rows.
+
+**Measured**, interleaved, control re-run in every repetition. The machine
+was shared with another benchmarking agent throughout (load 12–22/18 for the
+first run, 5–7 for the second), which is why there are two runs of the target
+shape and why `points` is wide.
+
+| Shape | `d1dbe4c` | AHL-528a | Verdict |
+| --- | --- | --- | --- |
+| `aggregate`, 100k rows / 100 groups, `--seconds 5` (load 12–22) | 103 / 89 / 97 ops/s | **156 / 139 / 155** | **1.5x**, 3/3, non-overlapping |
+| the same, re-run (load 5–7) | 102 / 102 / 100 | **151 / 147 / 151** | **1.48x**, 3/3, non-overlapping |
+| `aggregate`, 20k rows (fits the cache) | 531 / 515 / 534 | **797 / 823 / 815** | **1.55x**, 3/3, non-overlapping |
+| `joins`, 20k (full-scan shapes) | 45 / 47 / 45 | 48 / 42 / 46 | flat, mixed sign |
+| `indexed-range`, 20k | 66.4 / 66.1 / 62.9k | 66.6 / 61.2 / 63.5k | flat, mixed sign |
+| `points`, 20k | 1.42 / 0.77 / 1.40M | 0.90 / 0.87 / 1.65M | flat, mixed sign — contention-wide, and the point read does not touch this path |
+
+Stacked on the day: 85 ops/s at the morning's baseline (before AHL-521) to
+~150 now on this shape, 1.76x.
+
+**Pinned.** `a_bytes_fed_aggregate_agrees_with_the_decoded_stream_and_the_collected_fold`
+in `tests/cost_planner.rs` ties the three folds — bytes-fed (`FROM t`),
+decoded-stream (`FROM (SELECT * FROM t)`), collected (`GROUP_CONCAT` forces
+it) — to one answer over the aggregate shapes under six `WHERE` clauses,
+including one through a `NOCASE` column's collation. Removing the `WHERE`
+from the bytes-fed arm fails it on the first filtered shape (checked by
+mutation). Reverting the whole change to the decoded stream is behaviour-
+identical by design and passes; the profile is the only witness to that one.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness

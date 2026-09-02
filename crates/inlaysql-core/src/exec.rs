@@ -250,6 +250,31 @@ impl Iterator for RowBytes<'_> {
     }
 }
 
+/// What a streamed aggregate folds from.
+///
+/// The single-table read path hands over its row *bytes* rather than a
+/// decoded stream, so the fold can decode each row into one borrowed buffer
+/// it reuses — `SELECT n, COUNT(*) FROM t GROUP BY n` over 100,000 rows in
+/// 100 groups used to decode every row into an owned `Vec<Value>` and drop
+/// it, when only the 100 rows that open a group are ever kept (`PERF.md`,
+/// AHL-528). Every other shape — a join, a derived table, a scored retrieval,
+/// a `WITHOUT ROWID` table — arrives already decoded and folds exactly as
+/// before. Both are folded by the same code, over the same
+/// `eval::AggFold::step`; only where a row's cells live differs.
+pub(crate) enum AggregateInput<'a> {
+    /// Row bytes, decoded per row into a buffer the fold owns and reuses,
+    /// under `mask`, and — when the query has a `WHERE` — tested against
+    /// `filter` on the borrowed cells before anything is folded, exactly as
+    /// [`DecodeFilter`] tests it.
+    Bytes {
+        source: RowBytes<'a>,
+        mask: &'a ColumnMask,
+        filter: Option<&'a Expr>,
+    },
+    /// Rows already decoded by the pipeline.
+    Rows(RowStream<'a>),
+}
+
 /// Decode the scanned bytes into rows, materialising only the columns the
 /// statement can observe.
 pub(crate) struct Decode<'a> {
@@ -427,7 +452,7 @@ impl Iterator for DecodeFilter<'_> {
 /// is the test that it really does keep the allocation, because that reuse is
 /// a library optimisation rather than a language guarantee and losing it
 /// silently would put the per-row allocation back.
-fn park(mut cells: Vec<ValueRef<'_>>) -> Vec<ValueRef<'static>> {
+pub(crate) fn park(mut cells: Vec<ValueRef<'_>>) -> Vec<ValueRef<'static>> {
     cells.clear();
     cells.into_iter().map(|_| unreachable!()).collect()
 }
