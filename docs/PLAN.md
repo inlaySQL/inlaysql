@@ -43,6 +43,13 @@ current execution order without relying on local conversation history.
   1.5x** on top of the morning's 1.44x). A third agent found the range
   shape's row ids were already fetched in rowid order and that a multi-slot
   point cursor measures *negative* on the published shapes — B3 is closed.
+- 2026-09-03, 01:00–02:30: AHL-541 (leaf format change rejected by
+  reading — the slot directory already exists; a shared inlined cell parser
+  landed: +4–9% on every read shape), AHL-542 (**C7 landed**: pages stay
+  decoded for the life of a transaction, encoded once at commit; batch
+  insert 1.29–1.44x; five DST sweeps green), AHL-543 (C1 design brief,
+  `docs/research/commit-group-logical.md`; first slice is rebase-only
+  absorption).
 - 2026-09-03, small hours: AHL-538 (streamed aggregate by callback off the
   borrowed leaf, walk stops at the last wanted column; aggregate 1.08–1.12x
   at every row width), AHL-539 (in-memory rows shared, 0 allocations per
@@ -75,7 +82,9 @@ current execution order without relying on local conversation history.
 
 ## Next work, in order
 
-1. **Gated `SUITE=joins REPEATS=3` at HEAD, then `repeat-compare.sh`.** The
+1. **`repeat-compare.sh` (MySQL 8.4 / PG 17) — queued behind the hold,
+   Docker images pulled.** The joins table is current (three
+   regenerations on 2026-09-02). Original text: The
    joins table must be replaced from a clean run (two attempts on 2026-09-02
    were `CONTAMINATED` by spikes just over the gate). Then the `compare.sh`
    tables, which have never had the repeat wrapper. Pre-build the bench
@@ -88,11 +97,11 @@ current execution order without relying on local conversation history.
    REPEATS=5 ./bench/repeat-compare.sh
    ```
 
-2. **B4's next slice**: after AHL-538 the aggregate shape is fold loop
-   ~30%, cell iteration ~20%, kernel fetch ~15%. The cell iteration
-   (`scan_leaf_cells` per cell) is the next lever and probably needs a
-   leaf-format change (cell offset table) — design before code, DST
-   mandatory. A8 and A9 are done/closed.
+2. **C1 first slice** (rebase-only absorption under the leader's gate,
+   per `docs/research/commit-group-logical.md`), DST-gated; then the
+   insert path's remaining per-row costs (`leaf_split_point`, `encode_leaf`
+   per-cell `Vec`, `UPDATE`'s `encode_table_row`). B4's cell iteration is
+   closed (AHL-541: the format already has the offset table).
 
 3. **`RangeCursor` extension (A3)** to `walk`/`scan_range_from` — the
    cheapest first step is `colliding_rows` using `scan_index_row_ids`
