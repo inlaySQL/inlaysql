@@ -302,6 +302,27 @@ impl ColumnMask {
         }
     }
 
+    /// How many leading columns of a `count`-column row have to be walked
+    /// before every wanted column has been reached.
+    ///
+    /// The row format has no column directory, so column *k* is reached by
+    /// stepping over columns `0..k`; but nothing past the last wanted column
+    /// has to be stepped over at all. For `SELECT COUNT(*), MIN(id), MAX(id)`
+    /// over a four-column row that is one column walked instead of four. The
+    /// answer is `count` — walk everything — whenever the mask cannot narrow:
+    /// it wants everything, or the row is wider than the mask, in which case
+    /// every ordinal past the mask's width is wanted (see [`ColumnMask::wants`]).
+    pub fn walk_len(&self, count: usize) -> usize {
+        if self.everything || count > self.width {
+            return count;
+        }
+        if let Some(last) = self.spilled.iter().rposition(|wanted| *wanted) {
+            return (INLINE_COLUMNS + last + 1).min(count);
+        }
+        let inline = u128::BITS - self.inline.leading_zeros();
+        (inline as usize).min(count)
+    }
+
     /// The mask covering ordinals `start..start + width` of a joined row,
     /// rebased so that ordinal `0` is the sub-row's first column.
     ///
@@ -399,6 +420,51 @@ pub fn decode_row_ref_masked_into<'a>(
             skip_value(&mut cursor)?;
             out.push(ValueRef::Null);
         }
+    }
+    Ok(())
+}
+
+/// [`decode_row_ref_masked_into`] that stops walking after the last wanted
+/// column.
+///
+/// Same cells, same width, same mask semantics: a column the mask does not
+/// want is [`ValueRef::Null`], the row is never truncated, and a row wider
+/// than the mask decodes in full. The one difference is the contract on a
+/// structurally corrupt column *after* the last wanted one — a `TEXT` whose
+/// length runs past the row, say. [`decode_row_masked`] promises to catch it,
+/// because it walks every column to the end; this does not walk them
+/// ([`ColumnMask::walk_len`]) and so does not see them. The row's own column
+/// count is still checked against its length, and every column up to the last
+/// wanted one is walked under the same checks as before.
+///
+/// That is why this is only for a consumer that never hands the row on: the
+/// streamed aggregate (`Engine::stream_aggregate`), which reads its group key
+/// and its arguments from the cells and keeps at most one row per group. It
+/// does not want `body` to fold `COUNT(*)`, and stepping over three columns
+/// to reach the end of a row it is about to discard was measured at
+/// `skip_value` 5.3% self of the aggregate profile (`PERF.md`, AHL-538). A
+/// path that returns rows keeps [`decode_row_ref_masked_into`] and its
+/// promise.
+pub fn decode_row_ref_wanted_into<'a>(
+    bytes: &'a [u8],
+    mask: &ColumnMask,
+    out: &mut Vec<ValueRef<'a>>,
+) -> Result<()> {
+    out.clear();
+    let mut cursor = Cursor::new(bytes);
+    let count = cursor.count(1)?;
+    out.reserve(count);
+    let walk = mask.walk_len(count);
+    for ordinal in 0..walk {
+        if mask.wants(ordinal) {
+            out.push(decode_value_ref(&mut cursor)?);
+        } else {
+            skip_value(&mut cursor)?;
+            out.push(ValueRef::Null);
+        }
+    }
+    for _ in walk..count {
+        out.push(ValueRef::Null);
     }
     Ok(())
 }
@@ -742,6 +808,95 @@ mod tests {
         let mut mask = ColumnMask::none(1);
         mask.add(0);
         assert_eq!(decode_row_masked(&bytes, &mask).unwrap(), row);
+    }
+
+    /// The early-exit decode agrees with the full walk on every mask over a
+    /// well-formed row: same cells, same width, same nulls — including a mask
+    /// narrower than the row, where nothing may be skipped at all.
+    #[test]
+    fn the_wanted_decode_ties_the_masked_decode_on_every_mask() {
+        let row = vec![
+            Value::Integer(7),
+            Value::Text("email".to_string().into()),
+            Value::Blob(vec![1, 2, 3]),
+            Value::Real(2.5),
+            Value::Null,
+            Value::Vector(vec![0.5, 1.0]),
+        ];
+        let bytes = encode_row(&row);
+        for bits in 0..(1u32 << row.len()) {
+            let mut mask = ColumnMask::none(row.len());
+            for ordinal in 0..row.len() {
+                if bits & (1 << ordinal) != 0 {
+                    mask.add(ordinal);
+                }
+            }
+            let mut full = Vec::new();
+            decode_row_ref_masked_into(&bytes, &mask, &mut full).unwrap();
+            let mut wanted = Vec::new();
+            decode_row_ref_wanted_into(&bytes, &mask, &mut wanted).unwrap();
+            assert_eq!(wanted, full, "mask bits {bits:#b}");
+            assert_eq!(wanted.len(), row.len(), "mask bits {bits:#b}");
+        }
+        // Narrower than the row: every ordinal past the mask is wanted, so the
+        // walk runs to the end and only the one unwanted ordinal inside the
+        // mask is nulled.
+        let mut narrow = ColumnMask::none(2);
+        narrow.add(0);
+        assert_eq!(narrow.walk_len(row.len()), row.len());
+        let mut wanted = Vec::new();
+        decode_row_ref_wanted_into(&bytes, &narrow, &mut wanted).unwrap();
+        let owned: Vec<Value> = wanted.iter().map(ValueRef::to_owned_value).collect();
+        let mut expected = row.clone();
+        expected[1] = Value::Null;
+        assert_eq!(owned, expected);
+        // `ALL` walks everything; a mask wanting nothing walks nothing.
+        assert_eq!(ColumnMask::ALL.walk_len(4), 4);
+        assert_eq!(ColumnMask::none(4).walk_len(4), 0);
+    }
+
+    /// The contract the early exit trades, pinned both ways: a corrupt column
+    /// *after* the last wanted one is caught by the full walk and is not seen
+    /// by the wanted walk; a corrupt column *at or before* it is caught by
+    /// both.
+    #[test]
+    fn a_corrupt_trailing_column_is_caught_by_the_full_walk_and_not_the_wanted_one() {
+        let row = vec![
+            Value::Integer(1),
+            Value::Text("kept".to_string().into()),
+            Value::Text("trailing".to_string().into()),
+        ];
+        let mut bytes = encode_row(&row);
+        // The trailing TEXT's length, made to run past the row: count (4) +
+        // integer (1 + 8) + text (1 + 4 + 4) puts its tag at 22 and its
+        // length at 23.
+        assert_eq!(bytes[22], TAG_TEXT);
+        bytes[23..27].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let mut mask = ColumnMask::none(3);
+        mask.add(1);
+        let mut cells = Vec::new();
+        assert!(matches!(
+            decode_row_ref_masked_into(&bytes, &mask, &mut cells),
+            Err(Error::Corrupt(_))
+        ));
+        decode_row_ref_wanted_into(&bytes, &mask, &mut cells).unwrap();
+        assert_eq!(
+            cells,
+            vec![ValueRef::Null, ValueRef::Text("kept"), ValueRef::Null]
+        );
+
+        // Wanted, or before a wanted column: both walks fail the same way.
+        let mut mask = ColumnMask::none(3);
+        mask.add(2);
+        assert!(matches!(
+            decode_row_ref_wanted_into(&bytes, &mask, &mut cells),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(matches!(
+            decode_row_ref_masked_into(&bytes, &mask, &mut cells),
+            Err(Error::Corrupt(_))
+        ));
     }
 
     /// An out-of-range reference widens the mask instead of being dropped.

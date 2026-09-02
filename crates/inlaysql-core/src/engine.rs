@@ -47,8 +47,8 @@ use crate::plan::{
 };
 use crate::planner::{self, JoinDecision, JoinPath, PlannerStats, STATS_META_KEY};
 use crate::row::{
-    decode_row, decode_row_masked, decode_row_ref_masked_into, decode_value_at, encode_typed_row,
-    encode_typed_row_into, ColumnMask, RowBuf,
+    decode_row, decode_row_masked, decode_row_ref_masked_into, decode_row_ref_wanted_into,
+    decode_value_at, encode_typed_row, encode_typed_row_into, ColumnMask, RowBuf,
 };
 use crate::shared::SharedStorage;
 use crate::sql::{self, TableRules};
@@ -7108,7 +7108,11 @@ impl Engine {
                     let (id, bytes) = row?;
                     self.interrupt.check()?;
                     let mut cells: Vec<ValueRef<'_>> = core::mem::take(&mut scratch);
-                    let outcome = decode_row_ref_masked_into(bytes.as_slice(), mask, &mut cells)
+                    // The row is folded and dropped, never returned, so the
+                    // walk stops at the last column the fold reads — see
+                    // `decode_row_ref_wanted_into` for the contract that
+                    // trades.
+                    let outcome = decode_row_ref_wanted_into(bytes.as_slice(), mask, &mut cells)
                         .and_then(|()| {
                             // The `WHERE`, on the borrowed cells, before any
                             // fold — the same test and the same three-valued
