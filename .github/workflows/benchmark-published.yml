@@ -1,0 +1,138 @@
+# Publishable benchmarks, on a dedicated machine, behind the quiet-machine gate.
+#
+# PREPARATION ONLY — no runner carries the `bench` label yet, so a dispatch
+# of this workflow queues and waits. It exists so the runner-side work is one
+# `./config.sh --labels bench` away rather than a workflow written in a hurry.
+#
+# Why a second benchmark workflow. `benchmark.yml` runs on GitHub's shared
+# runners with the load gate forced off, and its report says what that makes
+# it: a trend, never a published figure. `BENCHMARK.md`'s numbers have to
+# come out of `bench/repeat.sh` / `bench/repeat-compare.sh` with the gate ON,
+# on a machine nothing else is using — which today means one developer's Mac
+# in a quiet mid-morning hour (`PERF.md` §4). A dedicated self-hosted runner
+# is that machine, every time, with Docker for the cross-engine rows.
+#
+# Security posture, since this repository is public. A self-hosted runner
+# must never execute code from a fork, so this workflow has no
+# `pull_request` or `pull_request_target` trigger at all: `workflow_dispatch`
+# from a collaborator, or the (commented-out) schedule, on `main` only. Keep
+# the runner in a runner group restricted to this repository, and keep the
+# repository's "require approval for all outside collaborators" setting on
+# for the other workflows.
+#
+# What it produces. Raw result files under `bench/results/`, committed on a
+# branch and opened as a pull request — never a direct push to `main`, and
+# never an edit to `BENCHMARK.md`: turning raw medians into the published
+# tables is an editorial pass (`bench/README.md`) that reads the spread list
+# and says which figures moved and why. The PR is where that pass happens.
+name: Benchmark (published, gated)
+
+on:
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: "Native suites for repeat.sh (space-separated), or 'all'"
+        default: "all"
+      compare:
+        description: "Also run repeat-compare.sh (Docker: mysql 8.4, postgres 17, duckdb, pgvector, meilisearch)"
+        type: boolean
+        default: true
+      repeats:
+        description: "Repetitions per suite (median of N)"
+        default: "3"
+  # Enable once the runner exists:
+  # schedule:
+  #   - cron: "17 2 * * 2"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: benchmark-published
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # The gate stays ON. A refused run is the correct outcome on a busy box;
+  # the job fails loudly rather than publishing noise.
+  BENCH_MAX_LOAD_PER_CPU: "0.25"
+
+jobs:
+  gated:
+    name: gated repeats on the dedicated runner
+    runs-on: [self-hosted, bench]
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Toolchain and provenance
+        run: |
+          rustup show active-toolchain
+          uname -srm
+          nproc || sysctl -n hw.ncpu
+          cat /proc/loadavg 2>/dev/null || sysctl -n vm.loadavg
+
+      - name: Build the bench binary before the timed phase
+        # `run.sh` does `cargo run --release`; a compile inside the measured
+        # window would trip the gate's own sampler.
+        run: cargo build --release -p inlaysql-bench
+
+      - name: Native suites, gated, median of N
+        env:
+          SUITES: ${{ github.event.inputs.suites || 'all' }}
+          REPEATS: ${{ github.event.inputs.repeats || '3' }}
+        run: |
+          set -euo pipefail
+          if [ "$SUITES" = "all" ]; then
+            REPEATS="$REPEATS" ./bench/repeat.sh
+          else
+            for suite in $SUITES; do
+              REPEATS="$REPEATS" SUITE="$suite" ./bench/repeat.sh
+            done
+          fi
+          if grep -l CONTAMINATED bench/results/*-repeat.txt; then
+            echo "::error::a repeat was marked CONTAMINATED — not publishable"
+            exit 3
+          fi
+
+      - name: Cross-engine comparison, gated, median of N
+        if: ${{ github.event.inputs.compare != 'false' }}
+        env:
+          REPEATS: ${{ github.event.inputs.repeats || '3' }}
+        run: |
+          set -euo pipefail
+          docker compose -f bench/external/compose.yml pull
+          REPEATS="$REPEATS" ./bench/repeat-compare.sh
+          if grep -l CONTAMINATED bench/results/*-compare*.txt; then
+            echo "::error::a comparison repeat was marked CONTAMINATED — not publishable"
+            exit 3
+          fi
+
+      - name: Upload the raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-raw-results
+          path: bench/results/
+          retention-days: 90
+
+      - name: Open a pull request with the raw files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+          branch="bench/published-$stamp"
+          git config user.name "inlaysql-bench-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add bench/results/
+          git commit -m "bench: gated raw results from the dedicated runner, $stamp" \
+            -m "Median-of-${{ github.event.inputs.repeats || '3' }} files from benchmark-published.yml at $(git rev-parse --short main). BENCHMARK.md is not edited here: the editorial pass reads the spread list and says what moved and why, on this PR."
+          git push -u origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "bench: gated raw results, $stamp" \
+            --body "Raw \`repeat.sh\`/\`repeat-compare.sh\` files from the dedicated runner, gate on, none contaminated. Next: the BENCHMARK.md editorial pass (\`bench/README.md\`), then README.md and \`www/index.html\` via \`./bench/check_benchmark_sync.py\`, then the org profile and the site publish dispatch."

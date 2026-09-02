@@ -104,6 +104,28 @@ server-to-server OLTP comparison
 (InlaySQL's own MySQL wire against MySQL's, same client, a couple of
 concurrency levels — see "Server-to-server" below).
 
+## Where a published number may come from (2026-09-02)
+
+Two workflows benchmark this repository and only one of them may feed
+`BENCHMARK.md`:
+
+- `.github/workflows/benchmark.yml` — GitHub-hosted shared runner, gate
+  **off**, weekly. Writes `RUNNER-BENCHMARK.md`. Trend and regression
+  tripwire only; read two of its reports against each other, never one of
+  them against `BENCHMARK.md`.
+- `.github/workflows/benchmark-published.yml` — a dedicated self-hosted
+  runner (label `bench`), gate **on**, `workflow_dispatch` only, never on a
+  pull request (public repository; a fork must not reach that machine). It
+  commits the raw files on a branch and opens a PR; the editorial pass into
+  `BENCHMARK.md` happens there. **Preparation only until a runner carries
+  the label.** Until then the published tables come from the same commands
+  on a quiet developer machine, as they always have.
+
+The MySQL container is `mysql:8.4` (LTS) from 2026-09-02; every "MySQL 8"
+figure published before that date was measured against 8.0.x and its
+provenance says so. The first 8.4 regeneration must name the version in
+its tables.
+
 ## How many times to run it
 
 Once is not enough, and the project learned that the expensive way. Two
