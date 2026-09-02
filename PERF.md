@@ -3789,6 +3789,112 @@ paths and still compiles) all pass. `cargo test --release -p inlaysql-core
 `dst_sweep.rs` tests already ran under the plain workspace test pass) passes
 unchanged — `mem.rs`'s semantics did not move, only which allocation a read
 pays.
+### The miss path already copies once, and that copy is the kernel's (AHL-540, 2026-09-03)
+
+AHL-536 left the last copy on the cold sweep named and unfixed: "a page the
+device does not hold is `pread` into the window and copied into the per-leaf
+`Arc`, and on a cold pass the device copies it again to admit it." Root plan
+A9 was to remove it — read a miss straight into the buffer that will be
+shared, once. It was built, measured against `52c74bb` over six shapes, and
+reverted. The finding is that **there is no copy left to remove**: on the
+shape A9 targets the miss path is already one `pread` plus one `Arc::from`
+per leaf, and moving that `Arc::from` earlier makes it eager, which loses.
+
+**What the profile said before anything was built.** `--suite aggregate
+--rows 100000`, 7,600 samples, load 20–24 (another agent's run; relative
+attribution only, no wall-clock claim is made from it):
+
+| Frame | Samples | Self | What it is |
+| --- | --- | --- | --- |
+| `pread` | 668 | 8.8% | the kernel's copy into the read-ahead window |
+| `FileDevice::read` (inclusive) | 672 | 8.8% | i.e. the read is *entirely* `pread` |
+| `memmove` under `walk_raw_row_values` | 176 | 2.3% | the window → per-leaf `Arc<[u8]>` copy |
+| `memmove` under `RawLeafCache::insert` | 49 | 0.6% | the 64-entry `Vec::remove(0)` shift |
+| `memmove` under the shared cache's fill | **0** | **0%** | never runs on this shape |
+
+That last row is the one that decided it. `ReadCache::insert_if_room` refuses
+before it copies once the 8 MiB budget is full, and the 100k table's leaves
+outgrow it, so the "third copy" AHL-536 named is not paid on the shape it was
+named for — it is paid once, on the pass that fills the cache, and amortised
+to nothing across a five-second run. Turning the cache off entirely
+(`INLAYSQL_DISABLE_SHARED_READ_CACHE=1`, the pure cold path, 6,735 samples)
+gives the same structure with the syscall larger: `pread` 15.4% self, the
+per-leaf copy 3.6%, the raw-leaf shift 1.1%, the fill still zero. **The
+kernel's copy is four times the removable one, in both.**
+
+**What was built.** `Device::read_pages(offset, page_size, count, scratch)
+-> Option<Vec<Arc<[u8]>>>`, defaulted over `Device::read` so every other
+device keeps working, with `FileDevice` overriding it to `pread` into the
+caller's reusable scratch and split the result into per-page `Arc`s;
+`Readahead` holding `Vec<Arc<[u8]>>` instead of `Vec<u8>`, so a leaf borrows
+the window's buffer rather than copying out of it; and `ReadCache` gaining
+`insert_arc`/`insert_arc_if_room` so admission is a refcount bump, plus an
+`admissible` pre-check so a page the cache will refuse is not copied on its
+way to being dropped (`insert` was `Arc::from(page.to_vec())`, which is two
+copies, not one). Copies per page on a miss: kernel + one `Arc::from`,
+against a fill pass's kernel + `Arc::from` + `to_vec` + `Arc::from` before.
+
+**Why that is not a win.** Because outside the fill pass the *old* count was
+also kernel + one `Arc::from`. The change does not delete a copy; it moves it
+from the way out of the window to the way in. The floor is structural: a
+`pread` fills a `&mut [u8]`, an `Arc<[u8]>` cannot be filled in place without
+`Arc::new_uninit_slice` + `assume_init` — `unsafe`, and both crates are
+`#![forbid(unsafe_code)]` — so every safe construction is one copy out of the
+buffer the read filled. `Arc::<[u8]>::from(&[u8])` is that copy;
+`Arc::from(Vec<u8>)` is that copy *again* on top of the `to_vec`, which is the
+only thing here that was genuinely wasteful and it only ever ran on admission.
+
+**And moving it costs.** Splitting the whole window eagerly pays for sixteen
+pages whether or not the scan reads them; the lazy copy on the way out pays
+only for leaves actually scanned. The `joins` profile has it exactly: the
+per-leaf copy is 38 samples (0.58%) on `52c74bb` and the eager split is 75
+(1.1%) — double, because the join abandons windows part-read.
+
+**Measured**, interleaved, control re-run every repetition, order alternated
+per repetition, `--seconds 5` for the 100k shape and `4` for the rest, two
+other agents benchmarking on the same machine throughout:
+
+| Shape | `52c74bb` | `read_pages` | Verdict |
+| --- | --- | --- | --- |
+| `aggregate`, 100k rows (does not fit the caches) | 168 / 168 / 174 ops/s | 172 / 166 / 174 | flat, mixed sign |
+| `aggregate`, 20k rows (fits) | 978 / 934 / 980 | 979 / 937 / 984 | flat |
+| `joins`, 20k | 46 / 47 / 47 | **44 / 45 / 42** | **3/3 loss**, −6%, non-overlapping |
+| `points`, 20k | 3.06 / 3.23 / 3.29M | 3.08 / 3.27 / 3.15M | flat |
+| `indexed-range`, 20k | 92.2 / 101.7 / 90.7k | 94.7 / 101.8 / 103.5k | flat, mixed |
+| `joins-limit`, 20k | 160.7 / 160.0 / 153.5k | **155.1 / 159.0 / 145.9k** | **3/3 loss**, −3% |
+
+Load 5.17 / 4.43 / 3.32 at the head of the three repetitions. The two losses
+are the two shapes that stop reading a window before its end, which is the
+mechanism above and not noise: they lost 3/3 in the same direction with the
+control re-run beside them each time.
+
+**One attempt inside the change, dropped.** The first cut allocated the
+window's `Vec<u8>` inside `FileDevice::read_pages` rather than taking the
+caller's scratch. A fresh 64 KiB allocation per wide read cost 1.5% of the
+100k aggregate in `madvise` alone — the allocator handing the pages back to
+the kernel between reads — on top of everything above. Passing the tree's
+reused buffer through the trait removed it (`madvise` gone, `memmove` 4.3% →
+3.4%), and the shape still measured as the table shows. Recorded because
+"return an owned `Vec<Arc<[u8]>>`" reads as the obvious signature and it is
+the expensive one.
+
+**What would actually remove the copy, and why it is not worth building.**
+Only reading into an `Arc<[u8]>` that already exists. That is reachable
+safely — `Arc::get_mut` hands out `&mut [u8]` when the refcount is one, so a
+small pool of recycled window buffers could be `pread` into directly — but it
+needs the leaf to borrow a *sub-range* of a multi-page buffer, which means
+threading a page base through `scan_leaf_into`, `resolve_value_at`,
+`admits_whole_leaf` and `RawScanCursorCandidate`, and it needs a fallback to
+the copying path for every shape that holds its rows (a pool entry whose rows
+are still alive cannot be reused, and allocating a replacement is `calloc` +
+`Arc::from`, worse than the copy it replaces). The ceiling on all of that is
+the 2.3% the copy costs — 3.6% fully cold — in the file where a mistake
+corrupts a database, and it is inside §4's floor. **A9 is closed on the
+measurement, not on the attempt**: the miss path's cost is the kernel's copy
+in `pread`, and that is not removable from this side of the `Device` seam.
+The next place to look is the seam itself — an `mmap`-backed device would
+have no `pread` copy at all — and that is an architecture decision about
+`SIGBUS`, truncation and write coherence, not a perf patch.
 
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
