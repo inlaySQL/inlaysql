@@ -303,14 +303,14 @@
   </p>
   <div class="figures">
     <div class="figure">
-      <b>1,069,233</b>
+      <b>872,474</b>
       <span>point reads per second</span>
-      <em>~2.5-4× SQLite in journal mode, durable</em>
+      <em>~2.5-7× SQLite in journal mode, durable</em>
     </div>
     <div class="figure">
       <b>~14×</b>
       <span>SQLite on concurrent writes</span>
-      <em>1,347 commits/s at 8 writers, 0% aborted</em>
+      <em>1,228 commits/s at 8 writers, 0% aborted</em>
     </div>
     <div class="figure">
       <b>198 µs</b>
@@ -478,19 +478,19 @@
       <tbody>
         <tr>
           <td>Point read by primary key</td>
-          <td class="num">1,069,233 ops/s</td>
+          <td class="num">872,474 ops/s</td>
           <td>SQLite, journal (durable)</td>
-          <td class="win">~2.5-4× faster</td>
+          <td class="win">~2.5-7× faster</td>
         </tr>
         <tr>
           <td>Concurrent writes, 8 writers</td>
-          <td class="num">1,347 commits/s</td>
+          <td class="num">1,228 commits/s</td>
           <td>SQLite, journal</td>
           <td class="win">~14× faster</td>
         </tr>
         <tr>
           <td>Vector search, recall@10 1.000</td>
-          <td class="num">75.17 µs</td>
+          <td class="num">69.08 µs</td>
           <td><code>sqlite-vec</code></td>
           <td class="win">~9× faster</td>
         </tr>
@@ -514,15 +514,15 @@
         </tr>
         <tr>
           <td>Secondary-index inner join, 20k × 160k rows</td>
-          <td class="num">3.78 ms</td>
+          <td class="num">3.49 ms</td>
           <td>SQLite</td>
-          <td class="win">~8× faster</td>
+          <td class="win">~7-8× faster</td>
         </tr>
         <tr>
           <td>Indexed range scan, 50 rows</td>
-          <td class="num">13.67 µs</td>
+          <td class="num">9.83 µs</td>
           <td>SQLite, journal</td>
-          <td class="loss">~2× slower</td>
+          <td class="loss">~1.5× slower</td>
         </tr>
         <tr>
           <td>Indexed range scan, 50 rows</td>
@@ -585,13 +585,15 @@
       </li>
       <li>
         <strong>Row iteration loses to SQLite.</strong> Range scans and both
-        <code>LIMIT 10</code> join shapes are slower than SQLite (roughly 2×
-        and 1.7-1.9×); both full joins are faster, and against MySQL and
-        PostgreSQL the range scan wins outright. Measured, published above,
-        and the current top priority. What is left in the
-        <code>LIMIT</code>-shape gap is profiled: per-row page-decode cost,
-        with the obvious fix tried twice and rejected for regressing point
-        reads.
+        <code>LIMIT 10</code> join shapes are slower than SQLite (roughly 1.5×
+        and 1.2-1.6×, both narrower than last edition after a borrowing row
+        API and a <code>LIMIT</code>-sized first batch); both full joins are
+        faster, and against MySQL and PostgreSQL the range scan wins outright.
+        Measured, published above, and the current top priority. What is left
+        in the <code>LIMIT</code>-shape gap is profiled: ten full tree
+        descents for ten consecutive keys in one leaf, plus the per-row
+        page-decode cost whose obvious fix was tried twice and rejected for
+        regressing point reads.
       </li>
       <li>
         <strong><code>GROUP BY</code> and aggregates are the worst shape we
