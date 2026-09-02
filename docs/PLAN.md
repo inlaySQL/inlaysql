@@ -43,6 +43,11 @@ current execution order without relying on local conversation history.
   1.5x** on top of the morning's 1.44x). A third agent found the range
   shape's row ids were already fetched in rowid order and that a multi-slot
   point cursor measures *negative* on the published shapes — B3 is closed.
+- 2026-09-03, small hours: AHL-538 (streamed aggregate by callback off the
+  borrowed leaf, walk stops at the last wanted column; aggregate 1.08–1.12x
+  at every row width), AHL-539 (in-memory rows shared, 0 allocations per
+  in-memory point read; A8 done), AHL-540 (A9 closed by measurement: the
+  miss path's remaining copy is the kernel's; PERF.md only).
 - Night: AHL-535 (borrowing row API `query_prepared_each_ref`, zero
   allocations per row on the point/range shapes; benches step rows on both
   sides; **points 1.56x, range 1.40x**), AHL-536 (leaf scan borrows the
@@ -83,10 +88,11 @@ current execution order without relying on local conversation history.
    REPEATS=5 ./bench/repeat-compare.sh
    ```
 
-2. **B4, re-scoped**: batch the leaf→column *decode* of the needed
-   ordinals (R3 measured the fold at 0.3–5 ns/row against 46–124 ns/row of
-   decode). A8: `MemStorage::get_row` copies rows (in-memory databases get
-   none of AHL-535's win). A9: the cold-sweep miss path still copies once.
+2. **B4's next slice**: after AHL-538 the aggregate shape is fold loop
+   ~30%, cell iteration ~20%, kernel fetch ~15%. The cell iteration
+   (`scan_leaf_cells` per cell) is the next lever and probably needs a
+   leaf-format change (cell offset table) — design before code, DST
+   mandatory. A8 and A9 are done/closed.
 
 3. **`RangeCursor` extension (A3)** to `walk`/`scan_range_from` — the
    cheapest first step is `colliding_rows` using `scan_index_row_ids`
