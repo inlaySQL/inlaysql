@@ -8,7 +8,15 @@ beside wins, because a table that only contains wins is advertising.
 **For a workload x SQLite/MySQL/PostgreSQL matrix with a WIN/LOSS/TIE/
 FLOOR-BOUND/N/A/UNKNOWN verdict per cell, and the fairness audit (durability,
 transport, tuning, structural asymmetry) that verdict rests on, see
-[`SCOREBOARD.md`](SCOREBOARD.md).** This file remains the source of truth for
+[`SCOREBOARD.md`](SCOREBOARD.md).**
+
+> **Runner benchmarks are separate.** A GitHub-hosted runner cannot meet the
+> quiet-machine, load-gated standard these numbers were measured under
+> (`PERF.md` §4), so automated runs live in their own file:
+> [`RUNNER-BENCHMARK.md`](RUNNER-BENCHMARK.md), regenerated weekly and on
+> demand by `.github/workflows/benchmark.yml` from the same scripts these
+> tables use. Read those numbers as trends against other runner runs — never
+> against the tables below. This file remains the source of truth for
 every headline figure; that one turns the figures below into a defined win/
 lose/tie, cell by cell, and states plainly which cells nobody has filled in
 yet.

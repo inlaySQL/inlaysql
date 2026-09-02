@@ -1,0 +1,170 @@
+name: benchmark
+
+# Runner-grade benchmarks, on a schedule and on demand.
+#
+# What this is: every suite the repository ships, run on a GitHub-hosted
+# runner, three repetitions per suite, medians published — so a regression
+# shows up in CI history without anyone babysitting a laptop.
+#
+# What this is not: the published benchmarks. A shared 4-vCPU runner is a
+# noisy machine by construction — the load-gate story in PERF.md §4 exists
+# because of machines exactly like it — so these numbers are trend-tracking
+# only, and `RUNNER-BENCHMARK.md` says so in its header. BENCHMARK.md stays
+# the quiet-machine source of truth.
+#
+# Free for a public repository: standard-runner minutes cost nothing, which
+# is what makes "run everything, every week" affordable here.
+
+on:
+  schedule:
+    # Weekly, so a regression cannot hide for long even when nobody pushes.
+    - cron: "41 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: "Native suites to run (space-separated: points indexed joins concurrency vectors retrieval)"
+        required: false
+        default: "points indexed joins concurrency"
+      compare:
+        description: "Also run the Docker cross-engine comparison (mysql, postgres, duckdb, pgvector)"
+        type: boolean
+        default: true
+
+# One benchmark at a time: overlapping runs would contaminate each other's
+# load measurements, which is the whole failure mode the local gate exists
+# for.
+concurrency:
+  group: benchmark
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # The quiet-machine gate is off by the same reasoning trust.yml's
+  # benchmarks job uses (AHL-501): a shared runner idles above 0.25/CPU, and
+  # these are trend numbers whose provenance the report file discloses.
+  BENCH_MAX_LOAD_PER_CPU: "off"
+
+jobs:
+  native:
+    name: native suites (3 repeats, medians)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/rust
+        with:
+          cache: bench
+
+      - name: Run the suites
+        env:
+          SUITES: ${{ github.event.inputs.suites || 'points indexed joins concurrency' }}
+        run: |
+          set -euo pipefail
+          for suite in $SUITES; do
+            echo "=== $suite (3 repeats) ==="
+            transcript="$(REPEATS=3 SUITE=$suite ./bench/repeat.sh)" || status=$?
+            if [ -n "${status:-}" ]; then
+              printf '%s\n' "$transcript" | tail -30
+              exit "$status"
+            fi
+            written="$(printf '%s\n' "$transcript" | sed -n 's/^written to //p' | tail -1)"
+            cp "$written" "bench/results/runner-$suite-repeat.txt"
+            echo "kept bench/results/runner-$suite-repeat.txt"
+          done
+
+      - name: Upload the native results
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-results
+          path: bench/results/runner-*-repeat.txt
+          retention-days: 30
+
+  compare:
+    name: docker cross-engine comparison
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    if: ${{ github.event.inputs.compare != 'false' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/rust
+        with:
+          cache: bench
+
+      - name: Run the cross-engine comparison
+        env:
+          SERVER_CONCURRENCY_LEVELS: "1,4,16"
+        run: ./bench/compare.sh
+
+      - name: Keep the report under a stable name
+        run: |
+          latest="$(ls -t bench/results/*-compare.txt | head -1)"
+          cp "$latest" bench/results/runner-compare.txt
+          echo "kept bench/results/runner-compare.txt (from $latest)"
+
+      - name: Upload the comparison
+        uses: actions/upload-artifact@v4
+        with:
+          name: compare-results
+          path: bench/results/runner-compare.txt
+          retention-days: 30
+
+  publish:
+    name: publish RUNNER-BENCHMARK.md
+    needs: [native, compare]
+    # `skipped` covers a manual dispatch with the comparison turned off.
+    if: >-
+      ${{
+        !cancelled() &&
+        needs.native.result == 'success' &&
+        (needs.compare.result == 'success' || needs.compare.result == 'skipped')
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-results"
+          path: bench/results
+
+      - name: Flatten the artifact directories
+        run: |
+          for dir in bench/results/*-results; do
+            [ -d "$dir" ] && cp "$dir"/* bench/results/
+          done
+          ls bench/results/
+
+      - name: Assemble the report
+        run: |
+          chmod +x bench/runner_report.sh
+          ./bench/runner_report.sh RUNNER-BENCHMARK.md \
+            runner-points-repeat.txt \
+            runner-indexed-repeat.txt \
+            runner-joins-repeat.txt \
+            runner-concurrency-repeat.txt \
+            runner-compare.txt
+
+      - name: Commit the report
+        run: |
+          git config user.name "inlaysql-bench-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add RUNNER-BENCHMARK.md
+          if git diff --cached --quiet; then
+            echo "nothing changed"
+          else
+            git commit -m "bench: runner benchmark report, $(date -u +%Y-%m-%d) [skip ci]"
+            git push
+          fi
+
+      - name: Attach the report
+        uses: actions/upload-artifact@v4
+        with:
+          name: RUNNER-BENCHMARK
+          path: RUNNER-BENCHMARK.md
