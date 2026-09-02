@@ -78,13 +78,14 @@ fn counted(run: impl FnOnce()) -> usize {
 
 #[test]
 fn a_borrowing_consumer_allocates_nothing_per_row() {
-    // A **file-backed** handle, because that is the one the claim is about and
-    // the one every benchmark measures: it reads a row as a `RowBuf::Shared`
-    // slice of a cached page, which is what there is to borrow from.
-    // `Database::open_in_memory`'s `MemStorage` copies each row out of a
-    // `BTreeMap` into an owned `Vec` before anything downstream sees it, so it
-    // allocates twice per lookup whatever the API above it does — a property of
-    // that backend, not of this path.
+    // A **file-backed** handle, because that is the one every benchmark
+    // measures: it reads a row as a `RowBuf::Shared` slice of a cached page,
+    // which is what there is to borrow from. `Database::open_in_memory`'s
+    // `MemStorage` gets the same measurement in the sibling test below
+    // (`AHL-539`) — it used to copy each row out of a `BTreeMap` into an
+    // owned `Vec` before anything downstream saw it, allocating twice per
+    // lookup whatever the API above it did; it now shares committed rows as
+    // `Arc<[u8]>` instead.
     let path = std::env::temp_dir().join(format!(
         "inlaysql-borrowed-allocations-{}-{}.inlay",
         std::process::id(),
@@ -218,13 +219,91 @@ fn a_borrowing_consumer_allocates_nothing_per_row() {
          borrowed path's {long} is not evidence of anything"
     );
 
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+
+    // --- AHL-539: the same point-read comparison, in-memory ---
+    //
+    // This module's own doc comment names why this stays inside the one
+    // `#[test]` rather than becoming a sibling: `cargo test` runs a binary's
+    // tests concurrently by default, and this counter is a single
+    // process-wide static, so a second test allocating at the same moment
+    // would land in this one's count and this one's in its. Reusing `sink`,
+    // `counted` and the file-backed test's own numbers above as commentary:
+    // `Database::open_in_memory`'s `MemStorage` used to copy every row out of
+    // a `BTreeMap` into an owned `Vec` before anything downstream saw it —
+    // twice per lookup whatever the API above it did. It now holds committed
+    // rows as `Arc<[u8]>` and hands back a share of them
+    // (`inlaysql_core::row::RowBuf::Shared`) instead, so this should cost
+    // exactly what the file-backed measurement above did: nothing.
+    let mut mem_db = Database::open_in_memory().expect("open in-memory");
+    mem_db
+        .execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)", &[])
+        .expect("create");
+    let mem_insert = mem_db
+        .prepare("INSERT INTO kv (id, body) VALUES (?, ?)")
+        .expect("prepare insert");
+    mem_db.begin().expect("begin");
+    for id in 1..=2_000i64 {
+        mem_db
+            .execute_prepared(
+                &mem_insert,
+                &[Value::Integer(id), Value::Text(payload.clone().into())],
+            )
+            .expect("insert");
+    }
+    mem_db.commit().expect("commit");
+
+    let mem_point = mem_db
+        .prepare("SELECT body FROM kv WHERE id = ?")
+        .expect("prepare point");
+
+    // Warm, same reasoning as above: steady state is what is claimed, so
+    // steady state is what gets measured.
+    for _ in 0..3 {
+        for id in 1..=lookups {
+            mem_db
+                .query_prepared_each_ref(&mem_point, &[Value::Integer(id)], |row| {
+                    sink += row[0].as_str().map_or(0, str::len);
+                    Ok(())
+                })
+                .expect("warm point");
+        }
+    }
+
+    let mem_borrowed_points = counted(|| {
+        for id in 1..=lookups {
+            let delivered = mem_db
+                .query_prepared_each_ref(&mem_point, &[Value::Integer(id)], |row| {
+                    sink += row[0].as_str().map_or(0, str::len);
+                    Ok(())
+                })
+                .expect("point");
+            assert_eq!(delivered, 1);
+        }
+    });
+    let mem_owned_points = counted(|| {
+        for id in 1..=lookups {
+            let rows = mem_db
+                .query_prepared(&mem_point, &[Value::Integer(id)])
+                .expect("point");
+            sink += rows.rows[0][0].as_str().map_or(0, str::len);
+        }
+    });
+    assert_eq!(
+        mem_borrowed_points, 0,
+        "{lookups} borrowed in-memory point reads made {mem_borrowed_points} allocations \
+         (was 400 before AHL-539's MemStorage change — 2 per lookup); the owned API \
+         made {mem_owned_points} over the same lookups"
+    );
+
     // `sink` is read so the compiler cannot elide the column reads above,
     // which would make every count here a measurement of nothing.
     assert!(sink > 0);
     println!(
         "point reads: borrowed {borrowed_points}, owned {owned_points} over {lookups} lookups; \
-         40-row scan: borrowed {long}, owned {owned_long}"
+         40-row scan: borrowed {long}, owned {owned_long}; \
+         in-memory point reads: borrowed {mem_borrowed_points}, owned {mem_owned_points}"
     );
-    drop(db);
-    let _ = std::fs::remove_file(&path);
+    drop(mem_db);
 }

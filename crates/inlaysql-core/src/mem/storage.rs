@@ -5,8 +5,10 @@
 //! only reaches the committed maps on `commit`. That is what makes an explicit
 //! rollback meaningful here — discarding the overlay discards the writes.
 
+use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ops::Bound;
 
@@ -14,14 +16,43 @@ use crate::error::Result;
 use crate::row::RowBuf;
 use crate::traits::{RowId, Storage};
 
+/// Lowercase `table` only when it actually holds an uppercase byte.
+///
+/// Every read here does this once per call, on the same table name over and
+/// over in a hot loop — [`crate::temp_storage::TempTableRouter::is_temp`]
+/// notes the same cost for the same reason. A schema's table names are
+/// created once and read forever, so the overwhelmingly common case is a
+/// name that is already lowercase and a `to_ascii_lowercase` that would have
+/// allocated a `String` to produce a copy identical to its input.
+fn lower_table(table: &str) -> Cow<'_, str> {
+    if table.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(table.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(table)
+    }
+}
+
 /// In-memory [`Storage`].
 ///
 /// `commit` folds the pending overlay into the committed maps; there is nothing
 /// to make durable, but the engine still calls it, which keeps the call pattern
 /// identical to the on-disk backends. `rollback` drops the overlay.
+///
+/// Committed row bytes are held as `Arc<[u8]>` (`AHL-539`), not `Vec<u8>`: a
+/// read that finds its row already committed hands back a share of these
+/// bytes — an `Arc` refcount bump — through [`RowBuf::Shared`] instead of
+/// cloning them into a fresh `RowBuf::Owned`. This is the in-memory backend's
+/// share of the win [`crate::storage::TreeStorage::get_row`] already had from
+/// `AHL-478`: a row that was never zero-copy to begin with (`MemStorage`,
+/// used by every test, the WASM demo and embedded callers) now is, on the
+/// committed path a warm point read actually takes. The pending overlay
+/// below stays `Vec<u8>` — an open transaction's own uncommitted write is a
+/// fresh insert, never shared with anything, so there is nothing to gain by
+/// wrapping it, and `commit` already has to touch every byte to move it into
+/// place regardless of its type.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MemStorage {
-    tables: BTreeMap<String, BTreeMap<RowId, Vec<u8>>>,
+    tables: BTreeMap<String, BTreeMap<RowId, Arc<[u8]>>>,
     meta: BTreeMap<String, Vec<u8>>,
     /// Buffered row writes; `None` marks a delete.
     pending_rows: BTreeMap<String, BTreeMap<RowId, Option<Vec<u8>>>>,
@@ -32,7 +63,7 @@ pub struct MemStorage {
     /// nothing here needs the two to share a key space the way the on-disk
     /// backend's one tree does; keeping them apart is what let every
     /// existing row-id path above stay untouched by this addition.
-    tables_keyed: BTreeMap<String, BTreeMap<Vec<u8>, Vec<u8>>>,
+    tables_keyed: BTreeMap<String, BTreeMap<Vec<u8>, Arc<[u8]>>>,
     /// [`MemStorage::tables_keyed`]'s buffered writes, the same shape
     /// [`MemStorage::pending_rows`] is to `tables`.
     pending_rows_keyed: BTreeMap<String, BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
@@ -68,16 +99,20 @@ impl Storage for MemStorage {
     }
 
     fn get_row(&self, table: &str, id: RowId) -> Result<Option<RowBuf>> {
-        let table = table.to_ascii_lowercase();
-        if let Some(pending) = self.pending_rows.get(&table).and_then(|rows| rows.get(&id)) {
+        let table = lower_table(table);
+        if let Some(pending) = self
+            .pending_rows
+            .get(table.as_ref())
+            .and_then(|rows| rows.get(&id))
+        {
             return Ok(pending.clone().map(RowBuf::Owned));
         }
         Ok(self
             .tables
-            .get(&table)
+            .get(table.as_ref())
             .and_then(|rows| rows.get(&id))
             .cloned()
-            .map(RowBuf::Owned))
+            .map(RowBuf::from))
     }
 
     fn delete_row(&mut self, table: &str, id: RowId) -> Result<()> {
@@ -100,7 +135,7 @@ impl Storage for MemStorage {
         after: Option<RowId>,
         limit: usize,
     ) -> Result<Vec<(RowId, RowBuf)>> {
-        let table = table.to_ascii_lowercase();
+        let table = lower_table(table);
         let start = match after {
             Some(id) => Bound::Excluded(id),
             None => Bound::Unbounded,
@@ -109,13 +144,13 @@ impl Storage for MemStorage {
         let empty_pending = BTreeMap::new();
         let mut committed = self
             .tables
-            .get(&table)
+            .get(table.as_ref())
             .unwrap_or(&empty_rows)
             .range((start, Bound::Unbounded))
             .peekable();
         let mut pending = self
             .pending_rows
-            .get(&table)
+            .get(table.as_ref())
             .unwrap_or(&empty_pending)
             .range((start, Bound::Unbounded))
             .peekable();
@@ -138,7 +173,7 @@ impl Storage for MemStorage {
                 Some(None) => {}
                 None => {
                     if let Some(bytes) = stored {
-                        out.push((next, RowBuf::Owned(bytes.clone())));
+                        out.push((next, RowBuf::from(bytes.clone())));
                     }
                 }
             }
@@ -155,20 +190,20 @@ impl Storage for MemStorage {
     }
 
     fn get_row_keyed(&self, table: &str, key: &[u8]) -> Result<Option<RowBuf>> {
-        let table = table.to_ascii_lowercase();
+        let table = lower_table(table);
         if let Some(pending) = self
             .pending_rows_keyed
-            .get(&table)
+            .get(table.as_ref())
             .and_then(|rows| rows.get(key))
         {
             return Ok(pending.clone().map(RowBuf::Owned));
         }
         Ok(self
             .tables_keyed
-            .get(&table)
+            .get(table.as_ref())
             .and_then(|rows| rows.get(key))
             .cloned()
-            .map(RowBuf::Owned))
+            .map(RowBuf::from))
     }
 
     fn delete_row_keyed(&mut self, table: &str, key: &[u8]) -> Result<()> {
@@ -187,7 +222,7 @@ impl Storage for MemStorage {
         after: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, RowBuf)>> {
-        let table = table.to_ascii_lowercase();
+        let table = lower_table(table);
         let start = match after {
             Some(key) => Bound::Excluded(key.to_vec()),
             None => Bound::Unbounded,
@@ -196,13 +231,13 @@ impl Storage for MemStorage {
         let empty_pending = BTreeMap::new();
         let mut committed = self
             .tables_keyed
-            .get(&table)
+            .get(table.as_ref())
             .unwrap_or(&empty_rows)
             .range((start.clone(), Bound::Unbounded))
             .peekable();
         let mut pending = self
             .pending_rows_keyed
-            .get(&table)
+            .get(table.as_ref())
             .unwrap_or(&empty_pending)
             .range((start, Bound::Unbounded))
             .peekable();
@@ -222,7 +257,7 @@ impl Storage for MemStorage {
                 Some(None) => {}
                 None => {
                     if let Some(bytes) = stored {
-                        out.push((next, RowBuf::Owned(bytes.clone())));
+                        out.push((next, RowBuf::from(bytes.clone())));
                     }
                 }
             }
@@ -295,7 +330,11 @@ impl Storage for MemStorage {
             for (id, value) in rows {
                 match value {
                     Some(bytes) => {
-                        committed.insert(id, bytes);
+                        // The one copy left on this path: an open
+                        // transaction's own write, folded into the map reads
+                        // will share from. It happens once per committed
+                        // row, not once per read of it.
+                        committed.insert(id, Arc::from(bytes));
                     }
                     None => {
                         committed.remove(&id);
@@ -308,7 +347,7 @@ impl Storage for MemStorage {
             for (key, value) in rows {
                 match value {
                     Some(bytes) => {
-                        committed.insert(key, bytes);
+                        committed.insert(key, Arc::from(bytes));
                     }
                     None => {
                         committed.remove(&key);

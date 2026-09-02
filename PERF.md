@@ -3691,6 +3691,105 @@ page, `None` for a wrong length, a miss, an offset below the data area, a
 read-only handle, and after reuse is enabled. The raw-vs-decoded parity tests
 and both DST sweeps pass unchanged.
 
+### `MemStorage` shares its committed rows instead of copying them (AHL-539, 2026-09-02)
+
+AHL-535's own "note on the in-memory backend" named the gap and left it:
+`Database::open_in_memory`'s `MemStorage` copied every row out of its
+`BTreeMap` into an owned `Vec` before the borrowing API could see it, so it
+"allocates twice per lookup whatever this API does" — a property of that
+backend, not of the borrowing path AHL-535 built. Every test in this repo,
+the WASM demo, and any embedded caller that never opens a file all sit behind
+that backend and got none of AHL-478's or AHL-535's win.
+
+**The fix.** `MemStorage::tables` and `tables_keyed` hold committed row bytes
+as `Arc<[u8]>` rather than `Vec<u8>`. A committed read clones the `Arc` — a
+refcount bump — and wraps it in `RowBuf::Shared` (`RowBuf::From<Arc<[u8]>>`
+already existed, from `crate::btree`'s own use of it) instead of cloning the
+bytes into `RowBuf::Owned`. `commit` pays the one conversion this adds:
+`Arc::from(bytes)` when a pending `Vec<u8>` write is folded into the
+committed map, once per committed row, not once per read of it — matching
+the brief's "writes may keep allocating (a write builds the row anyway)".
+The pending overlay itself (`pending_rows`, an open transaction's own
+uncommitted writes) stays `Vec<u8>`: those bytes are never shared with
+anything, so wrapping them buys nothing and a hot read that hits committed
+data — the case this fix is for — never touches that map's clone at all.
+
+**The second allocation the brief didn't name.** Every `get_row`/`scan_batch`
+call also ran `table.to_ascii_lowercase()` to key into the `BTreeMap<String,
+_>` — a fresh `String` on every lookup regardless of the row-copy fix, which
+would have kept the in-memory point read at one allocation per lookup instead
+of zero. `TempTableRouter::is_temp` had already solved this exact problem for
+its own hot path ("a `to_ascii_lowercase` allocation on every point read for
+a feature that database never uses would be exactly the cost that comment
+exists to avoid"); `MemStorage` now does the same thing under a private
+`lower_table` helper — `Cow::Borrowed` when the name has no uppercase byte
+(the overwhelmingly common case, since a schema's table names are created
+once and read forever), `Cow::Owned` only when it actually needs lowercasing.
+
+**`SharedStorage` and `TempTableRouter`**, the two wrappers around a
+`Storage` backend, needed no change: both delegate every row-reading method
+straight through to the inner backend and hand back whatever `RowBuf` it
+returns, so a `MemStorage` behind either one shares exactly as it does bare.
+
+**Tests.** `crates/inlaysql/tests/borrowed_row_allocations.rs`'s one test
+(kept as one, per its own module doc comment — `cargo test` runs a binary's
+tests concurrently by default, so a second `#[test]` would land its
+allocations in this one's process-wide counter and vice versa) now measures
+the in-memory case immediately after the file-backed one, same shape, same
+20 warm iterations first:
+
+| Case | Borrowed | Owned |
+| --- | --- | --- |
+| File-backed, 200 point reads | 0 | 1,800 |
+| In-memory, 200 point reads | **0** (was 400 before this change — 2 per lookup) | 1,800 |
+
+Mutation-checked by hand: reverting `get_row`'s committed-path return to
+`.map(|bytes| RowBuf::Owned(bytes.to_vec()))` (an `Arc`-to-`Vec` copy instead
+of a share) turned the in-memory assertion's `0` into `200` — one allocation
+per lookup, exactly the missing half of the fix — and the test failed with
+that count in its message. Restoring the `Arc` clone brought it back to `0`.
+
+**Throughput**, 200k point reads against a 20k-row in-memory table, three
+reps each, interleaved against a binary built from `52c74bb` (this section's
+parent commit) via a second worktree, both `--release`:
+
+| Rep | `52c74bb` | AHL-539 | Verdict |
+| --- | --- | --- | --- |
+| 1 | 6.09M ops/s | **6.80M** | +12% |
+| 2 | 6.94M ops/s | **8.57M** | +23% |
+| 3 | 6.69M ops/s | **8.55M** | +28% |
+
+3/3, non-overlapping, AHL-539 ahead every rep — noisier than the file-backed
+suites below because the whole loop (tree descent's `BTreeMap` equivalent,
+decode, callback) is a few hundred nanoseconds and a `String` allocation is a
+larger fraction of that than it is of a page-cache-backed lookup. The timing
+lives in `crates/inlaysql/tests/in_memory_point_read_throughput.rs`, marked
+`#[ignore]` (a wall-clock number is not something CI should gate on, per
+this file's own §6) and run by hand with `--ignored --nocapture`.
+
+**File-backed suites, unaffected, confirmed flat.** `bin/profile --suite
+points` and `--suite indexed-range`, three reps each, interleaved against the
+same `52c74bb` baseline binary, `--seconds 8`:
+
+| Suite | `52c74bb` | AHL-539 | Verdict |
+| --- | --- | --- | --- |
+| `points` | 3.293 / 3.215 / 3.226M | 3.208 / 3.196 / 3.232M | flat, mixed sign |
+| `indexed-range` | 99.1 / 101.1 / 100.2k | 102.9 / 101.9 / 98.4k | flat, mixed sign |
+
+Exactly what a change scoped to `MemStorage` should do to `TreeStorage`'s own
+suites: nothing. Neither suite opens an in-memory handle.
+
+**Gates.** `cargo fmt --all -- --check`, `cargo clippy --release --workspace
+--all-targets -- -D warnings`, `cargo test --release --workspace`,
+`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+--document-private-items`, and `cargo check -p inlaysql-wasm --target
+wasm32-unknown-unknown` (the WASM device's demo goes through `MemStorage`-shaped
+paths and still compiles) all pass. `cargo test --release -p inlaysql-core
+--test dst_sweep -- --ignored` (the thousand-seed sweep; the other three
+`dst_sweep.rs` tests already ran under the plain workspace test pass) passes
+unchanged — `mem.rs`'s semantics did not move, only which allocation a read
+pays.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness
