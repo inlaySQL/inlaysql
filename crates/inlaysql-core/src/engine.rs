@@ -5327,6 +5327,7 @@ impl Engine {
             fetch,
             stop_after,
             full_scan,
+            reorderable,
         } = scan_shape(plan, env, cap)?;
 
         // Join *ordering*, the one choice the cost model was never allowed to
@@ -5337,8 +5338,11 @@ impl Engine {
         // The clone is paid only by a two-table inner join whose stats say the
         // written order is the worse one; `can_swap_leading_join` is checked
         // first and costs nothing.
+        // The cost is asked with `stop_after`, not `fetch`: under an `ORDER
+        // BY` the `LIMIT` truncates the sorted answer rather than ending the
+        // scan, so the outer side is read in full whatever the `LIMIT` says.
         let swapped;
-        let plan = if full_scan && self.should_swap_leading_join(plan, fetch, env.params()) {
+        let plan = if reorderable && self.should_swap_leading_join(plan, stop_after, env.params()) {
             swapped = {
                 let mut candidate = plan.clone();
                 candidate.swap_leading_join();
@@ -7263,6 +7267,17 @@ pub(crate) struct ScanShape {
     pub stop_after: Option<usize>,
     /// Whether the driving side really is read end to end.
     pub full_scan: bool,
+    /// Whether the cost model may exchange which table drives a join.
+    ///
+    /// Reordering changes the order rows leave an unordered join. That is
+    /// invisible when the whole join is read (the answer is a set) and when
+    /// an `ORDER BY` decides the order afterwards — but under a `LIMIT` with
+    /// no `ORDER BY` a different order is a different *set*, and a plan
+    /// choice may not decide which rows a query returns. So: no `LIMIT`, or
+    /// an `ORDER BY`. A scored query is excluded because its driving table
+    /// is part of its meaning. (Ties under the `ORDER BY` may still come out
+    /// in another order, as they may in SQLite; a query that cares says so.)
+    pub reorderable: bool,
 }
 
 /// Resolve one `SELECT`'s [`ScanShape`] against the bound parameters.
@@ -7319,6 +7334,7 @@ pub(crate) fn scan_shape(
     let driving_is_a_point_lookup =
         pinned_rowid(&plan.from[0].table, plan.filter.as_ref(), env.params()).is_some();
     let full_scan = fetch.is_none() && plan.score.is_none() && !driving_is_a_point_lookup;
+    let reorderable = plan.score.is_none() && (fetch.is_none() || !plan.order.is_empty());
 
     Ok(ScanShape {
         limit,
@@ -7326,6 +7342,7 @@ pub(crate) fn scan_shape(
         fetch,
         stop_after,
         full_scan,
+        reorderable,
     })
 }
 

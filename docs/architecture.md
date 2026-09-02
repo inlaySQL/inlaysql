@@ -119,12 +119,17 @@ this decision used to defer:
   ordinal in the plan is remapped, producing exactly the plan the same query
   written the other way round would have produced. What executes is a shape
   the engine already ran, not a new one.
-* **Full scans only.** Reordering changes the order rows come out of an
-  unordered join — legal SQL, and what SQLite does — but under a `LIMIT` with
-  no `ORDER BY` a different order is a different *set*, and a plan choice may
-  not decide which rows a query returns. A limited join keeps its written
-  order. Ties keep the written order too, so a plan does not move on
-  estimation noise.
+* **No `LIMIT`, or an `ORDER BY` (AHL-525 widened this from "full scans
+  only", 2026-09-02).** Reordering changes the order rows come out of an
+  unordered join — legal SQL, and what SQLite does — but under a `LIMIT`
+  with no `ORDER BY` a different order is a different *set*, and a plan
+  choice may not decide which rows a query returns. With an `ORDER BY` the
+  sort decides the order afterwards and the `LIMIT` truncates the sorted
+  answer, so the reordered plan returns the same rows; only ties under the
+  `ORDER BY` may come out differently, exactly as they may in SQLite. A
+  limited join with no `ORDER BY` keeps its written order. Ties in the
+  *cost* keep the written order too, so a plan does not move on estimation
+  noise.
 
 ### D7 — Types follow SQLite affinity, not strict names
 Replace the strict `resolve_data_type` whitelist with SQLite's affinity rules

@@ -276,10 +276,10 @@ impl<'e> Explainer<'e> {
         // than not reporting the reordering at all: the one thing a plan
         // listing has to be is the plan that runs.
         let swapped;
-        let plan = if shape.full_scan
+        let plan = if shape.reorderable
             && self
                 .engine
-                .should_swap_leading_join(plan, shape.fetch, self.env.params())
+                .should_swap_leading_join(plan, shape.stop_after, self.env.params())
         {
             swapped = {
                 let mut candidate = plan.clone();

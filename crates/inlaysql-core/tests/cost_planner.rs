@@ -197,6 +197,67 @@ fn analyze_costs_existing_join_paths_and_explain_matches_execution() {
     );
 }
 
+/// A `LIMIT` join reorders under an `ORDER BY` and refuses without one.
+///
+/// `posts JOIN users` is the written order the cost model wants to swap (see
+/// `analyze_costs_existing_join_paths_and_explain_matches_execution`). With
+/// an `ORDER BY` the sort decides the output and the `LIMIT` truncates it,
+/// so the swap changes nothing observable and is allowed. Without one, the
+/// first five rows off the join *are* the answer, and which five they are
+/// must not depend on statistics — the swap is refused and the plan stays
+/// posts-driving. Both `LIMIT`s are past the point where the cost model
+/// would swap on its own (a small `LIMIT` makes the written order cheaper
+/// anyway, and the gate is never reached). Verified by mutation, twice:
+/// dropping the executor's gate changes the rows the bare `LIMIT` returns,
+/// and dropping `EXPLAIN`'s changes the plan it prints.
+#[test]
+fn a_limited_join_reorders_under_an_order_by_and_not_without_one() {
+    let mut engine = joined_engine();
+    run(&mut engine, "ANALYZE");
+
+    let ordered = details(
+        &mut engine,
+        "EXPLAIN SELECT posts.id, users.name FROM posts \
+         JOIN users ON posts.user_id = users.id ORDER BY posts.id LIMIT 40",
+    );
+    assert!(
+        ordered
+            .iter()
+            .any(|detail| detail.contains("HASH JOIN posts") && detail.contains("COSTED")),
+        "expected the reordered plan under ORDER BY, got {ordered:?}"
+    );
+
+    // `LIMIT 20` is past the point where the cost model would swap (the
+    // written order costs 8 + 5·20, the swap 84) and short of the table, so
+    // the two orders return *different* rows. The plan must stay as written
+    // and the rows must be the first twenty in posts order — which is what
+    // `ORDER BY posts.id` spells out, and what a swap would not produce.
+    let bare = details(
+        &mut engine,
+        "EXPLAIN SELECT posts.id, users.name FROM posts \
+         JOIN users ON posts.user_id = users.id LIMIT 20",
+    );
+    assert!(
+        bare.iter().any(|detail| detail == "SCAN posts")
+            && !bare.iter().any(|detail| detail.contains("JOIN posts")),
+        "a LIMIT without ORDER BY must keep its written order, got {bare:?}"
+    );
+    let limited = answer(
+        &mut engine,
+        "SELECT posts.id, users.name FROM posts JOIN users ON posts.user_id = users.id LIMIT 20",
+    );
+    let spelled_out = answer(
+        &mut engine,
+        "SELECT posts.id, users.name FROM posts JOIN users ON posts.user_id = users.id \
+         ORDER BY posts.id LIMIT 20",
+    );
+    assert_eq!(limited.len(), 20);
+    assert_eq!(
+        limited, spelled_out,
+        "the limited join returned rows in an order the written plan does not produce"
+    );
+}
+
 #[test]
 fn a_row_write_makes_stats_stale_and_restores_the_rule_based_fallback() {
     let mut engine = joined_engine();
@@ -347,6 +408,11 @@ fn a_reordered_join_answers_exactly_as_the_written_order_does() {
         // An expression over both sides, and a LIMIT.
         "SELECT users.name || '/' || posts.title FROM users JOIN posts \
          ON posts.user_id = users.id ORDER BY 1 LIMIT 7",
+        // The order the reorder wants to swap, under an `ORDER BY` with a
+        // total key and a `LIMIT`: reordered since AHL-525, and the `LIMIT`
+        // must truncate the same sorted answer either way.
+        "SELECT posts.id, users.name FROM posts JOIN users ON posts.user_id = users.id \
+         ORDER BY posts.id DESC LIMIT 5 OFFSET 2",
     ];
 
     let build = |analyse: bool| {
