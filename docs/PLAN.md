@@ -96,28 +96,22 @@ current execution order without relying on local conversation history.
 
 ## Next work, in order
 
-1. **`repeat-compare.sh` (MySQL 8.4 / PG 17) — queued behind the hold,
-   Docker images pulled.** The joins table is current (three
-   regenerations on 2026-09-02). Original text: The
-   joins table must be replaced from a clean run (two attempts on 2026-09-02
-   were `CONTAMINATED` by spikes just over the gate). Then the `compare.sh`
-   tables, which have never had the repeat wrapper. Pre-build the bench
-   binary before the run so its own compile cannot trip the gate; the quiet
-   window on this machine is mid-morning.
+1. **Cross-engine tables: DONE 2026-09-03** — `repeat-compare.sh` median
+   of three clean runs and the read/batch drivers at REPS=5 (MySQL 8.4,
+   PG 17), plus the containerised batch-insert row. Still owed for a
+   like-for-like OLTP write row: nothing; both rows are published. The
+   quiet window on this machine is mid-morning; pre-build the bench binary
+   before any gated run.
 
-   ```sh
-   cargo build --release -p inlaysql-bench
-   REPEATS=3 SUITE=joins ./bench/repeat.sh
-   REPEATS=5 ./bench/repeat-compare.sh
-   ```
-
-2. **C1 first slice** (rebase-only absorption under the leader's gate,
-   per `docs/research/commit-group-logical.md`), DST-gated. The insert
-   path's remaining per-row costs are closed (AHL-545: linear split
-   point, in-place encoders, the `UPDATE` hoist — ~1% of a statement
-   that is 89% fsync, landed as the algorithmic fixes they are and
-   measured flat, `PERF.md`). B4's cell iteration is closed (AHL-541: the
-   format already has the offset table).
+2. **C1 slice 2**: one WAL append and one sync per cohort in the leader's
+   region, followers acknowledged only after the leader's sync; per-record
+   layout kept; `docs/research/commit-group-slice1.md` names the seal and
+   the overlay it builds on. Slice 1 (AHL-544) is in, behind
+   `EngineOptions::commit_absorption`, flat as pre-registered. DST at every
+   crash point. Then **A10**: a leaf-cell-count `COUNT(*)` scan and an
+   exact live row count, which own the remaining scalar-aggregate loss
+   (0.75x/0.62x). The insert path's remaining per-row costs are closed
+   (AHL-545); B4's cell iteration is closed (AHL-541).
 
 3. **`RangeCursor` extension (A3)** to `walk`/`scan_range_from` — the
    cheapest first step is `colliding_rows` using `scan_index_row_ids`
