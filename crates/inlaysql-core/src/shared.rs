@@ -115,6 +115,21 @@ impl Storage for SharedStorage {
             .scan_batch_with(table, after, limit, row)
     }
 
+    /// Delegated explicitly for the same reason [`Storage::scan_index_row_ids`]
+    /// is below: the trait's default reaches the last row through *this*
+    /// type's own [`Storage::scan_batch`], which forwards correctly, but
+    /// [`Storage::last_in_table`]'s default is a full scan — the inner
+    /// backend's one-descent override (`TreeStorage`'s, through the tree's
+    /// `last_in_prefix`) is unreachable unless a wrapper that forwards
+    /// everything else forwards this too.
+    fn first_in_table(&self, table: &str) -> Result<Option<(RowId, RowBuf)>> {
+        self.inner.borrow().first_in_table(table)
+    }
+
+    fn last_in_table(&self, table: &str) -> Result<Option<(RowId, RowBuf)>> {
+        self.inner.borrow().last_in_table(table)
+    }
+
     fn put_row_keyed(&mut self, table: &str, key: &[u8], bytes: &[u8]) -> Result<()> {
         self.inner.borrow_mut().put_row_keyed(table, key, bytes)
     }
@@ -168,6 +183,17 @@ impl Storage for SharedStorage {
     /// this too, or the fast path it wraps stops being reachable through it.
     fn scan_index_row_ids(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<RowId>> {
         self.inner.borrow().scan_index_row_ids(start, end)
+    }
+
+    /// Delegated for the same reason as [`Storage::scan_index_row_ids`]
+    /// above: `TreeStorage`'s one-descent override is unreachable through the
+    /// default otherwise.
+    fn first_index_entry(&self, start: &[u8], end: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        self.inner.borrow().first_index_entry(start, end)
+    }
+
+    fn last_index_entry(&self, start: &[u8], end: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        self.inner.borrow().last_index_entry(start, end)
     }
 
     fn commit(&mut self) -> Result<()> {

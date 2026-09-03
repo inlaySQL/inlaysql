@@ -279,6 +279,16 @@ impl<D: Device> Storage for TreeStorage<D> {
             .scan_prefix_row_values_raw_with(&table_prefix(table), resume, limit, row)
     }
 
+    /// One descent to the tree's rightmost entry under this table's prefix,
+    /// instead of [`Storage::last_in_table`]'s default full scan — the
+    /// `MAX(rowid)` half of the `MIN`/`MAX` optimisation.
+    fn last_in_table(&self, table: &str) -> Result<Option<(RowId, RowBuf)>> {
+        let Some((key, value)) = self.tree.last_in_prefix(&table_prefix(table))? else {
+            return Ok(None);
+        };
+        Ok(Some((row_id_from_key(&key)?, value)))
+    }
+
     fn put_row_keyed(&mut self, table: &str, key: &[u8], bytes: &[u8]) -> Result<()> {
         let mut full = table_prefix(table);
         full.extend_from_slice(key);
@@ -368,6 +378,25 @@ impl<D: Device> Storage for TreeStorage<D> {
     fn scan_index_row_ids(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<RowId>> {
         self.tree
             .scan_range_row_ids_from(start, end, None, usize::MAX)
+    }
+
+    /// [`CowBTree::scan_range_from`] with `limit` `1`: the same one-descent
+    /// read [`Storage::scan_batch`] already gets, for an index entry instead
+    /// of a row.
+    fn first_index_entry(&self, start: &[u8], end: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .tree
+            .scan_range_from(start, end, None, 1)?
+            .into_iter()
+            .next()
+            .map(|(key, _)| key))
+    }
+
+    /// [`CowBTree::last_in_range`]: the tree's own descent to the rightmost
+    /// qualifying entry, rather than [`Storage::last_index_entry`]'s default
+    /// walk of the whole range.
+    fn last_index_entry(&self, start: &[u8], end: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        Ok(self.tree.last_in_range(start, end)?.map(|(key, _)| key))
     }
 
     /// Commit, turning a lost race into an error rather than a lie.

@@ -123,6 +123,27 @@ impl Storage for TempTableRouter {
         }
     }
 
+    // Routed like `scan_batch`: whichever side holds `table`'s rows is where
+    // its first and last row live too, and not left to the trait's default
+    // for the same reason `scan_batch_with` above is not — the durable
+    // side's one-descent override (`TreeStorage`'s) is unreachable through a
+    // default that never calls back into it by name.
+    fn first_in_table(&self, table: &str) -> Result<Option<(RowId, RowBuf)>> {
+        if self.is_temp(table) {
+            self.temp.first_in_table(table)
+        } else {
+            self.durable.first_in_table(table)
+        }
+    }
+
+    fn last_in_table(&self, table: &str) -> Result<Option<(RowId, RowBuf)>> {
+        if self.is_temp(table) {
+            self.temp.last_in_table(table)
+        } else {
+            self.durable.last_in_table(table)
+        }
+    }
+
     // A `WITHOUT ROWID` temporary table is a real combination — nothing about
     // the two features conflicts — so the keyed methods route exactly like
     // the row-id ones above, by the same table name and the same flag.
@@ -195,6 +216,14 @@ impl Storage for TempTableRouter {
 
     fn scan_index_row_ids(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<RowId>> {
         self.durable.scan_index_row_ids(start, end)
+    }
+
+    fn first_index_entry(&self, start: &[u8], end: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        self.durable.first_index_entry(start, end)
+    }
+
+    fn last_index_entry(&self, start: &[u8], end: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        self.durable.last_index_entry(start, end)
     }
 
     /// Durable first, temporary only if that succeeds.

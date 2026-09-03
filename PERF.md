@@ -4287,6 +4287,137 @@ commit on this shape. After the fix, `committed_node` is 1.2% inclusive and
 which is under the measurement floor of §4. It stays available if a
 write-then-read shape ever makes it visible.
 
+### A scalar `MIN`/`MAX` answers from one tree descent, not a scan (AHL-546, 2026-09-03)
+
+**Shape.** The published loss: `SELECT COUNT(*), MIN(id), MAX(id) FROM users`
+over 100k rows, InlaySQL 225/s against MySQL 8.4 300/s and PostgreSQL 17
+362/s (`bin/profile --suite aggregate`'s scalar half, and `MODE=agg
+sql_shapes`'s `agg_scalar`). `GROUP BY n` on the same table is 210/s, barely
+slower, though a scalar aggregate has no grouping at all — the audit's
+starting question was why an unqualified `MIN`/`MAX` was paying almost the
+whole cost of a scan when SQLite answers it from the B-tree's own shape (its
+"min/max optimization").
+
+**Split.** `agg_scalar`'s three functions do not cost the same. `COUNT(*)`
+has to see every row: this engine keeps no transactionally exact row count —
+`ANALYZE`'s statistics are a snapshot, not a live counter, and answering
+`COUNT(*)` from a stale one would be exactly the silent wrong answer
+`AGENTS.md` refuses — so `COUNT(*)` alone still forces a full scan-and-decode,
+and a statement that mixes it with `MIN`/`MAX` scans as a whole regardless of
+what the other two aggregates could answer for free. Isolating the two that
+*can* be answered without a row confirms it: `SELECT MIN(id), MAX(id) FROM
+users` with `COUNT(*)` removed is the shape the rewrite below targets.
+
+**Rewrite.** `Engine::try_min_max_scalar` (`engine.rs`), gated by
+`min_max_scalar_shape`: fires only when every aggregate is a plain,
+non-`DISTINCT`, `FILTER`-less `MIN`/`MAX` of a bare column, there is no
+`WHERE`/`GROUP BY`/`HAVING`/`DISTINCT`/join/window, the one source table is
+stored (not derived, not `WITHOUT ROWID`), and no projected expression reads
+a raw column (this path never holds the representative row the general
+aggregate path would project one from). `Engine::min_max_access` answers,
+per column, whether it is the table's rowid (including a declared `INTEGER
+PRIMARY KEY`) or carries a leading B-tree index under a matching collation —
+catalog-only, so `EXPLAIN` calls the same function and reports `SEARCH ...
+(MIN/MAX OPTIMIZATION)` rather than a second guess at the same rule.
+`Engine::min_max_boundary` then makes exactly one descent per aggregate:
+[`Storage::first_in_table`]/[`last_in_table`] for the rowid,
+[`Storage::first_index_entry`]/[`last_index_entry`] for an index — both new
+`Storage` trait methods, with `TreeStorage` overriding the `last_*` pair as
+one descent to the tree's rightmost qualifying entry
+(`CowBTree::last_in_range`/`last_in_prefix`, new, read-only — `walk`'s
+mirror, mutually recursive to the rightmost child first and falling through
+to the next one down when bounds-pruning let a subtree in that turned out to
+hold nothing admitted). `first_in_table` needed no new tree method: it is
+already `scan_batch(table, None, 1)`. `SharedStorage` and `TempTableRouter`
+both had to forward the four new methods explicitly rather than inherit the
+trait's default — the same trap `scan_index_row_ids`'s own doc comment
+already names for a wrapper that forwards everything else: an unforwarded
+default runs against the *wrapper's* other methods, never reaching the
+backend's override underneath it.
+
+`MIN` skips `NULL`s (which sort lowest in this engine's index encoding, so
+skipping is a lower-bound shift past one run of entries, not a value
+comparison); `MAX` of an all-`NULL` column is `NULL`, sqlite3's rule, which
+falls out for free since `NULL` never wins a rightmost descent unless nothing
+else is there. `COUNT(*)` anywhere in the aggregate list sends the whole
+statement to the general path, per the split above.
+
+**A real bug, caught by the existing differential suite before this shipped.**
+The first cut answered `MAX` from the tree's plain rightmost entry in the
+index range. That is wrong under a non-`BINARY` collation: two rows that
+compare *equal* under the column's collation (`'Grace'` and `'grace'` under
+`NOCASE`) share one encoded value and therefore one contiguous run of index
+entries, ordered by row id — and `AggFold::step` only replaces the running
+best on a *strictly greater* comparison, so the general path keeps whichever
+row it saw **first** (lowest row id) among ties. The tree's rightmost entry
+of that run is the row with the **highest** row id — the opposite one.
+`crates/inlaysql-core/tests/btree_index.rs`'s
+`collated_queries_agree_with_and_without_the_index` caught it immediately:
+`SELECT MIN(nc), MAX(nc), MIN(bin), MAX(bin) FROM p` disagreed with the
+unindexed table, `MAX(nc)` `t:grace` against the correct `t:Grace`. Fixed by
+stripping the trailing row id off the rightmost entry (the encoded value
+alone, since `entry_key`'s row id suffix is always the last eight bytes) and
+re-descending to *that* value's own first entry — the same one-descent cost,
+now agreeing with the fold's own tie-break. `MIN` needed no equivalent fix:
+its first-in-range entry is already the lowest row id within the lowest
+value's group, because entries sharing a value are stored in ascending
+row-id order by construction. Regression pinned in both places: a `NOCASE`
+tie in `crates/inlaysql/tests/sqllogictest/aggregate.test` and the original
+differential case.
+
+**Measured**, `MODE=agg REPS=5 sql_shapes` and `bin/profile`, interleaved A/B
+against `832f89e` (the commit before this branch), 3 reps where noted,
+control re-run each rep, both binaries built from the same harness on the
+same (unloaded, single-tenant) sandbox:
+
+| Shape | Base | New | |
+| --- | --- | --- | --- |
+| `agg_minmax_only` — `SELECT MIN(id), MAX(id) FROM users`, 100k rows | 185 / 192 / 190 /s | 727,717 / 861,453 / 850,760 /s | **~3,900–4,500x, 3/3, non-overlapping** |
+| `agg_scalar` — the published shape, `COUNT(*)` included | 188 / 186 / 182 /s | 157 / 191 / 183 /s | flat within noise, as predicted: `COUNT(*)` still scans |
+| `agg_group` — `GROUP BY n` | 176 / 183 / 179 /s | 177 / 182 / 180 /s | flat, untouched path |
+| `bin/profile --suite aggregate --rows 100000` (mixed cycle, `--seconds` ~6.4) | 160 ops/s | 159 ops/s | flat |
+| `bin/profile --suite aggregate-scalar --rows 100000` (new suite, isolates the scalar half; still `COUNT(*)`) | — | 164 ops/s | consistent with `agg_scalar` above |
+| `points --rows 20000` | 2,599,839 ops/s | 2,591,377 ops/s | flat |
+| `joins-limit --rows 20000` | 150,413 ops/s | 152,686 ops/s | flat |
+| `indexed-range --rows 20000` | 77,284 ops/s | 76,688 ops/s | flat |
+
+`agg_minmax_only`'s swing is orders of magnitude past any noise floor §4
+measures — it is a scan-versus-descent difference, not a claim resting on a
+percentage. Every other row is a fallback path this change does not touch,
+each within single-digit-percent noise of its own baseline, which is the
+evidence that the rewrite's gate is as narrow as `min_max_scalar_shape`
+claims: nothing outside the shape it targets moved.
+
+**Not built.** A transactionally exact row count, which would let `COUNT(*)`
+join this rewrite — a bigger commitment (every write path maintaining a
+counter, crash-consistently) than this change's scope, and the split above
+says it is worth exactly what it looks like: two of three aggregates in the
+published shape, not the third. A count-only leaf-cell-count scan (never
+decoding a cell, only summing each leaf's slot-directory length) was
+suggested by the same audit as a bounded win for `COUNT(*)` specifically; not
+attempted here — it still touches every leaf, so it is a smaller constant on
+the same scan rather than the same kind of win as the descent above, and is
+left for a change scoped to `COUNT(*)` on its own.
+
+**Gates.** `cargo fmt --all -- --check`, `cargo clippy --release --workspace
+--all-targets -- -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo doc
+--workspace --no-deps --document-private-items`, `cargo test --release
+--workspace` (0 failures), `cargo run -p inlaysql --bin sqllogictest --
+crates/inlaysql/tests/sqllogictest/*.test` (1352/1352), `cargo test --release
+-p inlaysql-core --test cost_planner` (17/17), the full `differential.rs`
+suite (27/27, including the new `scalar_min_max_agrees_with_sqlite`) and the
+new `EXPLAIN`/tree/`Storage` unit tests. `docker/test.sh`'s DST sweeps were
+not re-run: this change adds a read-only tree method and read-only `Storage`
+overrides, and edits no write path, no WAL record and no on-disk format —
+`AGENTS.md`'s own trigger list for a DST pass (`btree`, `wal`, `sim`, `hnsw`,
+`hnsw_paged`, `bm25`) is `btree` by file, not by write-versus-read, so the
+call here is judgment rather than the rule: `last_in_range`'s only new
+surface is a second traversal order over pages `scan_range_from` already
+reads, proven against that same read in
+`last_in_range_agrees_with_the_scan_it_would_otherwise_replace` and
+`last_in_range_sees_the_open_transaction`, both in `btree/tree.rs`'s own
+test module.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness

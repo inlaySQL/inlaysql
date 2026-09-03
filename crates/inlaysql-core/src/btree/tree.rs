@@ -1981,6 +1981,97 @@ impl<D: Device> CowBTree<D> {
         Ok(out)
     }
 
+    /// The greatest `(key, value)` pair in `[start, end)`, including the open
+    /// transaction's own writes.
+    ///
+    /// The mirror of `scan_range_from(start, end, None, 1)`'s least entry,
+    /// taken from the right edge of the range instead of the left. This is
+    /// the tree half of the `MIN`/`MAX` optimisation
+    /// (`crate::engine`'s scalar-aggregate rewrite): `MAX` on the leading key
+    /// of a B-tree — the table's own rowid, or a secondary index's leading
+    /// column — is one descent to this entry rather than a scan of every row.
+    /// `MIN` is already exactly `scan_range_from(start, end, None, 1)`, so it
+    /// needed no new tree method.
+    pub fn last_in_range(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<Option<(Vec<u8>, RowBuf)>> {
+        if end.is_some_and(|end| end <= start) {
+            return Ok(None);
+        }
+        let bounds = WalkBounds {
+            start,
+            end,
+            after: None,
+            limit: usize::MAX,
+        };
+        self.walk_last(self.read_root(), &bounds, self.has_pending)
+    }
+
+    /// The greatest `(key, value)` pair whose key starts with `prefix`, the
+    /// mirror of [`CowBTree::scan_prefix`] taken from the right edge instead
+    /// of collecting the whole range — see [`CowBTree::last_in_range`].
+    pub fn last_in_prefix(&self, prefix: &[u8]) -> Result<Option<(Vec<u8>, RowBuf)>> {
+        let upper = prefix_upper_bound(prefix);
+        self.last_in_range(prefix, upper.as_deref())
+    }
+
+    /// [`CowBTree::walk`]'s mirror for [`CowBTree::last_in_range`]: descends
+    /// the rightmost qualifying child first, and returns as soon as one
+    /// admitted entry is found, instead of collecting every admitted entry
+    /// into `out`. A subtree that bounds-pruning let through can still turn
+    /// out to hold nothing admitted (a sparse range after deletes), so a
+    /// child that answers `None` falls through to the next one down rather
+    /// than ending the walk.
+    fn walk_last(
+        &self,
+        id: PageId,
+        bounds: &WalkBounds<'_>,
+        pending: bool,
+    ) -> Result<Option<(Vec<u8>, RowBuf)>> {
+        if id == 0 {
+            return Ok(None);
+        }
+        let node = self.node_at(id, pending)?;
+        match &*node {
+            Node::Leaf { entries, .. } => {
+                for entry in entries.iter().rev() {
+                    let key = node.key(&entry.key);
+                    if bounds.admits(key) {
+                        let value =
+                            self.resolve_value_at(Some(node.bytes()), &entry.value, pending)?;
+                        return Ok(Some((key.to_vec(), value)));
+                    }
+                }
+                Ok(None)
+            }
+            Node::Internal {
+                leftmost, cells, ..
+            } => {
+                for (i, separator) in cells.iter().enumerate().rev() {
+                    let below_upper = match bounds.end {
+                        Some(end) => node.key(&separator.key) < end,
+                        None => true,
+                    };
+                    let above_lower = match cells.get(i + 1) {
+                        Some(next) => bounds.starts_below(node.key(&next.key)),
+                        None => true,
+                    };
+                    if below_upper && above_lower {
+                        if let Some(found) = self.walk_last(separator.child, bounds, pending)? {
+                            return Ok(Some(found));
+                        }
+                    }
+                }
+                if cells.is_empty() || bounds.starts_below(node.key(&cells[0].key)) {
+                    return self.walk_last(*leftmost, bounds, pending);
+                }
+                Ok(None)
+            }
+        }
+    }
+
     /// At most `limit` row ids among entries in `[start, end)` and strictly
     /// greater than `after`, in the order the walk visits them.
     ///
@@ -5705,6 +5796,71 @@ mod tests {
         assert_eq!(db.scan().unwrap().len(), 1200);
         // A prefix nothing starts with is empty, not everything.
         assert!(db.scan_prefix(b"z\0").unwrap().is_empty());
+    }
+
+    /// [`CowBTree::last_in_range`]/[`CowBTree::last_in_prefix`] against
+    /// enough keys and levels for pruning to matter, cross-checked against
+    /// the same range's [`CowBTree::scan_range`] (whose last entry is, by
+    /// definition, the answer this method exists to reach without reading
+    /// the rest of the range).
+    #[test]
+    fn last_in_range_agrees_with_the_scan_it_would_otherwise_replace() {
+        let mut db = CowBTree::create(disk(), PAGE).unwrap();
+        for i in 0..400u32 {
+            for table in ["a", "b", "c"] {
+                let mut key = table.as_bytes().to_vec();
+                key.push(0);
+                key.extend_from_slice(&i.to_be_bytes());
+                db.put(&key, &i.to_le_bytes()).unwrap();
+            }
+            db.commit().unwrap();
+        }
+
+        let whole = db.scan_prefix(b"b\0").unwrap();
+        assert_eq!(db.last_in_prefix(b"b\0").unwrap(), whole.last().cloned());
+
+        // A bounded sub-range: the last entry strictly below the halfway
+        // point.
+        let mut half = b"b\0".to_vec();
+        half.extend_from_slice(&200u32.to_be_bytes());
+        let ranged = db.scan_range(b"b\0", Some(&half)).unwrap();
+        assert_eq!(
+            db.last_in_range(b"b\0", Some(&half)).unwrap(),
+            ranged.last().cloned()
+        );
+
+        // A prefix nothing starts with has no last entry either.
+        assert_eq!(db.last_in_prefix(b"z\0").unwrap(), None);
+
+        // An empty range (`end <= start`) is empty, not the whole tree.
+        assert_eq!(db.last_in_range(b"b\0", Some(b"b\0")).unwrap(), None);
+    }
+
+    /// The uncommitted half of a transaction is visible to
+    /// [`CowBTree::last_in_range`] exactly as it is to
+    /// [`CowBTree::scan_prefix`] — the tree half of "the answer reflects
+    /// pending writes", which the `MIN`/`MAX` rewrite (`AHL-546`) relies on.
+    #[test]
+    fn last_in_range_sees_the_open_transaction() {
+        let mut db = CowBTree::create(disk(), PAGE).unwrap();
+        db.put(b"t\0a", b"1").unwrap();
+        db.commit().unwrap();
+        assert_eq!(
+            db.last_in_prefix(b"t\0").unwrap(),
+            Some((b"t\0a".to_vec(), RowBuf::Owned(b"1".to_vec())))
+        );
+
+        db.put(b"t\0b", b"2").unwrap();
+        assert_eq!(
+            db.last_in_prefix(b"t\0").unwrap(),
+            Some((b"t\0b".to_vec(), RowBuf::Owned(b"2".to_vec())))
+        );
+
+        db.delete(b"t\0b").unwrap();
+        assert_eq!(
+            db.last_in_prefix(b"t\0").unwrap(),
+            Some((b"t\0a".to_vec(), RowBuf::Owned(b"1".to_vec())))
+        );
     }
 
     #[test]

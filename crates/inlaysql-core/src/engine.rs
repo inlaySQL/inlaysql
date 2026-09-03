@@ -39,8 +39,8 @@ use crate::fusion::{reciprocal_rank_fusion, sort_by_score_desc};
 use crate::hnsw::VectorMetric;
 use crate::hnsw_paged::PagedHnswIndex;
 use crate::plan::{
-    Aggregate, AlterAction, AlterTablePlan, AnalyzePlan, ConflictAction, ConflictUpdate,
-    CreateTablePlan, DeletePlan, DropTablePlan, FrameBound, FrameUnit, FromItem, InsertPlan,
+    AggFunc, Aggregate, AlterAction, AlterTablePlan, AnalyzePlan, ConflictAction, ConflictUpdate,
+    CreateTablePlan, DeletePlan, DropTablePlan, Expr, FrameBound, FrameUnit, FromItem, InsertPlan,
     InsertSource, JoinKind, OnConflict, Order, OrderKey, Plan, RecursivePlan, ReindexPlan,
     ScalarPlan, ScoreExpr, SelectItem, SelectPlan, SetOp, SetOperationPlan, SubqueryBody,
     UpdatePlan, WindowFn, WindowFunc,
@@ -5633,6 +5633,19 @@ impl Engine {
 
         let driving = &plan.from[0];
         let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
+
+        // The `MIN`/`MAX` optimisation: a scalar `MIN`/`MAX` over the rowid
+        // or an indexed leading column answers from one tree descent per
+        // aggregate, with no row scanned at all. See
+        // `Engine::try_min_max_scalar`'s doc for exactly which statements
+        // qualify; everything else falls through to the ordinary pipeline
+        // below unchanged.
+        if is_aggregate {
+            if let Some(rows) = self.try_min_max_scalar(plan)? {
+                return self.finish_blocking(plan, rows, env, offset, limit, sink);
+            }
+        }
+
         let outer_rows = self.estimated_outer_rows(plan, fetch, env.params());
 
         // Which columns any of this can observe. Everything else is walked past
@@ -6818,6 +6831,209 @@ impl Engine {
         Ok(rows)
     }
 
+    /// The `MIN`/`MAX` optimisation (`AHL-546`): a scalar (no `GROUP BY`)
+    /// query whose every aggregate is `MIN`/`MAX` over the table's rowid or a
+    /// column carrying a leading B-tree index answers from one descent per
+    /// aggregate to the first or last key of that access path — sqlite3's own
+    /// "min/max optimization" — instead of decoding every row to fold three
+    /// accumulators that never move once the first (or last) row has been
+    /// seen.
+    ///
+    /// Fires only when nothing else in the statement forces a scan:
+    ///
+    /// * No `WHERE`, `GROUP BY`, `HAVING`, `DISTINCT`, join, retrieval score
+    ///   or window function.
+    /// * Exactly one source table, stored (not derived) and not
+    ///   `WITHOUT ROWID` — such a table has no rowid at all, and its primary
+    ///   key's own index is exactly the general indexed-column case below, so
+    ///   nothing is lost by excluding it here and it stays out of this
+    ///   already-narrow rewrite's proof obligation.
+    /// * Every aggregate is a plain, non-`DISTINCT`, filter-less `MIN` or
+    ///   `MAX` of a bare stored column — see [`Engine::min_max_boundary`] for
+    ///   which columns qualify.
+    /// * Every projected expression is answerable from the aggregates alone
+    ///   — no bare column. This path never holds a representative row the
+    ///   general aggregate path would have picked as the table's first row
+    ///   (`Engine::aggregate`'s doc); a projection that read one would see
+    ///   `NULL` instead, which is not what the general path returns for a
+    ///   non-empty table.
+    ///
+    /// **`COUNT(*)` is deliberately not answered here.** This engine keeps no
+    /// transactionally exact row count — `ANALYZE`'s statistics are a
+    /// snapshot of whatever was last collected, not the live count, and using
+    /// a stale number to answer `COUNT(*)` would be exactly the silent wrong
+    /// answer `AGENTS.md` refuses. Without one, `COUNT(*)` still needs a scan,
+    /// and a statement that mixes it with `MIN`/`MAX` still scans as a whole
+    /// — so a `COUNT(*)` anywhere in `plan.aggregates` sends the whole
+    /// statement to the general path below, `MIN`/`MAX` included in it.
+    ///
+    /// Returns `None` — never an error — for every shape this does not cover,
+    /// so [`Engine::run_select_to`] just runs the ordinary pipeline instead.
+    /// An error here is reserved for a corrupt index that names a row that no
+    /// longer exists — the same "this should be impossible" case
+    /// [`Engine::indexed_candidates`]'s siblings raise rather than mask.
+    fn try_min_max_scalar(&self, plan: &SelectPlan) -> Result<Option<Vec<ExecRow>>> {
+        let Some(table) = min_max_scalar_shape(plan) else {
+            return Ok(None);
+        };
+
+        let mut answers = Vec::with_capacity(plan.aggregates.len());
+        for aggregate in &plan.aggregates {
+            // `min_max_scalar_shape` has already checked every aggregate is a
+            // plain, non-`DISTINCT`, filter-less `MIN`/`MAX` of a bare column
+            // — see its doc — so only the boundary read can still say no.
+            let take_max = aggregate.func == AggFunc::Max;
+            let Some(Expr::Column(ordinal)) = &aggregate.arg else {
+                unreachable!("min_max_scalar_shape only admits a bare column argument")
+            };
+            let Some(access) = self.min_max_access(table, *ordinal, aggregate.collation) else {
+                return Ok(None);
+            };
+            answers.push(self.min_max_boundary(table, *ordinal, take_max, access)?);
+        }
+
+        Ok(Some(alloc::vec![ExecRow {
+            id: 0,
+            score: None,
+            values: alloc::vec![Value::Null; table.columns.len()],
+            aggregates: answers,
+            windows: Vec::new(),
+        }]))
+    }
+
+    /// The ordered access path that answers `MIN`/`MAX` of column `ordinal`
+    /// without a scan, or `None` when there is none: an un-indexed column, or
+    /// an index whose leading collation disagrees with the comparison's own
+    /// — the same rule [`Engine::choose_index`] holds a `WHERE` probe to, and
+    /// for the same reason: an index built under a different collation is a
+    /// different key order, and answering `MIN` from its first entry would
+    /// answer the wrong question.
+    ///
+    /// Catalog-only — no storage read — so [`crate::explain`] can call this
+    /// too and report exactly the path [`Engine::min_max_boundary`] would
+    /// take, rather than a second guess at it.
+    pub(crate) fn min_max_access<'a>(
+        &'a self,
+        table: &Table,
+        ordinal: usize,
+        collation: Collation,
+    ) -> Option<MinMaxAccess<'a>> {
+        if table.rowid_alias() == Some(ordinal) {
+            return Some(MinMaxAccess::Rowid);
+        }
+        let column_name = table.columns[ordinal].name.as_str();
+        self.catalog
+            .indexes_for(&table.name)
+            .into_iter()
+            .find(|index| {
+                index.kind == IndexKind::BTree
+                    && index.columns[0].eq_ignore_ascii_case(column_name)
+                    && index
+                        .collations
+                        .first()
+                        .copied()
+                        .unwrap_or(Collation::Binary)
+                        == collation
+            })
+            .map(MinMaxAccess::Index)
+    }
+
+    /// The `MIN`/`MAX` boundary value `access` names.
+    ///
+    /// `NULL`s: `MIN` skips them, `MAX` of an all-`NULL` column is `NULL` —
+    /// sqlite3's rule. Skipping is only interesting for `MIN`: `NULL` sorts
+    /// below every other value in this engine's index encoding
+    /// (`crate::index`'s module doc), so `MAX`'s plain last entry is already
+    /// `NULL` only when every entry is, which is the answer wanted; `MIN`
+    /// instead starts its descent just past the run of `NULL` entries.
+    fn min_max_boundary(
+        &self,
+        table: &Table,
+        ordinal: usize,
+        take_max: bool,
+        access: MinMaxAccess<'_>,
+    ) -> Result<Value> {
+        let index = match access {
+            // The rowid itself — `MIN(rowid)`/`MAX(rowid)`, or the declared
+            // `INTEGER PRIMARY KEY` column that aliases it. A rowid is never
+            // `NULL`, so there is no skip to make on the `MIN` side here.
+            MinMaxAccess::Rowid => {
+                let row = if take_max {
+                    self.storage.last_in_table(&table.name)?
+                } else {
+                    self.storage.first_in_table(&table.name)?
+                };
+                return Ok(match row {
+                    Some((id, _)) => Value::Integer(id as i64),
+                    None => Value::Null,
+                });
+            }
+            MinMaxAccess::Index(index) => index,
+        };
+
+        let prefix = crate::index::index_prefix(&index.name);
+        let upper = crate::index::upper_bound(&prefix);
+        let entry = if take_max {
+            // The tree's rightmost entry names the greatest *value*, but not
+            // necessarily the row `AggFold::Extreme` would keep: two rows
+            // that compare equal under this column's collation (`'Grace'`
+            // and `'grace'` under `NOCASE`, say) share one encoded value and
+            // therefore one contiguous run of entries, ordered by row id —
+            // and the fold keeps whichever it saw *first*, because only a
+            // strictly greater value replaces the running best (`AggFold::step`'s
+            // doc). The rightmost entry of that run is the *highest* row id,
+            // the opposite one. Stripping the trailing row id off the
+            // rightmost entry recovers the exact encoded value alone —
+            // `entry_key`'s row id suffix is always the last eight bytes —
+            // and re-descending to *that* value's first entry is the same
+            // one-descent cost for the row the fold actually keeps.
+            let Some(greatest) = self.storage.last_index_entry(&prefix, upper.as_deref())? else {
+                return Ok(Value::Null);
+            };
+            let value_prefix = greatest
+                .get(..greatest.len().saturating_sub(8))
+                .ok_or_else(|| {
+                    Error::Corrupt(alloc::format!(
+                        "index `{}` entry is too short to hold a row id",
+                        index.name
+                    ))
+                })?;
+            let value_upper = crate::index::upper_bound(value_prefix);
+            self.storage
+                .first_index_entry(value_prefix, value_upper.as_deref())?
+        } else {
+            // The whole run of `NULL` entries shares the prefix
+            // `index_prefix ++ encode(NULL)`; its upper bound is the first
+            // key past every one of them, `NULL` or not, so starting there
+            // is exactly "skip the `NULL`s".
+            let null_prefix =
+                crate::index::probe_prefix(&index.name, &[&Value::Null], &index.collations)?;
+            let skip_nulls = crate::index::upper_bound(&null_prefix).unwrap_or(null_prefix);
+            self.storage
+                .first_index_entry(&skip_nulls, upper.as_deref())?
+        };
+        let Some(entry) = entry else {
+            // Nothing past the `NULL`s (`MIN`), or the index has no entries
+            // at all (`MAX`, or a `MIN` over an empty table): both are
+            // `NULL`, sqlite3's answer for `MIN`/`MAX` of nothing.
+            return Ok(Value::Null);
+        };
+        let row_id = crate::index::row_id_from_entry(&entry)?;
+        let Some(row_bytes) = self.storage.get_row(&table.name, row_id)? else {
+            return Err(Error::Corrupt(alloc::format!(
+                "index `{}` names row {row_id} of `{}`, which does not exist",
+                index.name,
+                table.name
+            )));
+        };
+        // Read back from the row rather than decoded out of the index key:
+        // the index encoding is one-way (`crate::index::encode_value`, a
+        // `NOCASE` column's entry holds the *folded* text), so the original
+        // value — the one `MIN`/`MAX` has to return — lives only in the row.
+        let row = decode_row(&row_bytes)?;
+        Ok(row.get(ordinal).cloned().unwrap_or(Value::Null))
+    }
+
     /// Group the joined rows by the `GROUP BY` keys and compute the aggregates,
     /// Whether an aggregate query can be folded as its rows arrive, instead of
     /// being held and folded afterwards.
@@ -7777,6 +7993,97 @@ pub(crate) fn scan_shape(
         full_scan,
         reorderable,
     })
+}
+
+/// The ordered access path [`Engine::min_max_access`] found for one column —
+/// the table's own rowid order, or a named B-tree index's.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MinMaxAccess<'a> {
+    /// `MIN(rowid)`/`MAX(rowid)`, including a declared `INTEGER PRIMARY KEY`
+    /// column, which is the rowid under another name.
+    Rowid,
+    /// A B-tree index whose leading column is the one asked for, under a
+    /// matching collation.
+    Index(&'a Index),
+}
+
+impl MinMaxAccess<'_> {
+    /// `EXPLAIN`'s wording for this access path, shared with the executor's
+    /// own choice so the two cannot describe different plans — see
+    /// [`crate::explain`]'s module doc.
+    pub(crate) fn detail(self) -> String {
+        match self {
+            MinMaxAccess::Rowid => "INTEGER PRIMARY KEY".to_string(),
+            MinMaxAccess::Index(index) => alloc::format!("INDEX {}", index.name),
+        }
+    }
+}
+
+/// Whether `plan` is a scalar `MIN`/`MAX` query the [`Engine::try_min_max_scalar`]
+/// rewrite may answer, and if so, its one source table.
+///
+/// Purely structural — no catalog, no storage — so both the executor and
+/// [`crate::explain`] can ask it before either commits to anything: it is the
+/// complete list of conditions from [`Engine::try_min_max_scalar`]'s doc
+/// except whether an access path actually exists for each aggregate's column,
+/// which needs the catalog and is [`Engine::min_max_access`]'s question
+/// alone.
+pub(crate) fn min_max_scalar_shape(plan: &SelectPlan) -> Option<&Table> {
+    if plan.filter.is_some()
+        || !plan.group_by.is_empty()
+        || plan.having.is_some()
+        || plan.distinct
+        || !plan.joins.is_empty()
+        || plan.from.len() != 1
+        || plan.score.is_some()
+        || !plan.windows.is_empty()
+        || plan.aggregates.is_empty()
+    {
+        return None;
+    }
+    let driving = &plan.from[0];
+    if driving.derived.is_some() || driving.table.without_rowid {
+        return None;
+    }
+    let table = &driving.table;
+
+    for aggregate in &plan.aggregates {
+        if !matches!(aggregate.func, AggFunc::Min | AggFunc::Max) {
+            // `COUNT`/`SUM`/`AVG`/`GROUP_CONCAT` all need a scan — see
+            // `Engine::try_min_max_scalar`'s doc for why `COUNT(*)` is not
+            // special-cased even though the executor could answer it cheaply
+            // once the engine keeps an exact count.
+            return None;
+        }
+        if aggregate.distinct || aggregate.filter.is_some() {
+            return None;
+        }
+        if !matches!(aggregate.arg, Some(Expr::Column(_))) {
+            return None;
+        }
+    }
+
+    // No projected expression may read a raw column: see
+    // `Engine::try_min_max_scalar`'s doc for why that would disagree with the
+    // general path's answer. Reuses `Expr::columns_read` — the same walker
+    // projection pushdown trusts to find every column an expression can
+    // observe — rather than a second one that could disagree about a variant
+    // it missed.
+    let mut read = ColumnMask::none(table.columns.len());
+    for item in &plan.items {
+        match item {
+            SelectItem::Expr { expr, .. } => expr.columns_read(&mut read),
+            // `Column`/`Score` read a raw column or the retrieval score
+            // outright; `plan.score.is_none()` already ruled the latter out
+            // above, so only `Column` can still reach here.
+            SelectItem::Column { .. } | SelectItem::Score { .. } => return None,
+        }
+    }
+    if read.walk_len(table.columns.len()) != 0 {
+        return None;
+    }
+
+    Some(table)
 }
 
 /// The row id a `WHERE` filter pins down, if it pins one.
