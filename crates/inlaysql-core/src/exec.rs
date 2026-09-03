@@ -734,6 +734,20 @@ pub(crate) struct IndexProbe<'a> {
     /// [`IndexProbe::append_row_into`]. Either way the row is decoded once and
     /// copied at most once, at the boundary.
     matched: Vec<RowBuf>,
+    /// The row ids one index probe named, reused across outer rows.
+    ///
+    /// [`Storage::scan_index_row_ids_into`] fills it and it is sorted in place;
+    /// before AHL-549 both the `Vec` and its sort were a fresh allocation per
+    /// outer row.
+    ids: Vec<RowId>,
+    /// The probed key range's two edges, reused across outer rows for the same
+    /// reason [`IndexProbe::ids`] is — [`KeyRange::equality_into`] rebuilt
+    /// them in place rather than returning three fresh `Vec<u8>`s.
+    ///
+    /// `key_end` is meaningful only when [`KeyRange::equality_into`] says the
+    /// range has an upper bound, which for an index prefix it always does.
+    key_start: Vec<u8>,
+    key_end: Vec<u8>,
     /// The whole inner table, for the keys the index cannot answer. `None`
     /// until the first such key, and read at most once.
     fallback: Option<Vec<Vec<Value>>>,
@@ -769,6 +783,9 @@ impl<'a> IndexProbe<'a> {
             collation,
             kind,
             matched: Vec::new(),
+            ids: Vec::new(),
+            key_start: Vec::new(),
+            key_end: Vec::new(),
             fallback: None,
             scanning: false,
             interrupt,
@@ -812,6 +829,32 @@ impl<'a> IndexProbe<'a> {
             return self.fall_back();
         }
 
+        // The three reusable buffers are lent out for the length of the probe
+        // and put back whatever happens, so an error on one outer row does not
+        // cost the next one its reuse.
+        let mut ids = core::mem::take(&mut self.ids);
+        let mut start = core::mem::take(&mut self.key_start);
+        let mut end = core::mem::take(&mut self.key_end);
+        let outcome = self.probe(key, &mut ids, &mut start, &mut end);
+        self.ids = ids;
+        self.key_start = start;
+        self.key_end = end;
+        outcome
+    }
+
+    /// Read the rows one non-`NULL`, indexable key names, into `self.matched`.
+    ///
+    /// Split out of [`IndexProbe::prepare_key`] only so the three reusable
+    /// buffers can be lent to it as plain `&mut` locals: `self.kind` is
+    /// borrowed for as long as the index's name is in use, which is the whole
+    /// probe.
+    fn probe(
+        &mut self,
+        key: &Value,
+        ids: &mut Vec<RowId>,
+        start: &mut Vec<u8>,
+        end: &mut Vec<u8>,
+    ) -> Result<()> {
         match &self.kind {
             ProbeKind::RowId => {
                 if let Some(id) = row_id_of(key) {
@@ -819,21 +862,28 @@ impl<'a> IndexProbe<'a> {
                 }
             }
             ProbeKind::Index(index) => {
-                let range = KeyRange::equality(index, &[key], &[self.collation])?;
-                // `scan_index_row_ids` (`AHL-479`), not `scan_index_range` plus
-                // a per-entry decode: a join probe never looks at anything but
-                // the row id an entry names, which is exactly the case the
-                // row-id-only walk exists for — see its doc comment.
-                let mut ids = self
-                    .storage
-                    .scan_index_row_ids(&range.start, range.end.as_deref())?;
+                let bounded =
+                    KeyRange::equality_into(index, &[key], &[self.collation], start, end)?;
+                // `scan_index_row_ids_into` (`AHL-479`, `AHL-549`), not
+                // `scan_index_range` plus a per-entry decode: a join probe never
+                // looks at anything but the row id an entry names, which is
+                // exactly the case the row-id-only walk exists for — see its doc
+                // comment. `_into` so the id buffer is the operator's, refilled
+                // per outer row rather than allocated per outer row.
+                self.storage.scan_index_row_ids_into(
+                    start,
+                    bounded.then_some(end.as_slice()),
+                    ids,
+                )?;
                 // Entries sort by value and only then by row id, so a probe of
                 // a composite index's leading column is not in row-id order.
                 // The materialising path replays the inner table in row-id
                 // order and the pairs come out in that order, so this is what
                 // keeps the two answers identical row for row.
                 ids.sort_unstable();
-                for id in ids {
+                // `ids` is the operator's own buffer lent in, not a field of
+                // `self`, so this iterates it while `fetch` takes `&mut self`.
+                for &id in ids.iter() {
                     self.interrupt.check()?;
                     self.fetch(id)?;
                 }

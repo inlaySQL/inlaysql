@@ -192,6 +192,18 @@ impl Storage for SharedStorage {
         self.inner.borrow().scan_index_row_ids(start, end)
     }
 
+    /// Delegated for the same reason as [`Storage::scan_index_row_ids`] above:
+    /// the default would take the general walk and lose the backend's
+    /// row-id-only one.
+    fn scan_index_row_ids_into(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        out: &mut Vec<RowId>,
+    ) -> Result<()> {
+        self.inner.borrow().scan_index_row_ids_into(start, end, out)
+    }
+
     /// Delegated for the same reason as [`Storage::scan_index_row_ids`]
     /// above: `TreeStorage`'s one-descent override is unreachable through the
     /// default otherwise.

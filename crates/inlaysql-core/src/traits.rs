@@ -351,10 +351,32 @@ pub trait Storage {
     /// this method at all — only slower, and only exactly as slow as it
     /// already was before this method existed.
     fn scan_index_row_ids(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<RowId>> {
-        self.scan_index_range(start, end)?
-            .iter()
-            .map(|key| crate::index::row_id_from_entry(key))
-            .collect()
+        let mut out = Vec::new();
+        self.scan_index_row_ids_into(start, end, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`Storage::scan_index_row_ids`] into a buffer the caller already owns.
+    ///
+    /// Identical ids, identical order, identical errors — `out` is cleared
+    /// first and refilled. A join probe asks this once per outer row and can
+    /// hand back the same buffer every time, where the returning form allocated
+    /// (and, since the probe sorts, reallocated nothing but still allocated)
+    /// one `Vec` per outer row. See `crate::exec::IndexProbe::prepare_key`.
+    ///
+    /// The default is the same walk [`Storage::scan_index_row_ids`] describes,
+    /// so a backend that overrides neither still answers correctly.
+    fn scan_index_row_ids_into(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        out: &mut Vec<RowId>,
+    ) -> Result<()> {
+        out.clear();
+        for key in self.scan_index_range(start, end)? {
+            out.push(crate::index::row_id_from_entry(&key)?);
+        }
+        Ok(())
     }
 
     /// The least index entry key in `[start, end)`, or `None` if nothing in

@@ -228,6 +228,17 @@ impl Storage for TempTableRouter {
         self.durable.scan_index_row_ids(start, end)
     }
 
+    /// Delegated alongside [`Storage::scan_index_row_ids`], so the join probe's
+    /// reusable id buffer reaches the durable backend's fast walk here too.
+    fn scan_index_row_ids_into(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        out: &mut Vec<RowId>,
+    ) -> Result<()> {
+        self.durable.scan_index_row_ids_into(start, end, out)
+    }
+
     fn first_index_entry(&self, start: &[u8], end: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
         self.durable.first_index_entry(start, end)
     }
