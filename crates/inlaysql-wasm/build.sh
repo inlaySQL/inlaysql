@@ -73,6 +73,13 @@ else
   echo "js-sdk demo: no SDK checkout at $SDK_DIR — sources must be staged by the deploy workflow" >&2
 fi
 
+# The client-languages guide is a static page: no build step, no assets
+# beyond itself.
+cp "$ROOT/crates/inlaysql-wasm/demos/clients/index.html" "$DEMO_JS/../clients/index.html" 2>/dev/null || {
+  mkdir -p "$ROOT/crates/inlaysql-wasm/www/demo/clients"
+  cp "$ROOT/crates/inlaysql-wasm/demos/clients/index.html" "$ROOT/crates/inlaysql-wasm/www/demo/clients/index.html"
+}
+
 # Size is a first-class number for a module that ships over the network, so it
 # is printed rather than left for someone to check.
 raw=$(wc -c < "$OUT/inlaysql_wasm_bg.wasm")

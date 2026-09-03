@@ -94,9 +94,7 @@ The second is **[playground](../crates/inlaysql-wasm/demos/playground/README.md)
 a guided tutorial and free SQL console at `/demo/playground/`, against a
 database created empty in the tab. Where site-search shows the engine
 answering, the playground shows it *working*: DDL, DML, vectors, BM25 and
-hybrid fusion, every statement editable and every error verbatim.
-
-## Using it from a framework: React, Vue, jQuery, plain JS
+hybrid fusion, every statement editable and every error verbatim.## Using it from a framework: React, Vue, jQuery, plain JS
 
 The module is a plain ES module — `init()`, `new Database()`, `query()` — so
 the integration is the same three steps everywhere. The worked examples for

@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Using InlaySQL from PHP, Python, Ruby, Node, C#, Java — InlaySQL</title>
+<meta name="description" content="Two directions to every web language: embed the engine (Rust, JavaScript) or speak MySQL's wire protocol (PHP, Python, Ruby, C#, Java, Node).">
+
+<style>
+  /* Same palette and rules as the rest of the site: self-contained, no
+     third-party request, no CDN. */
+  :root {
+    --bg: #08080b; --bg-raised: #101015; --line: #23232c;
+    --ink: #e8e8ee; --ink-dim: #9a9aab; --ink-faint: #6b6b7b;
+    --accent: #a78bfa; --accent-warm: #f0abfc; --good: #6ee7b7; --warn: #fbbf24;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.65 var(--sans); -webkit-font-smoothing: antialiased; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { font-family: var(--mono); font-size: .85em; }
+  .wrap { max-width: 52rem; margin: 0 auto; padding: 0 1.5rem; }
+
+  header.hero { padding: 3.5rem 0 2rem; text-align: center; position: relative; overflow: hidden; }
+  header.hero::before {
+    content: ""; position: absolute; inset: -40% 0 auto 50%;
+    width: 60rem; height: 30rem; transform: translateX(-50%);
+    background: radial-gradient(closest-side, rgba(167, 139, 250, .14), transparent 70%);
+    pointer-events: none;
+  }
+  header.hero > * { position: relative; }
+  .eyebrow {
+    display: inline-block; font: 500 .78rem/1 var(--mono); letter-spacing: .08em;
+    text-transform: uppercase; color: var(--accent); border: 1px solid var(--line);
+    border-radius: 999px; padding: .5rem .9rem; margin-bottom: 1.25rem; background: var(--bg-raised);
+  }
+  h1 { font-size: clamp(1.9rem, 5vw, 2.9rem); letter-spacing: -.03em; margin: 0 0 1rem; line-height: 1.1; }
+  h1 .grad { background: linear-gradient(100deg, var(--accent), var(--accent-warm));
+             -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .lede { color: var(--ink-dim); max-width: 40rem; margin: 0 auto; font-size: 1.05rem; }
+
+  /* the two directions */
+  .directions { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 2.5rem 0; }
+  @media (max-width: 42rem) { .directions { grid-template-columns: 1fr; } }
+  .direction {
+    background: var(--bg-raised); border: 1px solid var(--line);
+    border-radius: 12px; padding: 1.4rem 1.5rem;
+  }
+  .direction h2 { margin: 0 0 .35rem; font-size: 1.1rem; }
+  .direction .tag {
+    display: inline-block; font: 600 .7rem/1 var(--mono); letter-spacing: .06em;
+    text-transform: uppercase; color: var(--accent);
+    border: 1px solid rgba(167, 139, 250, .35); border-radius: 999px;
+    padding: .3rem .65rem; margin-bottom: .6rem; background: rgba(167, 139, 250, .08);
+  }
+  .direction p { color: var(--ink-dim); font-size: .9rem; margin: .4rem 0; }
+  .direction .langs { font: 500 .8rem/1.6 var(--mono); color: var(--good); margin-top: .6rem; }
+  .direction pre { margin: .75rem 0 0; }
+
+  pre {
+    background: #0b0b10; border: 1px solid var(--line); color: #d7e2ee;
+    padding: .9rem 1.1rem; border-radius: 10px; overflow-x: auto;
+    font: .78rem/1.55 var(--mono);
+  }
+  pre .com { color: var(--ink-faint); }
+  pre .kw { color: var(--accent-warm); }
+
+  /* the honesty note */
+  .honest {
+    border: 1px solid var(--line); border-left: 2px solid var(--warn);
+    border-radius: 8px; padding: 1rem 1.2rem; background: var(--bg-raised);
+    color: var(--ink-dim); font-size: .92rem; margin: 2rem 0;
+  }
+  .honest strong { color: var(--ink); }
+
+  /* tabs */
+  .tabs { margin: 2.5rem 0; }
+  .tabbar { display: flex; gap: .25rem; flex-wrap: wrap; }
+  .tabbar button {
+    font: 500 .85rem/1 var(--mono); color: var(--ink-dim);
+    background: none; border: 1px solid var(--line); border-radius: 8px 8px 0 0;
+    padding: .6rem 1rem; cursor: pointer;
+  }
+  .tabbar button:hover { color: var(--ink); }
+  .tabbar button.active {
+    color: var(--ink); background: var(--bg-raised);
+    border-color: var(--accent); border-bottom-color: var(--bg-raised);
+  }
+  .tabpane { display: none; }
+  .tabpane.active { display: block; }
+  .tabpane .note { color: var(--ink-faint); font-size: .85rem; margin: .5rem 0 0; }
+
+  section h2 { font-size: 1.4rem; letter-spacing: -.02em; margin: 3rem 0 .5rem; }
+  section p { color: var(--ink-dim); font-size: .95rem; }
+
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; margin: 1.25rem 0; }
+  th, td { text-align: left; border: 1px solid var(--line); padding: .55rem .8rem; }
+  th { color: var(--ink-faint); font-weight: 500; background: var(--bg-raised); font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; }
+  td { color: var(--ink-dim); }
+  td:first-child { color: var(--ink); }
+
+  footer { margin-top: 4rem; border-top: 1px solid var(--line); padding: 1.5rem 0 3rem;
+           color: var(--ink-faint); font-size: .85rem; }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="eyebrow">every common web language, two directions</span>
+    <h1>PHP, Python, Ruby, C#, Java,<br><span class="grad">Node, Rust</span> — one file</h1>
+    <p class="lede">
+      Embed the engine in your process, or point any MySQL driver at the
+      wire-compatible server. The language you already have is enough.
+    </p>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <div class="directions">
+    <div class="direction">
+      <span class="tag">direction 1 · embed</span>
+      <h2>The database is a library</h2>
+      <p>
+        The engine compiles into your binary or runtime. No server, no socket:
+        the file is yours, reads and writes happen in-process, and MVCC lets
+        every thread open its own handle on the same file.
+      </p>
+      <p class="langs">Rust · JavaScript / TypeScript (WASM)</p>
+      <pre><span class="kw">let</span> db = Database::open(<span class="com">"app.inlay"</span>)?;</pre>
+    </div>
+    <div class="direction">
+      <span class="tag">direction 2 · mysql wire</span>
+      <h2>The database is a server</h2>
+      <p>
+        <code>inlaysql serve --mysql</code> opens the file and speaks MySQL's
+        protocol. Every driver that already knows MySQL connects — no new
+        client library, no new configuration surface.
+      </p>
+      <p class="langs">PHP · Python · Ruby · C#/.NET · Java · Node.js · Go</p>
+      <pre>inlaysql serve --mysql app.inlay \ <span class="com">--tls-cert … --tls-required</span></pre>
+    </div>
+  </div>
+
+  <div class="honest">
+    <strong>One honest correction first:</strong> a SQLite driver cannot open
+    an InlaySQL file. The project borrows SQLite's <em>model</em> — one file,
+    no server — not its on-disk bytes. The format is InlaySQL's own, and it is
+    what makes the native vector and BM25 indexes possible. "SQLite
+    compatibility" means the SQL dialect, not the file. That is exactly why
+    the MySQL direction exists.
+  </div>
+
+  <section id="embed">
+    <h2>Direction 1 — embed it</h2>
+    <p>
+      The full engine in your process. In Rust it is a
+      <code>#![forbid(unsafe_code)]</code> crate; in JavaScript it is the
+      ~660 KiB WASM module behind a zero-dependency SDK with an ORM and a
+      <code>search()</code> builder.
+    </p>
+    <div class="tabs" data-group="embed">
+      <div class="tabbar" role="tablist">
+        <button data-tab="rust" class="active">Rust</button>
+        <button data-tab="js">JavaScript / TypeScript</button>
+      </div>
+      <div class="tabpane active" id="tab-rust">
+<pre><span class="kw">use</span> inlaysql::{Database, Value};
+
+<span class="kw">let mut</span> db = Database::open(<span class="com">"app.inlay"</span>)?;
+
+db.execute(<span class="com">"CREATE TABLE IF NOT EXISTS docs (
+    id INTEGER PRIMARY KEY, title TEXT, body TEXT)"</span>, &[])?;
+
+db.execute(<span class="com">"INSERT INTO docs (title, body) VALUES (?, ?)"</span>,
+    &[Value::Text(title.into()), Value::Text(body.into())])?;
+
+<span class="kw">let</span> rows = db.query(<span class="com">"SELECT id, title FROM docs WHERE id = ?"</span>,
+    &[Value::Integer(id)])?;</pre>
+        <p class="note">Crate: <a href="https://github.com/inlaySQL/inlaysql">inlaySQL/inlaysql</a> — <code>#![forbid(unsafe_code)]</code>, thread-per-handle MVCC.</p>
+      </div>
+      <div class="tabpane" id="tab-js">
+<pre><span class="kw">import</span> { openDatabase } <span class="kw">from</span> "@inlaysql/core";
+<span class="kw">import</span> { opfs } <span class="kw">from</span> "@inlaysql/storage";
+<span class="kw">import</span> { defineModel, field, install, repo } <span class="kw">from</span> "@inlaysql/orm";
+
+<span class="kw">const</span> Page = defineModel(<span class="com">"pages"</span>, {
+  id: field.integer().primaryKey(),
+  body: field.text().index(<span class="com">"bm25"</span>),
+  embedding: field.vector(<span class="com">384</span>).index(<span class="com">"hnsw"</span>).embedFrom(<span class="com">"body"</span>),
+});
+
+<span class="kw">const</span> db = <span class="kw">await</span> openDatabase({ source: opfs(<span class="com">"app.inlay"</span>), create: <span class="kw">true</span> });
+<span class="kw">await</span> install(db, Page);
+<span class="kw">await</span> repo(db, Page).insert({ body: <span class="com">"full text"</span> });  <span class="com">// embedding computed</span>
+
+<span class="kw">const</span> hits = <span class="kw">await</span> repo(db, Page).search(<span class="com">"full text"</span>, { mode: <span class="com">"hybrid"</span> });</pre>
+        <p class="note">Runs in Node, Deno, Bun, the browser and edge runtimes. Live: <a href="../js-sdk/">the SDK demo</a>. Repo: <a href="https://github.com/inlaySQL/inlaysql-js">inlaySQL/inlaysql-js</a>.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="wire">
+    <h2>Direction 2 — the MySQL wire</h2>
+    <p>
+      Start the server once; every sample below assumes it is running. The
+      connection is plaintext until you hand it a certificate — for anything
+      beyond localhost, use <code>--tls-cert</code> and <code>--tls-required</code>.
+    </p>
+    <pre>inlaysql serve --mysql app.inlay --password-env INLAYSQL_PASSWORD \
+  --tls-cert server.pem --tls-key key.pem --tls-required</pre>
+
+    <div class="tabs" data-group="wire">
+      <div class="tabbar" role="tablist">
+        <button data-tab="php" class="active">PHP</button>
+        <button data-tab="python">Python</button>
+        <button data-tab="ruby">Ruby</button>
+        <button data-tab="csharp">C# / .NET</button>
+        <button data-tab="java">Java</button>
+        <button data-tab="node">Node.js</button>
+      </div>
+
+      <div class="tabpane active" id="tab-php">
+<pre><span class="com">// PDO — the same shape Laravel/Eloquent runs on. A stock Laravel 11
+// skeleton migrates and serves against this server today.</span>
+$pdo = <span class="kw">new</span> PDO(
+    <span class="com">'mysql:host=127.0.0.1;port=3306;dbname=app;charset=utf8mb4'</span>,
+    <span class="com">'inlaysql'</span>, getenv(<span class="com">'INLAYSQL_PASSWORD'</span>),
+    [PDO::ATTR_ERRMODE =&gt; PDO::ERRMODE_EXCEPTION],
+);
+
+$stmt = $pdo-&gt;prepare(<span class="com">'INSERT INTO docs (title, body) VALUES (?, ?)'</span>);
+$stmt-&gt;execute([$title, $body]);
+
+<span class="kw">foreach</span> ($pdo-&gt;query(<span class="com">'SELECT id, title FROM docs ORDER BY id LIMIT 20'</span>) <span class="kw">as</span> $row) {
+    echo $row[<span class="com">'title'</span>], PHP_EOL;
+}
+
+<span class="com">// Upsert and RETURNING work over the wire too:</span>
+$pdo-&gt;prepare(<span class="com">'INSERT INTO docs (id, title) VALUES (?, ?)
+               ON CONFLICT (id) DO UPDATE SET title = excluded.title'</span>)
+    -&gt;execute([$id, $title]);</pre>
+        <p class="note">PHP binds integers as strings; the engine applies SQLite's comparison affinity, so <code>WHERE id = ?</code> with <code>'1'</code> finds the integer row.</p>
+      </div>
+
+      <div class="tabpane" id="tab-python">
+<pre><span class="kw">import</span> pymysql  <span class="com"># or mysqlclient; SQLAlchemy: mysql+pymysql://…</span>
+
+conn = pymysql.connect(
+    host=<span class="com">"127.0.0.1"</span>, port=<span class="com">3306</span>,
+    user=<span class="com">"inlaysql"</span>, password=os.environ[<span class="com">"INLAYSQL_PASSWORD"</span>],
+)
+
+<span class="kw">with</span> conn.cursor() <span class="kw">as</span> cur:
+    cur.execute(<span class="com">"INSERT INTO docs (title, body) VALUES (%s, %s)"</span>, (title, body))
+    cur.execute(<span class="com">"SELECT id, title FROM docs ORDER BY id LIMIT 20"</span>)
+    <span class="kw">for</span> row <span class="kw">in</span> cur.fetchall():
+        print(row)</pre>
+        <p class="note">Django/SQLAlchemy point their <code>mysql</code> backend at the server; the SQL surface caveats are <a href="https://github.com/inlaySQL/inlaysql/blob/main/docs/server.md">documented</a>.</p>
+      </div>
+
+      <div class="tabpane" id="tab-ruby">
+<pre><span class="kw">require</span> <span class="com">"mysql2"</span>
+
+client = Mysql2::Client.new(
+  host: <span class="com">"127.0.0.1"</span>, port: <span class="com">3306</span>,
+  username: <span class="com">"inlaysql"</span>, password: ENV[<span class="com">"INLAYSQL_PASSWORD"</span>],
+)
+
+statement = client.prepare(<span class="com">"INSERT INTO docs (title, body) VALUES (?, ?)"</span>)
+statement.execute(title, body)
+
+client.query(<span class="com">"SELECT id, title FROM docs ORDER BY id LIMIT 20"</span>)
+      .each { |row| puts row[<span class="com">"title"</span>] }</pre>
+        <p class="note">Rails: point <code>database.yml</code> at the server with the <code>mysql2</code> adapter.</p>
+      </div>
+
+      <div class="tabpane" id="tab-csharp">
+<pre><span class="kw">using</span> MySqlConnector;
+
+<span class="kw">await using var</span> conn = <span class="kw">new</span> MySqlConnection(
+    <span class="com">"Server=127.0.0.1;Port=3306;User ID=inlaysql;Password=…"</span>);
+<span class="kw">await</span> conn.OpenAsync();
+
+<span class="kw">await using var</span> cmd = <span class="kw">new</span> MySqlCommand(
+    <span class="com">"INSERT INTO docs (title, body) VALUES (@t, @b)"</span>, conn);
+cmd.Parameters.AddWithValue(<span class="com">"@t"</span>, title);
+cmd.Parameters.AddWithValue(<span class="com">"@b"</span>, body);
+<span class="kw">await</span> cmd.ExecuteNonQueryAsync();</pre>
+        <p class="note">Entity Framework: the <code>Pomelo.EntityFrameworkCore.MySql</code> provider rides the same wire. MySqlConnector speaks the binary protocol, which is how <code>BLOB</code> values are written.</p>
+      </div>
+
+      <div class="tabpane" id="tab-java">
+<pre><span class="kw">try</span> (Connection c = DriverManager.getConnection(
+        <span class="com">"jdbc:mysql://127.0.0.1:3306/app"</span>, <span class="com">"inlaysql"</span>, password);
+     PreparedStatement insert = c.prepareStatement(
+        <span class="com">"INSERT INTO docs (title, body) VALUES (?, ?)"</span>)) {
+
+    insert.setString(<span class="com">1</span>, title);
+    insert.setString(<span class="com">2</span>, body);
+    insert.executeUpdate();
+}</pre>
+        <p class="note">Hibernate, jOOQ, MyBatis ride the same wire. JDBC uses the binary protocol — the one path that accepts <code>BLOB</code> writes today.</p>
+      </div>
+
+      <div class="tabpane" id="tab-node">
+<pre><span class="kw">import</span> mysql <span class="kw">from</span> <span class="com">"mysql2/promise"</span>;
+
+<span class="com">// The other Node direction is embedding — see the tabs above, or the
+// live SDK demo. Over the wire:</span>
+<span class="kw">const</span> conn = <span class="kw">await</span> mysql.createConnection({
+  host: <span class="com">"127.0.0.1"</span>, port: <span class="com">3306</span>, user: <span class="com">"inlaysql"</span>,
+  password: process.env.INLAYSQL_PASSWORD,
+});
+
+<span class="kw">await</span> conn.execute(<span class="com">"INSERT INTO docs (title, body) VALUES (?, ?)"</span>, [title, body]);
+<span class="kw">const</span> [rows] = <span class="kw">await</span> conn.query(<span class="com">"SELECT id, title FROM docs ORDER BY id LIMIT 20"</span>);</pre>
+        <p class="note">Node has both directions: the WASM SDK in-process, or <code>mysql2</code> when one server process should own the file.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="caveats">
+    <h2>What works over the wire — and what does not</h2>
+    <p>
+      The protocol is not the limit; the SQL surface underneath it is, and the
+      rule of this project is that a statement it cannot honour is
+      <strong>refused, never accepted and ignored</strong>.
+    </p>
+    <table>
+      <tr><th>Works today</th><th>Plan around</th></tr>
+      <tr><td>Joins, subqueries, CTEs (<code>WITH RECURSIVE</code>), set operations</td><td>Foreign keys are recorded but not enforced — SQLite's own default</td></tr>
+      <tr><td>Upserts, <code>INSERT … SELECT</code>, <code>RETURNING</code> on INSERT/UPDATE/DELETE</td><td><code>ADD CONSTRAINT … FOREIGN KEY</code> after creation can't be recorded — declare keys inside <code>CREATE TABLE</code></td></tr>
+      <tr><td>Full constraint DDL in <code>CREATE TABLE</code>; standalone <code>ADD {INDEX|UNIQUE|CONSTRAINT}</code>, <code>TRUNCATE</code>, <code>RENAME</code></td><td><code>BLOB</code> writes need a binary-protocol driver (Java, .NET)</td></tr>
+      <tr><td>Any declared type name — <code>TIMESTAMP</code>, <code>JSON</code>, <code>LONGTEXT</code> resolve under SQLite's affinities</td><td></td></tr>
+    </table>
+    <p>
+      Full detail, with the statements cited by test file:
+      <a href="https://github.com/inlaySQL/inlaysql/blob/main/docs/server.md">docs/server.md</a>.
+    </p>
+  </section>
+
+  <footer>
+    Part of <a href="https://github.com/inlaySQL/inlaysql">InlaySQL</a> —
+    other demos: <a href="../../">engine</a> ·
+    <a href="../site-search/">site search</a> ·
+    <a href="../playground/">playground</a> ·
+    <a href="../js-sdk/">JS SDK</a>.
+    The markdown original of this page is
+    <a href="https://github.com/inlaySQL/inlaysql/blob/main/docs/clients.md">docs/clients.md</a>.
+  </footer>
+</main>
+
+<script type="module">
+  // Tabs, nothing else. No framework, no third-party request — the page is
+  // about showing code in the language a reader already has.
+  for (const group of document.querySelectorAll(".tabs")) {
+    const bar = group.querySelector(".tabbar");
+    bar.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-tab]");
+      if (!button) return;
+      for (const b of bar.querySelectorAll("button")) b.classList.toggle("active", b === button);
+      for (const pane of group.querySelectorAll(".tabpane")) {
+        pane.classList.toggle("active", pane.id === `tab-${button.dataset.tab}`);
+      }
+    });
+  }
+</script>
+</body>
+</html>
