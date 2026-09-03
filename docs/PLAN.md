@@ -19,6 +19,12 @@ current execution order without relying on local conversation history.
 
 ## Current state (2026-09-02, evening)
 
+- 2026-09-03, 12:00–16:45: AHL-547 (C1 slice 2 — one WAL append and one
+  sync per cohort, acknowledged after the barrier; DST-clean; **measured
+  0.78–0.90x at 8–32 writers** because commit-side cohorts displace the
+  flush-side ticket gather; flag stays off) and AHL-548 (`COUNT(*)` from
+  leaf cell counts; the published scalar aggregate went 225 → 1,914/s,
+  ~6x MySQL 8.4, ~5x PG 17).
 - **Every `run.sh` suite was regenerated at `7b20175`** (three gated runs,
   none contaminated; `bench/results/20260902T022325Z-repeat.txt`).
   `BENCHMARK.md`, `README.md` and the web copy carry the new figures; the
@@ -103,24 +109,30 @@ current execution order without relying on local conversation history.
    quiet window on this machine is mid-morning; pre-build the bench binary
    before any gated run.
 
-2. **C1 slice 2**: one WAL append and one sync per cohort in the leader's
-   region, followers acknowledged only after the leader's sync; per-record
-   layout kept; `docs/research/commit-group-slice1.md` names the seal and
-   the overlay it builds on. Slice 1 (AHL-544) is in, behind
-   `EngineOptions::commit_absorption`, flat as pre-registered. DST at every
-   crash point. Then **A10**: a leaf-cell-count `COUNT(*)` scan and an
-   exact live row count, which own the remaining scalar-aggregate loss
-   (0.75x/0.62x). The insert path's remaining per-row costs are closed
-   (AHL-545); B4's cell iteration is closed (AHL-541).
+2. **C1 is closed as a measured loss until the layers compose.** Slices
+   1 (AHL-544) and 2 (AHL-547) are in behind `EngineOptions::commit_absorption`
+   (default off); `PERF.md` AHL-547 has the mechanism: one record and one
+   sync per cohort ran **26% more barriers**, because the commit-side cohort
+   (~5.6 members) displaces the flush-side ticket gather that already
+   amortises fsync over 6–9 commits — 0.78x / 0.87x / 0.90x at 8 / 16 / 32
+   writers, 3/3. The next C1 item, if any, is a brief for one flush ticket
+   per cohort that the flush side gathers across leaders, plus cohorts that
+   survive a region boundary — measurement gate before code. A10 item 1 is
+   done (AHL-548: `COUNT(*)` from leaf cell counts; the scalar aggregate is
+   ~6x/~5x the servers); the live row count is declined until a delta-merge
+   metadata rule exists. The insert path's remaining per-row costs are
+   closed (AHL-545); B4's cell iteration is closed (AHL-541). **Remaining
+   published losses:** `LIMIT 10` joins vs SQLite (1.27x/1.59x), range scan
+   vs SQLite (0.67x), point-read ops/s vs SQLite WAL (0.69x; p50 already
+   ahead), batch insert vs PostgreSQL like for like (0.68x), server-to-server
+   writes at 8 connections.
 
 3. **`RangeCursor` extension (A3)** to `walk`/`scan_range_from` — the
    cheapest first step is `colliding_rows` using `scan_index_row_ids`
    (already cursor-backed, no per-key `Vec`); WITHOUT ROWID scans next.
 
 4. **B2's last piece**: index-probe access paths do not reorder. B3 is
-   closed (measured negative). **A7**: a borrowing result API, so the point
-   read's answer is not an owned `Vec<Vec<Value>>` per query — 9% of what is
-   left on that shape; API change, design first.
+   closed (measured negative). A7 landed (AHL-535).
 
 5. **Server posture F3/F4** — refuse-to-expose defaults; fuzz the packet path.
 
