@@ -15,8 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 
 use inlaysql_core::btree::{
-    AbsorbDecision, AbsorbOutcome, AbsorbQueue, AbsorbSeal, AbsorbTxn, Device, Durability, PageId,
-    PendingOps,
+    AbsorbQueue, AbsorbResult, AbsorbTxn, Device, Durability, PageId, PendingOps,
 };
 use inlaysql_core::{Error, Result};
 
@@ -235,17 +234,24 @@ struct CommitCoordinator {
     /// wins" over the alternative (refusing a second, disagreeing request).
     durability: AtomicU8,
     /// Commit-side absorption's whole state: whether any handle asked for it,
-    /// the transactions currently parked for a gate holder to judge, the
-    /// decisions it made, and the chain seal that says whether one of those
-    /// decisions is still an answer to the right question.
+    /// the transactions currently parked for a gate holder to commit, the
+    /// ones it has taken, and the answers waiting to be collected.
     ///
     /// One `Mutex` for all of it, rather than a lock per slot, because every
     /// access but one already runs on a thread holding the reservation gate
     /// and so is serialized anyway. The exception is
     /// [`Device::absorb_offer`], which runs on a thread that is *about* to
-    /// park on the gate — this mutex is what orders that publication against
-    /// the leader's read of it. See `docs/research/commit-group-slice1.md`.
+    /// hand its transaction over — this mutex is what orders that
+    /// publication against the leader's read of it, and against the gate
+    /// release that would otherwise hand it straight back. See
+    /// `docs/research/commit-group-slice2.md`.
     absorption: Mutex<AbsorbQueue>,
+    /// Where an offered writer waits for its outcome — the wait that, under
+    /// absorption, *replaces* [`CommitCoordinator::reservation_done`] for
+    /// that writer rather than being added to it. Woken by
+    /// [`release_normal_reservation`], which is the one place an answer
+    /// becomes complete.
+    absorption_done: Condvar,
 }
 
 impl CommitCoordinator {
@@ -827,6 +833,21 @@ impl Drop for LeaderGuard<'_> {
 /// else ever clears [`CommitCoordinator::reserved`].
 fn release_normal_reservation(coordinator: &CommitCoordinator) -> u64 {
     let generation = coordinator.generation.fetch_add(1, Ordering::AcqRel) + 1;
+    // Absorption first, and under its own lock: this stamps the generation
+    // onto every answer this gate hold produced (a member that adopted `None`
+    // would be correct but would rescan the whole log on its next statement),
+    // stands this leader down so nobody offers into a gate hold that is over,
+    // hands back every transaction nobody took, and — reached from
+    // [`NormalCommitGuard::drop`] on an unwind — fails out every member a
+    // leader took and never answered. See [`AbsorbQueue::gate_released`].
+    {
+        let mut absorption = coordinator.absorption_state();
+        if absorption.enabled {
+            absorption.gate_released(Some(generation));
+            drop(absorption);
+            coordinator.absorption_done.notify_all();
+        }
+    }
     let mut reserved = coordinator
         .reserved
         .lock()
@@ -1445,6 +1466,15 @@ impl Device for FileDevice {
         drop(waiter_guard);
         if result.is_ok() {
             coordinator.normal_inflight.fetch_add(1, Ordering::Release);
+            // Advertise this hold to writers that have not reached the gate
+            // yet: only while this is set will anyone hand its transaction
+            // over rather than queue behind the reservation.
+            {
+                let mut absorption = coordinator.absorption_state();
+                if absorption.enabled {
+                    absorption.gate_acquired();
+                }
+            }
             self.gate_started_ns.store(now_nanos(), Ordering::Relaxed);
             let racing = coordinator
                 .flush
@@ -1682,71 +1712,95 @@ impl Device for FileDevice {
         }
     }
 
-    /// Park this transaction where the gate holder can see it, one instant
-    /// before this thread parks on the gate itself.
+    /// Hand this transaction to whichever writer holds the gate, one instant
+    /// before this thread waits for the answer.
     ///
     /// Returns `None` — leaving `ops` exactly where they were — whenever
-    /// there is nothing to be gained: absorption off, a read-only handle, or
-    /// a cohort already at [`AbsorbQueue::COHORT_MAX`]. That is the path every
-    /// commit takes today and the only one it takes with the flag off, and it
-    /// costs one uncontended lock and no allocation.
+    /// there is nothing to be gained: absorption off, a read-only handle, a
+    /// cohort already at [`AbsorbQueue::COHORT_MAX`], or **no normal commit
+    /// holding the gate**. That last one is read under the same lock the
+    /// offer takes and the gate release takes, which is what makes "I handed
+    /// my transaction to a leader that had already gone" impossible rather
+    /// than merely unlikely — and it is also why a single writer, which by
+    /// construction never has company, pays nothing at all for this feature
+    /// being switched on.
     fn absorb_offer(&self, root: PageId, ops: &mut PendingOps) -> Option<u64> {
         let coordinator = self.coordinator.as_ref()?;
-        // Nobody is holding the gate, so this writer is about to acquire it
-        // rather than park behind it — there is no leader to judge the offer
-        // and it would only have to claim it straight back. A hint, not a
-        // guarantee: a writer that loses the race after reading zero here
-        // simply commits the way it does today, and one that reads non-zero
-        // and then finds the gate free has its offer returned to it
-        // unjudged. What it buys is that a single writer, which by
-        // construction never has company, pays nothing at all for this
-        // feature being switched on — `PERF.md`'s AHL-544 section measured
-        // the version without it ~4% below the control at one writer.
-        if coordinator.normal_inflight.load(Ordering::Acquire) == 0 {
+        let mut absorption = coordinator.absorption_state();
+        if !absorption.gate_held() {
             return None;
         }
-        coordinator.absorption_state().offer(root, ops)
+        absorption.offer(root, ops)
     }
 
-    /// Take this transaction back, with the gate holder's decision if one was
-    /// made. The operations come home whether or not anyone judged them.
-    fn absorb_claim(&self, token: u64, ops: &mut PendingOps) -> Option<AbsorbDecision> {
-        let coordinator = self.coordinator.as_ref()?;
-        coordinator.absorption_state().claim(token, ops)
-    }
-
-    /// Hand every parked transaction to this gate holder, in the order they
-    /// were offered, and file the decision it makes for each.
+    /// Wait for the leader's answer — the wait that replaces
+    /// [`FileDevice::begin_normal_commit`]'s gate wait for an offered writer.
     ///
-    /// The leader's own key-set comparisons run with this lock held. That is
-    /// the one place a follower can be made to wait on absorption rather than
-    /// on the gate — it blocks in [`Device::absorb_offer`] one instant before
-    /// it would have blocked on the gate anyway, so the wait is moved rather
-    /// than added.
-    fn absorb_cohort(&self, seq: u64, decide: &mut dyn FnMut(&[AbsorbTxn]) -> Vec<AbsorbOutcome>) {
-        if let Some(coordinator) = &self.coordinator {
-            coordinator.absorption_state().cohort(seq, decide);
+    /// It is finite for the three reasons `AbsorbQueue` documents, and the
+    /// predicate is re-checked under the mutex on every wake, so a spurious
+    /// one costs a loop iteration and nothing else. An answer is only visible
+    /// once [`release_normal_reservation`] has completed it, which is
+    /// strictly after the leader's barrier returned and its gate hold ended.
+    fn absorb_wait(&self, token: u64, ops: &mut PendingOps) -> AbsorbResult {
+        let Some(coordinator) = self.coordinator.as_ref() else {
+            return AbsorbResult::Fallback;
+        };
+        let mut absorption = coordinator.absorption_state();
+        loop {
+            if let Some(result) = absorption.wait_step(token, ops) {
+                return result;
+            }
+            absorption = coordinator
+                .absorption_done
+                .wait(absorption)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
 
-    /// The absorption chain position this file's committed state is at. Read
-    /// under the reservation gate, and compared for equality — all three
-    /// fields — against a decision's [`AbsorbDecision::expect`].
-    fn absorption_seal(&self) -> Option<AbsorbSeal> {
-        let coordinator = self.coordinator.as_ref()?;
-        coordinator.absorption_state().seal()
+    /// Take every parked transaction, in the order they were offered, and fix
+    /// this cohort's membership. Everything returned here is answered through
+    /// [`Device::absorb_resolve`] before this thread leaves the gate; a leader
+    /// that unwinds instead has them failed out by
+    /// [`release_normal_reservation`], reached from
+    /// [`NormalCommitGuard::drop`].
+    fn absorb_take(&self) -> Vec<(u64, AbsorbTxn)> {
+        match &self.coordinator {
+            Some(coordinator) => coordinator.absorption_state().take(),
+            None => Vec::new(),
+        }
     }
 
-    /// Publish the chain position this commit leaves behind, or clear it.
-    ///
-    /// Called by every commit that reaches the gate and by every checkpoint.
-    /// `None` is the answer from everything the leader did not predict, and a
-    /// cleared seal matches no decision, so a stale decision is unusable
-    /// rather than merely unlikely.
-    fn set_absorption_seal(&self, seal: Option<AbsorbSeal>) {
+    /// File one answer per member. Deliberately does **not** wake anybody:
+    /// an answer is incomplete until the gate release stamps the generation
+    /// onto it, and that release is the one place the waiters are notified.
+    fn absorb_resolve(&self, results: Vec<(u64, AbsorbResult, PendingOps)>) {
         if let Some(coordinator) = &self.coordinator {
-            coordinator.absorption_state().set_seal(seal);
+            coordinator.absorption_state().resolve(results);
         }
+    }
+
+    /// The commit barrier for a cohort leader that is still holding the
+    /// reservation gate.
+    ///
+    /// [`FileDevice::sync_commit`]'s gather window yields for as long as a
+    /// normal commit is inflight or queued — and a leader syncing inside the
+    /// gate is itself that inflight commit, so the window would spin against
+    /// its own caller until its yield budget ran out and gather nothing,
+    /// because nobody else can reach the gate to publish a ticket. This takes
+    /// the same barrier at the same [`CommitCoordinator::effective_durability`]
+    /// without the window, exactly as a checkpoint's in-gate sync already
+    /// does and for exactly the same reason.
+    fn sync_commit_in_gate(&mut self) -> Result<()> {
+        let Some(coordinator) = &self.coordinator else {
+            return Err(self.read_only_error("sync"));
+        };
+        let ticket = self.pending_commit_ticket.swap(0, Ordering::AcqRel);
+        if ticket == 0 {
+            return self.sync();
+        }
+        let file = &self.file;
+        let level = coordinator.effective_durability();
+        coordinator.make_durable(ticket, || commit_barrier(file, level))
     }
 
     /// Raise this file's [`Device::sync_commit`] barrier toward `durability`
@@ -1868,6 +1922,7 @@ fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator
         reuse_enabled: AtomicBool::new(false),
         durability: AtomicU8::new(DURABILITY_UNSET),
         absorption: Mutex::new(AbsorbQueue::default()),
+        absorption_done: Condvar::new(),
     });
     registry.insert(file_id, Arc::downgrade(&coordinator));
     Ok(coordinator)
@@ -2018,6 +2073,7 @@ mod group_commit_tests {
             reuse_enabled: AtomicBool::new(false),
             durability: AtomicU8::new(DURABILITY_UNSET),
             absorption: Mutex::new(AbsorbQueue::default()),
+            absorption_done: Condvar::new(),
         }
     }
 

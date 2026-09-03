@@ -40,52 +40,69 @@ pub struct AbsorbTxn {
     pub ops: PendingOps,
 }
 
-/// What the gate holder decided about one parked transaction: the same
-/// answer `rebase_pending` returns, computed by somebody else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AbsorbOutcome {
-    /// No key this transaction touched changed under it. It may rebase.
-    Clean,
-    /// A key it touched was changed by an earlier committer, so
-    /// first-committer-wins aborts it — exactly
-    /// [`crate::btree::CommitOutcome::Conflict`].
-    Conflict,
-}
-
-/// Where a decision sits in one leader's chain, and what the file's committed
-/// state must be for that decision to still be an answer to the right
-/// question.
+/// What a leader hands one member of its cohort back, once the whole cohort
+/// is durable.
 ///
-/// A decision is computed under one gate hold and used under a later one, so
-/// something has to rule out everything that can happen in between: an
-/// outsider commits, a checkpoint lands, an earlier member of the same cohort
-/// fails on a device error while somebody else takes the sequence number it
-/// was going to use. All three fields together do it, and `seq` alone does
-/// not — a `Clean` member that never commits while an outsider commits in its
-/// place leaves the sequence number exactly where the chain expected it and
-/// the *content* somewhere else. Only a member acting on cohort `cohort`'s
-/// decision at position `index` ever publishes `index + 1`, so the pair pins
-/// the identity of every commit in between, not merely how many there were.
+/// Plain `Copy` data, like everything else that crosses this seam: the leader
+/// computed it on its own thread against its own tree, and the member's
+/// `CowBTree` — `!Send`, and always will be — only ever adopts numbers out of
+/// it. See `docs/research/commit-group-slice2.md` §1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AbsorbSeal {
-    /// Which leader's cohort this position belongs to. Never reused.
-    pub cohort: u64,
-    /// How many members of that cohort have already resolved.
-    pub index: u32,
-    /// The file's highest committed sequence number at that point.
-    pub seq: u64,
+pub enum AbsorbResult {
+    /// The leader rebased, encoded, appended and synced this transaction on
+    /// its behalf. The member adopts these three values and reports
+    /// [`crate::btree::CommitOutcome::Committed`].
+    Committed {
+        /// The committed root this transaction produced.
+        root: PageId,
+        /// The next free page id it left behind.
+        next: PageId,
+        /// The sequence number it committed at — this member's own, never the
+        /// cohort's last, because the reader watermark it feeds has to stay
+        /// conservative for the oldest live reader.
+        seq: u64,
+        /// The one generation the whole gate hold produced, or `None` from a
+        /// device that does not count them.
+        generation: Option<u64>,
+    },
+    /// First-committer-wins aborted it against an earlier member of the same
+    /// cohort or against the state the leader found. The file is at the state
+    /// named here and the member reloads it, exactly as a conflicting commit
+    /// does today.
+    Conflict {
+        /// The committed root the member should adopt.
+        root: PageId,
+        /// The next free page id that state names.
+        next: PageId,
+        /// The highest committed sequence number at that state.
+        seq: u64,
+        /// See [`AbsorbResult::Committed::generation`].
+        generation: Option<u64>,
+    },
+    /// The commit that was carrying this transaction failed after its record
+    /// may already have reached the file. Reported to the caller as an error,
+    /// never as `Fallback`: telling a member to commit again when its bytes
+    /// may be on disk is how a transaction gets applied twice. This is the
+    /// same ambiguity a solo commit whose own append or sync failed has
+    /// always had.
+    Failed(&'static str),
+    /// Nobody judged it. Its operations are back in its handle and it commits
+    /// exactly as it does with absorption off. Every device that does not
+    /// absorb answers this, always.
+    Fallback,
 }
 
-/// One parked transaction's decision, and the state it is an answer for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AbsorbDecision {
-    /// The seal the device must be showing for [`AbsorbDecision::outcome`] to
-    /// be used. Anything else — including `None` — means the file moved in a
-    /// way the leader did not predict, and the follower does the ordinary
-    /// full `rebase_pending` instead, which is always correct.
-    pub expect: AbsorbSeal,
-    /// What the leader decided.
-    pub outcome: AbsorbOutcome,
+/// One member of a cohort as the queue holds it between the offer and the
+/// answer.
+#[derive(Debug)]
+struct Parked {
+    token: u64,
+    /// The value [`AbsorbQueue::gate_generation`] had when this was offered.
+    /// If it has moved and this entry is still parked, the gate hold it was
+    /// offered into ended without taking it, and it must go back to its owner
+    /// rather than wait for a leader that is never coming.
+    gate_generation: u64,
+    txn: AbsorbTxn,
 }
 
 /// Everything a commit's reservation gate would otherwise re-derive from the
@@ -153,56 +170,122 @@ pub enum Durability {
 ///
 /// A device that absorbs holds one of these behind whatever it already uses
 /// for interior mutability — a `Mutex` on the native file device, a `RefCell`
-/// in the deterministic simulation — and forwards the five `absorb_*`/seal
-/// methods of [`Device`] straight into it. That is deliberate: the part of
-/// this protocol that is easy to get wrong is the chain arithmetic in
-/// [`AbsorbQueue::cohort`], and a second copy of it in the simulation would
-/// mean the deterministic sweeps proved a different implementation correct
-/// than the one production runs.
+/// in the deterministic simulation — and forwards the `absorb_*` methods of
+/// [`Device`] straight into it. That is deliberate: the parts of this
+/// protocol that are easy to get wrong are the liveness rules in
+/// [`AbsorbQueue::wait_step`], and a second copy of them in the simulation
+/// would mean the deterministic sweeps proved a different implementation
+/// correct than the one production runs.
 ///
 /// Nothing here is `Send` or `Sync` by itself; the owning device supplies
-/// that, along with the ordering. Every method but [`AbsorbQueue::offer`] is
-/// called by a thread holding the commit reservation gate, so they are
-/// serialized against each other already; `offer` is called by a thread one
-/// instant before it parks on that gate, and the owner's lock is what orders
-/// it against a leader's [`AbsorbQueue::cohort`].
+/// that, along with the ordering.
+///
+/// # The three rules that make a parked writer's wait finite
+///
+/// 1. A leader resolves everything [`AbsorbQueue::take`] handed it, on every
+///    exit path — including an unwind, which is what
+///    [`AbsorbQueue::fail_in_flight`] is for.
+/// 2. A member never taken is handed back when the gate hold it offered into
+///    ends: [`AbsorbQueue::gate_released`] moves `gate_generation` on, and
+///    [`AbsorbQueue::wait_step`] un-parks anything still waiting at an older
+///    one.
+/// 3. A member taken but not yet resolved keeps waiting, which is safe
+///    because rule 1 guarantees an answer and rule 2 cannot fire for it.
+///
+/// See `docs/research/commit-group-slice2.md` §2.
 #[derive(Debug, Default)]
 pub struct AbsorbQueue {
     /// Whether any handle sharing this device asked for absorption. A device
     /// sets it once and never clears it: the gate belongs to the file, so
-    /// "some writers on this file may be judged and some may not" is not a
+    /// "some writers on this file may be absorbed and some may not" is not a
     /// state worth having.
     pub enabled: bool,
+    /// Whether a normal commit currently holds the reservation gate. Offers
+    /// are only accepted while it is true, and it is read under the same lock
+    /// the offer takes, so "I parked behind a leader that has already gone"
+    /// is impossible rather than unlikely.
+    gate_held: bool,
     next_token: u64,
-    next_cohort: u64,
     /// Offered and not yet taken by a leader, in gate-arrival order.
-    parked: Vec<(u64, AbsorbTxn)>,
-    /// Taken and decided, waiting for their own thread to claim them back.
-    ///
-    /// An entry orphaned by a writer that panicked between offering and
-    /// claiming stays here until the device is dropped. That is memory, not
-    /// correctness: the operations it holds belong to a transaction whose
-    /// handle is unwinding, and nothing else can ever name its token.
-    judged: BTreeMap<u64, (AbsorbTxn, Option<AbsorbDecision>)>,
-    seal: Option<AbsorbSeal>,
-    /// Cohorts formed and members judged over this device's lifetime, so a
-    /// test can assert that absorption actually happened rather than assume
-    /// it — the discipline `pages_reused` exists for on the free list.
+    parked: Vec<Parked>,
+    /// Taken by a leader and not yet answered.
+    in_flight: Vec<u64>,
+    /// Answered, waiting for their own thread to pick the answer up. The
+    /// operations ride along because a `Fallback` has to give them back, and
+    /// the `bool` is whether the answer is complete — see
+    /// [`AbsorbQueue::gate_released`].
+    resolved: BTreeMap<u64, (AbsorbResult, PendingOps, bool)>,
+    /// Moved on by every gate release. See the field on [`Parked`].
+    gate_generation: u64,
+    /// Cohorts a leader has taken over this device's lifetime, so a test can
+    /// assert that absorption actually happened rather than assume it — the
+    /// discipline `pages_reused` exists for on the free list.
     pub cohorts: u64,
-    /// Transactions judged as part of one of those cohorts. See
+    /// Transactions taken as part of one of those cohorts. See
     /// [`AbsorbQueue::cohorts`].
     pub members: u64,
+    /// Of those, the ones a leader actually committed on their behalf.
+    pub committed: u64,
 }
 
 impl AbsorbQueue {
-    /// Most transactions one gate holder will judge in a single cohort.
+    /// Most transactions one gate holder will commit in a single cohort.
     ///
-    /// A bound rather than a tuning knob: the leader runs one key-set
-    /// comparison per member inside its own gate hold, so an unbounded cohort
-    /// would let one leader hold the gate for arbitrarily long on other
-    /// writers' behalf. A writer arriving at a full cohort is simply not
-    /// offered and commits exactly as it does today.
+    /// A bound rather than a tuning knob: the leader does every member's
+    /// rebase, encode and page write inside its own gate hold, and the whole
+    /// cohort's records go into one buffer that has to fit a write-ahead-log
+    /// region. A writer arriving at a full cohort is simply not offered and
+    /// commits exactly as it does today.
     pub const COHORT_MAX: usize = 32;
+
+    /// Whether a normal commit holds the gate right now — the condition
+    /// [`Device::absorb_offer`] checks before offering, under this queue's
+    /// own lock.
+    pub fn gate_held(&self) -> bool {
+        self.gate_held
+    }
+
+    /// A normal commit has acquired the reservation gate and may lead.
+    pub fn gate_acquired(&mut self) {
+        self.gate_held = true;
+    }
+
+    /// A normal commit has released the reservation gate, producing
+    /// `generation`.
+    ///
+    /// Three things happen here, and each closes a different hole.
+    ///
+    /// *Stamping.* A leader files its answers before it can know the
+    /// generation its own gate release will produce, so it files them
+    /// incomplete and this fills them in. A member is not allowed to see an
+    /// answer until then: adopting `None` would be correct but would cost it
+    /// a full log scan on its next statement, which is the cost
+    /// [`Device::commit_generation`] exists to avoid.
+    ///
+    /// *Moving `gate_generation` on.* That is what lets a member nobody took
+    /// stop waiting (rule 2 above).
+    ///
+    /// *Failing out anything still in flight.* The safety net for rule 1: a
+    /// leader answers its cohort before it releases, so on every ordinary
+    /// path there is nothing here to fail. It fires when the leader unwound,
+    /// and it is reached because the same guard that releases the gate on a
+    /// panic calls this too.
+    pub fn gate_released(&mut self, generation: Option<u64>) {
+        self.gate_held = false;
+        self.gate_generation += 1;
+        for (result, _, ready) in self.resolved.values_mut() {
+            if *ready {
+                continue;
+            }
+            match result {
+                AbsorbResult::Committed { generation: g, .. }
+                | AbsorbResult::Conflict { generation: g, .. } => *g = generation,
+                AbsorbResult::Failed(_) | AbsorbResult::Fallback => {}
+            }
+            *ready = true;
+        }
+        self.fail_in_flight("the commit leading this cohort did not finish");
+    }
 
     /// [`Device::absorb_offer`]. Leaves `ops` untouched when it answers
     /// `None`, so the disabled path costs nothing but the check.
@@ -213,91 +296,100 @@ impl AbsorbQueue {
         self.next_token += 1;
         let token = self.next_token;
         let ops = core::mem::take(ops);
-        self.parked.push((token, AbsorbTxn { root, ops }));
+        self.parked.push(Parked {
+            token,
+            gate_generation: self.gate_generation,
+            txn: AbsorbTxn { root, ops },
+        });
         Some(token)
     }
 
-    /// [`Device::absorb_claim`]. The operations come home whether or not
-    /// anyone judged them — from `judged` if a leader took the offer, and
-    /// otherwise straight back out of the queue this thread put them in.
-    pub fn claim(&mut self, token: u64, ops: &mut PendingOps) -> Option<AbsorbDecision> {
-        if let Some((txn, decision)) = self.judged.remove(&token) {
-            *ops = txn.ops;
-            return decision;
-        }
-        if let Some(index) = self.parked.iter().position(|(id, _)| *id == token) {
-            let (_, txn) = self.parked.remove(index);
-            *ops = txn.ops;
-        }
-        None
-    }
-
-    /// [`Device::absorb_cohort`]: fix this cohort's membership, judge it, and
-    /// file one decision per member.
+    /// [`Device::absorb_take`]: fix this cohort's membership and hand it to
+    /// the leader.
     ///
     /// Membership is fixed by the drain, exactly as the flush side fixes its
     /// cohort by snapshotting `writes_completed` strictly before the barrier —
     /// a writer that parks after this point belongs to somebody else's cohort.
-    pub fn cohort(&mut self, seq: u64, decide: &mut dyn FnMut(&[AbsorbTxn]) -> Vec<AbsorbOutcome>) {
+    /// The tokens stay behind in `in_flight` so an unwind can still answer
+    /// them.
+    pub fn take(&mut self) -> Vec<(u64, AbsorbTxn)> {
         if !self.enabled || self.parked.is_empty() {
-            return;
+            return Vec::new();
         }
-        self.next_cohort += 1;
-        let cohort = self.next_cohort;
-        let (tokens, txns): (Vec<u64>, Vec<AbsorbTxn>) =
-            core::mem::take(&mut self.parked).into_iter().unzip();
-        let outcomes = decide(&txns);
-        // An answer of the wrong length is "no decisions", and every member
-        // falls back to the rebase it would have done anyway. That is also how
-        // a caller declines a cohort it cannot judge, so getting this wrong
-        // costs throughput and never correctness.
-        let judged = outcomes.len() == txns.len();
-        // The chain the leader is predicting. Only a member that *commits*
-        // moves the file's sequence number on; a conflicting member resolves
-        // its position without changing the file, which is the whole of the
-        // difference between `index` and `chain_seq`.
-        let mut index = 0u32;
-        let mut chain_seq = seq;
-        for (token, txn) in tokens.into_iter().zip(txns) {
-            let decision = judged.then(|| {
-                let outcome = outcomes[index as usize];
-                index += 1;
-                let expect = AbsorbSeal {
-                    cohort,
-                    index,
-                    seq: chain_seq,
-                };
-                if outcome == AbsorbOutcome::Clean {
-                    chain_seq += 1;
-                }
-                AbsorbDecision { expect, outcome }
-            });
-            self.judged.insert(token, (txn, decision));
-        }
-        if judged {
-            self.cohorts += 1;
-            self.members += u64::from(index);
-        }
-        // Published only once every member is filed, so a follower that wakes
-        // early can never find a seal naming a decision that is not there yet.
-        self.seal = judged.then_some(AbsorbSeal {
-            cohort,
-            index: 1,
-            seq,
-        });
+        let cohort: Vec<(u64, AbsorbTxn)> = core::mem::take(&mut self.parked)
+            .into_iter()
+            .map(|parked| (parked.token, parked.txn))
+            .collect();
+        self.cohorts += 1;
+        self.members += cohort.len() as u64;
+        self.in_flight
+            .extend(cohort.iter().map(|(token, _)| *token));
+        cohort
     }
 
-    /// [`Device::absorption_seal`].
-    pub fn seal(&self) -> Option<AbsorbSeal> {
-        self.seal
+    /// [`Device::absorb_resolve`]: file one answer per member.
+    ///
+    /// `ops` is only read for [`AbsorbResult::Fallback`], which is the one
+    /// answer that says "this transaction is still yours"; every other answer
+    /// means the leader consumed it.
+    pub fn resolve(&mut self, results: Vec<(u64, AbsorbResult, PendingOps)>) {
+        for (token, result, ops) in results {
+            self.in_flight.retain(|held| *held != token);
+            if matches!(result, AbsorbResult::Committed { .. }) {
+                self.committed += 1;
+            }
+            self.resolved.insert(token, (result, ops, false));
+        }
     }
 
-    /// [`Device::set_absorption_seal`]. A device that was never asked for
-    /// absorption keeps `None` forever, which matches no decision.
-    pub fn set_seal(&mut self, seal: Option<AbsorbSeal>) {
-        if self.enabled {
-            self.seal = seal;
+    /// Answer every member a leader took and never resolved with
+    /// [`AbsorbResult::Failed`].
+    ///
+    /// `Failed` rather than `Fallback` on purpose: the leader may have got as
+    /// far as writing the cohort's records, and a member told to try again
+    /// with bytes already on the file would apply its transaction twice.
+    pub fn fail_in_flight(&mut self, reason: &'static str) {
+        for token in core::mem::take(&mut self.in_flight) {
+            self.resolved.insert(
+                token,
+                (AbsorbResult::Failed(reason), PendingOps::new(), true),
+            );
         }
+    }
+
+    /// One turn of [`Device::absorb_wait`]'s wait.
+    ///
+    /// `Some` is the final answer and `ops` has been restored if the answer
+    /// needs them. `None` means "not yet" — a threaded device waits on its
+    /// condvar and calls again; a single-threaded simulation can never see it,
+    /// because there the leader has always already resolved by the time a
+    /// follower's `commit()` is entered.
+    pub fn wait_step(&mut self, token: u64, ops: &mut PendingOps) -> Option<AbsorbResult> {
+        if self
+            .resolved
+            .get(&token)
+            .is_some_and(|(_, _, ready)| *ready)
+        {
+            let (result, returned, _) = self
+                .resolved
+                .remove(&token)
+                .expect("just checked that this token is resolved");
+            *ops = returned;
+            return Some(result);
+        }
+        let Some(index) = self.parked.iter().position(|parked| parked.token == token) else {
+            // Taken by a leader and not answered yet. Rule 3.
+            return None;
+        };
+        if self.parked[index].gate_generation == self.gate_generation && self.gate_held {
+            return None;
+        }
+        // Rule 2: the gate hold this was offered into has ended without
+        // taking it. Nothing was written on its behalf, so the ordinary
+        // commit path is exactly right.
+        let parked = self.parked.remove(index);
+        *ops = parked.txn.ops;
+        Some(AbsorbResult::Fallback)
     }
 }
 
@@ -703,67 +795,67 @@ pub trait Device {
         None
     }
 
-    /// Take back the transaction offered under `token`, with the gate
-    /// holder's decision if one was made.
+    /// Block until the leader that this transaction was offered to has an
+    /// answer for it, and take the transaction back if the answer needs it.
     ///
-    /// Called once, after [`Device::begin_normal_commit`] returns — success
-    /// or failure — because the ops belong to the caller's handle and must
-    /// come home either way. `None` means no leader reached this offer, and
-    /// the caller runs the ordinary `rebase_pending`.
-    fn absorb_claim(&self, _token: u64, _ops: &mut PendingOps) -> Option<AbsorbDecision> {
-        None
+    /// This is what an offered writer does **instead of**
+    /// [`Device::begin_normal_commit`]: a follower under commit-side
+    /// absorption never queues for the reservation gate at all. It is woken
+    /// once, with an outcome, strictly after the leader's own barrier
+    /// returned — so no member is ever told it committed before the bytes it
+    /// depends on are durable.
+    ///
+    /// The default answers [`AbsorbResult::Fallback`] without waiting, which
+    /// is unreachable for a device whose [`Device::absorb_offer`] never hands
+    /// out a token — every device that does not absorb.
+    ///
+    /// `ops` is restored if and only if the answer is
+    /// [`AbsorbResult::Fallback`]; every other answer means the leader
+    /// consumed the transaction.
+    fn absorb_wait(&self, _token: u64, _ops: &mut PendingOps) -> AbsorbResult {
+        AbsorbResult::Fallback
     }
 
     /// Hand the gate holder every transaction currently parked for
-    /// absorption, in gate-arrival order, and file the decision it makes for
-    /// each.
+    /// absorption, in gate-arrival order, and fix this cohort's membership.
     ///
-    /// Called by a writer that has just published its own [`CommitPoint`] and
-    /// still holds the gate; `seq` is the sequence number it committed at.
-    /// The whole cohort arrives as one slice rather than one call per member
-    /// so the caller can fold a *logical overlay* forward across it — member
-    /// `j` has to be judged against member `j - 1`'s post-rebase root, which
-    /// does not exist yet and never will under this slice, so it is answered
-    /// from the earlier members' own operations instead. See
-    /// `docs/research/commit-group-slice1.md` §1.
+    /// Called by a writer that holds the gate and has just finished its own
+    /// in-gate work. Everything returned here **must** be answered through
+    /// [`Device::absorb_resolve`] before the gate is released; the device is
+    /// entitled to assume that, and to treat anything left over as a failed
+    /// leader.
     ///
-    /// `decide` returns one outcome per transaction, in the same order. A
-    /// return of any other length is treated as "no decision" and every
-    /// member falls back, so a caller that gets this wrong loses performance
-    /// and never correctness.
-    ///
-    /// The implementation is responsible for assigning the cohort id and for
-    /// publishing the leader's own [`AbsorbSeal`] — the caller does not know
-    /// what cohort it just created.
-    fn absorb_cohort(
-        &self,
-        _seq: u64,
-        _decide: &mut dyn FnMut(&[AbsorbTxn]) -> Vec<AbsorbOutcome>,
-    ) {
+    /// The default returns nothing, which is what keeps every non-absorbing
+    /// device on today's protocol.
+    fn absorb_take(&self) -> Vec<(u64, AbsorbTxn)> {
+        Vec::new()
     }
 
-    /// The absorption chain position the file's committed state is currently
-    /// at, or `None` when the last thing to change it was not a chain member.
+    /// Answer every member of the cohort [`Device::absorb_take`] handed over,
+    /// and wake them.
     ///
-    /// Read under the reservation gate, and compared for equality against
-    /// [`AbsorbDecision::expect`] — all three fields. Answering `None`, the
-    /// default, is what makes every non-absorbing device refuse every
-    /// decision it could never have been handed anyway.
-    fn absorption_seal(&self) -> Option<AbsorbSeal> {
-        None
-    }
+    /// Called under the reservation gate and, for a cohort that reached the
+    /// disk, strictly after the leader's barrier returned. The third element
+    /// of each tuple is that member's operations, moved back for an
+    /// [`AbsorbResult::Fallback`] and empty for every other answer.
+    fn absorb_resolve(&self, _results: Vec<(u64, AbsorbResult, PendingOps)>) {}
 
-    /// Publish the absorption chain position this commit leaves behind.
+    /// [`Device::sync_commit`]'s barrier, for a leader that is still holding
+    /// the reservation gate.
     ///
-    /// Called under the reservation gate by **every** commit that reaches it,
-    /// and by [`crate::btree::CowBTree::checkpoint`]: `Some` from a member
-    /// that acted on its own decision, `None` from everything else — an
-    /// ordinary commit, a conflict that did not come from a decision, a
-    /// checkpoint, an error inside the gate. That is what makes a stale
-    /// decision impossible to use rather than merely unlikely: anything the
-    /// leader did not predict clears the seal, and a cleared seal matches no
-    /// `expect`.
-    fn set_absorption_seal(&self, _seal: Option<AbsorbSeal>) {}
+    /// One thing separates it from [`Device::sync_commit`]: it must not wait
+    /// for other normal committers to publish their tickets. A leader syncing
+    /// inside the gate is itself the only normal committer that can be in
+    /// flight, and the gather window `inlaysql`'s coordinator opens on the
+    /// ordinary path would spin against its own caller until its yield budget
+    /// ran out. Checkpoints already take a non-coalescing barrier for exactly
+    /// this reason.
+    ///
+    /// The default forwards to [`Device::sync_commit`], which is right for
+    /// every device that has only one barrier.
+    fn sync_commit_in_gate(&mut self) -> Result<()> {
+        self.sync_commit()
+    }
 
     /// Whether page ids may already be reused on this device.
     ///
@@ -883,19 +975,19 @@ impl<T: Device> Device for Rc<RefCell<T>> {
         self.borrow().absorb_offer(root, ops)
     }
 
-    fn absorb_claim(&self, token: u64, ops: &mut PendingOps) -> Option<AbsorbDecision> {
-        self.borrow().absorb_claim(token, ops)
+    fn absorb_wait(&self, token: u64, ops: &mut PendingOps) -> AbsorbResult {
+        self.borrow().absorb_wait(token, ops)
     }
 
-    fn absorb_cohort(&self, seq: u64, decide: &mut dyn FnMut(&[AbsorbTxn]) -> Vec<AbsorbOutcome>) {
-        self.borrow().absorb_cohort(seq, decide);
+    fn absorb_take(&self) -> Vec<(u64, AbsorbTxn)> {
+        self.borrow().absorb_take()
     }
 
-    fn absorption_seal(&self) -> Option<AbsorbSeal> {
-        self.borrow().absorption_seal()
+    fn absorb_resolve(&self, results: Vec<(u64, AbsorbResult, PendingOps)>) {
+        self.borrow().absorb_resolve(results);
     }
 
-    fn set_absorption_seal(&self, seal: Option<AbsorbSeal>) {
-        self.borrow().set_absorption_seal(seal);
+    fn sync_commit_in_gate(&mut self) -> Result<()> {
+        self.borrow_mut().sync_commit_in_gate()
     }
 }

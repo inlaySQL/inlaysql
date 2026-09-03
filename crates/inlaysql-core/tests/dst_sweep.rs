@@ -24,8 +24,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use inlaysql_core::btree::{
-    AbsorbDecision, AbsorbOutcome, AbsorbQueue, AbsorbSeal, AbsorbTxn, CommitOutcome, CowBTree,
-    Device, PageId, PendingOps,
+    AbsorbQueue, AbsorbResult, AbsorbTxn, CommitOutcome, CowBTree, Device, PageId, PendingOps,
 };
 use inlaysql_core::mem::SeededRng;
 use inlaysql_core::sim::{FaultSchedule, SimDisk, Simulator};
@@ -303,13 +302,14 @@ fn multi_writer_regions_recover_to_a_committed_interleaving() {
 }
 
 // ---------------------------------------------------------------------------
-// Commit-side absorption (AHL-544, `docs/research/commit-group-slice1.md`)
+// Commit-side absorption (AHL-547, `docs/research/commit-group-slice2.md`)
 //
-// Absorption moves the first-committer-wins *decision* to whichever writer
-// holds the commit reservation gate: it judges every transaction parked
-// behind it, in gate-arrival order, each against the previous member's
-// logical post-rebase state. Every writer still rebases, encodes, appends
-// into its own region, publishes its own ticket and runs its own sync.
+// A writer that offers its transaction to the commit reservation gate is
+// committed *by* whichever writer holds it. The leader judges every parked
+// transaction in gate-arrival order with the unchanged `rebase_pending`
+// comparison, replays the clean ones through its own tree, writes their
+// pages, appends every member's record back to back in its own region as one
+// write, syncs once, and only then hands each member its outcome.
 //
 // The claim that has to be checked rather than asserted is that this changes
 // nothing: the same transactions, offered in the same order, must produce the
@@ -364,25 +364,42 @@ impl<D: Device> Device for AbsorbingDevice<D> {
         }
     }
 
+    /// The sweep has no threads, so this is where the gate's *shape* is
+    /// modelled: a leader advertises itself here and stands down in
+    /// [`Device::end_normal_commit`], which is what lets `AbsorbQueue`'s
+    /// "a member nobody took goes home when the gate hold ends" rule be the
+    /// production one rather than a second copy written for the test.
+    fn begin_normal_commit(&self) -> Result<()> {
+        self.gate.borrow_mut().gate_acquired();
+        Ok(())
+    }
+
+    fn end_normal_commit(&self) -> Option<u64> {
+        self.gate.borrow_mut().gate_released(None);
+        None
+    }
+
     fn absorb_offer(&self, root: PageId, ops: &mut PendingOps) -> Option<u64> {
         self.gate.borrow_mut().offer(root, ops)
     }
 
-    fn absorb_claim(&self, token: u64, ops: &mut PendingOps) -> Option<AbsorbDecision> {
-        self.gate.borrow_mut().claim(token, ops)
+    /// Never actually waits: a single-threaded sweep only reaches a member's
+    /// `commit()` after the leader's has returned, and a leader answers every
+    /// member it took before it releases the gate. `None` here would mean
+    /// that invariant is broken, which is worth failing loudly for.
+    fn absorb_wait(&self, token: u64, ops: &mut PendingOps) -> AbsorbResult {
+        self.gate
+            .borrow_mut()
+            .wait_step(token, ops)
+            .expect("a leader answers every member it took before it releases the gate")
     }
 
-    fn absorb_cohort(&self, seq: u64, decide: &mut dyn FnMut(&[AbsorbTxn]) -> Vec<AbsorbOutcome>) {
-        // `decide` reads the tree, which borrows `shared`, never `gate`.
-        self.gate.borrow_mut().cohort(seq, decide);
+    fn absorb_take(&self) -> Vec<(u64, AbsorbTxn)> {
+        self.gate.borrow_mut().take()
     }
 
-    fn absorption_seal(&self) -> Option<AbsorbSeal> {
-        self.gate.borrow().seal()
-    }
-
-    fn set_absorption_seal(&self, seal: Option<AbsorbSeal>) {
-        self.gate.borrow_mut().set_seal(seal);
+    fn absorb_resolve(&self, results: Vec<(u64, AbsorbResult, PendingOps)>) {
+        self.gate.borrow_mut().resolve(results);
     }
 }
 
@@ -441,15 +458,16 @@ fn absorbing_writers(
 }
 
 /// Apply one cohort exactly as the gate would see it: every member buffers
-/// its transaction, every follower parks, the leader commits (judging the
-/// parked followers if absorption is on), then each follower commits in
-/// arrival order. Returns one outcome per member, in that order.
+/// its transaction, every follower parks, the leader commits — judging,
+/// writing, appending and syncing the whole cohort — and then each follower's
+/// own `commit()` collects the answer the leader left for it. Returns one
+/// outcome per member, in arrival order.
 fn run_cohort(
     writers: &mut [CowBTree<AbsorbingDevice<Simulator>>],
     cohort: &Cohort,
     absorption: bool,
     shared: &Rc<RefCell<Simulator>>,
-) -> Vec<CommitOutcome> {
+) -> Vec<Option<CommitOutcome>> {
     for txn in cohort {
         let writer = &mut writers[txn.writer];
         match &txn.value {
@@ -462,14 +480,50 @@ fn run_cohort(
             writers[txn.writer].park_for_absorption();
         }
     }
-    // A crash rolls the readable image back to the durable one, so anything
-    // committed after it is written on top of a file that no longer exists.
-    // Stop at the first one, exactly as every other sweep here does.
     let mut outcomes = Vec::new();
-    for txn in cohort {
-        outcomes.push(writers[txn.writer].commit().unwrap());
-        if shared.borrow().crashed() {
+    for (index, txn) in cohort.iter().enumerate() {
+        // A crash rolls the readable image back to the durable one, so a
+        // commit issued afterwards writes on top of a file that no longer
+        // exists — every sweep here stops at the first one. A cohort *member*
+        // is the exception and has to keep going: it writes nothing at all,
+        // it only collects the answer its leader already decided, and
+        // skipping it would leave the acknowledged set short of members whose
+        // records are on the disk.
+        let member = absorption && index > 0;
+        if !member && shared.borrow().crashed() {
             break;
+        }
+        let before = writers[txn.writer].absorbed_commits();
+        match writers[txn.writer].commit() {
+            Ok(outcome) => {
+                if member
+                    && writers[txn.writer].absorbed_commits() == before
+                    && shared.borrow().crashed()
+                {
+                    // The leader declined it, so it committed for itself —
+                    // after the crash, on top of a file the readable image
+                    // has already rolled back past. Whether its record is in
+                    // the durable image is exactly as unknowable as the
+                    // `Err` case below, and it is recorded the same way.
+                    outcomes.push(None);
+                    break;
+                }
+                outcomes.push(Some(outcome));
+            }
+            // The commit carrying this member failed after its record may
+            // already have reached the disk — the ambiguity
+            // `docs/research/commit-group-slice2.md` §9 names, and the honest
+            // answer is that neither this handle nor this test can say. Every
+            // member from here on is in the same position, and none of them
+            // is asked to commit: a leader that failed has already decided
+            // them, and the one thing that must not happen is a member
+            // writing for itself on top of a rolled-back file.
+            Err(_) => {
+                while outcomes.len() < cohort.len() {
+                    outcomes.push(None);
+                }
+                break;
+            }
         }
     }
     outcomes
@@ -482,7 +536,11 @@ fn replay(
     cohorts: &[Cohort],
     writers: usize,
     absorption: bool,
-) -> Option<(Vec<Vec<CommitOutcome>>, BTreeMap<Vec<u8>, Vec<u8>>, u64)> {
+) -> Option<(
+    Vec<Vec<Option<CommitOutcome>>>,
+    BTreeMap<Vec<u8>, Vec<u8>>,
+    u64,
+)> {
     let (mut handles, shared, gate) =
         absorbing_writers(writers, FaultSchedule::script(&[]), absorption)?;
     let outcomes = cohorts
@@ -625,10 +683,10 @@ fn a_follower_conflicts_with_an_earlier_member_of_its_own_cohort() {
         assert_eq!(
             outcomes,
             vec![
-                CommitOutcome::Committed,
-                CommitOutcome::Conflict,
-                CommitOutcome::Committed,
-                CommitOutcome::Conflict,
+                Some(CommitOutcome::Committed),
+                Some(CommitOutcome::Conflict),
+                Some(CommitOutcome::Committed),
+                Some(CommitOutcome::Conflict),
             ],
             "absorption = {absorption}"
         );
@@ -666,13 +724,13 @@ fn a_follower_conflicts_with_an_earlier_member_of_its_own_cohort() {
     }
 }
 
-/// A decision is used only when the file's committed state is the one it was
-/// computed against. An outsider committing between the leader and the
-/// follower makes it something else, and the follower must fall back to the
-/// full comparison rather than trust an answer to the wrong question.
+/// A transaction offered into a gate hold that ends without taking it must
+/// be handed back, not left waiting for a leader that is never coming — the
+/// second of `AbsorbQueue`'s three liveness rules, and the only one a
+/// single-threaded sweep can drive directly.
 #[test]
-fn an_outsider_commit_invalidates_a_pending_decision() {
-    let (mut writers, _shared, _gate) =
+fn a_member_no_leader_took_is_handed_back_and_commits_itself() {
+    let (mut writers, _shared, gate) =
         absorbing_writers(4, FaultSchedule::script(&[]), true).unwrap();
     writers[0].put(b"x", b"1").unwrap();
     writers[0].commit().unwrap();
@@ -680,123 +738,227 @@ fn an_outsider_commit_invalidates_a_pending_decision() {
         writer.refresh().unwrap();
     }
 
-    // Member 1 parks behind the leader, and would be told `Clean`.
+    // Writer 1 offers, and then a whole gate hold happens without anybody
+    // draining the queue — which is exactly what a writer that parks *after*
+    // the leader fixed its cohort's membership sees.
     writers[1].put(b"y", b"9").unwrap();
-    writers[1].park_for_absorption();
-    writers[0].put(b"z", b"9").unwrap();
-    assert_eq!(writers[0].commit().unwrap(), CommitOutcome::Committed);
+    assert!(writers[1].park_for_absorption());
+    gate.borrow_mut().gate_acquired();
+    gate.borrow_mut().gate_released(None);
 
-    // An outsider takes the gate first and writes the very key member 1 is
-    // about to write. Its decision is now an answer about a state the file
-    // is no longer in.
-    writers[2].put(b"y", b"8").unwrap();
-    assert_eq!(writers[2].commit().unwrap(), CommitOutcome::Committed);
-
-    assert_eq!(writers[1].commit().unwrap(), CommitOutcome::Conflict);
+    assert_eq!(writers[1].commit().unwrap(), CommitOutcome::Committed);
     assert_eq!(
         writers[1].absorbed_commits(),
         0,
-        "a stale decision must not be used"
+        "a member that was handed back commits itself"
+    );
+    writers[0].refresh().unwrap();
+    let state: BTreeMap<Vec<u8>, Vec<u8>> = writers[0]
+        .scan()
+        .unwrap()
+        .into_iter()
+        .map(|(key, value)| (key, value.into_vec()))
+        .collect();
+    assert_eq!(
+        state.get(b"y".as_slice()).map(Vec::as_slice),
+        Some(&b"9"[..])
     );
 }
 
-/// The chain itself, asserted value by value: what a leader publishes, and
-/// how a committing member and a conflicting member each move it on.
-///
-/// The three seal fields are jointly a chain *identity* — "the file is at
-/// cohort `C`, position `j`, sequence `s`" — and every one of them is
-/// individually redundant while the "anything the leader did not predict
-/// publishes `None`" rule holds everywhere. That rule is what
-/// [`an_outsider_commit_invalidates_a_pending_decision`] pins; this pins the
-/// arithmetic, which is the part that is easy to get subtly wrong: a
-/// conflicting member advances the position and *not* the sequence number,
-/// because it changed nothing on the file, and getting that backwards would
-/// make every member after a conflict silently fall back — still correct,
-/// still hiding the bug.
+/// **One append and one sync per cohort**, which is the whole of what this
+/// slice buys and is therefore checked rather than assumed. A counting device
+/// wraps the simulator and reports how many writes landed inside the WAL
+/// regions and how many barriers ran; a cohort of four must produce exactly
+/// one of each, and the recovered file must contain every member's row.
 #[test]
-fn the_absorption_chain_advances_one_position_per_member_and_one_sequence_per_commit() {
-    let (mut writers, shared, gate) =
-        absorbing_writers(4, FaultSchedule::script(&[]), true).unwrap();
-    writers[0].put(b"x", b"1").unwrap();
-    writers[0].commit().unwrap();
+fn a_cohort_is_one_wal_append_and_one_sync() {
+    let counts = Rc::new(RefCell::new((0usize, 0usize)));
+    let simulator = Simulator::with_disk(
+        0,
+        SimDisk::with_block_size(BLOCK, CAPACITY),
+        FaultSchedule::script(&[]),
+    );
+    let shared = Rc::new(RefCell::new(Counting {
+        inner: simulator,
+        counts: counts.clone(),
+        wal: 0..0,
+    }));
+    let gate: Gate = Rc::new(RefCell::new(AbsorbQueue::default()));
+    let device = |region| AbsorbingDevice {
+        shared: shared.clone(),
+        region,
+        gate: gate.clone(),
+    };
+    let mut first = CowBTree::create(device(0), PAGE).unwrap();
+    first.set_commit_absorption(true);
+    let mut writers = vec![first];
+    for region in 1..inlaysql_core::wal::WAL_REGIONS {
+        let mut handle = CowBTree::open(device(region)).unwrap();
+        handle.set_commit_absorption(true);
+        writers.push(handle);
+    }
+    let wal = inlaysql_core::wal::wal_start(PAGE)
+        ..inlaysql_core::wal::all_regions_end(PAGE, inlaysql_core::btree::FORMAT_VERSION);
+    shared.borrow_mut().wal = wal;
+
+    for (index, writer) in writers.iter_mut().enumerate() {
+        writer.put(format!("k{index}").as_bytes(), b"v").unwrap();
+    }
     for writer in writers.iter_mut().skip(1) {
-        writer.refresh().unwrap();
+        assert!(writer.park_for_absorption());
     }
-
-    let cohort = vec![
-        Txn {
-            writer: 0,
-            key: b"x".to_vec(),
-            value: Some(b"2".to_vec()),
-        },
-        // Conflicts with the leader.
-        Txn {
-            writer: 1,
-            key: b"x".to_vec(),
-            value: Some(b"3".to_vec()),
-        },
-        // Disjoint, so it commits.
-        Txn {
-            writer: 2,
-            key: b"y".to_vec(),
-            value: Some(b"4".to_vec()),
-        },
-    ];
-    for txn in &cohort {
-        let writer = &mut writers[txn.writer];
-        writer.put(&txn.key, txn.value.as_deref().unwrap()).unwrap();
-    }
-    writers[1].park_for_absorption();
-    writers[2].park_for_absorption();
-
+    *counts.borrow_mut() = (0, 0);
     assert_eq!(writers[0].commit().unwrap(), CommitOutcome::Committed);
-    let leader = gate
-        .borrow()
-        .seal()
-        .expect("a leader with a cohort seals it");
+    let (appends, syncs) = *counts.borrow();
     assert_eq!(
-        (leader.index, leader.seq),
-        (1, 2),
-        "leader's own commit is seq 2"
+        (appends, syncs),
+        (1, 1),
+        "a cohort must be one write into the log and one barrier"
     );
+    for writer in writers.iter_mut().skip(1) {
+        assert_eq!(writer.commit().unwrap(), CommitOutcome::Committed);
+    }
+    assert_eq!(
+        *counts.borrow(),
+        (1, 1),
+        "a member must not append or sync anything of its own"
+    );
+    assert_eq!(gate.borrow().cohorts, 1);
+    assert_eq!(gate.borrow().committed, writers.len() as u64 - 1);
 
-    assert_eq!(writers[1].commit().unwrap(), CommitOutcome::Conflict);
-    let after_conflict = gate
-        .borrow()
-        .seal()
-        .expect("a conflict resolves its position");
-    assert_eq!(
-        (
-            after_conflict.cohort,
-            after_conflict.index,
-            after_conflict.seq
-        ),
-        (leader.cohort, 2, 2),
-        "a conflict advances the position and leaves the file's sequence alone"
-    );
+    let image = shared.borrow().inner.disk().durable().to_vec();
+    drop(writers);
+    let reopened = CowBTree::open(SimDisk::with_image(BLOCK, &image)).unwrap();
+    let recovered: BTreeMap<Vec<u8>, Vec<u8>> = reopened
+        .scan()
+        .unwrap()
+        .into_iter()
+        .map(|(key, value)| (key, value.into_vec()))
+        .collect();
+    for index in 0..inlaysql_core::wal::WAL_REGIONS {
+        assert_eq!(
+            recovered
+                .get(format!("k{index}").as_bytes())
+                .map(Vec::as_slice),
+            Some(&b"v"[..]),
+            "member {index}'s row must survive the reopen"
+        );
+    }
+}
 
-    assert_eq!(writers[2].commit().unwrap(), CommitOutcome::Committed);
-    assert_eq!(writers[2].absorbed_commits(), 1);
-    let after_commit = gate
-        .borrow()
-        .seal()
-        .expect("a committing member seals its successor");
-    assert_eq!(
-        (after_commit.cohort, after_commit.index, after_commit.seq),
-        (leader.cohort, 3, 3),
-        "a commit advances both"
-    );
+/// A device that counts writes into the log regions and barriers, so
+/// [`a_cohort_is_one_wal_append_and_one_sync`] can assert the protocol rather
+/// than infer it.
+struct Counting {
+    inner: Simulator,
+    counts: Rc<RefCell<(usize, usize)>>,
+    wal: std::ops::Range<usize>,
+}
 
-    // And a writer that was never in the cohort clears the chain outright.
-    writers[3].refresh().unwrap();
-    writers[3].put(b"z", b"5").unwrap();
-    assert_eq!(writers[3].commit().unwrap(), CommitOutcome::Committed);
-    assert_eq!(
-        gate.borrow().seal(),
-        None,
-        "a commit nobody predicted must leave no chain for a stale decision to match"
-    );
-    assert!(!shared.borrow().crashed());
+impl Device for Counting {
+    fn read(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
+        self.inner.read(offset, buf)
+    }
+
+    fn write(&mut self, offset: usize, data: &[u8]) -> Result<()> {
+        if self.wal.contains(&offset) {
+            self.counts.borrow_mut().0 += 1;
+        }
+        self.inner.write(offset, data)
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        self.counts.borrow_mut().1 += 1;
+        Device::sync(&mut self.inner)
+    }
+}
+
+/// A cohort's records are one contiguous run of self-contained, chained
+/// records in the leader's region — which is what makes recovery need no new
+/// logic at all. Truncating the run after member *k* must leave recovery on
+/// exactly member *k*'s state, for every *k*.
+#[test]
+fn a_torn_record_in_a_cohort_keeps_exactly_the_prefix() {
+    // Build the same four-member cohort each time and cut the log short at a
+    // different record boundary.
+    for keep in 0..4usize {
+        let (mut writers, shared, _gate) =
+            absorbing_writers(4, FaultSchedule::script(&[]), true).unwrap();
+        writers[0].put(b"seed", b"0").unwrap();
+        writers[0].commit().unwrap();
+        for writer in writers.iter_mut().skip(1) {
+            writer.refresh().unwrap();
+        }
+        for (index, writer) in writers.iter_mut().enumerate() {
+            writer.put(format!("k{index}").as_bytes(), b"v").unwrap();
+        }
+        for writer in writers.iter_mut().skip(1) {
+            assert!(writer.park_for_absorption());
+        }
+        let region_start =
+            inlaysql_core::wal::region_start(PAGE, inlaysql_core::btree::FORMAT_VERSION, 0);
+        let before = writers[0]
+            .device()
+            .commit_point(0)
+            .map_or(region_start, |point| point.append_offset);
+        assert_eq!(writers[0].commit().unwrap(), CommitOutcome::Committed);
+        for writer in writers.iter_mut().skip(1) {
+            assert_eq!(writer.commit().unwrap(), CommitOutcome::Committed);
+        }
+
+        // Walk the cohort's own byte range and find each record boundary.
+        let image = shared.borrow().disk().durable().to_vec();
+        // Walk the region record by record exactly as `scan_region` does:
+        // a four-byte length prefix, then that many bytes to decode.
+        let mut offset = region_start;
+        let mut boundaries: Vec<(usize, u64)> = Vec::new();
+        loop {
+            let total = u32::from_le_bytes(image[offset..offset + 4].try_into().unwrap()) as usize;
+            if total == 0 || offset + total > image.len() {
+                break;
+            }
+            let Some(record) = inlaysql_core::wal::decode_record(&image[offset..offset + total])
+            else {
+                break;
+            };
+            offset += total;
+            boundaries.push((offset, record.seq));
+        }
+        // The first record is the seed commit; the cohort is the four after
+        // it, appended by one writer in one call.
+        let boundaries: Vec<(usize, u64)> = boundaries.split_off(boundaries.len() - 4);
+        let _ = before;
+        assert_eq!(
+            boundaries.len(),
+            4,
+            "a four-member cohort appends four chained records"
+        );
+        let (cut, kept_seq) = boundaries[keep];
+        let mut torn = image.clone();
+        // Everything past the cut is lost, which is what a torn write of the
+        // cohort's single `pwrite` leaves behind.
+        for byte in torn[cut..].iter_mut() {
+            *byte = 0;
+        }
+        drop(writers);
+        let reopened = CowBTree::open(SimDisk::with_image(BLOCK, &torn))
+            .unwrap_or_else(|err| panic!("keep {keep}: recovery failed: {err}"));
+        let recovered: BTreeMap<Vec<u8>, Vec<u8>> = reopened
+            .scan()
+            .unwrap()
+            .into_iter()
+            .map(|(key, value)| (key, value.into_vec()))
+            .collect();
+        for index in 0..4usize {
+            let present = recovered.contains_key(format!("k{index}").as_bytes());
+            assert_eq!(
+                present,
+                index <= keep,
+                "keep {keep}: member {index}'s row present = {present}, but the chain \
+                 stops at seq {kept_seq}"
+            );
+        }
+    }
 }
 
 /// Crash at every sync of a cohort's run — the leader before its own sync,
@@ -822,7 +984,7 @@ fn a_crash_at_every_step_of_a_cohort_never_publishes_an_unacknowledged_member() 
         'cohorts: for cohort in &cohorts {
             let outcomes = run_cohort(&mut writers, cohort, true, &shared);
             for (txn, outcome) in cohort.iter().zip(&outcomes) {
-                if *outcome == CommitOutcome::Committed {
+                if *outcome != Some(CommitOutcome::Conflict) {
                     *acknowledged.entry(txn.key.clone()).or_default() += 1;
                     match &txn.value {
                         Some(value) => committed.insert(txn.key.clone(), value.clone()),
@@ -878,7 +1040,10 @@ fn sweep_multi_writer_absorbed(seed: u64) -> u64 {
     'cohorts: for cohort in &cohorts {
         let outcomes = run_cohort(&mut writers, cohort, true, &shared);
         for (txn, outcome) in cohort.iter().zip(&outcomes) {
-            if *outcome == CommitOutcome::Committed {
+            // `None` is "the leader could not say" — its record may or may
+            // not have reached the disk, so both states are legal recovery
+            // targets and both go into the set.
+            if *outcome != Some(CommitOutcome::Conflict) {
                 match &txn.value {
                     Some(value) => expected.insert(txn.key.clone(), value.clone()),
                     None => expected.remove(&txn.key),

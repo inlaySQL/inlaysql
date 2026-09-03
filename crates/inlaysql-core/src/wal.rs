@@ -216,6 +216,25 @@ where
     I: ExactSizeIterator<Item = (PageId, &'a [u8])>,
 {
     out.clear();
+    encode_record_onto(out, format_version, meta, pages);
+}
+
+/// [`encode_record_into`], appending to whatever `out` already holds instead
+/// of replacing it — the same bytes, at a later offset.
+///
+/// Commit-side absorption (`docs/research/commit-group-slice2.md`) is why
+/// this exists: a cohort leader encodes its own record and then one per
+/// member into a single buffer and issues **one** `pwrite` for all of them,
+/// back to back in its own region. The records are byte-for-byte what N
+/// separate commits would have written, which is the whole reason recovery
+/// needs no new logic — each one keeps its own length prefix and its own
+/// checksum, so `scan_region` validates them one at a time and a torn write
+/// truncates the chain at whichever record did not survive.
+pub fn encode_record_onto<'a, I>(out: &mut Vec<u8>, format_version: u32, meta: RecordMeta, pages: I)
+where
+    I: ExactSizeIterator<Item = (PageId, &'a [u8])>,
+{
+    let start = out.len();
     push_u32(out, 0); // length placeholder, patched once the body is known
     push_u64(out, meta.seq);
     if format_version >= MULTI_REGION_FORMAT_VERSION {
@@ -230,9 +249,9 @@ where
         push_u32(out, bytes.len() as u32);
         out.extend_from_slice(bytes);
     }
-    let total = (out.len() + 8) as u32;
-    out[R_LEN..R_LEN + 4].copy_from_slice(&total.to_le_bytes());
-    let checksum = crate::checksum::fnv1a(out);
+    let total = (out.len() - start + 8) as u32;
+    out[start + R_LEN..start + R_LEN + 4].copy_from_slice(&total.to_le_bytes());
+    let checksum = crate::checksum::fnv1a(&out[start..]);
     push_u64(out, checksum);
 }
 
