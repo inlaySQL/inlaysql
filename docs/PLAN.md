@@ -19,6 +19,13 @@ current execution order without relying on local conversation history.
 
 ## Current state (2026-09-02, evening)
 
+- 2026-09-03 evening: AHL-549 (the probed inner row is decoded once where
+  it is used, the borrowing API serves joins, an index probe's four
+  per-outer-row buffers are reused: PK `LIMIT 10` join 4.4 → 3.7 µs vs
+  SQLite 3.4–3.5, secondary 6.4 → 6.1) and AHL-550 (the residual filter is
+  compiled once per execution: `indexed-range` 1.22–1.36x; the UTF-8
+  re-validation item measured flat and was not landed). Both unpublished
+  until the next gated `repeat.sh`.
 - 2026-09-03, 12:00–16:45: AHL-547 (C1 slice 2 — one WAL append and one
   sync per cohort, acknowledged after the barrier; DST-clean; **measured
   0.78–0.90x at 8–32 writers** because commit-side cohorts displace the
