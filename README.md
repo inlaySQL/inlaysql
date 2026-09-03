@@ -1,42 +1,86 @@
-# InlaySQL
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="logo/InlaySQL_Logo-horizontal-dark.svg">
+    <img alt="InlaySQL" src="logo/InlaySQL_Logo-horizontal.svg" width="420">
+  </picture>
+</div>
 
-[![CI](https://github.com/inlaySQL/inlaysql/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/inlaySQL/inlaysql/actions/workflows/ci.yml?query=branch%3Amain)
-[![WASM](https://github.com/inlaySQL/inlaysql/actions/workflows/wasm.yml/badge.svg?branch=main)](https://github.com/inlaySQL/inlaysql/actions/workflows/wasm.yml?query=branch%3Amain)
+<p align="center">
+  <a href="https://github.com/inlaySQL/inlaysql/actions/workflows/ci.yml"><img src="https://github.com/inlaySQL/inlaysql/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/inlaySQL/inlaysql/actions/workflows/wasm.yml"><img src="https://github.com/inlaySQL/inlaysql/actions/workflows/wasm.yml/badge.svg?branch=main" alt="WASM"></a>
+  <a href="https://github.com/inlaySQL/inlaysql/releases"><img src="https://img.shields.io/badge/version-0.0.1--experimental-orange" alt="experimental"></a>
+  <a href="https://github.com/inlaySQL/inlaysql/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPLv3--or--commercial-blue" alt="license"></a>
+</p>
 
-<!-- Both badges are pinned to `main`, because a badge that reports whatever ran
-     most recently on any branch is not reporting anything. `trust.yml` has no
-     badge on purpose: it is allowed to go red when the fuzzer finds something,
-     and its output is the artifacts, not a colour. -->
+<!-- Both CI badges are pinned to `main`, because a badge that reports whatever
+     ran most recently on any branch is not reporting anything. `trust.yml` has
+     no badge on purpose: it is allowed to go red when the fuzzer finds
+     something, and its output is the artifacts, not a colour. -->
 
-**InlaySQL is an embedded database for Rust applications — the same shape as
-SQLite: one file, no server, plain SQL. It adds the two things you otherwise
-bolt on from outside: many writers at once, and search — vector and
-full-text — that lives inside the database and is queried with ordinary SQL.**
+## InlaySQL
+
+InlaySQL is an embedded, serverless SQL database in Rust: **SQLite's model —
+one file, no server, plain SQL — with MVCC concurrent writers, and vector and
+full-text search as first-class parts of the SQL dialect** rather than
+extensions bolted on the side.
+
+It runs as a [Rust crate](#using-it) (`#![forbid(unsafe_code)]` outside one
+Linux I/O backend), in [the browser as WebAssembly](https://inlaysql.github.io)
+(the live demo, plus [framework examples](https://inlaysql.github.io/frameworks/)
+for vanilla JS, jQuery, React and Vue), over the [MySQL wire
+protocol](docs/server.md) so existing ORMs connect as-is, and as a CLI.
 
 > [!WARNING]
-> **Experimental. Do not put data you care about in this yet.**
->
-> InlaySQL is version `0.0.1` and has never been run in production by anyone.
-> The short version of why: the on-disk format is pre-1.0 (the policy is
-> *recreate the database*, not migrate — [`docs/recovery.md`](docs/recovery.md));
-> crash-safety is proven by deterministic simulation rather than years of real
-> hardware; and the known gaps are listed, not hidden — see
-> [What this is not](#what-this-is-not). Use it for experiments, prototypes and
-> anything you can rebuild from source data. If you find a bug, please open an
-> issue — it is genuinely useful to us.
+> **Experimental — version 0.0.1, never run in production.** The on-disk
+> format is pre-1.0 (the policy is *recreate the database*, not migrate —
+> [`docs/recovery.md`](docs/recovery.md)); crash-safety is proven by
+> deterministic simulation rather than years of real hardware; and the known
+> gaps are listed, not hidden — see [What this is not](#what-this-is-not).
+> Use it for experiments, prototypes and anything you can rebuild from source
+> data. Found a bug? Please [open an issue](https://github.com/inlaySQL/inlaysql/issues)
+> — it is genuinely useful to us. Security issues go to
+> [`SECURITY.md`](SECURITY.md), privately.
 
-## Try it in 30 seconds
+## Installation
 
-**In your browser, no install** — the real engine compiled to WebAssembly,
-running in this page's own tab: **[inlaysql.github.io](https://inlaysql.github.io)**
-— type SQL, run hybrid search, and save the database into your browser.
+**Rust crate** (not on crates.io yet — the format is pre-1.0):
 
-**On your machine:**
+```toml
+[dependencies]
+inlaysql = { git = "https://github.com/inlaySQL/inlaysql" }
+```
+
+**CLI and MySQL-wire server:**
 
 ```sh
 git clone https://github.com/inlaySQL/inlaysql
-cd inlaysql
-cargo run --example hybrid_search
+cd inlaysql && cargo build --release -p inlaysql-mcp
+target/release/inlaysql serve --mysql app.inlay   # point your ORM at :3306
+```
+
+**Browser:** the WASM module is built by `./crates/inlaysql-wasm/build.sh`
+from source; the compiled demo and the
+[framework examples](https://inlaysql.github.io/frameworks/) run live without
+any install.
+
+## The demo
+
+Hybrid retrieval — vector search and BM25 fused — is **one ordinary SQL
+statement**:
+
+```sql
+SELECT id, body, fuse(vector_score(embedding, ?), bm25_score(body, ?)) AS score
+FROM docs
+ORDER BY score DESC
+LIMIT 3;
+```
+
+The planner recognises the retrieval functions, turns each into an index
+probe, and fuses the two rankings. No separate vector store, no
+application-side merge step, no second query language.
+
+```sh
+cargo run --example hybrid_search     # end to end, in one example
 ```
 
 ```
@@ -58,46 +102,17 @@ hybrid (rank fusion)
   3. [7] 0.0161  write ahead logging and crash recovery in storage engines
 ```
 
-The third ranking comes out of **one ordinary SQL statement**:
+## Documentation
 
-```sql
-SELECT id, body, fuse(vector_score(embedding, ?), bm25_score(body, ?)) AS score
-FROM docs
-ORDER BY score DESC
-LIMIT 3;
-```
-
-No separate vector store, no application-side merge step, no second query
-language. The planner recognises the retrieval functions, turns each into an
-index probe, and fuses the two rankings.
-
-## What you get
-
-- **One file, no server.** Your whole database — tables, indexes, vectors,
-  full text — is a single `.inlay` file you can copy, back up and ship.
-- **Writers that do not queue.** MVCC with concurrent committers; eight
-  writers do roughly 13x the work of one (measured, not claimed — see
-  [Performance](#performance)).
-- **Search is SQL.** `VECTOR(n)` columns, BM25 indexes, and a `fuse()` that
-  ranks across both in one statement — no sidecar process to keep in sync.
-- **Your ORM already speaks it.** `inlaysql serve --mysql` serves the
-  database over the MySQL wire protocol, so existing MySQL clients and ORMs
-  connect as-is.
-- **Crash-safe by construction.** Every crash and torn-write schedule is
-  replayed byte-for-byte in CI by a deterministic simulator, and the whole
-  engine is `#![forbid(unsafe_code)]` outside one Linux I/O backend.
-- **Async without a runtime.** Plain futures that Tokio, async-std, smol —
-  or nothing at all — can drive.
-
-## Where to go next
-
-| If you want to… | Read |
+| | |
 | --- | --- |
-| embed it in an application | [Using it](#using-it) |
-| learn the SQL dialect | [The SQL surface](#the-sql-surface) |
-| see the benchmark table, wins and losses | [Performance](#performance) |
-| check what is missing before you depend on it | [What this is not](#what-this-is-not) |
-| read the honest engineering plan | [Next](#next), [`docs/PLAN.md`](docs/PLAN.md) |
+| [Using it](#using-it) | the API: sync, prepared statements, async without a runtime, I/O backends |
+| [The SQL surface](#the-sql-surface) | the dialect, including `VECTOR`, `bm25_score`, `vector_score` and `fuse` |
+| [Using it from a framework](crates/inlaysql-wasm/www/frameworks/README.md) | React, Vue, jQuery and plain JS against the WASM build |
+| [`docs/server.md`](docs/server.md) | the MySQL wire server: accounts, TLS, limits, translated and refused SQL |
+| [Performance](#performance) and [`SCOREBOARD.md`](SCOREBOARD.md) | every benchmark, wins and losses, and the verdict matrix with its fairness audit |
+| [What this is not](#what-this-is-not) and [Next](#next) | the gaps, listed rather than hidden, and the build order |
+| [`docs/architecture.md`](docs/architecture.md) | the load-bearing design decisions and what each rules out |
 
 ## Why
 
@@ -1412,6 +1427,31 @@ useful one.
   [`docs/enterprise-readiness.md`](docs/enterprise-readiness.md). Incremental
   backup is not implemented either.
 - **Full Postgres parity is not a goal**, now or later.
+
+## Development
+
+```sh
+cargo test --workspace          # unit, integration, sqllogictest, wire
+./docker/test.sh                # every CI gate, in Linux containers
+./docker/test.sh sweep          # the DST crash/torn-write sweeps
+./bench/run.sh                  # the benchmark suites
+```
+
+CI gates a merge on four jobs: the check list above, fuzz targets, the
+determinism job (the core stays `no_std` with no OS-facing dependency), and
+the DST sweeps. The rules of the road — conventional commits, benchmarks only
+from scripts, a clause that cannot be honoured is refused rather than ignored,
+DST sweeps for storage changes — are in [`CONTRIBUTING.md`](CONTRIBUTING.md),
+and what the tests cover and deliberately do not is in
+[`TESTING.md`](TESTING.md).
+
+## Security
+
+Security issues go through the private disclosure flow in
+[`SECURITY.md`](SECURITY.md) — never a public issue. That file also states the
+threat model and its known limitations in plain language, including the
+MySQL-wire server's deployment boundaries; the gap-by-gap engineering audit
+it summarises is [`docs/enterprise-readiness.md`](docs/enterprise-readiness.md).
 
 ## Licence
 
