@@ -43,6 +43,13 @@ current execution order without relying on local conversation history.
   1.5x** on top of the morning's 1.44x). A third agent found the range
   shape's row ids were already fetched in rowid order and that a multi-slot
   point cursor measures *negative* on the published shapes — B3 is closed.
+- 2026-09-03, 10:00–11:00: AHL-545 (split point linear, cells written
+  straight into the page, `UPDATE` encoder hoisted — landed as algorithmic
+  fixes, no number claimed: the batch-insert statement is 89% fsync),
+  AHL-546 (`MIN`/`MAX` on rowid/indexed column in one descent; the
+  published scalar shape still scans for `COUNT(*)`), and the batch-insert
+  row measured like for like in a container (67,484 rows/s: ~1.2x MySQL
+  8.4, 0.68x PG 17).
 - 2026-09-03, 01:00–02:30: AHL-541 (leaf format change rejected by
   reading — the slot directory already exists; a shared inlined cell parser
   landed: +4–9% on every read shape), AHL-542 (**C7 landed**: pages stay
