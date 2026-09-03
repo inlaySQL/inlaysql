@@ -65,41 +65,51 @@ REPS=5 cargo run --release -p inlaysql-bench --bin sql_shapes -- --mode batch  #
 
 | | |
 | --- | --- |
-| Commit | `run.sh` tables: `3cf0d85` (engine source identical to `619f5ba`, the last engine commit on top of the AHL-536 merge; the one commit between them touches only `docs/PLAN.md`). `compare.sh`-sourced and driver-sourced tables (DuckDB/pgvector/Meilisearch, MySQL/PostgreSQL, server-to-server, read shapes, batch insert): `bdc64eb` — engine identical to `edc8aed`, which changed only `bench/summarise.py`; `3cf0d85..bdc64eb` is AHL-538 through AHL-542 (`PERF.md`, 2026-09-02/03), so the two commits are not the same engine and every section says which one it came from. |
-| Date | 2026-09-02 (`run.sh`, evening); 2026-09-02/03 (`compare.sh` and the drivers, 18:53–19:15 UTC, i.e. 02:53–03:15 local on the 3rd) |
+| Commit | `run.sh` tables: `1f7921a` (engine source identical to the merge `7f4979a`, the AHL-549 merge; the one commit between them touches only `docs/PLAN.md`). `compare.sh`-sourced and driver-sourced tables (DuckDB/pgvector/Meilisearch, MySQL/PostgreSQL, server-to-server, read shapes, batch insert): `bdc64eb` — engine identical to `edc8aed`, which changed only `bench/summarise.py`; `bdc64eb..1f7921a` is AHL-544 through AHL-550 (`PERF.md`, 2026-09-03), so the two commits are not the same engine — the `run.sh` tables are now the *newer* build, where last edition they were the older — and every section says which one it came from. |
+| Date | 2026-09-03 (`run.sh`, 12:39–13:01 UTC, i.e. 20:39–21:01 local); 2026-09-02/03 (`compare.sh` and the drivers, 18:53–19:15 UTC, i.e. 02:53–03:15 local on the 3rd) |
 | Tree | source clean at measurement (`dirty: no` in all three `run.sh` raw outputs and in the `repeat.sh` summary). |
 | Machine | Apple Mac17,9, 18 cores, macOS 27.0 (Darwin 27.0.0 arm64) |
 | Toolchain | rustc 1.91.1 (ed61e7d7e 2025-11-07) |
-| Raw output | **`run.sh`/SQLite/sqlite-vec/concurrency/retrieval, median of three** (`SUITE=all`: points, indexed, joins, vectors, concurrency 1/2/4/8, retrieval): `bench/results/20260902T124832Z-repeat.txt`, built from `bench/results/20260902T{124833,125609,130346}Z.txt`. Load, sampled every 5 s throughout the measured phases, min/median/max per run: 2.27/2.84/3.76, 2.07/3.27/4.33 and 2.56/3.01/3.68 of 18 CPUs against the gate's 0.25/CPU (4.5) ceiling; no run marked `CONTAMINATED`, and all three runs came from the first attempt. This is the third full regeneration of 2026-09-02; the second, at `4f8e5dd` in the afternoon (`bench/results/20260902T062536Z-repeat.txt`, load 2.06–4.17/18), is the "previous edition" every section below compares against, and the first, at `7b20175` that morning (`bench/results/20260902T022325Z-repeat.txt`, load 0.82–4.04/18), is the one before it. **Two suites' harness changed between the previous edition and this one** (AHL-535, `f1b81c7`): `points` and `indexed` now step rows through the borrowing API and read every selected column on both sides — the point-read and secondary-index sections say exactly what changed and which way it cuts, and their edition-to-edition comparisons are read in that light. **Carried forward from the 2026-08-30 edition at `2cb2539`, not regenerated this edition** (each section says so where it appears): the **concurrency wide sweep + tail latency** (`bench/results/20260830T{124155,124632,125240}Z.txt`, `WRITER_LEVELS=1,2,3,4,5,6,8,12,16,24,32`, median of three, load 2.9–3.6/18 — this regeneration ran only the default 1/2/4/8 levels, so the 1/2/4/8 table is fresh and the eleven-level sweep and its 32-writer tail row are not); the **quantisation spot-check at scale** (`bench/results/20260830T{125800,131326,132715}Z.txt`, `SUITE=quantization DOCS=100000 QUERIES=50`, median of three, load 2.3–4.8/18). **Regenerated for the first time under the gate, at `bdc64eb`, on the night of 2026-09-02/03** (each section says so where it appears): every **`compare.sh`-sourced table** — the **DuckDB/pgvector/Meilisearch retrieval** table, the **"Against MySQL and PostgreSQL"** OLTP table (host and containerised InlaySQL, MySQL **8.4**, PostgreSQL 17) and the **"Server-to-server"** 1/8-connection table — is now the median of three complete `REPEATS=3 ./bench/repeat-compare.sh` runs (`bench/results/20260902T185304Z-repeat-compare.txt`, built from `bench/results/20260902T{185718,190221,190724}Z-compare.txt`; load sampled every 5 s through the measured phases, min/median/max per run 0.85/1.81/2.49, 1.60/2.34/3.05 and 2.05/2.45/2.77 of 18 against the 4.5 ceiling; no run marked `CONTAMINATED`; the same four unrelated user containers as before were present and idle throughout; 30 s cooldown between repetitions; 53 of 146 metrics disagreed by 10% or more across the three, listed in the summary file); and the **read-shape and batch-insert** tables' MySQL/PostgreSQL columns and InlaySQL aggregate/batch cells are `REPS=5` medians with min–max from `bench/results/20260902T191343Z-scoreboard/` (`read-{mysql,postgres}.txt`, `batch-{mysql,postgres}.txt`, `sql-shapes-inlaysql.txt`, `sql-shapes-inlaysql-batch.txt`; `provenance.txt` records `uptime` before and after — load 1.47–2.36/18 — rather than a mid-run sampler, a weaker gate than `compare.sh`'s, disclosed). **The MySQL container is `mysql:8.4` (LTS) from `e7cc895` (2026-09-02) on; every "MySQL 8" figure this file published before tonight was 8.0.x**, and the version changed underneath every MySQL edition-to-edition comparison below — none of those moves is attributed to either engine. The InlaySQL range and join cells of the read-shape table are reused from this edition's `run.sh` tables at `3cf0d85`, as the previous edition reused its own, and say so. **Carried forward from 2026-08-31, not regenerated**: the two "Server-to-server, extended" 1/4/16-connection sweeps (5 interleaved repetitions each, manually load-gated; raw JSON not retained). **Carried forward from earlier still**: the concurrent-writer old-vs-new A/B (`08f5fd4`, 2026-08-30, `bench/results/ab-head-run{1,2,3}-*.txt` and `ab-pre94d96a6-run{1,2,3}-*.txt`), and, as history only, the 2026-08-30 interleaved OLTP rerun at `b4798ce` (`bench/results/20260830T095714Z-interleaved-oltp-compare.txt`), superseded by tonight's gated repeat. |
+| Raw output | **`run.sh`/SQLite/sqlite-vec/concurrency/retrieval, median of three** (`SUITE=all`: points, indexed, joins, vectors, concurrency 1/2/4/8, retrieval): `bench/results/20260903T123928Z-repeat.txt`, built from `bench/results/20260903T{123928,124701,125358}Z.txt`. Load, sampled every 5 s throughout the measured phases, min/median/max per run: 1.96/2.63/3.77, 1.60/2.33/4.31 and 1.87/2.86/3.93 of 18 CPUs against the gate's 0.25/CPU (4.5) ceiling; no run marked `CONTAMINATED`, `dirty: no` throughout, and all three runs came from the first attempt. This is the fourth full regeneration since 2026-09-02 and the first on the 3rd; the third, at `3cf0d85` on the evening of the 2nd (`bench/results/20260902T124832Z-repeat.txt`, load 2.07–4.33/18), is the "previous edition" every section below compares against, and the two before it — `4f8e5dd` that afternoon (`bench/results/20260902T062536Z-repeat.txt`) and `7b20175` that morning (`bench/results/20260902T022325Z-repeat.txt`) — are named where a section's history needs them. **No harness changed between the previous edition and this one**: every `run.sh` suite is the same measurement as the evening's with a different binary, which the previous edition's `points` and `indexed` tables could not say (AHL-535 changed both harnesses under them; that change is now one edition old and its description stays in those sections as history). **Carried forward from the 2026-08-30 edition at `2cb2539`, not regenerated this edition** (each section says so where it appears): the **concurrency wide sweep + tail latency** (`bench/results/20260830T{124155,124632,125240}Z.txt`, `WRITER_LEVELS=1,2,3,4,5,6,8,12,16,24,32`, median of three, load 2.9–3.6/18 — this regeneration ran only the default 1/2/4/8 levels, so the 1/2/4/8 table is fresh and the eleven-level sweep and its 32-writer tail row are not); the **quantisation spot-check at scale** (`bench/results/20260830T{125800,131326,132715}Z.txt`, `SUITE=quantization DOCS=100000 QUERIES=50`, median of three, load 2.3–4.8/18). **Regenerated for the first time under the gate, at `bdc64eb`, on the night of 2026-09-02/03** (each section says so where it appears): every **`compare.sh`-sourced table** — the **DuckDB/pgvector/Meilisearch retrieval** table, the **"Against MySQL and PostgreSQL"** OLTP table (host and containerised InlaySQL, MySQL **8.4**, PostgreSQL 17) and the **"Server-to-server"** 1/8-connection table — is now the median of three complete `REPEATS=3 ./bench/repeat-compare.sh` runs (`bench/results/20260902T185304Z-repeat-compare.txt`, built from `bench/results/20260902T{185718,190221,190724}Z-compare.txt`; load sampled every 5 s through the measured phases, min/median/max per run 0.85/1.81/2.49, 1.60/2.34/3.05 and 2.05/2.45/2.77 of 18 against the 4.5 ceiling; no run marked `CONTAMINATED`; the same four unrelated user containers as before were present and idle throughout; 30 s cooldown between repetitions; 53 of 146 metrics disagreed by 10% or more across the three, listed in the summary file); and the **read-shape and batch-insert** tables' MySQL/PostgreSQL columns and InlaySQL aggregate/batch cells are `REPS=5` medians with min–max from `bench/results/20260902T191343Z-scoreboard/` (`read-{mysql,postgres}.txt`, `batch-{mysql,postgres}.txt`, `sql-shapes-inlaysql.txt`, `sql-shapes-inlaysql-batch.txt`; `provenance.txt` records `uptime` before and after — load 1.47–2.36/18 — rather than a mid-run sampler, a weaker gate than `compare.sh`'s, disclosed). **The MySQL container is `mysql:8.4` (LTS) from `e7cc895` (2026-09-02) on; every "MySQL 8" figure this file published before tonight was 8.0.x**, and the version changed underneath every MySQL edition-to-edition comparison below — none of those moves is attributed to either engine. The InlaySQL range and join cells of the read-shape table are reused from this edition's `run.sh` tables at `1f7921a`, as the previous two editions reused their own same-day `run.sh` figures, and say so — those cells are now a *later* build than the server columns beside them, not an earlier one. **Carried forward from 2026-08-31, not regenerated**: the two "Server-to-server, extended" 1/4/16-connection sweeps (5 interleaved repetitions each, manually load-gated; raw JSON not retained). **Carried forward from earlier still**: the concurrent-writer old-vs-new A/B (`08f5fd4`, 2026-08-30, `bench/results/ab-head-run{1,2,3}-*.txt` and `ab-pre94d96a6-run{1,2,3}-*.txt`), and, as history only, the 2026-08-30 interleaved OLTP rerun at `b4798ce` (`bench/results/20260830T095714Z-interleaved-oltp-compare.txt`), superseded by tonight's gated repeat. |
 
 One developer machine. Reproduce it; do not trust it. Every `run.sh` table
 on this page — points, indexed, joins, vectors, concurrency at 1/2/4/8
-writers, retrieval — comes from `3cf0d85`, measured fresh in one gated
-sitting on the evening of 2026-09-02. Every `compare.sh` table and every
+writers, retrieval — comes from `1f7921a`, measured fresh in one gated
+sitting on the evening of 2026-09-03. Every `compare.sh` table and every
 driver-sourced cell — DuckDB/pgvector/Meilisearch, MySQL 8.4/PostgreSQL 17
 OLTP, server-to-server at 1/8 connections, the read shapes and batch insert
-— comes from `bdc64eb`, measured in one gated sitting a few hours later,
-the first time any of those tables has been repeated or gated at all. The
+— comes from `bdc64eb`, measured in one gated sitting on the night of
+2026-09-02/03, the first time any of those tables has been repeated or
+gated at all and now the *older* of the two builds on this page. The
 tables that remain carried forward (the wide concurrency sweep, the
 quantisation spot-check, the 1/4/16-connection server sweeps, the writer
 A/B) each state their own commit and date where they appear, so a reader
 can always tell which build produced which number. What landed between the
-previous edition and this one, all in `PERF.md`'s 2026-09-02 sections and
-the only source any attribution below draws on: AHL-532 (a limited scan's
-first batch is sized to the `LIMIT`; measured 1.2–1.4x on `joins-limit`),
-AHL-535 (a borrowing row API, and the harness change that rides on it;
-1.56x on `points` and 1.40x on `indexed-range` on the new harness, flat on
-the old), AHL-536 (the leaf scan borrows the device's page; 1.14x on the
-20k aggregate, which no table here measures, and flat on everything that
-is), and AHL-537 (a research brief, no code). Between `3cf0d85` and
-`bdc64eb`, in `PERF.md`'s 2026-09-02/03 sections: AHL-538 (the streamed
-aggregate takes rows by callback; 1.08–1.12x on the 100k aggregate),
-AHL-539 (`MemStorage` shares committed rows; test backend only), AHL-540
-(no change — the miss path's copy is the kernel's), AHL-541 (the leaf's
-cell offset table; 1.05x on the 100k aggregate, 1.04–1.09x on the indexed
-shapes) and AHL-542 (a hundred-row `INSERT` re-encodes each path page once,
-not a hundred times; 1.29–1.44x on the engine's own batch-insert profile).
-Nothing on this page is withheld.
+previous edition (`3cf0d85`) and this one, all in `PERF.md`'s 2026-09-02/03
+and 2026-09-03 sections and the only source any attribution below draws
+on: AHL-538 (the streamed aggregate takes rows by callback; 1.08–1.12x on
+the 100k aggregate — no `run.sh` table measures it), AHL-539 (`MemStorage`
+shares committed rows; the in-memory backend, not on any path here),
+AHL-540 (no change — the miss path's copy is the kernel's), AHL-541 (one
+inlined leaf-cell parser behind every reader; 1.09x on `indexed`, 1.04x on
+`indexed-range` and `joins-limit`, `points` flat), AHL-542 (C7 — a
+transaction's pages stay decoded until it commits; 1.29–1.44x on the
+engine's own hundred-row batch-insert profile, `writes` flat, and the
+`batched write` row below is the shape it is for), AHL-545 (the insert
+path's remainders; measured flat on everything, and its control moved 1.7x
+with the load), AHL-546 and AHL-548 (scalar `MIN`/`MAX` and `COUNT(*)` by
+descent and from cell counts — not in any `run.sh` suite), AHL-544 and
+AHL-547 (C1, commit-side absorption, behind `EngineOptions::commit_absorption`,
+which defaults to `false`: every figure on this page is the flag-off
+engine, and `PERF.md` states the flag-off path as one relaxed atomic load —
+said once here and not repeated per section), **AHL-549** (the probed
+inner row is decoded once, where it is used, and the probe reuses its four
+buffers per outer row; 1.16x and 1.05x on the two `LIMIT 10` join shapes
+on the published harness, the two unlimited shapes 3–5% and ~10% *behind*
+in the same A/B, `points` and `indexed-range` flat), and **AHL-550** (the
+residual filter is compiled once per execution; 1.22–1.36x on
+`indexed-range`, `indexed` flat, `points` flat-to-positive, `joins-limit`
+flat). Nothing on this page is withheld.
 
 **Tooling correction, 2026-08-31, paid 2026-09-02/03.** Until this edition
 every `compare.sh`-sourced table on this page was a single ungated pass
@@ -119,35 +129,43 @@ addressed: interleaving the engines *within* one pass (`compare.sh`'s phase
 order is fixed — retrieval, then OLTP, then server-to-server), which is the
 half of the recommendation `bench/README.md` still carries.
 
-**This edition's spread sits between the day's two earlier sittings on the
-whole suite, is the narrowest of the three on the core columns, and still
-carries the loudest single row this page has ever published — and is
-still nowhere near the floor.** The main `run.sh` suite
-(points/indexed/joins/vectors/concurrency/retrieval), median of three
-complete runs at `3cf0d85`: **109 of 343 metrics disagreed by 10% or more**
-across the three, against 114 of 343 at `4f8e5dd` in the afternoon, 106 of
-343 at `7b20175` in the morning and 196 of 343 on 2026-08-30, all counted
-by the same `bench/summarise.py`. On the columns that are the measurement
-itself (ops/s, p50, joins/s, commits/s, recall@k — excluding
-`max`/`p95`/`p99`/`cold`, which are one sample and expected to swing far
-more) it is 10 of 135 (7%), against 19 of 135 in both earlier sittings; the
-2026-08-30 edition's "53 of 108 (49%)" was counted over a slightly different
-column selection (`PERF.md` §4), so compare the whole-suite
-109-versus-114-versus-106-versus-196 and not the core fractions digit for
-digit. Median load was 2.8–3.3/18 across the three runs against 2.7–3.2 in
-the afternoon, with every sample still under the gate's 4.5 and the second
-run (`125609Z`) the busiest at a 4.33 peak against 3.76 and 3.68 — and that
-second run is where most of what is loud below happened. The tightest
-tables here (durable writes, both InlaySQL secondary-index columns, every
-SQLite WAL row, the exact-HNSW p50s, the InlaySQL side of three of the four
-join rows) held within 0–7%. The loud core columns, all named in their
-sections: the point-read row, wider than it has ever been (InlaySQL ops/s
-85%, p50 129% across three runs of one binary — the second run read 413k
-ops/s at 1.25 µs where the other two read 872k and 1,154k at 0.58 and
-0.50 µs), the hybrid retrieval p50 (52%, the same second run), the 2-writer
-commits/s (23%) and 4-writer p50 (19%), SQLite's journal-mode indexed range
-ops/s (16%), the BM25 p50 (15%), the secondary-index full join's InlaySQL
-joins/s (13%), and two SQLite joins/s cells (10–18%). The 2026-08-30
+**This edition's spread is the same on the whole suite as the previous
+edition's and twice as wide on the core columns, on the quietest machine of
+the four sittings — and is still nowhere near the floor.** The main
+`run.sh` suite (points/indexed/joins/vectors/concurrency/retrieval), median
+of three complete runs at `1f7921a`: **114 of 343 metrics disagreed by 10%
+or more** across the three, against 109 of 343 at `3cf0d85` the evening
+before, 114 at `4f8e5dd`, 106 at `7b20175` and 196 on 2026-08-30, all
+counted by the same `bench/summarise.py` (the summary file itself says
+120 of 363: `edc8aed` taught the tool to read the concurrency table's
+four `barriers:` counter lines as values, twenty metrics no earlier
+edition counted, and the 343 here excludes them so the sequence stays
+one measurement). On the columns that are the measurement itself (ops/s,
+p50, joins/s, commits/s, recall@k — excluding `max`/`p95`/`p99`/`cold`,
+which are one sample and expected to swing far more) it is **22 of 135
+(16%)**, against 10 of 135 the evening before and 19 in the two sittings
+before that; the 2026-08-30 edition's "53 of 108 (49%)" was counted over a
+slightly different column selection (`PERF.md` §4), so compare the
+whole-suite 114-versus-109-versus-114-versus-106-versus-196 and not the
+core fractions digit for digit. Median load was 2.3–2.9/18 across the three
+runs against 2.8–3.3 the evening before — the quietest of the four sittings
+by median — with every sample under the gate's 4.5 and the second run
+(`124701Z`) carrying the highest peak (4.31 against 3.77 and 3.93) *and*
+the fastest point read, so the loud rows below do not have one run to
+point at this time. The tightest tables here (durable writes on InlaySQL's
+side, every InlaySQL join p50, both InlaySQL secondary-index p50s, every
+SQLite WAL point and range row, the BM25 p50) held within 0–7%. The loud
+core columns, all named in their sections: the point-read row again
+(InlaySQL ops/s 88%, p50 67% across three runs of one binary — the runs
+read 693k, 1,169k and 558k ops/s at 0.625, 0.500 and 0.916 µs), the
+2-writer row (p50 93%, commits/s 49% — the widest concurrency cells this
+page has published) and the 4-writer p50 (14%) and commits/s (11%), the
+batched write (p50 25%, ops/s 15%), SQLite WAL's secondary-index `LIMIT`
+join (p50 36%, joins/s 29%), SQLite's journal-mode durable-write ops/s
+(13%) and p50 (12%) and its journal-mode point-read p50 (24%) and ops/s
+(13%), the int8 uniform-corpus p50 (19%), the exact realistic-corpus p50
+(13%) and its ratio (12%), and three joins/s cells — InlaySQL's two full
+shapes (12% and 14%) and SQLite journal's PK `LIMIT` (13%). The 2026-08-30
 edition's history — first published as "worse than the last full edition's
 56 of 285", then recomputed on the 266 metrics common to both editions as
 54/266 (20.3%) then, 146/266 (54.9%) there — stands as written in `PERF.md`
@@ -175,134 +193,134 @@ and `fullfsync` is what makes a macOS number mean anything at all. WAL +
 ### Point reads by primary key — we beat the durable configuration
 
 20,000 rows, 5,000 lookups, prepared statements on both sides. Median of
-three runs (`bench/results/20260902T{124833,125609,130346}Z.txt`, load
-2.1–4.3/18 throughout, gate passed).
+three runs (`bench/results/20260903T{123928,124701,125358}Z.txt`, load
+1.6–4.3/18 throughout, gate passed).
 
-**The harness changed this edition, on both sides** (AHL-535, `f1b81c7`,
-`crates/inlaysql-bench/src/points.rs`). Three things are different from the
-loop that produced every earlier edition of this table. InlaySQL's side now
-steps each row through `query_prepared_each_ref` — `&[ValueRef]` borrowed
-out of the page — instead of `query_prepared`, which built and dropped a
-`Vec<Vec<Value>>` per lookup; SQLite's `sqlite3_step` has always stepped,
-so that was a difference in API shape, not in engine speed, and it is gone.
-SQLite's side now reads its column through `row.get_ref(0)?.as_str()`
-instead of `row.get::<String>(0)`, which copied out of SQLite's page — one
-allocation per lookup removed from *SQLite's* loop. And both sides now read
-the `body` column of every row into a checksum the loop `black_box`es,
-where before they counted rows; an answer nobody looks at is not a workload
-anybody has. The first change helps us, the second helps SQLite, the third
-adds work to both. The bench module's own doc states it as the comparison
-getting harder for InlaySQL rather than easier, and that is the right
-reading: this edition's row and the previous one are not the same
-measurement with a different binary, on either side.
+**The harness is the previous edition's, unchanged** — so this table and
+the evening's are, for the first time since AHL-535, the same measurement
+with a different binary. For the record, because the six editions before
+the last were on a different loop: since AHL-535 (`f1b81c7`,
+`crates/inlaysql-bench/src/points.rs`) InlaySQL's side steps each row
+through `query_prepared_each_ref` — `&[ValueRef]` borrowed out of the page
+— instead of `query_prepared`, which built and dropped a `Vec<Vec<Value>>`
+per lookup; SQLite's side reads its column through
+`row.get_ref(0)?.as_str()` instead of `row.get::<String>(0)`, one
+allocation per lookup removed from *SQLite's* loop; and both sides read the
+`body` column of every row into a checksum the loop `black_box`es, where
+before they counted rows. The first change helps us, the second helps
+SQLite, the third adds work to both, and the bench module's own doc states
+it as the comparison getting harder for InlaySQL rather than easier.
 
 | Engine | ops/s (median, range) | p50 (median, range) | p95 (median)† |
 | --- | --- | --- | --- |
-| **InlaySQL** | **872,474** (413k–1,154k) | **0.583 µs** (0.50–1.25 µs) | 4.67 µs |
-| SQLite, WAL + `sync=NORMAL` | 1,261,021 (1,204k–1,287k) | 0.750 µs (0.750–0.750 µs) | 1.00 µs |
-| SQLite, journal + `sync=FULL` | 170,380 (165k–173k) | 5.38 µs (5.33–5.58 µs) | 8.50 µs |
+| **InlaySQL** | **692,893** (558k–1,169k) | **0.625 µs** (0.50–0.92 µs) | 6.50 µs |
+| SQLite, WAL + `sync=NORMAL` | 1,233,552 (1,181k–1,285k) | 0.750 µs (0.750–0.792 µs) | 1.00 µs |
+| SQLite, journal + `sync=FULL` | 177,098 (176k–199k) | 5.33 µs (4.17–5.42 µs) | 7.67 µs |
 
 † `p95` (and `p99`/`max`, not shown) is one tail sample and swings far more
 run to run than `ops/s` or `p50` — see the floor note at the top of this
 file — so it is not given a range here.
 
-**Roughly 2.5-7x the durable configuration, and that range is the
+**Roughly 3-6.5x the durable configuration, and that range is the
 measurement.** This session's own three individual-run ratios against
-journal-mode SQLite were 5.30x, 2.39x and 6.77x (the harness's own "is Nx
-faster" lines); the median run says 5.30x, but a number whose InlaySQL side
-swung 413,489 to 1,153,968 ops/s (85% of the median) and 0.50 to 1.25 µs on
-p50 (129%) across three runs of one unrebuilt binary cannot support one
-significant figure, let alone two. Those are the two widest core-column
-disagreements in the whole suite, and the widest this row has ever been —
-77% on p50 and 37% on ops/s in the afternoon, 1.8x run-to-run the edition
-before that. SQLite's journal row held within 5% on ops/s and 5% on p50; its
-WAL row within 7% and to the nanosecond.
+journal-mode SQLite were 3.94x, 6.60x and 2.81x (the harness's own "is Nx
+faster" lines); the median run says 3.94x, but a number whose InlaySQL side
+swung 558,202 to 1,168,645 ops/s (88% of the median) and 0.50 to 0.92 µs on
+p50 (67%) across three runs of one unrebuilt binary cannot support one
+significant figure, let alone two. Those are again two of the three widest
+core-column disagreements in the whole suite — a shade narrower than the
+evening's 85% and 129%, wider than every sitting before that. SQLite's
+journal row was loud too this time, 13% on ops/s and 24% on p50 (the third
+run read 198,989 at 4.17 µs where the other two read 176–177k at
+5.33–5.42); its WAL row held within 8% and to within 42 ns.
 
-**Which run carried the tail.** The second run, `125609Z`: 413,489 ops/s,
-p50 1.25 µs, p95 10.88 µs, p99 17.67 µs, max 235.88 µs — against 872,474 /
-0.583 / 4.67 / 7.38 / 131.67 in the first and 1,153,968 / 0.500 / 3.33 /
-5.21 / 98.88 in the third. It was the run with the highest load (peak
-4.33/18 against 3.76 and 3.68; median 3.27 against 2.84 and 3.01), under
-the gate throughout, and the same run carries the hybrid-retrieval and BM25
-tails the retrieval section names — the whole run was the noisy one, not
-one phase of it. SQLite's own rows in that run were its slowest of the
-three too, by 6% on WAL ops/s — not by 2.8x. That is a description, not an
-explanation: the gate passed, nothing in the raw output says what was
-competing for the machine, and the median is published as the median with
-the run beside it rather than the run dropped.
+**No single run carried the tail this time.** The runs, in order
+(`123928Z`, `124701Z`, `125358Z`): 692,893 / 1,168,645 / 558,202 ops/s at
+p50 0.625 / 0.500 / 0.916 µs, p95 6.50 / 3.13 / 7.29, p99 10.50 / 5.08 /
+11.79, max 283.63 / 144.29 / 237.29 µs. The middle run is the fast one and
+it is also the run with the highest load peak (4.31/18 against 3.77 and
+3.93) and the lowest median load (2.33 against 2.63 and 2.86); the third
+run, slowest here, had the highest median load and the middle peak. The
+previous edition could name one busy run and put it beside the median;
+this one cannot, and the honest description is that two runs of three
+carried a tail and the load samples do not say which one should have. The
+gate passed throughout, nothing in the raw output says what was competing
+for the machine, and the median is published as the median with the runs
+beside it.
 
-**Against the previous edition this row moved down on ops/s and up on p50
-while the code it measures got faster, and both halves of that are stated
-without one being used to explain the other away.** The afternoon's
-`4f8e5dd` edition read 1,069,233 ops/s at 0.54 µs (765k–1,156k, 0.50–0.92
-µs, p95 2.88 µs, p99 4.63 µs); this one reads 872,474 at 0.583 µs
-(413k–1,154k, 0.50–1.25 µs, p95 4.67 µs, p99 7.38 µs) — −18% on the median
-ops/s, +8% on the median p50, and p95/p99 1.6x wider. The best run of each
-sitting is the same figure (1,155,913 then, 1,153,968 now, at 0.50 µs both
-times); what differs is the tail, and the tail is what ops/s pays for.
-Against that, `PERF.md`'s AHL-535 section measured this exact shape
-interleaved against `dc180db`, control re-run every repetition, load
-2.6–3.6/18: the engine change alone, old harness on both binaries, is
-**flat** (2.138 / 2.093 / 2.142M against 2.086 / 2.093 / 2.056M in
-`bin/profile`'s tighter loop), and the new harness against the published
-baseline is **1.56x, 3 of 3, non-overlapping** (2.148 / 2.162 / 2.116M →
-3.390 / 3.361 / 3.270M), with `malloc`, `free` and the `ResultSet` drop gone
-from the profile's top 25 entirely and a counting allocator putting 200
-warm point reads through the borrowing API at zero allocations. AHL-536
-measured `points` flat (+3%, inside the floor; the point read does not take
-that path except on a cache miss) and AHL-532 flat, mixed sign. So a change
-that measured 1.56x in an interleaved A/B sits in a gated three-run median
-that reads 0.82x of the previous edition's, and the two instruments are
-answering different questions: the A/B — same machine, same minutes,
-alternating order, control re-run every time — is the better instrument for
-"did the code get faster"; the median of three complete runs is the better
-instrument for "what does the published harness read on a gated machine";
-and they disagree by more than this benchmark's own floor on this metric
-(`PERF.md` §4: 7.3% CoV quiet, 20.2% under desktop load) covers. This
-document does not pick between them. What the floor does cover is that one
-run of three reading 0.36x of another is not a property of the binary.
+**Against the previous edition this row moved down again on ops/s and up
+again on p50, on code `PERF.md` measured flat on this shape five separate
+times, and that is stated as a sitting and not as a regression — with the
+caveat the floor imposes, stated with it.** The evening's `3cf0d85`
+edition read 872,474 ops/s at 0.583 µs (413k–1,154k, 0.50–1.25 µs, p95
+4.67 µs, p99 7.38 µs); this one reads 692,893 at 0.625 µs (558k–1,169k,
+0.50–0.92 µs, p95 6.50 µs, p99 10.50 µs) — −21% on the median ops/s, +7%
+on the median p50, p95/p99 1.4x wider, and the worst run *better* than the
+evening's worst (558k against 413k). The best run of each sitting is the
+same figure for the third time in a row (1,155,913, 1,153,968, now
+1,168,645, at 0.50 µs each time); what differs is the tail, and the tail is
+what ops/s pays for. Nothing on this row's path changed in
+`3cf0d85..1f7921a` except AHL-541's shared leaf-cell parser, which
+`decode` reaches, and AHL-549's `get_from`-adjacent probe code, which a
+point read does not take; every A/B in the range that ran `points` as its
+control reports it flat — AHL-541 (3.29 / 3.27 / 3.20M against 3.31 / 3.30
+/ 3.19M, mixed sign), AHL-542 (3.30 / 3.27 / 3.40M against 3.25 / 3.30 /
+3.37M), AHL-549a (3.168 / 3.358 / 3.384M against 3.217 / 3.353 / 3.310M,
+mixed sign), AHL-549b (3.036 / 2.797 / 2.970M against 3.109 / 3.110 /
+2.817M, mixed sign), and AHL-550 (2.63 / 2.76 / 2.76M against 3.06 / 2.95 /
+2.90M — above 3 of 3 in the run it kept, mixed in the run it discarded,
+read as flat-to-positive), with AHL-545's control moving 1.7x repetition to
+repetition with the load. So the interleaved instrument says the binary did
+not move on this shape, in either direction, and the gated median says
+0.79x of the previous edition's. That is the same disagreement the previous
+edition published (1.56x interleaved against 0.82x gated), in the same
+direction, one edition later and with no code to point at this time — which
+makes it more likely, not less, that the gated median of this row is
+reading the machine. `PERF.md` §4's floor on this metric (7.3% CoV quiet,
+20.2% under desktop load) does not cover a 21% move on its own, and this
+document does not pick between the instruments; it records that four
+sittings on three binaries have now put the median at 1,069k, 872k and 693k
+while the best run sat at 1,155k, 1,154k and 1,169k.
 
-SQLite's own rows moved too, on the harness change above and on code that
-did not. The journal row went 277,517 → 170,380 ops/s (−39%), 3.08 → 5.38
-µs — back onto the morning's 170,234 almost exactly, so three sittings today
-have put SQLite's durable point read at 170k, 278k and 170k with its engine
-unchanged and, this time, its harness changed in the direction that should
-have made it faster. The WAL row went 1,153,879 → 1,261,021 (+9%) and 0.83
-→ 0.75 µs, outside the afternoon's 4% spread and this run's 7%, the size
-and direction one removed allocation per lookup predicts, and not measured
-in isolation. Nothing on SQLite's side is attributed either way.
+SQLite's own rows moved a little, on code that did not. The journal row
+went 170,380 → 177,098 ops/s (+4%), 5.38 → 5.33 µs, inside this run's 13%
+spread — four sittings have put SQLite's durable point read at 170k, 278k,
+170k and 177k. The WAL row went 1,261,021 → 1,233,552 (−2%), 0.750 →
+0.750 µs, inside both sittings' spreads. Nothing on SQLite's side is
+attributed either way.
 
 **Against WAL-mode SQLite this row still reads two ways, and both are
-stated.** On p50, InlaySQL's 0.583 µs is *below* WAL's 0.750 µs — at the
-median and in two runs of three (0.583 and 0.500 against 0.750), with the
-second run's 1.25 µs the one that lost. On throughput, InlaySQL's 872,474
-ops/s is **0.69x** of WAL's 1,261,021 — per run 0.68x, 0.34x and 0.92x, so
-no run crossed this time where one did in the afternoon (0.93x median then,
-1.04x in its best run). A p50 that wins while ops/s loses is not a
-contradiction: ops/s is 5,000 lookups' *total* wall-clock, so it pays the
-tail, and InlaySQL's p95 (4.67 µs) and p99 (7.38 µs) are 4.7x and 6.3x WAL's
-(1.00 and 1.17 µs), against 2.8x and 3.7x in the afternoon. The typical
-lookup is faster than SQLite's fastest configuration; the slow ones are
-slower than they were last edition, and the throughput figure is where they
-show. The page cache (AHL-420) is what does the winning half on a *warm*
-handle; a cold one warms more slowly than SQLite's because our miss path is
-dearer.
+stated.** On p50, InlaySQL's 0.625 µs is *below* WAL's 0.750 µs — at the
+median and in two runs of three (0.625 against 0.792 and 0.500 against
+0.750), with the third run's 0.916 µs the one that lost. On throughput,
+InlaySQL's 692,893 ops/s is **0.56x** of WAL's 1,233,552 — per run 0.59x,
+0.95x and 0.43x, so again no run crossed (0.69x median the evening before,
+0.92x in its best run; 0.93x and 1.04x the afternoon before that). A p50
+that wins while ops/s loses is not a contradiction: ops/s is 5,000
+lookups' *total* wall-clock, so it pays the tail, and InlaySQL's p95 (6.50
+µs) and p99 (10.50 µs) are 6.5x and 8.7x WAL's (1.00 and 1.21 µs), against
+4.7x and 6.3x the evening before. The typical lookup is faster than
+SQLite's fastest configuration; the slow ones are slower than they were
+last edition, and the throughput figure is where they show. The page cache
+(AHL-420) is what does the winning half on a *warm* handle; a cold one
+warms more slowly than SQLite's because our miss path is dearer.
 
 This row has now been published at 636,980, then 342,747, then 901,158, then
-522,562, then 533,943, then 1,069,233, and now 872,474 ops/s across seven
-editions — the last on a different harness from the six before it, so the
-sequence is not one measurement any more. **The swing is not mysterious in
-kind, only in size: `PERF.md` §4 dissected this exact metric directly and
-found background scheduling contention alone triples its CoV, from 7.3% on
-a quiet, gated machine to 20.2% on this same machine under ordinary desktop
-load, on five runs of one unrebuilt binary — no rebuild, no edition change,
-no code touching the read path at all.** This gated sitting reproduced that
-and then some: the widest of its three runs is 2.8x the narrowest, on a
-machine that passed the load gate throughout. That is the worst-measured
-floor of any row in this document, which is why this edition publishes a
-median of repeated runs with the runs beside it, and why the ratio against
-journal-mode SQLite — read as "roughly 2.5-7x", not to three digits and not
-to one — is the number to quote, not the point value either side of it.
+522,562, then 533,943, then 1,069,233, then 872,474, and now 692,893 ops/s
+across eight editions — the last two on a different harness from the six
+before them, so the sequence is not one measurement. **The swing is not
+mysterious in kind, only in size: `PERF.md` §4 dissected this exact metric
+directly and found background scheduling contention alone triples its CoV,
+from 7.3% on a quiet, gated machine to 20.2% on this same machine under
+ordinary desktop load, on five runs of one unrebuilt binary — no rebuild,
+no edition change, no code touching the read path at all.** This gated
+sitting reproduced that: the widest of its three runs is 2.1x the
+narrowest (2.8x the evening before), on a machine that passed the load
+gate throughout. That is the worst-measured floor of any row in this
+document, which is why this edition publishes a median of repeated runs
+with the runs beside it, and why the ratio against journal-mode SQLite —
+read as "roughly 3-6.5x", not to three digits and not to one — is the
+number to quote, not the point value either side of it.
 
 ### Secondary-index reads — point win, range loss
 
@@ -310,76 +328,82 @@ to one — is the number to quote, not the point value either side of it.
 100 range queries of 50 rows (`SUITE=indexed`). Same three runs as the point
 reads above.
 
-**The harness changed this edition, on both sides** (AHL-535, `f1b81c7`,
-`crates/inlaysql-bench/src/indexed.rs`), the same three ways the point-read
-section describes: InlaySQL steps rows through `query_prepared_each_ref`
-instead of collecting a `Vec<Vec<Value>>` per query, SQLite reads through
-`row.get_ref(..)` instead of `row.get::<String>(..)`, and both sides read
-*both* selected columns of every row into a checksum instead of counting
-rows. On the fifty-row range that is fifty allocations per query removed
-from SQLite's loop and fifty column reads added to ours, which is why the
-bench's own doc names this as the suite where the old API-shape asymmetry
-mattered most and says the comparison got harder for us, not easier. The
-previous edition's InlaySQL columns and these are not the same measurement.
+**The harness is the previous edition's, unchanged** (AHL-535's loop,
+`crates/inlaysql-bench/src/indexed.rs`: InlaySQL steps rows through
+`query_prepared_each_ref`, SQLite reads through `row.get_ref(..)`, both
+sides read *both* selected columns of every row into a checksum), so every
+column here is the same measurement as the evening's with a different
+binary — which the previous edition's table could not say.
 
 | Engine | point ops/s (median, range) | point p50 (median, range) | range ops/s (median, range) | range p50 (median, range) |
 | --- | --- | --- | --- | --- |
-| **InlaySQL (B-tree index)** | **488,367** (476k–503k) | **1.83 µs** (1.79–1.88 µs) | 97,624 (94k–98k) | 9.83 µs (9.79–10.25 µs) |
-| InlaySQL (no index: full scan) | 931 (908–934) | 1.07 ms (1.07–1.08 ms) | 655 (655–656) | 1.53 ms (1.51–1.53 ms) |
-| SQLite, journal (index) | 259,938 (260k–280k) | 3.67 µs (3.38–3.67 µs) | **140,154** (134k–156k) | **6.63 µs** (6.13–6.79 µs) |
-| SQLite, WAL (index) | 753,291 (744k–755k) | 1.13 µs (1.13–1.13 µs) | **240,529** (237k–244k) | **3.96 µs** (3.92–4.00 µs) |
+| **InlaySQL (B-tree index)** | **481,918** (463k–487k) | **1.83 µs** (1.83–1.96 µs) | 119,219 (110k–120k) | 8.25 µs (8.25–8.79 µs) |
+| InlaySQL (no index: full scan) | 1,255 (1,243–1,255) | 0.79 ms (0.79–0.80 ms) | 1,121 (1,111–1,122) | 0.89 ms (0.89–0.90 ms) |
+| SQLite, journal (index) | 264,677 (252k–265k) | 3.58 µs (3.58–3.75 µs) | **143,954** (142k–146k) | **6.67 µs** (6.63–6.75 µs) |
+| SQLite, WAL (index) | 765,189 (744k–774k) | 1.13 µs (1.13–1.17 µs) | **237,624** (231k–242k) | **4.00 µs** (3.96–4.04 µs) |
 
-The index itself is worth **roughly 500x** over our own full scan on point
-probes and **roughly 150x** on range scans (AHL-423; the harness's own
-per-run figures were 523x/541x/524x and 149x/143x/149x — the afternoon
-read ~500x/~110-120x, and the range multiple rose because the indexed side
-got faster and the scan did not: both sides of that ratio are InlaySQL on
-the same new harness, so the ratio itself is fair, and the unindexed rows'
-own move — 803 → 931 and 576 → 655 ops/s, faster while reading columns it
-used to only count — is the harness's removed `Vec<Vec<Value>>` outweighing
-the added reads on that path too). **This table is the tightest it has
-been**: every InlaySQL cell held within 6% across the three runs and none is
-in this run's ≥10% list; SQLite's journal-mode range ops/s (16%) is the one
-cell that is, the third run reading 155,986 where the other two read
-134–140k. **On point probes we beat journal-mode SQLite by roughly
-1.7-1.9x** (1.88x median of medians; 1.88x, 1.94x and 1.70x per run; the
-afternoon read roughly 1.5x) **and trail WAL-mode at roughly 0.65x**
-(0.63–0.67x, essentially flat). **Range scans we still lose, by less —
-roughly 0.7x of journal and roughly 0.4x of WAL** (0.63–0.70x and
-0.39–0.41x per run on ops/s; on p50, 6.63 against 9.83 µs is 0.67x),
-against 0.5x and 0.35x in the afternoon.
+The index itself is worth **roughly 400x** over our own full scan on point
+probes and **roughly 100x** on range scans (AHL-423; the harness's own
+per-run figures were 388x/388x/369x and 108x/106x/98x — the evening read
+~500x/~150x, and both multiples *fell* because the unindexed scan got
+faster and the indexed side did not by as much: the no-index rows moved
+931 → 1,255 ops/s (+35%, 1.07 → 0.79 ms) and 655 → 1,121 (+71%, 1.53 →
+0.89 ms), far outside either sitting's 0–3% spreads on those rows, and
+they have a name — a full scan with a `WHERE` on it evaluates the residual
+filter on every one of 20,000 rows, which is exactly the shape AHL-550
+compiled, on top of AHL-541's parser under the leaf walk. Neither A/B ran
+the unindexed rows, so the size is by mechanism; the direction is not in
+doubt). **This table is a shade looser than the evening's**: every
+InlaySQL cell held within 9% across the three runs (the range ops/s, 8.5%,
+is the widest — the third run read 110,011 at 8.79 µs where the other two
+read 119–120k at 8.25) and none is in this run's ≥10% list; nor is any
+SQLite cell, for the first time. **On point probes we beat journal-mode
+SQLite by roughly 1.8x** (1.82x median of medians; 1.92x, 1.84x and 1.74x
+per run; the evening read roughly 1.7-1.9x) **and trail WAL-mode at
+roughly 0.6x** (0.60–0.65x, essentially flat). **Range scans we still
+lose, by less again — roughly 0.8x of journal and roughly 0.5x of WAL**
+(0.76–0.84x and 0.45–0.52x per run on ops/s; on p50, 6.67 against 8.25 µs
+is 0.81x), against 0.67x and 0.4x the evening before and 0.5x/0.35x the
+afternoon before that.
 
-InlaySQL's range row moved 66,798 → 97,624 ops/s (+46%) and 13.67 → 9.83
-µs, far outside either sitting's spread (10% then, 4% now) and outside the
-64–78k band the previous edition said no edition had yet left. **This one
-is attributed**: `PERF.md`'s AHL-535 section measured `indexed-range`
-interleaved against `dc180db`, control re-run every repetition, and found
-the engine change alone flat on the old harness (71.9 / 70.4 / 72.5k against
-73.5 / 71.2 / 72.2k) and the new harness against the published baseline
-**1.40x, 3 of 3, non-overlapping** (72.7 / 72.6 / 71.2k → 102.7 / 100.4 /
-102.0k), with no allocator anywhere in the profile's top 25 afterwards.
-1.40x on 66,798 is 93.5k; the published 97,624 is within 5% of that, and
-AHL-536 measured the same suite flat (76.0 / 77.8 / 74.2k against 75.6 /
-74.5 / 74.1k, mixed sign) and AHL-532 3.5% behind, inside the floor. The
-point probe moved 398,866 → 488,367 (+22%), 2.21 → 1.83 µs, on the same
-harness change to the same file; `PERF.md`'s `indexed` A/B ran on
-`bin/profile`'s suite, which kept its old harness, and read flat (457 /
-457 / 467k against 449 / 460 / 465k), so the point column's move is
-attributed to the harness half of AHL-535 by mechanism — the same
-borrowing API, the same `Vec<Vec<Value>>` per lookup removed — and not by
-an interleaved measurement of this shape on the new harness, which nobody
-ran.
+InlaySQL's range row moved 97,624 → 119,219 ops/s (+22%) and 9.83 → 8.25
+µs (−16%), outside both sittings' spreads (4% then, 8.5% now), with
+SQLite's own range rows flat beside it (journal 140,154 → 143,954, +3%;
+WAL 240,529 → 237,624, −1%) — so the sitting is not where the move came
+from. **This one is attributed, to AHL-550.** `PERF.md`'s AHL-550 (b)
+section profiled this exact shape, found the residual filter's walk —
+`evaluate_ref`, `compare_cells`, `eval_operand`, `affinity_conversion`,
+the operand drops — at 21.8% inclusive, compiled the conjunction once per
+execution into a per-row `CompiledFilter::admits` at 6.9% inclusive, and
+measured `indexed-range` interleaved against `6adfaf7`, control re-run
+every repetition, order alternated: **1.22–1.36x, 3 of 3, non-overlapping
+by 21k** (94.9 / 91.3 / 89.2k → 116.1 / 121.2 / 121.3k), with the bench
+binary's own range row in the same runs 99.1 / 96.2 / 69.0k → 107.7 /
+102.8 / 99.3k at p50 9.75 / 10.00 / 11.17 → 8.92 / 9.21 / 9.50 µs. AHL-541
+measured the same suite **1.04x, 3 of 3** (102.3 / 100.6 / 101.4k → 105.4
+/ 105.4 / 105.9k); AHL-542 flat (99.6 / 102.4 / 102.7k against 99.9 /
+102.6 / 96.1k); AHL-549a "flat to slightly ahead" (98.4 / 104.0 / 101.1k
+against 104.3 / 104.9 / 103.9k) and AHL-549b flat, mixed sign. 1.04 ×
+1.22–1.36 on 97,624 is 124–138k; the published 119,219 sits just under the
+low end of that, and this edition's 8.25 µs is inside the A/B's own
+8.92–9.50 band on the bench binary once the A/B's louder machine (load
+4.5–9.6 against this sitting's 1.6–4.3) is allowed for. The point probe
+did *not* move — 488,367 → 481,918 (−1%), 1.83 → 1.83 µs — where AHL-541's
+A/B read `indexed` at **1.09x, 3 of 3, non-overlapping** (430 / 463 / 469k
+→ 503 / 505 / 512k) and AHL-550's read it flat; so a 1.09x that was
+measured interleaved does not appear in the gated median, which is inside
+its own 5% spread of where it was. That is the same two-instrument
+disagreement the point-read section describes, on a smaller scale, and it
+is recorded rather than resolved.
 
-SQLite's side moved too, on the half of the harness change that helps it:
-journal point 272,115 → 259,938 (−4%, inside its 8% spread), journal range
-134,439 → 140,154 (+4%), WAL point 666,800 → 753,291 (+13%), WAL range
-182,454 → 240,529 (+32%) and 5.17 → 3.96 µs on p50. The WAL range move is
-the size and direction fifty fewer `String` allocations per query predict;
-it is stated as consistent with that, not measured to be it, and it is the
-reason the ratio narrowed less than InlaySQL's own +46% would suggest. What
-the range loss is now, per AHL-535's after-profile: with the owned output
-gone, `memcmp` is 21% and the residual filter (`evaluate_ref`,
-`compare_cells`, `eval_operand`, `affinity_conversion`) about 16% — the
+SQLite's side held: journal point 259,938 → 264,677 (+2%), journal range
+140,154 → 143,954 (+3%), WAL point 753,291 → 765,189 (+2%), WAL range
+240,529 → 237,624 (−1%) — all inside the sittings' spreads, on code that
+did not change, and the tightest SQLite has been on this table. What the
+range loss is now, per AHL-550's after-profile: `_platform_memcmp` 27%
+(the descent), `get_from` 6%, `from_utf8` 5% (the item AHL-550 (a) built,
+measured flat and did not land), `decode_value_ref` 5%,
+`decode_row_ref_masked_into` 4%, and the compiled filter itself 7% — the
 per-row work of the entry walk, the same family as the `LIMIT` join loss
 below.
 
@@ -390,60 +414,95 @@ below.
 from the warm p50 — the cold column is where the join plan and its tables get
 built, so it is the expensive one:
 
-**Regenerated this edition at `3cf0d85`** (`SUITE=all REPEATS=3`, median of
+**Regenerated this edition at `1f7921a`** (`SUITE=all REPEATS=3`, median of
 three, same three runs as every table above, quiet-machine gate passed
 throughout and no run marked `CONTAMINATED`; raw:
-`bench/results/20260902T124832Z-repeat.txt`). The joins harness did not
-change this edition — this table, unlike the two above it, is the same
-measurement as the afternoon's with a different binary.
+`bench/results/20260903T123928Z-repeat.txt`). The joins harness did not
+change — this table is the same measurement as the evening's with a
+different binary, and this time so is every table above it.
 
 | Query shape | InlaySQL cold → p50 (median) | SQLite journal cold → p50 (median) | vs journal |
 | --- | --- | --- | --- |
-| PK inner, full join | 17.87 ms → **3.23 ms** | 11.01 ms → 10.42 ms | **~3x faster** |
-| PK inner, LIMIT 10 | 24.25 µs → 4.25 µs | 13.12 µs → 3.33 µs | ~1.2-1.3x slower |
-| Secondary-index inner, full | 24.77 ms → **3.49 ms** | 31.07 ms → 31.29 ms | **~7-8x faster** |
-| Secondary-index inner, LIMIT 10 | 58.17 µs → 6.88 µs | 17.79 µs → 4.38 µs | ~1.5-1.6x slower |
+| PK inner, full join | 21.77 ms → **3.25 ms** | 10.97 ms → 10.33 ms | **~3x faster** |
+| PK inner, LIMIT 10 | 45.46 µs → 3.75 µs | 6.79 µs → 3.54 µs | ~1.1x slower |
+| Secondary-index inner, full | 28.92 ms → **3.63 ms** | 30.89 ms → 30.76 ms | **~7-8x faster** |
+| Secondary-index inner, LIMIT 10 | 55.79 µs → 5.79 µs | 15.33 µs → 4.33 µs | ~1.3-1.5x slower |
 
 The last column is the harness's own throughput ratio (joins/s against
-joins/s), the median of the three runs' own lines: 3.04x, 3.06x and 2.98x
-for the PK inner full join; 8.30x, 8.00x and 7.23x for the secondary-index
-full join; 1.27x, 1.34x and 1.19x slower for the PK `LIMIT` shape; 1.59x,
-1.58x and 1.46x slower for the secondary `LIMIT` shape. The InlaySQL p50
-column held to 3.11–3.33 ms and 3.48–3.57 ms on the two full shapes (7% and
-3% spread) and 4.17–4.33 µs and 6.58–6.96 µs on the two `LIMIT` shapes (4%
-and 6%), and none of the four is in this run's ≥10% list. What is: every
-`cold` cell (single samples, as always), InlaySQL's secondary-index full
-`joins/s` (13%, because the third run's p95 on that shape was 8.05 ms
-against 4.2–4.3 in the other two — the one tail in this table's InlaySQL
-columns, and the reason that shape's ratio ranges 7.23–8.30x), SQLite
-journal-mode's PK `LIMIT` joins/s (10%) and one SQLite WAL joins/s cell
-(18%).
+joins/s), the median of the three runs' own lines: 2.97x, 3.02x and 2.60x
+for the PK inner full join; 7.84x, 8.11x and 6.94x for the secondary-index
+full join; 1.12x, 1.21x and 1.05x slower for the PK `LIMIT` shape; 1.38x,
+1.31x and 1.48x slower for the secondary `LIMIT` shape. The InlaySQL p50
+column held to 3.18–3.29 ms and 3.51–3.76 ms on the two full shapes (3% and
+7% spread) and 3.71–3.75 µs and 5.50–5.92 µs on the two `LIMIT` shapes (1%
+and 7%), and none of the four is in this run's ≥10% list. What is: every
+`cold` cell (single samples, as always), both InlaySQL full-join `joins/s`
+cells (12% and 14%, because the third run's p95 on both full shapes was
+6.12 and 5.76 ms against 4.0–4.7 in the other two — the one tail in this
+table's InlaySQL columns, and the reason both full ratios' per-run ranges
+bottom out in that run, at 2.60x and 6.94x), SQLite journal-mode's PK
+`LIMIT` joins/s (13%), and SQLite WAL's secondary `LIMIT` row (joins/s
+29%, p50 36% — the first run read 3.08 µs where the other two read 2.25 and
+2.29, the loudest SQLite cell on this page).
 
-**Every InlaySQL cell moved down from the afternoon, and the two `LIMIT`
-rows have a name for it.** The full shapes: 3.56 → 3.23 ms (−9%) and 3.78
-→ 3.49 ms (−8%), outside the afternoon's 1–3% spreads and this sitting's
-3–7% — and SQLite's own rows moved with them, 11.03 → 10.42 ms (−6%) and
-32.60 → 31.29 ms (−4%), on code that did not change. `PERF.md` measured the
-full-scan join shapes across `4f8e5dd..3cf0d85` and found them flat both
-times (AHL-532: 49 / 40 / 47 against 47 / 44 / 48, mixed sign; AHL-536: 54
-/ 55 / 55 against 55 / 56 / 56, +2%), so what is left of the InlaySQL move
-after the sitting's own 4–6% is inside the floor and unattributed; the
-ratios read as they did. The `LIMIT` shapes: 5.75 → 4.25 µs (−26%) and 8.00
-→ 6.88 µs (−14%), far outside both sittings' spreads, against SQLite's 3.54
-→ 3.33 µs (−6%) and 4.79 → 4.38 µs (−9%) on unchanged code, back to where
-`2eeced7` had them (3.33 / 4.33 µs) — so roughly a third of each ratio's
-improvement is the sitting. The rest is **AHL-532**: `PERF.md` profiled the
-PK `LIMIT` shape expecting per-execution planning cost and found it was
-~5% of the query (the plan cache it went in to build was measured
-unnecessary and not built); what the split showed instead was the driving
-scan reading a 32-row first batch to answer ten, and the fix sizes the
-first batch to the `LIMIT` when there is no `WHERE`. Measured interleaved
-against `e7cc895`, control re-run every repetition, order alternated:
-**1.2–1.4x on `joins-limit`, 3 of 3, non-overlapping** (125.9 / 110.0 /
-122.6k → 161.2 / 156.1 / 132.1k ops/s). The published rows moved 1.35x and
-1.16x on InlaySQL's side, inside that range once the sitting's share is
-taken off. AHL-536 measured `joins-limit` flat, mixed sign, and AHL-535
-flat on the old harness this suite still uses.
+**The two `LIMIT` rows moved down and have a name for it; the two full
+rows did not move, and that answers the question `PERF.md` left open.**
+The `LIMIT` shapes: 4.25 → 3.75 µs (−12%) and 6.88 → 5.79 µs (−16%),
+outside both sittings' spreads (4–6% then, 1–7% now), against SQLite's own
+3.33 → 3.54 µs (+6%) and 4.38 → 4.33 µs (−1%) on unchanged code — so on
+the PK shape the sitting moved SQLite the *other* way, and none of the
+ratio's improvement there is the sitting. The name is **AHL-549**:
+`PERF.md`'s AHL-549a section took the probed inner row off the
+per-candidate path — `IndexProbe` keeps the rows it probed as bytes and
+decodes each candidate when the pairing loop reaches it, onto a reused
+buffer, through a `BorrowedJoin` operator whose projection selects cells
+rather than copying them, with `run_single_join_to` turning the projected
+cells into owned ones once at the sink where it used to pay a decode copy
+and then a projection copy — and measured the published bench's own shape
+interleaved against `6adfaf7`, control re-run every repetition, order
+alternated: PK `LIMIT 10` **4.42 / 4.33 / 5.54 → 3.71 / 3.83 / 3.71 µs
+(1.16x, 3 of 3, non-overlapping)** and secondary `LIMIT 10` **6.42 / 6.38
+/ 6.25 → 6.08 / 6.04 / 6.08 µs (1.05x, 3 of 3)**, with `bin/profile`'s
+`joins-limit` 1.07x. AHL-549b took the probe's four per-outer-row
+allocations (two key-range edges, a copy of one, the row-id vector) into
+buffers the operator owns and refills, committed on a counter (+160
+allocations over 39 rows → +4; +100 → +5, the residue per query or per leaf
+and none of it per row) rather than a clock: `joins-limit` flat, the
+bench's PK `LIMIT` 3.67 / 3.75 / 3.63 → 3.67 / 3.67 / 3.67 µs, secondary
+6.08 / 5.96 / 5.88 → 5.88 / 5.83 / 5.88 (ahead 3 of 3 by 1.5%, inside the
+floor). AHL-541 measured `joins-limit` **1.04x, 3 of 3** (159.8 / 158.5 /
+162.8k → 169.4 / 169.9 / 167.8k); AHL-542, AHL-545 and AHL-550 measured
+it flat. The published rows moved 1.13x and 1.19x on InlaySQL's side:
+1.16 × 1.04 on the PK shape lands on 3.52 µs against a published 3.75, so
+that row is fully accounted for with room to spare, and the A/B's own
+3.71–3.83 band contains the published figure exactly; 1.05 × 1.04 on the
+secondary shape lands on 6.30 µs against a published 5.79, so roughly half
+that row's move is what the A/Bs measured and the other half — with
+SQLite's side flat beside it — is inside the floor and unattributed.
+
+The full shapes: 3.23 → 3.25 ms (+1%) and 3.49 → 3.63 ms (+4%), both
+inside their own spreads (3% and 7% here, 7% and 3% the evening before),
+with SQLite's own rows at 10.42 → 10.33 ms (−1%) and 31.29 → 30.76 ms
+(−2%). **This is the row the AHL-549 section said would settle here.** Its
+interleaved A/B read both unlimited shapes *behind*, 3 of 3, on the bench's
+own harness — PK 3.15 / 3.55 / 3.30 → 3.26 / 3.71 / 3.50 ms (3–5%),
+secondary 3.60 / 4.10 / 3.60 → 4.12 / 4.22 / 4.12 ms (~10%) — on a shape
+that does not run the borrowed operator at all (an unlimited join over 20k
+users takes the hash inner side, which AHL-549 does not touch), and could
+not say whether that was one added branch in `JoinSink::emit_owned` per
+row or the machine; `bin/profile --suite joins`, which has no `JoinSink`,
+was behind by the same ~4%, which argued for the machine, and AHL-549b's
+second A/B read the same suite flat, mixed sign (47 / 42 / 46 against 47 /
+45 / 44). The gated regeneration comes out on the machine's side, mostly:
++1% on the PK shape is nothing, and +4% on the secondary shape is inside
+its own 7% spread, smaller than the A/B's ~10%, and sits beside a −2% move
+on SQLite's unchanged row — so a 10% regression is not what this table
+reads, and a 4% one is below what it can see. What it cannot do is rule a
+few per cent out: the secondary shape's sign matches the A/B's, and
+`PERF.md` §4's floor on a joins/s column is wider than that. Recorded as
+flat within the floor, sign noted, not as a regression and not as a
+vindication. The ratios read as they did, and their per-run floors this
+time (2.60x and 6.94x) are the third run's tail, named above.
 
 **Both full joins win, and the reason is one commit, found by this
 benchmark in the morning's edition.** The story is told in full in
@@ -462,46 +521,56 @@ should not produce. AHL-524 (`OUTER_ROW_COST = 4`, so an outer row is
 charged on both paths and the smaller table drives) is the fix; the bisect
 and the single-run measurement at the fix (3.21 ms / 3.47 ms, gate off) are
 in `PERF.md`, the afternoon's gated sitting landed both full shapes at 3.56
-and 3.78 ms, and this one at 3.23 and 3.49 ms — the same users-driving plan
-for both, which is why they sit within 8% of each other having been 11.72
-ms and 3.71 ms at `2eeced7`.
+and 3.78 ms, the evening's at 3.23 and 3.49 ms, and this one at 3.25 and
+3.63 ms — the same users-driving plan for both, which is why they sit
+within 12% of each other having been 11.72 ms and 3.71 ms at `2eeced7`.
 
 The full-join ratios' history, for the record: the secondary-index inner
 shape — the one AHL-464 built the index nested-loop join for — went from
 **10.71x slower** (2026-08-20) to 2.85x faster (`9aba437`) to 3.65x faster
 (`9b2f11e`, AHL-447) to roughly 8x (2026-08-30) to roughly 7.5x (`2eeced7`)
 to a withheld 2.2x (`7b20175`, the regression above) to roughly 8x
-(`4f8e5dd`) to **roughly 7-8x** here (8.30x at the median, 7.23x in the
-run with the tail) — and its p50 is 3.71 → 3.78 → 3.49 ms across the three
-published editions either side of the regression. The PK inner full join
-went from 5.56x slower to 1.43x to 1.20x to roughly 1.1x to roughly 1.15x
-slower (`2eeced7`) to 1.17x faster in the withheld run to roughly 3x faster
-at `4f8e5dd` and **roughly 3x** here — 11.72 → 8.77 → 3.56 → 3.23 ms — and
-the step to 3.56 is the genuine, attributed improvement: it is the shape
-the corrected reorder moves *into* users-driving, on top of AHL-522's
+(`4f8e5dd`) to roughly 7-8x (`3cf0d85`) to **roughly 7-8x** here (7.84x at
+the median, 6.94x in the run with the tail) — and its p50 is 3.71 → 3.78 →
+3.49 → 3.63 ms across the four published editions either side of the
+regression. The PK inner full join went from 5.56x slower to 1.43x to 1.20x
+to roughly 1.1x to roughly 1.15x slower (`2eeced7`) to 1.17x faster in the
+withheld run to roughly 3x faster at `4f8e5dd` and at `3cf0d85` and
+**roughly 3x** here — 11.72 → 8.77 → 3.56 → 3.23 → 3.25 ms — and the step
+to 3.56 is the genuine, attributed improvement: it is the shape the
+corrected reorder moves *into* users-driving, on top of AHL-522's
 read-ahead window, which `PERF.md` measured at 1.17x on the full-scan join
 shapes interleaved (AHL-521's page-cache hash was flat on them — its win is
 on the `LIMIT` shapes). SQLite's own PK-inner p50 read 9.99 ms at
-`2eeced7`, 11.03 ms in the afternoon and 10.42 ms here (10.27–10.50 across
-the three runs), a 6–10% band on code that did not change, which is the
-size of the sitting-to-sitting noise to hold against every ratio in this
-table.
+`2eeced7`, 11.03 ms in the afternoon, 10.42 ms in the evening and 10.33 ms
+here (10.15–10.42 across the three runs), a 6–10% band on code that did
+not change, which is the size of the sitting-to-sitting noise to hold
+against every ratio in this table.
 
-**The `LIMIT` rows are still a loss, and it is the smallest it has been.**
-1.2-1.3x and 1.5-1.6x slower warm, against 1.7x and 1.9x in the afternoon,
-2.0x and 2.1x at `2eeced7`, and 4.7–5.8x before the raw-leaf cache. A
-`LIMIT` shape is never reordered (AHL-525 reorders one only under an `ORDER
-BY`), so AHL-524 has no part in these two rows, and AHL-532's after-profile
-says what is left once the first batch is right-sized: `JoinInner::prepare`
-is 54% of the PK `LIMIT` query, and it is ten full root-to-leaf descents
-into `users` for ten consecutive keys that live in one leaf — a cursor
-shape, with `PLAN.md` §9a recording the multi-slot cursor as closed for
-these shapes and the profile showing full descents anyway; whether the
-single-slot reseek is reached from the probe's `get_row` at all is the next
-question. The per-row page-decode cost `PERF.md`'s AHL-488/493 sections
-diagnosed earlier, and AHL-493 tried twice and rejected for regressing point
-reads and small joins, is the other half of the same shape — a confirmed
-opportunity still open, not a new one.
+**The `LIMIT` rows are still a loss, and the PK shape is now within the
+noise of parity.** 1.1x and 1.3-1.5x slower warm, against 1.2-1.3x and
+1.5-1.6x the evening before, 1.7x and 1.9x the afternoon before that, 2.0x
+and 2.1x at `2eeced7`, and 4.7–5.8x before the raw-leaf cache. On the PK
+shape the per-run ratios were 1.12x, 1.21x and 1.05x slower, and the p50s
+3.71–3.75 µs against SQLite's 3.38–3.67 — the two bands touch, so that row
+is read as "a few per cent behind, at the floor", not as parity and not as
+a loss to one digit. The secondary shape is a real loss still, 5.79
+against 4.33 µs. A `LIMIT` shape is never reordered (AHL-525 reorders one
+only under an `ORDER BY`), so AHL-524 has no part in these two rows, and
+AHL-549b's after-profile says what is left now that the decode and the
+bookkeeping are gone: `Storage::get_row` → `CowBTree::get_from` is **37%**
+of the PK `LIMIT` query on its own (was ~32% under `JoinInner::prepare`'s
+54%), and it is ten full root-to-leaf descents into `users` for ten
+consecutive keys that live in one leaf — with `_platform_memcmp` at 21%
+self and the allocator down to ~9% from ~10%. `PLAN.md` §9a records the
+multi-slot cursor as closed for these shapes and the profile shows full
+descents anyway; whether the single-slot reseek is reached from the
+probe's `get_row` at all, and whether a probe that remembered the leaf its
+last key landed in could answer the next with a bounds check, is `PERF.md`'s
+item (c), deliberately not built with AHL-549 because it is a change to
+the tree's read path with its own DST obligation. The per-row page-decode
+cost `PERF.md`'s AHL-488/493 sections diagnosed earlier is now the half
+AHL-549a took.
 
 ### Durable writes — we win
 
@@ -510,28 +579,54 @@ session as the tables above.
 
 | Engine | ops/s (median, range) | p50 (median, range) |
 | --- | --- | --- |
-| **InlaySQL** | **243** (242–243) | **3.96 ms** (3.96–3.96 ms) |
-| SQLite, journal + `sync=FULL` + `fullfsync` | 91 (91–91) | 11.15 ms (11.15–11.18 ms) |
+| **InlaySQL** | **248** (248–253) | **3.91 ms** (3.90–3.91 ms) |
+| SQLite, journal + `sync=FULL` + `fullfsync` | 99 (87–100) | 10.27 ms (10.16–11.36 ms) |
 
-**~2.7x** (2.66x, 2.67x and 2.66x, the harness's own per-run lines — again
-the tightest ratio on this page) — down from the afternoon's ~2.8x, and the
-move is InlaySQL's: 256 → 243 ops/s (−5%, 3.88 → 3.96 ms), outside both
-sittings' spreads (1% then, 0.4% now) and back inside the morning's
-237–278 range, with SQLite 92 → 91 (−1%, 10.95 → 11.15 ms). **It is
-unattributed**: nothing in `4f8e5dd..3cf0d85` touches the commit path —
-AHL-532 sizes a scan's first batch, AHL-535 is a read API and a bench
-change, AHL-536 adds a read-side `Device::read_shared` and borrows pages on
-the scan path — and `PERF.md` has no A/B on this shape across it. Three
-sittings today have put this row at 241, 256 and 243 ops/s with the commit
-path unchanged throughout, so its real sitting-to-sitting band is roughly
-240–260 — tighter than any other InlaySQL row's, and still wider than any
-one sitting's own spread says. Still the most stable row in this document
-across editions: the commit gate no longer re-derives the log on every
-commit (AHL-468), which paid on the solo path too. Batching lifts the same
-workload to 56,501 ops/s (56,369–57,694, 2% spread) at 11.58 µs
-(11.46–11.67 µs) — **~230x** (237x, 234x and 232x per run) — which is the
-number to quote for a bulk load and not for a transaction. That batched
-figure is 1% under the afternoon's 57,131, inside both sittings' spreads.
+**~2.5x** (2.86x, 2.52x and 2.52x, the harness's own per-run lines) — down
+from the evening's ~2.7x, and this time the move is SQLite's: 91 → 99
+ops/s (+9%, 11.15 → 10.27 ms) on code that did not change, with its own
+three runs at 87, 100 and 99 (13% spread, in this run's ≥10% list beside
+its p50 at 12% — the first run read 11.36 ms where the other two read
+10.16–10.27), while InlaySQL went 243 → 248 (+2%, 3.96 → 3.91 ms), inside
+its 2% spread. **InlaySQL's side is unattributed, and this time there is
+code on its path to not attribute it to**: AHL-542 keeps a transaction's
+pages decoded until commit and AHL-545 rewrites the leaf and internal
+encoders to write in place, both on the path a single-row durable commit
+takes, and `PERF.md` measured `writes` across both — AHL-542 227 / 283 /
+248 against 224 / 289 / 253, AHL-545 239 / 269 / 261 against 264 / 273 /
+265 with the first base run at its load peak, AHL-541 140 / 139 / 138
+against 139 / 140 / 136 — flat, overlapping, every time. AHL-544/547's
+absorption is off, and `PERF.md`'s own flag-off 1-writer rows across those
+two changes (252 → 258) sit where this row does. Four sittings have now put
+this row at 241, 256, 243 and 248 ops/s, so its real sitting-to-sitting
+band is roughly 240–260 — tighter than any other InlaySQL row's, and still
+wider than any one sitting's own spread says. Still the most stable row in
+this document across editions: the commit gate no longer re-derives the
+log on every commit (AHL-468), which paid on the solo path too.
+
+**Batching lifts the same workload to 227,261 ops/s (217,578–252,881, 15%
+spread) at 1.67 µs (1.42–1.83 µs) — roughly 900x (916x, 1001x and 877x
+per run) — which is the number to quote for a bulk load and not for a
+transaction, and it is 4.0x the evening's 56,501 at 11.58 µs.** That is
+far outside both sittings' spreads (2% then, 15% now — this row is in the
+≥10% list on both columns for the first time, because at 1.4–1.8 µs per
+row the loop is short enough to feel the machine) and it has a name,
+**AHL-542** (C7): this row inserts rows one prepared statement at a time
+inside one transaction until the engine says the log would overflow, then
+commits and begins again — thousands of rows per commit — and until
+AHL-542 a transaction's dirty pages existed only as bytes between
+statements, so every insert decoded its leaf and its path, mutated them
+and re-encoded them, and the next statement decoded them again. Now the
+pages stay decoded until the commit encodes each exactly once. `PERF.md`
+measured it on the hundred-row `INSERT ... VALUES (...) x100` shape at
+**1.29–1.44x, 3 of 3, non-overlapping** (19,487 / 19,508 / 16,835 →
+25,123 / 26,110 / 24,289 rows/s) with `encode_leaf` and `encode_internal`
+gone from the profile's top entries; nobody A/B'd this row's own shape,
+which amortises its `fsync` over far more rows than a hundred and so had
+the per-row re-encode as a much larger share of each row's cost. 4.0x is
+stated as consistent with that mechanism, at the size a many-thousand-row
+transaction predicts, and not as measured to be it. AHL-545, which
+followed on the same path, measured the hundred-row shape flat.
 
 Every row above is full-durability, on both sides of every comparison, on
 purpose — an opt-in relaxed-durability tier also exists
@@ -541,8 +636,8 @@ mixed into these tables.
 ### Concurrent writers — the peak sits at sixteen, and past it the win still shrinks
 
 200 transactions per writer, one row each, on real OS threads. Median of
-three runs at `3cf0d85` (`bench/results/20260902T{124833,125609,130346}Z.txt`,
-the default `WRITER_LEVELS` of 1/2/4/8, load 2.1–4.3/18 throughout, gate
+three runs at `1f7921a` (`bench/results/20260903T{123928,124701,125358}Z.txt`,
+the default `WRITER_LEVELS` of 1/2/4/8, load 1.6–4.3/18 throughout, gate
 passed). The eleven-level wide sweep and the tail-latency table further down
 were **not** re-run in this sitting and are carried forward from the
 2026-08-30 sweep at `2cb2539`, as each says in place — so this page again
@@ -550,46 +645,51 @@ carries two concurrency sessions.
 
 | Writers | InlaySQL commits/s (median, range) | SQLite commits/s (median, range) |
 | --- | --- | --- |
-| 1 | 247 (243–247) | 87 (85–88) |
-| 2 | 354 (342–425) | 88 (87–88) |
-| 4 | 609 (601–614) | 88 (87–88) |
-| 8 | **1228** (1228–1261) | 87 (83–88) |
+| 1 | 247 (242–252) | 87 (86–87) |
+| 2 | 360 (300–475) | 88 (88–90) |
+| 4 | 553 (546–609) | 89 (87–89) |
+| 8 | **1184** (1173–1267) | 89 (88–90) |
 
-**Roughly 14x SQLite at 8 writers (14.1-14.8x across this run's own three
-pairings, median 14.1x), 0.0% aborted — against 14-15x in the afternoon's
-edition, 13.2x in the morning's and 13.7x in the 2026-08-30 wide sweep, all
-up from 8.1x before the adaptive gather window (`94d96a6`, unchanged
-since).** The 8-writer InlaySQL row is 1228 here against 1347 in the
-afternoon (−9%), 1148 in the morning (+7%) and 1209 in the wide sweep
-(+2%) — outside this run's own 2.7% spread and the afternoon's 5.5%, and
-squarely inside the roughly ±10%-around-1200 band the previous edition said
-to quote instead of its 1347. **It is unattributed**: nothing in
-`4f8e5dd..3cf0d85` touches the commit path or the coalescing window
-(AHL-536 adds `Device::read_shared`, a read-side method defaulting to
-`None`, to `device.rs`; AHL-532 and AHL-535 are read-side), so there is no
-commit to credit or blame, and `PERF.md` contains no A/B on this shape
-across it. Four sessions have now put this one point at 1209, 1148, 1347
-and 1228 with the coalescing code unchanged throughout; the band holds, and
-the band, not the 1228, is what to quote. The commit gate's pre-`fsync`
-gather window (`coalesce_normal_commits`, `crates/inlaysql/src/device.rs`)
-keeps yielding while a normal commit is inflight or waiting and progress
-keeps happening, closing on stalled progress instead of a fixed 8-yield
-count — see `PERF.md` for the full mechanism, unchanged since it shipped.
-The 8-writer scaling (1228 against 247 at one writer) is roughly 5x by the
-harness's own line — 4.97x, 5.04x and 5.11x per run — against the
-afternoon's roughly 5.5x, the morning's roughly 4.7x and the 2026-08-30
-sweep's roughly 5x, and it moves for the same unattributed reason the
-8-writer row does. **The 2-writer case is the noise measurement it always
-was**: 354 against 247 is roughly 1.4x (1.38–1.75x per run; commits/s
-spread 23%, the widest concurrency cell and in this run's ≥10% list beside
-the 4-writer p50 at 19%), against 1.6x in both earlier sittings today,
-1.25x on 2026-08-30 and 1.60x the edition before. Five sessions have now
-put this one point at 1.60x, 1.25x, 1.6x, 1.6x and 1.4x with no change to
-the coalescing code between any of them, and the 8-writer figure — read as
-a band, above — is the one to trust. SQLite's own rows sat at 87–88 at
-every level (83–88 across runs), 1-4 commits/s under the afternoon's 89–92
-and back on the morning's 85–88, the same size of sitting-to-sitting move
-the durable-write row above shows.
+**Roughly 13x SQLite at 8 writers (13.2-14.4x across this run's own three
+pairings, median 13.2x), 0.0% aborted — against 14x in the evening's
+edition, 14-15x the afternoon before, 13.2x that morning and 13.7x in the
+2026-08-30 wide sweep, all up from 8.1x before the adaptive gather window
+(`94d96a6`, unchanged since).** The 8-writer InlaySQL row is 1184 here
+against 1228 the evening before (−4%), 1347 (−12%), 1148 (+3%) and 1209 in
+the wide sweep (−2%) — inside this run's own 8% spread and squarely inside
+the roughly ±10%-around-1200 band the last two editions said to quote.
+**It is unattributed, and this time the commit path did change under it**:
+AHL-542 and AHL-545 are on every writer's encode path and `PERF.md`
+measured `writes` flat across both (the durable-write section has the
+numbers); AHL-544 and AHL-547 put commit-side absorption into `device.rs`
+behind `EngineOptions::commit_absorption`, which defaults to `false`, so
+this table is the flag-off engine — and `PERF.md`'s own flag-off 8-writer
+control rows in those two sections read 1,421 and 1,344 commits/s on its
+louder harness settings, which says nothing about this row except that
+the flag-off path did not fall over. Five sessions have now put this one
+point at 1209, 1148, 1347, 1228 and 1184 with the coalescing window
+unchanged throughout; the band holds, and the band, not the 1184, is what
+to quote. The commit gate's pre-`fsync` gather window
+(`coalesce_normal_commits`, `crates/inlaysql/src/device.rs`) keeps
+yielding while a normal commit is inflight or waiting and progress keeps
+happening, closing on stalled progress instead of a fixed 8-yield count —
+see `PERF.md` for the full mechanism, unchanged since it shipped. The
+8-writer scaling (1184 against 247 at one writer) is roughly 5x by the
+harness's own line — 5.14x, 4.66x and 4.90x per run — against the
+evening's roughly 5x, the afternoon's roughly 5.5x, the morning's roughly
+4.7x and the 2026-08-30 sweep's roughly 5x. **The 2-writer case is the
+noise measurement it always was, and this sitting is its loudest**: 360
+against 247 is roughly 1.5x (1.19–1.92x per run; commits/s 475 / 300 /
+360, a 49% spread, and p50 4.07 / 7.93 / 4.15 ms, 93% — the two widest
+concurrency cells this page has published, at the top of this run's core
+≥10% list beside the 4-writer p50 at 14% and commits/s at 11%), against
+1.4x the evening before, 1.6x in the two sittings before that, 1.25x on
+2026-08-30 and 1.60x the edition before. Six sessions have now put this
+one point at 1.60x, 1.25x, 1.6x, 1.6x, 1.4x and 1.5x with no change to the
+coalescing code between any of them, and the 8-writer figure — read as a
+band, above — is the one to trust. SQLite's own rows sat at 87–89 at every
+level (86–90 across runs), on the evening's 87–88 and the morning's 85–88,
+tight to within 2%.
 
 **Published because it is true, not because it flatters us: eight writers is
 still not the peak.** **Carried forward from the 2026-08-30 wide sweep at
@@ -597,7 +697,7 @@ still not the peak.** **Carried forward from the 2026-08-30 wide sweep at
 `WRITER_LEVELS=1,2,3,4,5,6,8,12,16,24,32`, load 2.9–3.6/18), not re-run
 this edition** — the figures from here to the end of the tail-latency table
 below are that sweep's. Its 1/2/4/8 points differ from the fresh table
-above by 1%, 16%, 4% and 2% respectively — the 2-writer point being the
+above by 1%, 18%, 6% and 2% respectively — the 2-writer point being the
 noise measurement the paragraph above describes, the other three inside or
 at the edge of the overlap of the two sessions' own ranges. All eleven levels (medians;
 run-to-run
@@ -653,12 +753,13 @@ concurrency`. The wide sweep above already measured every writer level
 with percentiles, so this table is a slice of it (`1, 8, 32`) rather than a
 separate session — **and, like that sweep, it is carried forward from
 2026-08-30 at `2cb2539`, not regenerated this edition**, because the
-2026-09-02 run stopped at 8 writers and has no 32-writer row to put here.
+2026-09-03 run stopped at 8 writers and has no 32-writer row to put here.
 For the record, that fresh run's own 1- and 8-writer tails (p50 / p95 / p99
-/ max, medians of three): 4.02 / 4.25 / 7.92 / 8.05 ms at 1 writer and 4.90
-/ 20.06 / 32.97 / 53.90 ms at 8 — the same shape as the rows below, the
-8-writer p50 within 0.1 ms of it and p99 within 2 ms, which is as close as
-a one-sample tail column gets between sessions.
+/ max, medians of three): 4.03 / 4.24 / 7.88 / 8.02 ms at 1 writer and 4.83
+/ 19.03 / 39.14 / 54.92 ms at 8 — the same shape as the rows below, the
+8-writer p50 within 0.2 ms of it and p95 within 0.2 ms, the p99 8 ms
+wider, which is the kind of distance a one-sample tail column keeps
+between sessions.
 
 | Writers | InlaySQL commits/s | p50 | p95 | p99 | max | SQLite commits/s | p50 | p95 | p99 | max |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -739,31 +840,31 @@ banked, and the shipped constants are unchanged.
 
 2,000 vectors, dim 384, 100 queries, top-10, recall measured against an
 exhaustive oracle. Median of three runs, same session as the SQLite tables
-above (`bench/results/20260902T{124833,125609,130346}Z.txt`).
+above (`bench/results/20260903T{123928,124701,125358}Z.txt`).
 
 | Corpus | recall@10 | p50 (median, range) | vs `sqlite-vec` (median, range across the 3 runs) |
 | --- | --- | --- | --- |
-| Text-derived embeddings | 1.000 | 69.08 µs (68.96–69.75 µs) | **~9x faster at 100% of its recall** (per-run ratio 9.07–9.25x, median 9.15x) |
-| Uniform random | 0.922 | 95.17 µs (93.00–97.08 µs) | ~6.5-7x faster at 92.2% of its recall (6.53–6.82x, median 6.78x) |
+| Text-derived embeddings | 1.000 | 68.67 µs (65.38–74.04 µs) | **~9x faster at 100% of its recall** (per-run ratio 8.60–9.70x, median 9.17x) |
+| Uniform random | 0.922 | 93.00 µs (89.96–97.88 µs) | ~7x faster at 92.2% of its recall (6.91–7.52x, median 7.04x) |
 
 The multiples are the median of the three runs' own per-run ratios (the
 harness's "is Nx faster" lines), not the ratio of the two median p50s; the
-two methods agree on the realistic corpus (632.50 / 69.08 = 9.16x against
-9.15x) and to within a tenth on the uniform one (634.33 / 95.17 = 6.67x
-against 6.78x), and neither InlaySQL p50 is in this run's ≥10% list this
-time (1.1% and 4.3% spread — the tightest this table has been). Both
-InlaySQL p50s moved *down* from the afternoon's 75.17 µs and 106.88 µs — 8%
-and 11%, outside this run's own spreads — landing within 1% and 3% of the
-morning's 69.54 / 92.08 µs, and `sqlite-vec`'s own p50 moved with them
-(687.08 → 632.50 µs realistic, −8%; 684.25 → 634.33 µs uniform, −7%), which
-is why the ratios are unchanged to the first digit (9.14x → 9.15x, 6.50x →
-6.78x). That is the sitting speaking, not either engine: four editions'
-medians (78.96, 69.54, 75.17, 69.08 µs) are one figure measured on four
-different sittings, `PERF.md` has no A/B on this suite across
-`4f8e5dd..3cf0d85` (AHL-536 changed the tree's leaf buffers from `Rc` to
-`Arc` and measured the shapes it did measure flat; nothing measured the
-vector index), so the move is unattributed in both directions and the
-honest quote is still roughly 70-80 µs.
+two methods agree to within a tenth on the realistic corpus (634.00 /
+68.67 = 9.23x against 9.17x) and to within a quarter on the uniform one
+(676.46 / 93.00 = 7.27x against 7.04x). The realistic-corpus InlaySQL p50
+is in this run's ≥10% list (12.6% spread — the second run read 74.04 µs
+where the other two read 65.38 and 68.67) and so is its ratio (12%), where
+the evening's table was the tightest this one had been (1.1% and 4.3%);
+the uniform p50 held within 8.5%. Both InlaySQL medians are where the
+evening left them — 69.08 → 68.67 µs (−1%) and 95.17 → 93.00 µs (−2%),
+inside this run's spreads — and `sqlite-vec`'s own moved by about as
+little (632.50 → 634.00 µs realistic, +0.2%; 634.33 → 676.46 µs uniform,
++7%, which is the whole of the uniform ratio's 6.78x → 7.04x). Five
+editions' medians (78.96, 69.54, 75.17, 69.08, 68.67 µs) are one figure
+measured on five different sittings; `PERF.md` has no A/B on this suite
+across `3cf0d85..1f7921a` (nothing in AHL-538 through AHL-550 touches
+`hnsw.rs` or the distance kernels), so the honest quote is still roughly
+70-80 µs and this sitting sits at the bottom of it.
 
 Both corpus shapes are published because only one of them flatters us. Uniform
 random vectors in 384 dimensions have no structure for a graph index to
@@ -774,17 +875,19 @@ embeddings are what an application actually stores.
 (0.986 vs 1.000 exact) and nothing measurable on the random one (0.922 both),
 for a 1.65x smaller file and a 3.96x smaller resident payload — all four
 figures identical across all three runs and identical to the previous
-edition's. Its per-query cost at this scale is 154.88 µs (152.33–159.00 µs)
-realistic and 255.04 µs (239.04–255.96 µs) uniform, roughly 2.2x and 2.7x
-the exact index's p50 (the int8 rows held within 4% and 7% here; both moved
-down 7% and 3% from the afternoon's 165.88 / 262.50 µs, the same direction
-as the exact rows above, and unattributed for the same reason).
+edition's. Its per-query cost at this scale is 153.83 µs (153.38–155.42 µs)
+realistic and 243.63 µs (240.42–285.83 µs) uniform, roughly 2.2x and 2.6x
+the exact index's p50 (the realistic int8 row held within 1.3%; the
+uniform one is in this run's ≥10% list at 19%, the first run reading
+285.83 µs where the other two read 240–244; the medians moved 154.88 →
+153.83 and 255.04 → 243.63 µs from the evening's, −1% and −4%, inside the
+spreads and unattributed for the same reason as the exact rows above).
 
 **Spot-checked at scale, `SUITE=quantization DOCS=100000 QUERIES=50`, median
 of three runs (`bench/results/20260830T{125800,131326,132715}Z.txt`, load
 2.3–4.8/18 throughout) — carried forward from the 2026-08-30 edition at
-`2cb2539`, not regenerated this edition; the 2026-09-02 sitting ran only the
-default 2,000-document suite above.** Recall loss widens to 0.028 (realistic, 0.970 vs
+`2cb2539`, not regenerated this edition; the 2026-09-03 sitting, like the
+three before it, ran only the default 2,000-document suite above.** Recall loss widens to 0.028 (realistic, 0.970 vs
 0.998) and 0.014 (uniform, 0.104 vs 0.118) — both figures exact and identical
 across all three runs (0% spread), a real and fully reproducible finding, not
 subject to this section's usual hedging.
@@ -910,38 +1013,39 @@ on the wire changed. See `bench/README.md` and `docs/server.md`.
 
 ## Retrieval — BM25 is no longer the expensive half
 
-2,000 documents, dim 384, `LIMIT 10`. Ingest 14,877 docs/s (median of three
-runs, 14,262–16,573; same session as the tables above —
-`bench/results/20260902T{124833,125609,130346}Z.txt`).
+2,000 documents, dim 384, `LIMIT 10`. Ingest 17,527 docs/s (median of three
+runs, 15,962–19,844; same session as the tables above —
+`bench/results/20260903T{123928,124701,125358}Z.txt`).
 
 | Workload | p50 (median, range) | p95 (median) | Previous edition (`9aba437`) |
 | --- | --- | --- | --- |
-| Vector only | 66.25 µs (65.83–67.71 µs) | 113.17 µs | 87.88 µs |
-| BM25 only | **46.42 µs** (45.04–52.13 µs) | 64.04 µs | 347.50 µs |
-| Hybrid (fused) | **93.63 µs** (93.04–141.50 µs) | 110.88 µs | 453.88 µs |
+| Vector only | 74.04 µs (73.25–77.75 µs) | 123.63 µs | 87.88 µs |
+| BM25 only | **49.42 µs** (47.83–49.92 µs) | 62.79 µs | 347.50 µs |
+| Hybrid (fused) | **97.83 µs** (96.00–105.58 µs) | 118.92 µs | 453.88 µs |
 
 Hybrid is **one SQL statement**, not two queries and a client-side merge.
 
-BM25 fell **roughly 7x** and hybrid **roughly 5x** against that historical
-baseline (this session's own three runs give 6.67–7.72x and 3.21–4.88x —
-and the low end of both is the second run, `125609Z`, the same run that
-carried the point-read tail: its BM25 p50 read 52.13 µs against 45–46 in
-the other two, and its hybrid p50 141.50 µs against 93 in both others. The
-hybrid p50's 52% spread is in this run's ≥10% list, as is BM25's 15%, and
-every BM25 and hybrid tail column — p95, p99, max — tops the whole suite's
-disagreement list because of that one run; the other two runs agree within
-3% on both. The vector leg held within 3%). Against the afternoon's
-`4f8e5dd` edition (50.50 / 102.79 µs) both medians are 8-9% *lower* and
-within 1-2% of the morning's 46.67 / 95.54 µs, so four editions now read
-51.21, 46.67, 50.50, 46.42 µs on BM25 with no code touching `bm25.rs` in
-any of the ranges between them and no A/B in `PERF.md` on this suite across
-`4f8e5dd..3cf0d85`: the move is unattributed, the band is roughly 46–51 µs,
-and the ratio against the fixed `9aba437` baseline is roughly 7x on BM25
-and roughly 4.5-5x on hybrid, to one digit. The ingest figure moved 15,961
-→ 14,877 docs/s (−7%), inside this run's 16% spread. The vector leg moved
-74.67 → 66.25 µs (−11%), outside this run's 3% spread, the same direction
-and size as the `sqlite-vec` section's exact-HNSW rows above, and
-unattributed with them. The underlying rewrite is still code, from the
+BM25 fell **roughly 7x** and hybrid **roughly 4.5x** against that
+historical baseline (this session's own three runs give 6.96–7.27x and
+4.30–4.73x — the tightest this table has been on both: BM25's p50 held
+within 4% and hybrid's within 10%, just under the ≥10% list, where the
+evening's second run had put hybrid at 52% and every BM25/hybrid tail
+column at the top of the suite's disagreement list). Against the evening's
+`3cf0d85` edition (46.42 / 93.63 µs) both medians are 4-6% *higher*, inside
+the band, so five editions now read 51.21, 46.67, 50.50, 46.42, 49.42 µs on
+BM25 with no code touching `bm25.rs` in any of the ranges between them and
+no A/B in `PERF.md` on this suite across `3cf0d85..1f7921a`: the move is
+unattributed, the band is roughly 46–51 µs, and the ratio against the
+fixed `9aba437` baseline is roughly 7x on BM25 and roughly 4.5x on hybrid,
+to one digit. The ingest figure moved 14,877 → 17,527 docs/s (+18%), with
+its own 22% spread (15,962 / 19,844 / 17,527) — a short phase that reads
+the machine; AHL-542 is on its commit path and measured flat on the
+single-row write, and no A/B ran this ingest, so it is not attributed. The
+vector leg moved 66.25 → 74.04 µs (+12%), outside this run's 6% spread and
+*not* mirrored by the `sqlite-vec` section's exact-HNSW row above, which
+held at 68.67 µs on the same index code in the same runs; five editions
+have put this leg at 87.88, 74.67, 66.25 and 74.04 µs, and it is
+unattributed. The underlying rewrite is still code, from the
 same earlier edition as before: the full-text
 index stopped being a map of maps and became an ordinary inverted index with
 dense document ordinals, a bounded top-`k` heap instead of scoring and sorting
@@ -1058,12 +1162,16 @@ published with each run's own figure. **Two things changed underneath the
 MySQL column at once**: the container is now `mysql:8.4` (LTS) where every
 earlier row was 8.0.x (`e7cc895`), and it runs `--innodb-buffer-pool-size=512M`
 (the 2026-08-31 tuning fix above) where the `b4798ce` row did not. So no
-MySQL edition-to-edition move here is attributed to anything. The
-`3cf0d85..bdc64eb` engine range (AHL-538 through AHL-542) touches scans,
-aggregates and the batch-insert write path, not the single-row durable
-commit this section's write column measures, and no read-path change in it
-was measured on a point read (`PERF.md`: AHL-541's `points` control was
-flat). The interleaved rerun of 2026-08-30 stays below as one paragraph of
+MySQL edition-to-edition move here is attributed to anything. `bdc64eb`
+now sits between two `run.sh` editions: the `3cf0d85..bdc64eb` engine
+range (AHL-538 through AHL-542) touches scans, aggregates and the
+batch-insert write path, and `bdc64eb..1f7921a` (AHL-544 through AHL-550)
+the insert path, the join probe and the residual filter, plus commit-side
+absorption behind a default-off flag — none of it the single-row durable
+commit this section's write column measures beyond what `PERF.md` measured
+flat on `writes` (AHL-542, AHL-545), and no read-path change in either
+range was measured to move a point read (`PERF.md`: every `points`
+control in both ranges was flat). The interleaved rerun of 2026-08-30 stays below as one paragraph of
 history; the "Correction" stays because its transport-tax accounting is
 still the right way to read this table.
 
@@ -1623,11 +1731,14 @@ promoted). Raw: `bench/results/20260902T191343Z-scoreboard/`
 either engine. InlaySQL's aggregate and batch-insert cells are
 `sql_shapes` at `REPS=5` from this sitting, on the host; its range and
 join cells are reused from this edition's gated `run.sh` tables at
-`3cf0d85` (2026-09-02 evening, median of three — the previous edition
-likewise reused a same-day `run.sh` figure for those cells), which means
-two disclosures: they are a different sitting from the server columns,
-and the `run.sh` join suite's `LIMIT` shapes are `LIMIT 10` where the
-drivers run `LIMIT 20`. InlaySQL runs in-process throughout; the servers
+`1f7921a` (2026-09-03 evening, median of three — the previous two editions
+likewise reused their own `run.sh` figures for those cells), which means
+three disclosures: they are a different sitting from the server columns,
+they are a *later* build than the server columns' `bdc64eb` by AHL-544
+through AHL-550 (of which AHL-549 and AHL-550 moved the `LIMIT` join and
+range cells, as the sections above say), and the `run.sh` join suite's
+`LIMIT` shapes are `LIMIT 10` where the drivers run `LIMIT 20`. InlaySQL
+runs in-process throughout; the servers
 sit behind a unix socket — an asymmetry that favours InlaySQL, so every
 LOSS recorded here is conservative and every WIN is partly the transport.
 
@@ -1639,22 +1750,22 @@ generated with the same seeded xorshift64* the Rust suite uses.
 
 | Engine | ops/s (median, range) | p50 (median) |
 | --- | --- | --- |
-| **InlaySQL** (`run.sh` at `3cf0d85`, gated median of three) | 97,624 (94k–98k) | 9.83 µs |
+| **InlaySQL** (`run.sh` at `1f7921a`, gated median of three) | 119,219 (110k–120k) | 8.25 µs |
 | PostgreSQL 17 | 21,824 (9,009–22,931) | 44 µs |
 | MySQL 8.4 | 14,330 (14,181–14,635) | 67 µs |
 
-**~7x MySQL 8.4 and ~4.5x PostgreSQL at the medians** (was ~3.7x/~2.3x on
-2026-08-31). The servers' columns are the like-for-like part of that
-change and they barely moved — MySQL 13,124 → 14,330 across a version
-change and a quieter machine, PostgreSQL 21,455 → 21,824 (one 9,009 rep
-tonight is the min; the other four sit at 21,640–22,931). The whole of the
-wider multiple is InlaySQL's own cell, 49,259 → 97,624, and that is two
-things at once: the 2026-08-31 figure was a same-sitting median under
-desktop load against a published-clean 64,250, and AHL-535 (borrowing row
-API) measured 1.40x on this exact shape interleaved and changed the
-harness under it (the secondary-index section above says how). So read
-the growth in the multiple as roughly half measurement conditions and
-half engine, and the WIN itself as the unchanged finding: the range scan
+**~8x MySQL 8.4 and ~5.5x PostgreSQL at the medians** (was ~7x/~4.5x with
+the `3cf0d85` cell, ~3.7x/~2.3x on 2026-08-31). The servers' columns are
+the 2026-09-02/03 sitting's and did not move; the whole of this edition's
+step is InlaySQL's own cell, 97,624 → 119,219, which the secondary-index
+section above attributes to AHL-550 (the residual filter compiled once per
+execution; 1.22–1.36x interleaved on this exact shape) over AHL-541's
+1.04x. The step before it, 49,259 → 97,624, was two things at once: the
+2026-08-31 figure was a same-sitting median under desktop load against a
+published-clean 64,250, and AHL-535 measured 1.40x on this shape and
+changed the harness under it. So read the growth in the multiple since
+2026-08-31 as part measurement conditions and part two attributed engine
+changes, and the WIN itself as the unchanged finding: the range scan
 InlaySQL loses to SQLite is a shape it wins against both servers.
 
 ### Two-table join — WIN all four shapes against both servers
@@ -1664,33 +1775,35 @@ InlaySQL loses to SQLite is a shape it wins against both servers.
 medians compared, both FROM orders reported worst-first per
 `SCOREBOARD.md`'s pre-fixed join rule.
 
-| Shape | InlaySQL p50 (`3cf0d85`) | MySQL 8.4 p50 (median, range) | PostgreSQL 17 p50 (median, range) |
+| Shape | InlaySQL p50 (`1f7921a`) | MySQL 8.4 p50 (median, range) | PostgreSQL 17 p50 (median, range) |
 | --- | --- | --- | --- |
-| PK inner, full join | **3.23 ms** | 13.68 ms (13.64–13.71 ms) | 9.36 ms (9.28–9.47 ms) |
-| Secondary-index inner, full join | **3.49 ms** | 13.71 ms (13.68–13.83 ms) | 9.42 ms (9.30–9.49 ms) |
-| PK inner, LIMIT (ours 10, theirs 20) | 4.25 µs | 44 µs (42–44 µs) | 29 µs (28–30 µs) |
-| Secondary-index inner, LIMIT (ours 10, theirs 20) | 6.88 µs | 51 µs (49–52 µs) | 30 µs (28–30 µs) |
+| PK inner, full join | **3.25 ms** | 13.68 ms (13.64–13.71 ms) | 9.36 ms (9.28–9.47 ms) |
+| Secondary-index inner, full join | **3.63 ms** | 13.71 ms (13.68–13.83 ms) | 9.42 ms (9.30–9.49 ms) |
+| PK inner, LIMIT (ours 10, theirs 20) | 3.75 µs | 44 µs (42–44 µs) | 29 µs (28–30 µs) |
+| Secondary-index inner, LIMIT (ours 10, theirs 20) | 5.79 µs | 51 µs (49–52 µs) | 30 µs (28–30 µs) |
 
 Both servers hash-join either FROM order in ~13.7/~9.4 ms — the
 iteration-side asymmetry that used to split InlaySQL's own two full-join
 shapes does not exist for them, and as of AHL-524 it no longer exists for
-InlaySQL either. **Full joins: ~4x MySQL 8.4 and ~2.8x PostgreSQL on both
-shapes.** The 2026-08-31 edition had the PK-inner full join at 13.04 ms —
-a TIE against MySQL and the one red cell against PostgreSQL (LOSS ~1.24x),
-"the shape where PG's planner picked the better order". That cell is gone
-for a named reason: AHL-524 (`PERF.md`, 2026-09-02) fixed AHL-512's
+InlaySQL either. **Full joins: ~4x MySQL 8.4 and ~2.6-2.9x PostgreSQL on
+both shapes.** The 2026-08-31 edition had the PK-inner full join at 13.04
+ms — a TIE against MySQL and the one red cell against PostgreSQL (LOSS
+~1.24x), "the shape where PG's planner picked the better order". That cell
+is gone for a named reason: AHL-524 (`PERF.md`, 2026-09-02) fixed AHL-512's
 inverted cost model so both written orders run the same users-driving
-plan, measured 9.34 → 3.21 ms on this shape in a single run and 3.23 ms in
-the gated `3cf0d85` median. The servers' own full-join columns moved
-15.00/15.01 → 13.68/13.71 ms (MySQL, version change and quiet machine) and
-10.49 → 9.36/9.42 ms (PostgreSQL, quiet machine) — the direction of a
-quieter sitting, unattributed. **The `LIMIT` rows are not the same shape on
-both sides** — `LIMIT 10` from `run.sh` against the drivers' `LIMIT 20` —
-so the arithmetic (7–10x MySQL, 4.5–7x PostgreSQL) overstates a
-like-for-like comparison by up to the per-row cost of ten more rows; read
-those two rows as "several times faster, on a smaller LIMIT", not as the
-digits. The previous edition's InlaySQL `LIMIT 20` cells (14.08 / 13.38 µs)
-came from a same-sitting run under desktop load and are not reused.
+plan, measured 9.34 → 3.21 ms on this shape in a single run, 3.23 ms in
+the gated `3cf0d85` median and 3.25 ms in this edition's. The servers' own
+full-join columns moved 15.00/15.01 → 13.68/13.71 ms (MySQL, version
+change and quiet machine) and 10.49 → 9.36/9.42 ms (PostgreSQL, quiet
+machine) — the direction of a quieter sitting, unattributed. **The `LIMIT`
+rows are not the same shape on both sides** — `LIMIT 10` from `run.sh`
+against the drivers' `LIMIT 20` — so the arithmetic (9–12x MySQL, 5–8x
+PostgreSQL; the InlaySQL cells moved 4.25 → 3.75 and 6.88 → 5.79 µs on
+AHL-549, per the joins section) overstates a like-for-like comparison by
+up to the per-row cost of ten more rows; read those two rows as "several
+times faster, on a smaller LIMIT", not as the digits. The 2026-08-31
+edition's InlaySQL `LIMIT 20` cells (14.08 / 13.38 µs) came from a
+same-sitting run under desktop load and are not reused.
 
 Full-join methodology, disclosed: the full-join shapes are timed as
 server-side `SELECT COUNT(*) FROM (<join>) q` wrappers, because a Python
@@ -1873,8 +1986,8 @@ item again — the insert path's remaining costs the root plan lists
   Every `run.sh`-derived table (points, indexed, joins, vectors, concurrency,
   retrieval) is a median of three complete runs, published as median-plus-
   range rather than a bare point value, with the disagreement between runs
-  disclosed per section: 109 of 343 metrics moved by 10% or more across the
-  three main-suite runs at `3cf0d85` (10 of 135 on core columns alone — see
+  disclosed per section: 114 of 343 metrics moved by 10% or more across the
+  three main-suite runs at `1f7921a` (22 of 135 on core columns alone — see
   the spread note at the top of this file), and, in the carried-forward
   2026-08-30 sessions, 63 of 180 in the wide concurrency sweep and 25 of 64
   in the quantisation spot-check. A same-binary A/A test (`PERF.md` §4,
@@ -1882,27 +1995,29 @@ item again — the insert path's remaining costs the root plan lists
   the main suite's core columns, 3.6% on the concurrency sweep, 0.3% on the
   quantisation spot-check, and 7.3-20.2% on the single most scrutinised
   metric depending on how busy the machine was — the acceptance target (CoV
-  under 3%) is not met today. This edition's whole-suite spread (109 of 343)
-  sits between the same day's two earlier sittings (106 of 343 at `7b20175`,
-  114 at `4f8e5dd`) and well under the 2026-08-30 edition's (196 of 343),
-  all on the same tool and the same metric list; that 2026-08-30 edition's
-  was in turn wider than the one before it — 54/266 (20.3%) then, 146/266
-  (54.9%) there, recomputed on the metrics common to both — see the spread
-  note at the top of this file and `PERF.md` §4 for the full measurement,
-  including why the originally published "56 of 285" comparison overstated
-  it. What three full regenerations in one day add to that picture: several
-  rows moved between sittings by more than any sitting's own three-run
-  spread — the durable write on both sides, the 8-writer commits/s, both
-  vector p50s, the BM25 and hybrid p50s, the ingest rate, SQLite's own
-  durable point read (170k, 278k, 170k) — on code that did not change
-  between them, so a sitting's own min–max is a floor on the noise, not the
-  whole of it, and each section says so where it applies. And two of this
-  edition's tables (point reads, secondary-index reads) are on a harness
-  that changed in between, so their edition-to-edition moves are not noise
-  measurements at all and each says so in place. Read every ratio in this
+  under 3%) is not met today. This edition's whole-suite spread (114 of 343)
+  matches the widest of the previous day's three sittings (106 at
+  `7b20175`, 114 at `4f8e5dd`, 109 at `3cf0d85`) and is well under the
+  2026-08-30 edition's (196 of 343), all on the same tool and the same
+  metric list; that 2026-08-30 edition's was in turn wider than the one
+  before it — 54/266 (20.3%) then, 146/266 (54.9%) there, recomputed on the
+  metrics common to both — see the spread note at the top of this file and
+  `PERF.md` §4 for the full measurement, including why the originally
+  published "56 of 285" comparison overstated it. What four full
+  regenerations in two days add to that picture: several rows moved between
+  sittings by more than any sitting's own three-run spread — the durable
+  write on both sides, the 8-writer commits/s, both vector p50s, the BM25
+  and hybrid p50s, the retrieval vector leg, the ingest rate, SQLite's own
+  durable point read (170k, 278k, 170k, 177k) and its durable write (92,
+  91, 99) — on code that did not change between them, so a sitting's own
+  min–max is a floor on the noise, not the whole of it, and each section
+  says so where it applies. This edition is the first since AHL-535 on
+  which every `run.sh` table is the same harness as the edition before, so
+  every edition-to-edition move on this page is a noise measurement or an
+  attributed one, and each section says which. Read every ratio in this
   document as approximate rather than exact — the point-reads section above
   is the extreme case, where the individual runs' own ratios against
-  journal-mode SQLite ranged from 2.39x to 6.77x. `bench/compare.sh` carried
+  journal-mode SQLite ranged from 2.81x to 6.60x. `bench/compare.sh` carried
   none of the gated machinery when its tables were first measured — no
   repeat wrapper, and load sampled once before the run rather than
   throughout it. **Both landed 2026-08-31** (`bench/load_gate.sh`, shared

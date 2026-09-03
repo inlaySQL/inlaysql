@@ -304,14 +304,14 @@
   </p>
   <div class="figures">
     <div class="figure">
-      <b>872,474</b>
+      <b>692,893</b>
       <span>point reads per second</span>
-      <em>~2.5-7× SQLite in journal mode, durable</em>
+      <em>~3-6.5× SQLite in journal mode, durable</em>
     </div>
     <div class="figure">
-      <b>~14×</b>
+      <b>~13×</b>
       <span>SQLite on concurrent writes</span>
-      <em>1,228 commits/s at 8 writers, 0% aborted</em>
+      <em>1,184 commits/s at 8 writers, 0% aborted</em>
     </div>
     <div class="figure">
       <b>192 µs</b>
@@ -479,19 +479,19 @@
       <tbody>
         <tr>
           <td>Point read by primary key</td>
-          <td class="num">872,474 ops/s</td>
+          <td class="num">692,893 ops/s</td>
           <td>SQLite, journal (durable)</td>
-          <td class="win">~2.5-7× faster</td>
+          <td class="win">~3-6.5× faster</td>
         </tr>
         <tr>
           <td>Concurrent writes, 8 writers</td>
-          <td class="num">1,228 commits/s</td>
+          <td class="num">1,184 commits/s</td>
           <td>SQLite, journal</td>
-          <td class="win">~14× faster</td>
+          <td class="win">~13× faster</td>
         </tr>
         <tr>
           <td>Vector search, recall@10 1.000</td>
-          <td class="num">69.08 µs</td>
+          <td class="num">68.67 µs</td>
           <td><code>sqlite-vec</code></td>
           <td class="win">~9× faster</td>
         </tr>
@@ -515,21 +515,21 @@
         </tr>
         <tr>
           <td>Secondary-index inner join, 20k × 160k rows</td>
-          <td class="num">3.49 ms</td>
+          <td class="num">3.63 ms</td>
           <td>SQLite</td>
           <td class="win">~7-8× faster</td>
         </tr>
         <tr>
           <td>Indexed range scan, 50 rows</td>
-          <td class="num">9.83 µs</td>
+          <td class="num">8.25 µs</td>
           <td>SQLite, journal</td>
-          <td class="loss">~1.5× slower</td>
+          <td class="loss">~1.2× slower</td>
         </tr>
         <tr>
           <td>Indexed range scan, 50 rows</td>
-          <td class="num">97,624 ops/s</td>
+          <td class="num">119,219 ops/s</td>
           <td>MySQL 8.4, PostgreSQL 17</td>
-          <td class="win">~4-7× faster</td>
+          <td class="win">~5-8× faster</td>
         </tr>
         <tr>
           <td><code>GROUP BY</code>, 100 groups over 100k rows</td>

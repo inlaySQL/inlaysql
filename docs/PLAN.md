@@ -120,7 +120,7 @@ published row without a gated regeneration.
    `Vec`. Angles: the inner side borrows (AHL-535's buffer applied to the
    join's probed row), the match buffer is reused across outer rows, and a
    probe that reseeks from the retained cursor's parent on a leaf miss.
-2. **Range scan vs SQLite (0.67x).** After AHL-550: the residual filter
+2. **Range scan vs SQLite (0.81x since AHL-550; was 0.67x).** After AHL-550: the residual filter
    is compiled per execution and is ~7% of the shape (1.22–1.36x on
    `indexed-range`, `PERF.md` 2026-09-03); reading the filter-only `TEXT`
    column raw to skip its `from_utf8` was built and measured flat — the
