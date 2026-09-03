@@ -870,3 +870,121 @@ fn a_prepared_explain_describes_its_own_result_set() {
         "EXPLAIN of anything is a read, which is what keeps it off the write path"
     );
 }
+
+// ------------------------------------------------------- MIN/MAX (AHL-546)
+
+/// `MIN`/`MAX` of the rowid reports the optimisation and never a scan.
+#[test]
+fn min_max_of_the_rowid_reports_the_optimisation() {
+    let mut engine = engine();
+    run(
+        &mut engine,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
+    );
+    let plan = plan(&mut engine, "EXPLAIN SELECT MIN(id), MAX(id) FROM t");
+    assert_says(&plan, "MIN/MAX OPTIMIZATION");
+    assert_says(&plan, "USING INTEGER PRIMARY KEY");
+    assert_never_says(&plan, "SCAN t");
+}
+
+/// A column with a leading B-tree index reports the optimisation by that
+/// index's name, and a column with none falls back to a scan.
+#[test]
+fn min_max_of_an_indexed_column_names_the_index_and_falls_back_without_one() {
+    let mut engine = engine();
+    run(
+        &mut engine,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, indexed INTEGER, bare INTEGER)",
+    );
+    run(
+        &mut engine,
+        "CREATE INDEX t_indexed ON t (indexed) USING BTREE",
+    );
+
+    let indexed_plan = plan(&mut engine, "EXPLAIN SELECT MIN(indexed) FROM t");
+    assert_says(&indexed_plan, "MIN/MAX OPTIMIZATION");
+    assert_says(&indexed_plan, "USING INDEX t_indexed");
+
+    let bare_plan = plan(&mut engine, "EXPLAIN SELECT MIN(bare) FROM t");
+    assert_never_says(&bare_plan, "MIN/MAX OPTIMIZATION");
+    assert_says(&bare_plan, "SCAN t");
+}
+
+/// `COUNT(*)` forces a scan even alongside `MIN`/`MAX`, because this engine
+/// keeps no transactionally exact row count — see
+/// `Engine::try_min_max_scalar`'s doc.
+#[test]
+fn count_star_alongside_min_max_still_scans() {
+    let mut engine = engine();
+    run(&mut engine, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
+    let plan = plan(
+        &mut engine,
+        "EXPLAIN SELECT COUNT(*), MIN(id), MAX(id) FROM t",
+    );
+    assert_never_says(&plan, "MIN/MAX OPTIMIZATION");
+    assert_says(&plan, "SCAN t");
+}
+
+/// Every one of `WHERE`, `GROUP BY`, `DISTINCT` and a join sends the
+/// statement to the general path, mutation by mutation: dropping any one of
+/// `try_min_max_scalar`'s conditions has to fail one of these.
+#[test]
+fn where_group_by_distinct_and_a_join_all_fall_back_to_the_general_path() {
+    let mut engine = engine();
+    run(
+        &mut engine,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
+    );
+    run(
+        &mut engine,
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, t_id INTEGER)",
+    );
+
+    for sql in [
+        "EXPLAIN SELECT MIN(id) FROM t WHERE n > 0",
+        "EXPLAIN SELECT n, MIN(id) FROM t GROUP BY n",
+        "EXPLAIN SELECT DISTINCT MIN(id) FROM t",
+        "EXPLAIN SELECT MIN(t.id) FROM t JOIN u ON u.t_id = t.id",
+    ] {
+        let plan = plan(&mut engine, sql);
+        assert_never_says(&plan, "MIN/MAX OPTIMIZATION");
+    }
+}
+
+/// A projection that reads a raw column alongside the aggregates falls back:
+/// this rewrite never holds the representative row the general path's
+/// answer for that column would come from.
+#[test]
+fn a_raw_column_in_the_projection_falls_back() {
+    let mut engine = engine();
+    run(
+        &mut engine,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
+    );
+    let plan = plan(&mut engine, "EXPLAIN SELECT n, MIN(id) FROM t");
+    assert_never_says(&plan, "MIN/MAX OPTIMIZATION");
+}
+
+/// `HAVING`, `COUNT(DISTINCT ...)`, `FILTER`, a non-column argument and a
+/// derived `FROM` each have to fall back too — the remaining conditions
+/// `min_max_scalar_shape` checks beyond the ones already covered above.
+#[test]
+fn having_distinct_filter_expression_and_a_derived_table_all_fall_back() {
+    let mut engine = engine();
+    run(
+        &mut engine,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
+    );
+    run(&mut engine, "INSERT INTO t VALUES (1, 5), (2, 5), (3, 9)");
+
+    for sql in [
+        "EXPLAIN SELECT MIN(id) FROM t HAVING MIN(id) > 0",
+        "EXPLAIN SELECT MIN(DISTINCT n) FROM t",
+        "EXPLAIN SELECT MIN(id) FILTER (WHERE n > 0) FROM t",
+        "EXPLAIN SELECT MIN(id + 1) FROM t",
+        "EXPLAIN SELECT MIN(id) FROM (SELECT * FROM t)",
+    ] {
+        let plan = plan(&mut engine, sql);
+        assert_never_says(&plan, "MIN/MAX OPTIMIZATION");
+    }
+}

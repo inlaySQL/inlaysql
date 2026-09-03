@@ -149,6 +149,45 @@ pub trait Storage {
         Ok((batch.len(), last))
     }
 
+    /// The row at the low end of `table`'s row-id order, or `None` for an
+    /// empty table.
+    ///
+    /// This is `scan_batch(table, None, 1)`'s single answer, named for what
+    /// it is used for: the `MIN`/`MAX` optimisation
+    /// (`crate::engine`'s scalar-aggregate rewrite) answers `MIN(rowid)` —
+    /// and `MIN` of a declared `INTEGER PRIMARY KEY`, which *is* the row id —
+    /// with this one call instead of a table scan, the same way sqlite3's
+    /// own min/max optimisation does. The default is already cheap for every
+    /// backend, since `scan_batch` itself has to be; no backend needs to
+    /// override it.
+    fn first_in_table(&self, table: &str) -> Result<Option<(RowId, RowBuf)>> {
+        Ok(self.scan_batch(table, None, 1)?.into_iter().next())
+    }
+
+    /// The row at the high end of `table`'s row-id order, or `None` for an
+    /// empty table — the mirror of [`Storage::first_in_table`], for
+    /// `MAX(rowid)`.
+    ///
+    /// **The default is a full scan** — correct for a backend with no
+    /// cheaper way to find the last row (`crate::mem::MemStorage`, any test
+    /// double), but not the optimisation: a backend whose storage keeps rows
+    /// ordered and can descend straight to the high end should override this.
+    /// [`crate::storage::TreeStorage`] does, through the tree's
+    /// `last_in_prefix`.
+    fn last_in_table(&self, table: &str) -> Result<Option<(RowId, RowBuf)>> {
+        let mut last = None;
+        let mut after = None;
+        loop {
+            let batch = self.scan_batch(table, after, 4096)?;
+            match batch.last() {
+                Some((id, _)) => after = Some(*id),
+                None => break,
+            }
+            last = batch.into_iter().next_back();
+        }
+        Ok(last)
+    }
+
     /// Write (or overwrite) a `WITHOUT ROWID` table's row, addressed by its
     /// primary key's encoded bytes rather than a [`RowId`] — there is no
     /// row id on such a table at all.
@@ -285,6 +324,24 @@ pub trait Storage {
             .iter()
             .map(|key| crate::index::row_id_from_entry(key))
             .collect()
+    }
+
+    /// The least index entry key in `[start, end)`, or `None` if nothing in
+    /// the range is indexed — the secondary-index half of the `MIN`/`MAX`
+    /// optimisation, alongside [`Storage::first_in_table`]'s rowid half.
+    ///
+    /// The default is exactly [`Storage::scan_index_range`]'s first answer,
+    /// so any backend that only implements the general walk answers
+    /// correctly, only not the fast way. [`crate::storage::TreeStorage`]
+    /// overrides this with a one-descent tree read.
+    fn first_index_entry(&self, start: &[u8], end: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        Ok(self.scan_index_range(start, end)?.into_iter().next())
+    }
+
+    /// The greatest index entry key in `[start, end)` — the mirror of
+    /// [`Storage::first_index_entry`], for `MAX`.
+    fn last_index_entry(&self, start: &[u8], end: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
+        Ok(self.scan_index_range(start, end)?.into_iter().next_back())
     }
 
     /// Make all buffered writes durable.

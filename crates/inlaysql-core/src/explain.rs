@@ -292,6 +292,32 @@ impl<'e> Explainer<'e> {
         };
 
         let driving = &plan.from[0];
+
+        // The `MIN`/`MAX` optimisation (`AHL-546`): reported straight from
+        // `Engine::min_max_scalar_shape`/`Engine::min_max_access` — the same
+        // two functions `Engine::try_min_max_scalar` asks — rather than a
+        // second guess at the same rule, so `EXPLAIN` cannot say this rewrite
+        // fired when the executor in fact fell back to a scan, or the other
+        // way round.
+        if let Some(table) = crate::engine::min_max_scalar_shape(plan) {
+            if let Some(lines) = self.min_max_access_lines(table, plan)? {
+                for line in lines {
+                    self.push(parent, line);
+                }
+                if !plan.order.is_empty() {
+                    self.push(parent, "SORT FOR ORDER BY".to_string());
+                }
+                if plan.limit.is_some() {
+                    // Never pushed into a scan: there is no scan to push it
+                    // into. The one row this rewrite produces is what
+                    // `OFFSET`/`LIMIT` are applied to afterwards, same as any
+                    // other already-materialised answer.
+                    self.push(parent, "LIMIT APPLIED AFTER MATERIALISING".to_string());
+                }
+                return self.subqueries(plan, parent);
+            }
+        }
+
         let outer_rows = self
             .engine
             .estimated_outer_rows(plan, shape.fetch, self.env.params());
@@ -403,6 +429,39 @@ impl<'e> Explainer<'e> {
     }
 
     // ---------------------------------------------------------- access paths
+
+    /// One `SEARCH ... (MIN/MAX OPTIMIZATION)` line per aggregate in a query
+    /// [`crate::engine::min_max_scalar_shape`] already approved structurally,
+    /// or `None` if any aggregate's column has no ordered access path — the
+    /// one condition that function cannot check without the catalog, so this
+    /// falls back to describing the general path instead, exactly as
+    /// [`Engine::try_min_max_scalar`] falls back to running it.
+    fn min_max_access_lines(
+        &self,
+        table: &Table,
+        plan: &SelectPlan,
+    ) -> Result<Option<Vec<String>>> {
+        let mut lines = Vec::with_capacity(plan.aggregates.len());
+        for aggregate in &plan.aggregates {
+            let Some(Expr::Column(ordinal)) = &aggregate.arg else {
+                // Unreachable: `min_max_scalar_shape` only admits a bare
+                // column argument.
+                return Ok(None);
+            };
+            let Some(access) = self
+                .engine
+                .min_max_access(table, *ordinal, aggregate.collation)
+            else {
+                return Ok(None);
+            };
+            lines.push(alloc::format!(
+                "SEARCH {} USING {} (MIN/MAX OPTIMIZATION)",
+                table.name,
+                access.detail()
+            ));
+        }
+        Ok(Some(lines))
+    }
 
     /// How the rows of one stored table are reached, given the filter that
     /// applies to it — the three paths [`Engine::candidate_bytes`] chooses

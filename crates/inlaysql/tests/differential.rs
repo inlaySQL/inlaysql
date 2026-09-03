@@ -778,6 +778,97 @@ fn aggregates_agree_with_sqlite() {
     }
 }
 
+// ------------------------------------------------ scalar MIN/MAX (AHL-546)
+//
+// The `MIN`/`MAX` optimisation answers a scalar (no `GROUP BY`) `MIN`/`MAX`
+// from a tree descent instead of a scan. It is meant to be invisible to SQL,
+// so the oracle here is the same one `aggregates_agree_with_sqlite` already
+// trusts: sqlite3, over the same random `(g, v)` rows, but with `v` indexed
+// on one side and bare on the other — one exercises the rewrite, the other
+// the general path it falls back to, and both have to agree with sqlite3 and
+// therefore with each other.
+const SCALAR_MIN_MAX_QUERY: &str = "SELECT COUNT(*), MIN(id), MAX(id), MIN(v), MAX(v) FROM t";
+
+fn inlaysql_scalar_min_max(
+    groups: &[(i64, Option<i64>)],
+    indexed: bool,
+) -> Result<Vec<Vec<String>>, inlaysql::Error> {
+    let mut db = Database::open_in_memory()?;
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        &[],
+    )?;
+    if indexed {
+        db.execute("CREATE INDEX t_v ON t (v) USING BTREE", &[])?;
+    }
+    for (index, (group, value)) in groups.iter().enumerate() {
+        db.execute(
+            "INSERT INTO t (id, g, v) VALUES (?, ?, ?)",
+            &[
+                Value::Integer(index as i64 + 1),
+                Value::Integer(*group),
+                value.map(Value::Integer).unwrap_or(Value::Null),
+            ],
+        )?;
+    }
+    let result = db.query(SCALAR_MIN_MAX_QUERY, &[])?;
+    Ok(result
+        .rows
+        .iter()
+        .map(|row| row.iter().map(canonical_inlaysql).collect())
+        .collect())
+}
+
+fn sqlite_scalar_min_max(groups: &[(i64, Option<i64>)]) -> rusqlite::Result<Vec<Vec<String>>> {
+    let conn = rusqlite::Connection::open_in_memory()?;
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        [],
+    )?;
+    for (index, (group, value)) in groups.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO t (id, g, v) VALUES (?1, ?2, ?3)",
+            rusqlite::params![index as i64 + 1, group, value],
+        )?;
+    }
+    let mut statement = conn.prepare(SCALAR_MIN_MAX_QUERY)?;
+    let columns = statement.column_count();
+    let mut rows = statement.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let mut values = Vec::with_capacity(columns);
+        for index in 0..columns {
+            values.push(canonical_sqlite(row.get_ref(index)?));
+        }
+        out.push(values);
+    }
+    Ok(out)
+}
+
+#[test]
+fn scalar_min_max_agrees_with_sqlite() {
+    // Round `0` alone stands in for the empty table, exercising the "MIN/MAX
+    // of nothing is NULL" edge without needing a fifth generator.
+    for (seed, empty) in (0..rounds()).map(|seed| (seed, false)).chain([(0, true)]) {
+        let mut rng = SeededRng::new(seed);
+        let groups = if empty {
+            Vec::new()
+        } else {
+            generate_groups(&mut rng)
+        };
+        let theirs = sqlite_scalar_min_max(&groups).expect("SQLite is the oracle");
+        for indexed in [false, true] {
+            let ours = inlaysql_scalar_min_max(&groups, indexed)
+                .expect("InlaySQL scalar MIN/MAX must answer");
+            assert_eq!(
+                ours, theirs,
+                "seed {seed} (empty={empty}, indexed={indexed}): scalar MIN/MAX disagreed\n\
+                 groups: {groups:?}"
+            );
+        }
+    }
+}
+
 // --------------------------------------------------------- window functions
 //
 // AHL-494. Reuses `generate_groups`'s `(group, value)` rows and `t`'s exact

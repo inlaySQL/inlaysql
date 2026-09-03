@@ -53,3 +53,231 @@ SELECT COUNT(*) FROM t WHERE a >= 3
 
 statement error
 SELECT a FROM t WHERE COUNT(*) > 1
+
+# ------------------------------------------- MIN/MAX optimisation (AHL-546)
+#
+# The rewrite is invisible to SQL — same answers, fewer rows touched — so
+# these pin the answers a general aggregate scan would give too. `differential.rs`
+# fuzzes the two paths against each other and against sqlite3; these are the
+# hand-picked edges: empty table, all-NULL indexed column, mixed NULLs,
+# negative/boundary integers, TEXT/REAL under an index, WITHOUT ROWID, and an
+# uncommitted write inside a transaction.
+
+statement ok
+CREATE TABLE mm(id INTEGER PRIMARY KEY, n INTEGER, s TEXT, r REAL)
+
+statement ok
+CREATE INDEX mm_n ON mm (n) USING BTREE
+
+statement ok
+CREATE INDEX mm_s ON mm (s) USING BTREE
+
+statement ok
+CREATE INDEX mm_r ON mm (r) USING BTREE
+
+# Empty table: MIN/MAX of nothing is NULL, on the rowid and on every indexed
+# column, confirmed against sqlite3.
+
+query I nosort
+SELECT MIN(id) FROM mm
+----
+NULL
+
+query I nosort
+SELECT MAX(id) FROM mm
+----
+NULL
+
+query I nosort
+SELECT MIN(n) FROM mm
+----
+NULL
+
+query I nosort
+SELECT MAX(n) FROM mm
+----
+NULL
+
+statement ok
+INSERT INTO mm VALUES (1, -5, 'banana', -2.5), (2, NULL, NULL, NULL), (3, 10, 'apple', 3.5), (4, NULL, NULL, NULL), (5, -100, 'cherry', 0.0)
+
+# Negative and boundary integers, on the rowid and on an indexed column.
+
+query I nosort
+SELECT MIN(id) FROM mm
+----
+1
+
+query I nosort
+SELECT MAX(id) FROM mm
+----
+5
+
+query I nosort
+SELECT MIN(n) FROM mm
+----
+-100
+
+query I nosort
+SELECT MAX(n) FROM mm
+----
+10
+
+# MIN skips NULLs; MAX of a column that has any non-NULL entry is never NULL
+# just because some rows are.
+
+query T nosort
+SELECT MIN(s) FROM mm
+----
+apple
+
+query T nosort
+SELECT MAX(s) FROM mm
+----
+cherry
+
+query R nosort
+SELECT MIN(r) FROM mm
+----
+-2.5
+
+query R nosort
+SELECT MAX(r) FROM mm
+----
+3.5
+
+# An indexed column that is NULL in every row: MIN skips every entry and
+# finds nothing, MAX's plain last entry is NULL too — both answer NULL.
+
+statement ok
+CREATE TABLE all_null(id INTEGER PRIMARY KEY, n INTEGER)
+
+statement ok
+CREATE INDEX all_null_n ON all_null (n) USING BTREE
+
+statement ok
+INSERT INTO all_null VALUES (1, NULL), (2, NULL)
+
+query I nosort
+SELECT MIN(n) FROM all_null
+----
+NULL
+
+query I nosort
+SELECT MAX(n) FROM all_null
+----
+NULL
+
+# WHERE, GROUP BY, DISTINCT and a join all still answer correctly — the
+# rewrite falls back to the general path for every one of these rather than
+# refusing them, and the general path is what these numbers pin.
+
+query I nosort
+SELECT MIN(n) FROM mm WHERE id > 1
+----
+-100
+
+query II nosort
+SELECT n, MIN(id) FROM mm GROUP BY n ORDER BY n
+----
+NULL 2
+-100 5
+-5 1
+10 3
+
+query I nosort
+SELECT DISTINCT MIN(id) FROM mm
+----
+1
+
+statement ok
+CREATE TABLE mm_tag(mm_id INTEGER, tag TEXT)
+
+statement ok
+INSERT INTO mm_tag VALUES (1, 'x'), (3, 'y')
+
+query I nosort
+SELECT MIN(mm.id) FROM mm JOIN mm_tag ON mm_tag.mm_id = mm.id
+----
+1
+
+# WITHOUT ROWID: excluded from the rewrite (`Table::without_rowid`), but the
+# general path still answers it correctly.
+
+statement ok
+CREATE TABLE wr(k INTEGER, v INTEGER, PRIMARY KEY (k)) WITHOUT ROWID
+
+statement ok
+INSERT INTO wr VALUES (3, 30), (1, 10), (2, 20)
+
+query I nosort
+SELECT MIN(k) FROM wr
+----
+1
+
+query I nosort
+SELECT MAX(v) FROM wr
+----
+30
+
+# Uncommitted writes inside a transaction: the answer reflects the pending
+# insert and delete, not only what was last committed.
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO mm VALUES (6, 500, 'zebra', 500.0)
+
+statement ok
+DELETE FROM mm WHERE id = 5
+
+query I nosort
+SELECT MAX(id) FROM mm
+----
+6
+
+query I nosort
+SELECT MIN(n) FROM mm
+----
+-5
+
+query T nosort
+SELECT MAX(s) FROM mm
+----
+zebra
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT MAX(id) FROM mm
+----
+6
+
+# A collated tie: two rows compare equal under NOCASE but differ in case.
+# MAX keeps the first-seen row's casing (`AggFold::step` only replaces on a
+# strictly greater comparison), which the general path already did — this
+# pins the MIN/MAX optimisation's indexed path to the same tie-break rather
+# than the index's own row-id order within the tied group (AHL-546 fixed a
+# regression here: caught by `collated_queries_agree_with_and_without_the_index`
+# in crates/inlaysql-core/tests/btree_index.rs).
+
+statement ok
+CREATE TABLE nc(id INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE)
+
+statement ok
+CREATE INDEX nc_s ON nc (s) USING BTREE
+
+statement ok
+INSERT INTO nc VALUES (1, 'ada'), (2, 'Grace'), (3, 'grace'), (4, 'ADA')
+
+query T nosort
+SELECT MAX(s) FROM nc
+----
+Grace
+
+query T nosort
+SELECT MIN(s) FROM nc
+----
+ada

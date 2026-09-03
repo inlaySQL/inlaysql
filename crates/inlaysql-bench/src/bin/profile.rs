@@ -239,7 +239,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "points" => run_points(&config, &path),
         "indexed" => run_indexed(&config, &path),
         "indexed-range" => run_indexed_range(&config, &path),
-        "aggregate" => run_aggregate(&config, &path),
+        "aggregate" => run_aggregate(&config, &path, AggregateShapes::Both),
+        "aggregate-scalar" => run_aggregate(&config, &path, AggregateShapes::ScalarOnly),
         "joins" => run_joins(&config, &path, Shapes::All),
         "joins-limit" => run_joins(&config, &path, Shapes::LimitOnly),
         "writes" => run_writes(&config, &path),
@@ -248,7 +249,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         other => {
             eprintln!(
                 "unknown suite `{other}`, expected points, indexed, indexed-range, aggregate, \
-                 joins, joins-limit, writes, batch-insert or retrieval"
+                 aggregate-scalar, joins, joins-limit, writes, batch-insert or retrieval"
             );
             std::process::exit(2);
         }
@@ -418,7 +419,32 @@ const RANGE_SIZE: usize = 50;
 ///
 /// Same schema and the same 100-bucket `n` column `read_driver.py` builds for
 /// the opponents, so what is profiled here is the shape that lost.
-fn run_aggregate(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+///
+/// Which of the two shapes `run_aggregate` cycles through.
+///
+/// `AHL-546` split this out because the two shapes turned out to cost about
+/// the same — `SELECT n, COUNT(*) FROM users GROUP BY n` at 210/s against
+/// the scalar `SELECT COUNT(*), MIN(id), MAX(id) FROM users` at 225/s,
+/// `PERF.md` 2026-09-03 — which a `--suite aggregate` profile that alternates
+/// between them cannot distinguish: half its samples are the grouped shape's
+/// cost, diluting whatever the scalar shape's own split shows. `ScalarOnly`
+/// is `--suite aggregate-scalar`, mirroring `Shapes::LimitOnly` below for the
+/// same reason — one suite, one shape, one profile that is not an average of
+/// two different costs.
+enum AggregateShapes {
+    /// Both shapes, alternating — `--suite aggregate`'s original behaviour,
+    /// kept so an existing profile invocation still measures what it always
+    /// measured.
+    Both,
+    /// Only the scalar shape.
+    ScalarOnly,
+}
+
+fn run_aggregate(
+    config: &Config,
+    path: &Path,
+    shapes: AggregateShapes,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut db = config.open(path)?;
     db.execute(
         "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, body TEXT, n INTEGER)",
@@ -451,7 +477,14 @@ fn run_aggregate(config: &Config, path: &Path) -> Result<(), Box<dyn std::error:
     db.query_prepared(&group, &[])?;
     db.query_prepared(&scalar, &[])?;
 
-    let timed: [&Statement; 2] = [&group, &scalar];
+    let timed: Vec<&Statement> = match shapes {
+        AggregateShapes::Both => vec![&group, &scalar],
+        AggregateShapes::ScalarOnly => vec![&scalar],
+    };
+    let label = match shapes {
+        AggregateShapes::Both => "aggregate",
+        AggregateShapes::ScalarOnly => "aggregate-scalar",
+    };
     announce_query_phase();
     let mut cycle = 0usize;
     let (iterations, elapsed) = run_for(config.seconds, || {
@@ -459,7 +492,7 @@ fn run_aggregate(config: &Config, path: &Path) -> Result<(), Box<dyn std::error:
         cycle += 1;
         db.query_prepared(shape, &[]).map(|_| ())
     })?;
-    report("aggregate", iterations, elapsed);
+    report(label, iterations, elapsed);
     Ok(())
 }
 
