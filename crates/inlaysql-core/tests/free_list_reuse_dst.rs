@@ -369,6 +369,7 @@ fn raw_scan_sweep(seed: u64) -> u64 {
         DEFAULT_PAGE_CACHE_BYTES,
         true,
         Durability::Full,
+        false,
     ) {
         Ok(storage) => storage,
         Err(_) => return 0,

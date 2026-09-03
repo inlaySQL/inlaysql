@@ -180,7 +180,7 @@ impl<D: Device> TreeStorage<D> {
     /// [`crate::btree::cache`] and
     /// [`EngineOptions::page_cache_bytes`](crate::EngineOptions).
     pub fn open_on_with_cache(device: D, cache_bytes: usize) -> Result<Self> {
-        Self::open_on_with_options(device, cache_bytes, false, Durability::Full)
+        Self::open_on_with_options(device, cache_bytes, false, Durability::Full, false)
     }
 
     /// Open (or create) a database with an explicit cache budget, free-list
@@ -192,15 +192,20 @@ impl<D: Device> TreeStorage<D> {
     /// [`EngineOptions::durability`](crate::EngineOptions) before passing
     /// anything other than [`Durability::Full`] — the loss bound is real and
     /// the level is effectively per-file, not per-handle, on a shared device.
+    /// See [`EngineOptions::commit_absorption`](crate::EngineOptions) before
+    /// passing `true` for `commit_absorption` — it is off everywhere by
+    /// default and measured flat.
     pub fn open_on_with_options(
         device: D,
         cache_bytes: usize,
         page_reuse: bool,
         durability: Durability,
+        commit_absorption: bool,
     ) -> Result<Self> {
         let mut tree = CowBTree::open_or_create_with_cache(device, DEFAULT_PAGE_SIZE, cache_bytes)?;
         tree.set_page_reuse(page_reuse);
         tree.set_durability(durability);
+        tree.set_commit_absorption(commit_absorption);
         Ok(Self { tree })
     }
 
