@@ -273,6 +273,7 @@ impl Database {
             options.page_cache_bytes,
             options.page_reuse,
             options.durability,
+            options.commit_absorption,
         )?;
         Ok(Self {
             engine: Engine::open_with_options(

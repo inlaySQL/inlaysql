@@ -484,6 +484,26 @@ pub struct EngineOptions {
     /// somebody else chose. See `CowBTree::set_durability`'s doc comment for
     /// the full argument.
     pub durability: Durability,
+    /// Let whichever writer holds the commit reservation gate judge the
+    /// transactions of the writers parked behind it, instead of each of them
+    /// re-entering the gate to judge itself.
+    ///
+    /// This moves only the first-committer-wins *decision*: every writer
+    /// still rebases, encodes, appends into its own WAL region, publishes its
+    /// own durability ticket and runs its own sync, and no outcome is
+    /// acknowledged before that writer's own sync. Nothing about the
+    /// write-ahead log format or recovery changes. Conflict semantics are
+    /// identical by construction — the gate holder runs the same comparison,
+    /// over the same keys, in the same gate-arrival order — and that identity
+    /// is a checked property, not a claim: see
+    /// `docs/research/commit-group-slice1.md` and the parity sweep in
+    /// `crates/inlaysql-core/tests/dst_sweep.rs`.
+    ///
+    /// **Off by default, and measured flat.** It is the first landable slice
+    /// of `docs/research/commit-group-logical.md`, kept behind this flag
+    /// until a later slice makes it pay — see `PERF.md`'s AHL-544 section for
+    /// the numbers at 1/8/16/32 writers with it on and off.
+    pub commit_absorption: bool,
 }
 
 impl Default for EngineOptions {
@@ -497,6 +517,7 @@ impl Default for EngineOptions {
             query_memory_bytes: DEFAULT_QUERY_MEMORY_BYTES,
             page_reuse: false,
             durability: Durability::Full,
+            commit_absorption: false,
         }
     }
 }

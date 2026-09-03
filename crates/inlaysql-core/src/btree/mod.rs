@@ -24,6 +24,9 @@ pub mod tree;
 
 pub use backup::BackupSummary;
 pub use cache::{PageCache, DEFAULT_PAGE_CACHE_BYTES};
-pub use device::{CommitPoint, Device, Durability};
+pub use device::{
+    AbsorbDecision, AbsorbOutcome, AbsorbQueue, AbsorbSeal, AbsorbTxn, CommitPoint, Device,
+    Durability, PendingOps,
+};
 pub use page::{PageId, DEFAULT_PAGE_SIZE, MIN_PAGE_SIZE};
 pub use tree::{CommitOutcome, CowBTree, FORMAT_VERSION};

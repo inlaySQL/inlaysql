@@ -78,6 +78,25 @@ fn bench_durability() -> inlaysql::Durability {
     }
 }
 
+/// Whether to open this suite's writers with commit-side absorption
+/// (AHL-544), from `INLAYSQL_BENCH_ABSORPTION` (`1`/`true`/`on`, case
+/// insensitive) — off when unset, matching the engine's own default and every
+/// published concurrency number. Read once per process; every writer thread
+/// and the schema-creating handle share the same choice, which they must,
+/// because absorption is a property of the file's commit gate rather than of
+/// one handle. See `EngineOptions::commit_absorption`.
+fn bench_absorption() -> bool {
+    match std::env::var("INLAYSQL_BENCH_ABSORPTION") {
+        Ok(value) => {
+            let value = value.trim();
+            value.eq_ignore_ascii_case("1")
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false,
+    }
+}
+
 /// Open `path` with [`bench_durability`]'s level — the concurrency suite's
 /// own stand-in for `Database::open`, which always opens at `Durability::Full`.
 fn open_inlaysql(path: &Path) -> Result<Database, inlaysql::Error> {
@@ -85,6 +104,7 @@ fn open_inlaysql(path: &Path) -> Result<Database, inlaysql::Error> {
         FileDevice::open(path)?,
         EngineOptions {
             durability: bench_durability(),
+            commit_absorption: bench_absorption(),
             ..EngineOptions::default()
         },
     )
@@ -248,11 +268,16 @@ fn inlaysql_writers(
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
     let _ = std::fs::remove_file(path);
     let mut creator = open_inlaysql(path)?;
+    let absorption = bench_absorption();
     // No TEXT or VECTOR column: this suite is about the tree and the sync, and
     // an indexed column would also make every conflict pay for an index
     // rebuild, which is a different measurement.
     creator.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, n INTEGER)", &[])?;
     drop(creator);
+    // The coordinator, and with it the absorption counters, lives only as long
+    // as some handle on this file does. Held across the run so the cohort
+    // report below is the run's own and not a fresh coordinator's zeroes.
+    let keeper = FileDevice::open(path)?;
 
     // Open and lock every handle before starting the clock. SQLite's baseline
     // creates all of its connections before its timed loop; including
@@ -325,9 +350,26 @@ fn inlaysql_writers(
     }
 
     verify(path, txns * writers)?;
+    // Absorption's own STOP condition is "do cohorts form at all?", so the
+    // suite reports it rather than leaving a flat measurement ambiguous
+    // between "it does not help" and "it never ran".
+    if absorption {
+        let (cohorts, members) = keeper.absorption_stats().unwrap_or((0, 0));
+        println!(
+            "  absorption: {writers} writers, {cohorts} cohorts, {members} members judged \
+             ({:.2} members/cohort, {:.1}% of commits absorbed)",
+            members as f64 / (cohorts.max(1)) as f64,
+            100.0 * members as f64 / (committed.max(1)) as f64,
+        );
+    }
+    drop(keeper);
     let _ = std::fs::remove_file(path);
     Ok(Outcome {
-        label: "InlaySQL (parallel WAL regions)".to_string(),
+        label: if absorption {
+            "InlaySQL (parallel WAL regions, absorption)".to_string()
+        } else {
+            "InlaySQL (parallel WAL regions)".to_string()
+        },
         writers,
         committed,
         conflicts,

@@ -44,7 +44,7 @@ use crate::traits::RowId;
 
 use super::backup::{self, BackupSummary};
 use super::cache::{self, PageCache, DEFAULT_PAGE_CACHE_BYTES};
-use super::device::{CommitPoint, Device, Durability};
+use super::device::{AbsorbOutcome, AbsorbSeal, AbsorbTxn, CommitPoint, Device, Durability};
 use super::page::{self, Entry, Key, Node, PageId, Separator, ValueRef};
 
 /// The magic bytes at the front of the header.
@@ -525,6 +525,16 @@ pub struct CowBTree<D: Device> {
     raw_leaves: RefCell<RawLeafCache>,
     /// The raw scan's sequential read-ahead window. See [`Readahead`].
     readahead: RefCell<Readahead>,
+    /// The token [`Device::absorb_offer`] handed back for the open
+    /// transaction, when a gate holder is allowed to judge it — see
+    /// [`CowBTree::park_for_absorption`]. `None` on every handle whose device
+    /// does not absorb, which is every device by default.
+    absorb_token: Option<u64>,
+    /// Whether the last commit through the gate used an absorbed decision
+    /// rather than running the comparison itself. Diagnostic only: it is what
+    /// a test asserts on to prove a cohort actually formed, the same way
+    /// `pages_reused` proves the free list actually fired.
+    absorbed_commits: u64,
     /// Whether [`CowBTree::alloc_page`] may hand out a page id the free list
     /// (Phase 2 item 6) has recorded as reclaimable. `false` by default and
     /// for every existing caller: with this off, allocation is exactly the
@@ -774,6 +784,8 @@ impl<D: Device> CowBTree<D> {
             row_scan_cursor: RefCell::new(None),
             raw_leaves: RefCell::new(RawLeafCache::new()),
             readahead: RefCell::new(Readahead::new()),
+            absorb_token: None,
+            absorbed_commits: 0,
             reuse_enabled: false,
             durability: Durability::Full,
             free_candidates: Vec::new(),
@@ -870,6 +882,27 @@ impl<D: Device> CowBTree<D> {
     pub fn set_durability(&mut self, durability: Durability) {
         self.device.set_durability(durability);
         self.durability = durability;
+    }
+
+    /// Ask this handle's device to let a commit-gate holder absorb this
+    /// handle's transactions — `EngineOptions::commit_absorption`, off for
+    /// every caller that does not say otherwise.
+    ///
+    /// Absorption moves only the *decision* `rebase_pending` makes: whichever
+    /// writer holds the reservation gate judges every transaction parked
+    /// behind it, in gate-arrival order, and each of those writers then
+    /// performs its own rebase, encode, append, ticket and sync exactly as it
+    /// does today. Nothing about the write-ahead log, the region a record
+    /// lands in, or when an outcome may be acknowledged changes — see
+    /// `docs/research/commit-group-slice1.md`.
+    ///
+    /// Like [`CowBTree::set_durability`] and unlike
+    /// [`CowBTree::set_page_reuse`], the arbitration is the device's: the
+    /// reservation gate is shared by every handle on the file, so absorption
+    /// is a property of the file, not of one handle. Calling this on a device
+    /// that does not implement it does nothing at all.
+    pub fn set_commit_absorption(&mut self, enabled: bool) {
+        self.device.set_commit_absorption(enabled);
     }
 
     /// The [`Durability`] level this handle last requested. See
@@ -1354,7 +1387,26 @@ impl<D: Device> CowBTree<D> {
         if !self.has_pending {
             return Ok(CommitOutcome::Committed);
         }
-        self.device.begin_normal_commit()?;
+        // Offered *before* parking on the gate, so a leader that finds this
+        // transaction is finding a writer already committed to waiting. The
+        // ops leave the handle here and come back below, whatever happens —
+        // see [`CowBTree::park_for_absorption`].
+        self.park_for_absorption();
+        let offered = self.absorb_token.take();
+        if let Err(err) = self.device.begin_normal_commit() {
+            if let Some(token) = offered {
+                self.device.absorb_claim(token, &mut self.pending_ops);
+            }
+            return Err(err);
+        }
+        let absorbed = offered.and_then(|token| {
+            let decision = self.device.absorb_claim(token, &mut self.pending_ops);
+            // A decision was computed under an earlier gate hold. It is an
+            // answer about the committed state the leader predicted, and it
+            // is used only if that is the state the file is actually in — all
+            // three seal fields, read under this gate. See [`AbsorbSeal`].
+            decision.filter(|decision| self.device.absorption_seal() == Some(decision.expect))
+        });
         let region = self.device.wal_region() % crate::wal::region_count(self.format_version);
         // What the gate exists to establish: the committed state to rebase
         // against, and where this region's next record goes. A device that can
@@ -1382,8 +1434,30 @@ impl<D: Device> CowBTree<D> {
             // its in-memory counters behind the values actually reserved on
             // disk. Normalising monotonic metadata on every commit prevents a
             // later statement from moving those counters backwards.
-            if !self.rebase_pending(current_root, current_next, current_seq)? {
-                return Ok(None);
+            match absorbed {
+                Some(decision) if decision.outcome == AbsorbOutcome::Conflict => {
+                    // Nothing reaches the file, so the chain's state is
+                    // unchanged — but this position in it is resolved, and
+                    // the next member is expecting to hear so.
+                    self.device.set_absorption_seal(Some(AbsorbSeal {
+                        index: decision.expect.index + 1,
+                        ..decision.expect
+                    }));
+                    return Ok(None);
+                }
+                Some(_) => {
+                    self.absorbed_commits += 1;
+                    self.rebase_pending_inner(current_root, current_next, current_seq, false)?;
+                }
+                // The ordinary path, and the only one a device that does not
+                // absorb ever takes. A conflict here leaves the seal alone:
+                // this commit changed nothing on the file, so whatever the
+                // seal describes is still true.
+                None => {
+                    if !self.rebase_pending(current_root, current_next, current_seq)? {
+                        return Ok(None);
+                    }
+                }
             }
 
             let seq = current_seq + 1;
@@ -1474,14 +1548,35 @@ impl<D: Device> CowBTree<D> {
                     append_offset: append_offset + encoded.len(),
                 }),
             );
+            // Published in the same breath as the commit point and under the
+            // same gate, because it describes the same thing: what the file's
+            // committed state now is, in the terms an absorbed decision was
+            // written in. A commit that acted on a decision passes the chain
+            // to the next member; every other commit clears it, which is what
+            // makes a decision the leader did not predict impossible to use.
+            match absorbed {
+                Some(decision) => self.device.set_absorption_seal(Some(AbsorbSeal {
+                    index: decision.expect.index + 1,
+                    seq,
+                    ..decision.expect
+                })),
+                None => {
+                    self.device.set_absorption_seal(None);
+                    self.lead_absorption(seq);
+                }
+            }
             self.record_buf = retain_commit_buf(encoded);
             Ok(Some(seq))
         })();
         if prepared.is_err() {
             // Still inside the gate. Something between reserving and appending
             // failed, and this commit is the only thing that knows how far it
-            // got, so it hands back the question rather than an answer.
+            // got, so it hands back the question rather than an answer. The
+            // absorption chain gets the same treatment for the same reason:
+            // "unknown" costs the rest of a cohort one ordinary rebase each,
+            // where "wrong" would cost a commit.
             self.device.set_commit_point(region, None);
+            self.device.set_absorption_seal(None);
         }
         // A successful commit has issued every data-page and WAL write by this
         // point. Publish its durability ticket before releasing the gate so a
@@ -1764,6 +1859,10 @@ impl<D: Device> CowBTree<D> {
     /// by callers that want a clean close.
     pub fn checkpoint(&mut self) -> Result<()> {
         self.device.begin_commit()?;
+        // A checkpoint rewrites the state block and reuses a WAL region, so
+        // whatever an absorption chain believed about this file stops being
+        // something a leader predicted. Cleared before anything is written.
+        self.device.set_absorption_seal(None);
         let region = self.device.wal_region() % crate::wal::region_count(self.format_version);
         let result = (|| {
             let (root, next, seq) = match self.device.commit_point(region) {
@@ -2391,11 +2490,165 @@ impl<D: Device> CowBTree<D> {
     /// overlap the winner's. The SQL engine's monotonic metadata is adjusted to
     /// the newly reserved commit order; arbitrary metadata changes still use
     /// first-committer-wins and therefore conflict.
+    /// Offer this handle's open transaction to whichever writer holds the
+    /// commit reservation gate, and report whether it was taken.
+    ///
+    /// [`CowBTree::commit`] calls this itself, immediately before it parks on
+    /// the gate, so ordinary callers never need it. It is public because a
+    /// deterministic simulation has no threads to park: the only way for a
+    /// single-threaded sweep to build the cohort a leader would find is to
+    /// park the followers explicitly, then commit the leader, then commit
+    /// each follower — which is exactly what
+    /// `crates/inlaysql-core/tests/dst_sweep.rs` does. Calling it twice is a
+    /// no-op; the second call finds the transaction already offered.
+    ///
+    /// The transaction's operations are **moved** into the device while it is
+    /// offered and moved back by [`CowBTree::commit`]. Nothing may read them
+    /// in between, which on a real device is guaranteed by the offering
+    /// thread being parked on the gate, and in a simulation by there being
+    /// only one thread.
+    pub fn park_for_absorption(&mut self) -> bool {
+        if !self.has_pending || self.absorb_token.is_some() {
+            return false;
+        }
+        self.absorb_token = self.device.absorb_offer(self.root, &mut self.pending_ops);
+        self.absorb_token.is_some()
+    }
+
+    /// How many of this handle's commits used a gate holder's decision
+    /// instead of running the first-committer-wins comparison themselves.
+    ///
+    /// Diagnostic, and load-bearing for the tests rather than for the engine:
+    /// a sweep that turns absorption on proves nothing unless cohorts
+    /// actually formed, the same reason `pages_reused` exists for the free
+    /// list.
+    pub fn absorbed_commits(&self) -> u64 {
+        self.absorbed_commits
+    }
+
+    /// Judge a whole parked cohort the way each member would judge itself,
+    /// in gate-arrival order — the leader's half of commit-side absorption.
+    ///
+    /// `base_root` is the caller's own just-published committed root. Member
+    /// `j` has to be judged against member `j - 1`'s *post-rebase* root, and
+    /// under this slice that root does not exist: member `j - 1` has not
+    /// committed, has written no pages, and cannot be made to without its own
+    /// (`!Send`) handle. It does not need to exist. `rebase_pending`'s replay
+    /// applies exactly `ops[j-1]` on top of the root it rebases onto, so for
+    /// every key
+    ///
+    /// ```text
+    /// get_at(root_j-1, k) == ops[j-1][k]          when k is in ops[j-1]
+    /// get_at(root_j-1, k) == get_at(root_j-2, k)  otherwise
+    /// ```
+    ///
+    /// which is a *logical overlay* over `base_root`, folded forward one
+    /// member at a time. A member decided [`AbsorbOutcome::Conflict`]
+    /// contributes nothing to it and does not advance the chain, exactly as a
+    /// conflicting writer publishes no commit point today.
+    ///
+    /// Mergeable metadata keys are skipped here for the same reason
+    /// `rebase_pending` skips them, and are deliberately kept *out* of the
+    /// overlay too: an earlier member's `merge_monotonic_metadata` rewrites
+    /// their values at its own rebase, so an overlay entry for one would be a
+    /// value nobody will ever read and could be wrong.
+    ///
+    /// `Ok(None)` declines the whole cohort — every member falls back to its
+    /// own `rebase_pending`, which is always correct. The one thing that
+    /// triggers it is a transaction carrying a free-list bookkeeping key: an
+    /// earlier member writes those during its own `finalize_free_list`, which
+    /// runs *after* its rebase, so they land in the real `root_j-1` and never
+    /// in the overlay. A transaction's `pending_ops` cannot contain one at
+    /// this point — they are only ever written from inside `commit` — but a
+    /// total refusal is cheaper than depending on that.
+    pub fn absorb_decisions(
+        &self,
+        base_root: PageId,
+        txns: &[AbsorbTxn],
+    ) -> Result<Option<Vec<AbsorbOutcome>>> {
+        if txns
+            .iter()
+            .any(|txn| txn.ops.keys().any(|key| key.starts_with(FREE_LIST_PREFIX)))
+        {
+            return Ok(None);
+        }
+        let mut overlay: BTreeMap<&[u8], Option<&[u8]>> = BTreeMap::new();
+        let mut outcomes = Vec::with_capacity(txns.len());
+        for txn in txns {
+            let mut outcome = AbsorbOutcome::Clean;
+            for key in txn.ops.keys() {
+                if mergeable_metadata_key(key) {
+                    continue;
+                }
+                let committed;
+                let base = match overlay.get(&key[..]) {
+                    Some(value) => *value,
+                    None => {
+                        committed = self.get_at(base_root, key)?;
+                        committed.as_deref()
+                    }
+                };
+                if self.get_at(txn.root, key)?.as_deref() != base {
+                    outcome = AbsorbOutcome::Conflict;
+                    break;
+                }
+            }
+            if outcome == AbsorbOutcome::Clean {
+                for (key, value) in &txn.ops {
+                    if !mergeable_metadata_key(key) {
+                        overlay.insert(&key[..], value.as_deref());
+                    }
+                }
+            }
+            outcomes.push(outcome);
+        }
+        Ok(Some(outcomes))
+    }
+
+    /// Judge every transaction parked behind this commit and file the
+    /// answers, still holding the gate. Best-effort by construction: a device
+    /// that does not absorb does nothing, and a decision that cannot be
+    /// computed is simply not filed, leaving that writer to do what it does
+    /// today.
+    fn lead_absorption(&self, seq: u64) {
+        let base_root = self.pending_root;
+        self.device.absorb_cohort(seq, &mut |txns| {
+            match self.absorb_decisions(base_root, txns) {
+                Ok(Some(outcomes)) => outcomes,
+                // An empty answer is never the right length for a non-empty
+                // cohort, which is how the device is told "no decisions".
+                Ok(None) | Err(_) => Vec::new(),
+            }
+        });
+    }
+
     fn rebase_pending(
         &mut self,
         current_root: PageId,
         current_next: PageId,
         current_seq: u64,
+    ) -> Result<bool> {
+        self.rebase_pending_inner(current_root, current_next, current_seq, true)
+    }
+
+    /// [`CowBTree::rebase_pending`], with the option of skipping the
+    /// comparison because somebody else already ran it.
+    ///
+    /// `check` is false on exactly one path: a transaction a gate holder
+    /// absorbed and decided `AbsorbOutcome::Clean` for, whose
+    /// `AbsorbDecision::expect` seal still matches the device — which is to
+    /// say, whose decision was computed against precisely the committed state
+    /// this call is now rebasing onto. Everything past the comparison —
+    /// `merge_monotonic_metadata`, the cache invalidation, the counter
+    /// adoption, the watermark update and the replay itself — runs
+    /// identically either way, so an absorbed rebase and an unabsorbed one
+    /// differ in who answered the question and in nothing else.
+    fn rebase_pending_inner(
+        &mut self,
+        current_root: PageId,
+        current_next: PageId,
+        current_seq: u64,
+        check: bool,
     ) -> Result<bool> {
         // Before any read against `current_root`: a committer between this
         // handle's own root and `current_root` may have reused a page, and
@@ -2403,11 +2656,13 @@ impl<D: Device> CowBTree<D> {
         // `CowBTree::invalidate_for_reuse`. Doing this after the loop below,
         // which itself reads `current_root`, would be one commit too late.
         self.invalidate_for_reuse();
-        for key in self.pending_ops.keys() {
-            if self.get_at(self.root, key)? != self.get_at(current_root, key)?
-                && !mergeable_metadata_key(key)
-            {
-                return Ok(false);
+        if check {
+            for key in self.pending_ops.keys() {
+                if self.get_at(self.root, key)? != self.get_at(current_root, key)?
+                    && !mergeable_metadata_key(key)
+                {
+                    return Ok(false);
+                }
             }
         }
 
