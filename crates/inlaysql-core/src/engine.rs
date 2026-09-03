@@ -4166,8 +4166,7 @@ impl Engine {
         // encodes into — one allocation for the statement rather than one
         // grown from empty per row. `encoded` is only ever read back on the
         // line that fills it.
-        let types = column_types(&table);
-        let mut encoded: Vec<u8> = Vec::new();
+        let mut encoder = RowEncoder::for_table(&table);
 
         let mut written = 0usize;
         let mut returned: Vec<Vec<Value>> = Vec::new();
@@ -4261,8 +4260,14 @@ impl Engine {
                             let existing = conflict.id;
                             let old = conflict.values.clone();
                             self.ensure_unique(&table, &rules, existing, &next)?;
-                            let id =
-                                self.write_changed_row(&table, &indexes, existing, &old, next)?;
+                            let id = self.write_changed_row(
+                                &table,
+                                &indexes,
+                                &mut encoder,
+                                existing,
+                                &old,
+                                next,
+                            )?;
                             written += 1;
                             if let Some(items) = &insert.returning {
                                 returned.push(self.project_stored(&table, id, items, &env)?);
@@ -4273,8 +4278,8 @@ impl Engine {
                 }
             }
 
-            encode_typed_row_into(&mut encoded, &row, &types);
-            self.storage.put_row(&table.name, id, &encoded)?;
+            self.storage
+                .put_row(&table.name, id, encoder.encode(&row))?;
             // Only after the row is in the transaction, and only when the key
             // came from the counter: a caller reading this back is asking what
             // key it did not supply, and a row that failed to be written has no
@@ -4648,10 +4653,16 @@ impl Engine {
     /// row. Writing it back under the old key would leave the stored key and
     /// the column disagreeing — a row that `WHERE id = 5` cannot find and
     /// `SELECT id` reports as 5.
+    ///
+    /// `encoder` is the statement's [`RowEncoder`]: the column types and the
+    /// buffer the row is encoded into, built once per statement rather than
+    /// once per row — the hoist the `INSERT` loop got in AHL-517/518, which
+    /// `UPDATE` and `ON CONFLICT DO UPDATE` reach through here (AHL-545).
     fn write_changed_row(
         &mut self,
         table: &Table,
         indexes: &RowIndexes,
+        encoder: &mut RowEncoder,
         id: RowId,
         old: &[Value],
         next: Vec<Value>,
@@ -4687,7 +4698,7 @@ impl Engine {
             self.storage.delete_row(&table.name, id)?;
         }
         self.storage
-            .put_row(&table.name, moved, &encode_table_row(table, &next))?;
+            .put_row(&table.name, moved, encoder.encode(&next))?;
         self.write_btree_entries(table, indexes, moved, &next)?;
 
         // Then the retrieval backends, which may commit whatever is buffered.
@@ -5237,6 +5248,7 @@ impl Engine {
         let rules = self.rules_for(&table)?;
         let env = self.env(params);
         let indexes = RowIndexes::resolve(&self.catalog, &table.name);
+        let mut encoder = RowEncoder::for_table(&table);
         let mut count = 0;
         let mut returned: Vec<Vec<Value>> = Vec::new();
         for (id, bytes) in self.candidate_rows(&table, &plan.filter, params)? {
@@ -5263,7 +5275,7 @@ impl Engine {
             // row, which is the same O(rows) scan an `INSERT` pays and for the
             // same reason.
             self.ensure_unique(&table, &rules, id, &next)?;
-            let id = self.write_changed_row(&table, &indexes, id, &row, next)?;
+            let id = self.write_changed_row(&table, &indexes, &mut encoder, id, &row, next)?;
             count += 1;
             if let Some(items) = &plan.returning {
                 returned.push(self.project_stored(&table, id, items, &env)?);
@@ -5313,6 +5325,7 @@ impl Engine {
 
         let mut count = 0;
         let mut returned: Vec<Vec<Value>> = Vec::new();
+        let mut encoder = RowEncoder::for_table(table);
         for (old_key, bytes) in candidates {
             self.interrupt.check()?;
             let row = decode_row(&bytes)?;
@@ -5347,7 +5360,7 @@ impl Engine {
                 self.storage.delete_row_keyed(&table.name, &old_key)?;
             }
             self.storage
-                .put_row_keyed(&table.name, &new_key, &encode_table_row(table, &next))?;
+                .put_row_keyed(&table.name, &new_key, encoder.encode(&next))?;
             count += 1;
             if let Some(items) = &plan.returning {
                 let exec = ExecRow {
@@ -7669,10 +7682,37 @@ fn bind_embedding(
 ///
 /// Statement-invariant, for the same reason a statement's `Table` clone is:
 /// no DDL can interleave with a row loop. A statement that writes many rows
-/// builds this once and hands it to [`encode_typed_row_into`];
-/// [`encode_table_row`] is the single-row spelling of the same two lines.
+/// builds this once, inside a [`RowEncoder`], and hands it to
+/// [`encode_typed_row_into`] per row; [`encode_table_row`] is the single-row
+/// spelling of the same two lines.
 fn column_types(table: &Table) -> Vec<DataType> {
     table.columns.iter().map(|column| column.ty).collect()
+}
+
+/// What a statement that writes many rows keeps across its row loop: the
+/// column types [`encode_typed_row_into`] reads and the buffer it encodes
+/// into — one allocation for the statement rather than one `Vec<DataType>`
+/// and one `Vec<u8>` grown from empty per row. `INSERT`, `UPDATE` and
+/// `ON CONFLICT DO UPDATE` each build one; [`encode_table_row`] stays the
+/// single-row spelling for the paths that write one row.
+struct RowEncoder {
+    types: Vec<DataType>,
+    encoded: Vec<u8>,
+}
+
+impl RowEncoder {
+    fn for_table(table: &Table) -> Self {
+        Self {
+            types: column_types(table),
+            encoded: Vec::new(),
+        }
+    }
+
+    /// `row` in storage form, valid until the next call.
+    fn encode(&mut self, row: &[Value]) -> &[u8] {
+        encode_typed_row_into(&mut self.encoded, row, &self.types);
+        &self.encoded
+    }
 }
 
 fn encode_table_row(table: &Table, row: &[Value]) -> Vec<u8> {

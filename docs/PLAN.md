@@ -98,10 +98,12 @@ current execution order without relying on local conversation history.
    ```
 
 2. **C1 first slice** (rebase-only absorption under the leader's gate,
-   per `docs/research/commit-group-logical.md`), DST-gated; then the
-   insert path's remaining per-row costs (`leaf_split_point`, `encode_leaf`
-   per-cell `Vec`, `UPDATE`'s `encode_table_row`). B4's cell iteration is
-   closed (AHL-541: the format already has the offset table).
+   per `docs/research/commit-group-logical.md`), DST-gated. The insert
+   path's remaining per-row costs are closed (AHL-545: linear split
+   point, in-place encoders, the `UPDATE` hoist — ~1% of a statement
+   that is 89% fsync, landed as the algorithmic fixes they are and
+   measured flat, `PERF.md`). B4's cell iteration is closed (AHL-541: the
+   format already has the offset table).
 
 3. **`RangeCursor` extension (A3)** to `walk`/`scan_range_from` — the
    cheapest first step is `colliding_rows` using `scan_index_row_ids`

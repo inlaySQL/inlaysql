@@ -4287,6 +4287,123 @@ commit on this shape. After the fix, `committed_node` is 1.2% inclusive and
 which is under the measurement floor of §4. It stays available if a
 write-then-read shape ever makes it visible.
 
+### The insert path's remainders: a linear split point, encoders that write in place, and the `UPDATE` hoist (AHL-545, 2026-09-03)
+
+AHL-542 left three per-row costs named and unmeasured: `leaf_split_point`
+called `page::leaf_size` once per candidate prefix (quadratic in the cell
+count), `encode_leaf`/`encode_internal` built one `Vec<u8>` per cell, and
+`UPDATE`'s `write_changed_row` re-ran `encode_table_row` — a fresh
+`Vec<DataType>` and a fresh row buffer — per row, the hoist AHL-517/518 had
+already given `INSERT`. This is what they weighed, what landed, and what
+it bought, which is honestly nothing the floor can see.
+
+**Profiled first.** `bin/profile --suite batch-insert` at `832f89e`, 25s
+of `sample`, 17,538 samples, load 9 at the start:
+
+| Where | Share | What |
+| --- | --- | --- |
+| `sync_commit` + `sync` | 86.8% + 2.5% | the `F_FULLFSYNC` per statement, and the state-block sync |
+| `put`/`insert_into` | 4.4% / 3.8% | the per-row root-to-leaf round trip |
+| — `leaf_split_point` (with its `leaf_size` calls) | 0.3% self, ~0.7% inclusive | the quadratic loop |
+| `write_state_values` | 2.5% | |
+| `wal::encode_record_into` | 1.3% | |
+| `encode_leaf` + `encode_internal` (under `commit`'s `materialize_dirty`) | 0.4% + 0.25% | 24 of `encode_internal`'s 42 samples in `from_iter`'s `malloc`, 13 in `free`; the copy itself is 2 |
+| engine-side `encode_typed_row_into` | 0.1% | the `INSERT` loop's already-hoisted encoder |
+| index maintenance | 0 | the table has no secondary index |
+
+So after AHL-542, everything this brief names is ~1.3% of the statement,
+on a shape that is 89% fsync. The split is quadratic in theory and 0.7%
+in practice because a 4 KiB leaf of `(id, n)` rows holds ~100 cells and
+splits once per ~100 rows; the encoders run once per dirty page per
+commit and their cost is the allocator, not the copy. Nothing here could
+move the batch-insert number outside §4's floor, and the measurement
+below says exactly that. They landed anyway, for what they are: an
+algorithmic fix to a function whose cost grows with the square of the
+cells on a page — 64 KiB pages, or small keys on the default page, make
+that real — and an encoder whose per-cell allocation was most of its own
+cost.
+
+**What landed**, three commits, no on-disk change, `FORMAT_VERSION` 5:
+
+- *The split point is one pass.* `page::leaf_split_point`/
+  `internal_split_point` (moved beside the size functions they mirror)
+  accumulate header + slot + cell bytes and stop at the first prefix past
+  the page. Same answer as the old loop for every input — the largest
+  `n < len` whose first `n` cells fit, 0 for zero or one cell. The old
+  loops are kept verbatim in `page.rs`'s tests and
+  `the_split_point_is_the_one_the_per_prefix_loop_chose` holds the new
+  ones to them for every prefix of 40 random sequences per page size:
+  tiny cells, cells sized to half a page give or take a few bytes,
+  overflow pointers. Mutation-checked: including the last cell, `>=` for
+  `>`, forgetting the slot — each fails it.
+- *The encoders write into the page.* A `PageWriter` checks
+  `leaf_size`/`internal_size` against the page once, zeroes the buffer,
+  and hands each cell a `CellWriter` over exactly the bytes its size
+  reserves; the fields land there. No `Vec` per cell, no copy; a debug
+  build asserts each cell filled what its size promised. The old encoder,
+  `encode_page` and the `push_*` helpers survive verbatim in the tests,
+  and `the_{leaf,internal}_encoder_writes_the_bytes_the_per_cell_encoder_did`
+  compare the two byte for byte over empty, one-cell and many-cell pages
+  at three page sizes, borrowed and owned keys and values, overflow
+  pointers with `u64::MAX` fields, one cell that fills the page exactly
+  and one byte over, a page of small cells that fills it exactly, three
+  `leftmost` values. The refusals are the old ones too, including the one
+  nobody would have guessed: a page past 64 KiB has slot offsets no u16
+  can name, and the old encoder refused an empty 64 KiB page while
+  accepting one with a cell — `a_page_past_64k_is_refused_exactly_where_it_always_was`
+  pins both verdicts. Mutation-checked: a slot off by one, a stale
+  `free_start`, a wrong overflow tag, swapped overflow fields, a dropped
+  `leftmost`, a dropped child, a dropped size check — each fails the
+  comparison.
+- *`UPDATE` encodes through one per-statement `RowEncoder`* — the two
+  fields the `INSERT` loop already kept (`column_types` and the reusable
+  buffer), named, and passed into `write_changed_row` so `UPDATE`, the
+  `WITHOUT ROWID` `UPDATE` and `ON CONFLICT DO UPDATE` share `INSERT`'s
+  shape. `bin/profile` has no `UPDATE` suite; this is recorded as the
+  hoist it is, not as a number.
+
+**After, same shape, 25s, 17,408 samples.** `leaf_split_point` is gone
+from the self table (59 → 3 samples); `encode_leaf` + `encode_internal`
+are 30 samples where they were 112, and what is left of them is the page
+`vec![0; page_size]` and the copy. The remaining page-level entry on the
+per-row path is `leaf_size` itself at 0.3% — `insert_into`'s
+`leaf_size(&bytes, &entries) <= page_size` fit check walks every cell of
+the leaf once per row, which is the next linear-per-row cost if this
+shape ever needs it (a size kept on the decoded node would make it O(1)).
+
+**Measured**, `832f89e` against this branch, both `profile` binaries built
+from source in separate worktrees, interleaved, order alternated and
+the control re-run every repetition, `--seconds 6` for batch-insert and
+`4` for the rest. The machine was not quiet: this branch's own DST sweeps and two other
+agents' builds had just finished (load peaked at 135) and the 1-minute
+load fell from 12 to 6 across the run (the 5-minute average from 54 to
+29). Every suite overlaps; nothing
+is claimed.
+
+| Suite | `832f89e` | AHL-545 | Verdict |
+| --- | --- | --- | --- |
+| batch-insert (rows/s) | 24,090 / 24,323 / 24,763 | 24,064 / 25,633 / 24,493 | flat, overlapping (statements: 241/243/248 vs 241/256/245) |
+| writes | 239 / 269 / 261 | 264 / 273 / 265 | overlapping; the first base run sat at the load peak |
+| points (control) | 1.76 / 2.62 / 2.94 M | 1.80 / 2.08 / 2.35 M | the control moved 1.7x rep to rep with the load — this run's floor, and why none of the rows above is a claim |
+| aggregate 20k | 967 / 1,075 / 1,042 | 939 / 1,022 / 1,065 | flat, overlapping |
+| joins-limit | 148.5 / 163.3 / 158.6 k | 152.5 / 157.7 / 158.1 k | flat, overlapping |
+
+That is the result the profile predicted: ~1% of a statement that is 89%
+fsync does not show through a control that moved 70%. The reads are
+untouched by construction — nothing on a read path changed — and read
+flat. Both release DST sweeps pass, plus `free_list_reuse_dst` and
+`backup_dst`; `cargo test --release --workspace`, clippy, rustdoc and the
+wasm check are clean.
+
+**What this closes and what it does not.** The insert path's per-row
+page-level work is now: a descent, one `leaf_size` walk of the leaf, an
+in-place `Vec::insert`, and a split every ~100 rows that is linear in the
+leaf; at commit, one allocation-free encode per dirty page. What the
+batch-insert shape pays is the barrier (C1) and, a distant second,
+`write_state_values` + `wal::encode_record_into` at ~3.8% together. The
+brief's "engine-side row encode" and "index maintenance" were 0.1% and
+0 on this shape, and are not where the next commit should go.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness
