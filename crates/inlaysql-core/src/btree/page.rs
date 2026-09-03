@@ -322,26 +322,191 @@ fn internal_cell_size(key: &[u8]) -> usize {
 ///
 /// `source` is the shared page bytes the entries' borrowed key ranges index
 /// into; the encoded page copies those key bytes out of it.
+///
+/// Every cell is written straight into the page buffer at the offset its
+/// slot names (AHL-545): the layout is a slot directory and tail-packed
+/// cells, so a cell's place is known from its size alone. It used to build
+/// one `Vec<u8>` per cell and copy each into place — an allocation and a
+/// free per cell per dirty page at commit, and most of what `encode_leaf`
+/// and `encode_internal` cost on the batch-insert profile once AHL-542 had
+/// made them run once per page. The bytes are the ones the per-cell encoder
+/// produced, byte for byte: `the_leaf_encoder_writes_the_bytes_the_per_cell_encoder_did`
+/// keeps that encoder alive in the tests and compares.
 pub fn encode_leaf(page_size: usize, source: &[u8], entries: &[Entry]) -> Result<Vec<u8>> {
-    let contents = entries
-        .iter()
-        .map(|entry| encode_leaf_cell(source, entry))
-        .collect::<Result<Vec<_>>>()?;
-    encode_page(page_size, KIND_LEAF, 0, &contents)
+    let mut page = PageWriter::new(
+        page_size,
+        KIND_LEAF,
+        0,
+        entries.len(),
+        leaf_size(source, entries),
+    )?;
+    for entry in entries {
+        let key = key_bytes(source, &entry.key);
+        let mut cell = page.cell(leaf_cell_size(key, &entry.value))?;
+        cell.u16(key.len())?;
+        cell.bytes(key);
+        match &entry.value {
+            ValueRef::Inline(range) => {
+                let value = &source[range.clone()];
+                cell.u8(VALUE_INLINE);
+                cell.u32(value.len())?;
+                cell.bytes(value);
+            }
+            ValueRef::Owned(value) => {
+                cell.u8(VALUE_INLINE);
+                cell.u32(value.len())?;
+                cell.bytes(value);
+            }
+            ValueRef::Overflow { first, len } => {
+                cell.u8(VALUE_OVERFLOW);
+                cell.u64(*first);
+                cell.u64(*len as u64);
+            }
+        }
+    }
+    page.finish()
 }
 
-/// Encode an internal page.
+/// Encode an internal page. See [`encode_leaf`] for how the cells are laid
+/// down.
 pub fn encode_internal(
     page_size: usize,
     source: &[u8],
     leftmost: PageId,
     cells: &[Separator],
 ) -> Result<Vec<u8>> {
-    let contents = cells
-        .iter()
-        .map(|cell| encode_internal_cell(source, cell))
-        .collect::<Vec<_>>();
-    encode_page(page_size, KIND_INTERNAL, leftmost, &contents)
+    let mut page = PageWriter::new(
+        page_size,
+        KIND_INTERNAL,
+        leftmost,
+        cells.len(),
+        internal_size(source, cells),
+    )?;
+    for separator in cells {
+        let key = key_bytes(source, &separator.key);
+        let mut cell = page.cell(internal_cell_size(key))?;
+        // The key length is a separator key, always small in practice; a u16
+        // that overflows here would already have failed leaf encoding.
+        cell.u16(key.len()).expect("separator key too long");
+        cell.bytes(key);
+        cell.u64(separator.child);
+    }
+    page.finish()
+}
+
+/// A page under construction: the header written, the slot directory growing
+/// forward from [`HEADER_SIZE`] and the cells packed backwards from the end,
+/// each cell handed out as a [`CellWriter`] over exactly its own bytes.
+struct PageWriter {
+    buf: Vec<u8>,
+    cell_cursor: usize,
+    slot_cursor: usize,
+}
+
+impl PageWriter {
+    /// A zeroed page of `page_size` bytes, refused when `total` — the size
+    /// [`leaf_size`]/[`internal_size`] report for the cells about to be
+    /// written — does not fit it.
+    fn new(
+        page_size: usize,
+        kind: u8,
+        leftmost: PageId,
+        count: usize,
+        total: usize,
+    ) -> Result<Self> {
+        if total > page_size {
+            return Err(Error::Storage(alloc::format!(
+                "node needs {total} bytes, page holds {page_size}"
+            )));
+        }
+        let mut buf = vec![0u8; page_size];
+        buf[OFF_KIND] = kind;
+        write_u16(&mut buf[OFF_CELL_COUNT..OFF_CELL_COUNT + 2], count)?;
+        write_u64(&mut buf[OFF_LEFTMOST..OFF_LEFTMOST + 8], leftmost);
+        Ok(Self {
+            buf,
+            cell_cursor: page_size,
+            slot_cursor: HEADER_SIZE,
+        })
+    }
+
+    /// Reserve the next cell's `size` bytes at the tail and record its slot.
+    /// `size` is exact — the cell's fields fill it and nothing else, which
+    /// the [`CellWriter`] checks as it goes out of scope.
+    ///
+    /// `total` was checked against the page in [`Self::new`], so the slot
+    /// directory never reaches the cells; the slot's value can still fail to
+    /// fit a u16 on a page larger than 64 KiB, and is refused then exactly as
+    /// it always was rather than truncated.
+    fn cell(&mut self, size: usize) -> Result<CellWriter<'_>> {
+        self.cell_cursor -= size;
+        write_u16(
+            &mut self.buf[self.slot_cursor..self.slot_cursor + SLOT_SIZE],
+            self.cell_cursor,
+        )?;
+        self.slot_cursor += SLOT_SIZE;
+        Ok(CellWriter {
+            buf: &mut self.buf[self.cell_cursor..self.cell_cursor + size],
+            at: 0,
+        })
+    }
+
+    fn finish(mut self) -> Result<Vec<u8>> {
+        write_u16(
+            &mut self.buf[OFF_FREE_START..OFF_FREE_START + 2],
+            self.cell_cursor,
+        )?;
+        Ok(self.buf)
+    }
+}
+
+/// One cell's bytes, filled field by field from its start.
+struct CellWriter<'a> {
+    buf: &'a mut [u8],
+    at: usize,
+}
+
+impl CellWriter<'_> {
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.buf[self.at..self.at + bytes.len()].copy_from_slice(bytes);
+        self.at += bytes.len();
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.bytes(&[value]);
+    }
+
+    fn u16(&mut self, value: usize) -> Result<()> {
+        let value =
+            u16::try_from(value).map_err(|_| Error::Corrupt("value exceeds u16".to_string()))?;
+        self.bytes(&value.to_le_bytes());
+        Ok(())
+    }
+
+    fn u32(&mut self, value: usize) -> Result<()> {
+        let value =
+            u32::try_from(value).map_err(|_| Error::Corrupt("value exceeds u32".to_string()))?;
+        self.bytes(&value.to_le_bytes());
+        Ok(())
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.bytes(&value.to_le_bytes());
+    }
+}
+
+impl Drop for CellWriter<'_> {
+    /// A cell whose fields did not fill the bytes its size promised is a
+    /// layout bug, not a runtime condition: the size functions and the
+    /// writers above are two spellings of one format, and this is where a
+    /// disagreement between them shows in a debug build.
+    fn drop(&mut self) {
+        debug_assert_eq!(
+            self.at,
+            self.buf.len(),
+            "cell size and cell fields disagree"
+        );
+    }
 }
 
 /// Decode any B-tree page, copying `bytes` into the node's shared buffer.
@@ -461,76 +626,6 @@ pub fn overflow_next(page_size: usize, bytes: &[u8]) -> Result<PageId> {
         return Err(Error::Corrupt("expected an overflow page".to_string()));
     }
     get_u64(bytes, OFF_OVERFLOW_NEXT)
-}
-
-fn encode_leaf_cell(source: &[u8], entry: &Entry) -> Result<Vec<u8>> {
-    let key = key_bytes(source, &entry.key);
-    let mut out = Vec::with_capacity(2 + key.len() + 1 + 16);
-    push_u16(&mut out, key.len())?;
-    out.extend_from_slice(key);
-    match &entry.value {
-        ValueRef::Inline(range) => {
-            let value = &source[range.clone()];
-            out.push(VALUE_INLINE);
-            push_u32(&mut out, value.len())?;
-            out.extend_from_slice(value);
-        }
-        ValueRef::Owned(value) => {
-            out.push(VALUE_INLINE);
-            push_u32(&mut out, value.len())?;
-            out.extend_from_slice(value);
-        }
-        ValueRef::Overflow { first, len } => {
-            out.push(VALUE_OVERFLOW);
-            push_u64(&mut out, *first);
-            push_u64(&mut out, *len as u64);
-        }
-    }
-    Ok(out)
-}
-
-fn encode_internal_cell(source: &[u8], cell: &Separator) -> Vec<u8> {
-    let key = key_bytes(source, &cell.key);
-    let mut out = Vec::with_capacity(2 + key.len() + 8);
-    // The key length is a separator key, always small in practice; a u16 that
-    // overflows here would already have failed leaf encoding.
-    push_u16(&mut out, key.len()).expect("separator key too long");
-    out.extend_from_slice(key);
-    push_u64(&mut out, cell.child);
-    out
-}
-
-/// Lay out a header, slot directory and cells inside one `page_size` page.
-fn encode_page(
-    page_size: usize,
-    kind: u8,
-    leftmost: PageId,
-    contents: &[Vec<u8>],
-) -> Result<Vec<u8>> {
-    let total =
-        HEADER_SIZE + SLOT_SIZE * contents.len() + contents.iter().map(|c| c.len()).sum::<usize>();
-    if total > page_size {
-        return Err(Error::Storage(alloc::format!(
-            "node needs {total} bytes, page holds {page_size}"
-        )));
-    }
-
-    let mut buf = vec![0u8; page_size];
-    buf[OFF_KIND] = kind;
-    write_u16(&mut buf[OFF_CELL_COUNT..OFF_CELL_COUNT + 2], contents.len())?;
-
-    let mut cell_cursor = page_size;
-    let mut slot_cursor = HEADER_SIZE;
-    for content in contents {
-        cell_cursor -= content.len();
-        buf[cell_cursor..cell_cursor + content.len()].copy_from_slice(content);
-        write_u16(&mut buf[slot_cursor..slot_cursor + 2], cell_cursor)?;
-        slot_cursor += SLOT_SIZE;
-    }
-    write_u16(&mut buf[OFF_FREE_START..OFF_FREE_START + 2], cell_cursor)?;
-    write_u64(&mut buf[OFF_LEFTMOST..OFF_LEFTMOST + 8], leftmost);
-
-    Ok(buf)
 }
 
 // ---------------------------------------------------------------- decoding
@@ -752,24 +847,6 @@ pub fn scan_leaf_cells<'a>(
 }
 
 // --------------------------------------------------------- little-endian I/O
-
-fn push_u16(buf: &mut Vec<u8>, value: usize) -> Result<()> {
-    let value =
-        u16::try_from(value).map_err(|_| Error::Corrupt("value exceeds u16".to_string()))?;
-    buf.extend_from_slice(&value.to_le_bytes());
-    Ok(())
-}
-
-fn push_u32(buf: &mut Vec<u8>, value: usize) -> Result<()> {
-    let value =
-        u32::try_from(value).map_err(|_| Error::Corrupt("value exceeds u32".to_string()))?;
-    buf.extend_from_slice(&value.to_le_bytes());
-    Ok(())
-}
-
-fn push_u64(buf: &mut Vec<u8>, value: u64) {
-    buf.extend_from_slice(&value.to_le_bytes());
-}
 
 fn write_u16(buf: &mut [u8], value: usize) -> Result<()> {
     let value =
@@ -1156,12 +1233,35 @@ mod tests {
             }
         }
     }
-    /// The split points as they were before AHL-545 — `leaf_size`/
-    /// `internal_size` called once per candidate prefix — kept verbatim so
-    /// the one-pass versions can be held to their answer. Nothing outside the
-    /// tests reaches them.
+    /// The encoders as they were before AHL-545 — one `Vec<u8>` per cell,
+    /// copied into place by `encode_page` — kept verbatim so the direct
+    /// writers above can be held to their bytes. Nothing outside the tests
+    /// reaches them. The split points that called `leaf_size`/
+    /// `internal_size` once per candidate prefix are here for the same
+    /// reason.
     mod legacy {
         use super::super::*;
+
+        pub fn encode_leaf(page_size: usize, source: &[u8], entries: &[Entry]) -> Result<Vec<u8>> {
+            let contents = entries
+                .iter()
+                .map(|entry| encode_leaf_cell(source, entry))
+                .collect::<Result<Vec<_>>>()?;
+            encode_page(page_size, KIND_LEAF, 0, &contents)
+        }
+
+        pub fn encode_internal(
+            page_size: usize,
+            source: &[u8],
+            leftmost: PageId,
+            cells: &[Separator],
+        ) -> Result<Vec<u8>> {
+            let contents = cells
+                .iter()
+                .map(|cell| encode_internal_cell(source, cell))
+                .collect::<Vec<_>>();
+            encode_page(page_size, KIND_INTERNAL, leftmost, &contents)
+        }
 
         pub fn leaf_split_point(bytes: &[u8], entries: &[Entry], page_size: usize) -> usize {
             let mut split = 1;
@@ -1177,6 +1277,95 @@ mod tests {
                 split += 1;
             }
             split - 1
+        }
+
+        fn encode_leaf_cell(source: &[u8], entry: &Entry) -> Result<Vec<u8>> {
+            let key = key_bytes(source, &entry.key);
+            let mut out = Vec::with_capacity(2 + key.len() + 1 + 16);
+            push_u16(&mut out, key.len())?;
+            out.extend_from_slice(key);
+            match &entry.value {
+                ValueRef::Inline(range) => {
+                    let value = &source[range.clone()];
+                    out.push(VALUE_INLINE);
+                    push_u32(&mut out, value.len())?;
+                    out.extend_from_slice(value);
+                }
+                ValueRef::Owned(value) => {
+                    out.push(VALUE_INLINE);
+                    push_u32(&mut out, value.len())?;
+                    out.extend_from_slice(value);
+                }
+                ValueRef::Overflow { first, len } => {
+                    out.push(VALUE_OVERFLOW);
+                    push_u64(&mut out, *first);
+                    push_u64(&mut out, *len as u64);
+                }
+            }
+            Ok(out)
+        }
+
+        fn encode_internal_cell(source: &[u8], cell: &Separator) -> Vec<u8> {
+            let key = key_bytes(source, &cell.key);
+            let mut out = Vec::with_capacity(2 + key.len() + 8);
+            // The key length is a separator key, always small in practice; a u16 that
+            // overflows here would already have failed leaf encoding.
+            push_u16(&mut out, key.len()).expect("separator key too long");
+            out.extend_from_slice(key);
+            push_u64(&mut out, cell.child);
+            out
+        }
+
+        /// Lay out a header, slot directory and cells inside one `page_size` page.
+        fn encode_page(
+            page_size: usize,
+            kind: u8,
+            leftmost: PageId,
+            contents: &[Vec<u8>],
+        ) -> Result<Vec<u8>> {
+            let total = HEADER_SIZE
+                + SLOT_SIZE * contents.len()
+                + contents.iter().map(|c| c.len()).sum::<usize>();
+            if total > page_size {
+                return Err(Error::Storage(alloc::format!(
+                    "node needs {total} bytes, page holds {page_size}"
+                )));
+            }
+
+            let mut buf = vec![0u8; page_size];
+            buf[OFF_KIND] = kind;
+            write_u16(&mut buf[OFF_CELL_COUNT..OFF_CELL_COUNT + 2], contents.len())?;
+
+            let mut cell_cursor = page_size;
+            let mut slot_cursor = HEADER_SIZE;
+            for content in contents {
+                cell_cursor -= content.len();
+                buf[cell_cursor..cell_cursor + content.len()].copy_from_slice(content);
+                write_u16(&mut buf[slot_cursor..slot_cursor + 2], cell_cursor)?;
+                slot_cursor += SLOT_SIZE;
+            }
+            write_u16(&mut buf[OFF_FREE_START..OFF_FREE_START + 2], cell_cursor)?;
+            write_u64(&mut buf[OFF_LEFTMOST..OFF_LEFTMOST + 8], leftmost);
+
+            Ok(buf)
+        }
+
+        fn push_u16(buf: &mut Vec<u8>, value: usize) -> Result<()> {
+            let value = u16::try_from(value)
+                .map_err(|_| Error::Corrupt("value exceeds u16".to_string()))?;
+            buf.extend_from_slice(&value.to_le_bytes());
+            Ok(())
+        }
+
+        fn push_u32(buf: &mut Vec<u8>, value: usize) -> Result<()> {
+            let value = u32::try_from(value)
+                .map_err(|_| Error::Corrupt("value exceeds u32".to_string()))?;
+            buf.extend_from_slice(&value.to_le_bytes());
+            Ok(())
+        }
+
+        fn push_u64(buf: &mut Vec<u8>, value: u64) {
+            buf.extend_from_slice(&value.to_le_bytes());
         }
     }
 
@@ -1238,6 +1427,171 @@ mod tests {
             })
             .collect();
         (source, entries)
+    }
+
+    fn separators(rng: &mut Lcg, count: usize) -> Vec<Separator> {
+        (0..count)
+            .map(|i| Separator {
+                key: Key::Owned(alloc::vec![b'a' + (i % 26) as u8; 1 + rng.below(12)]),
+                child: 7 + i as u64 * 3,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_leaf_encoder_writes_the_bytes_the_per_cell_encoder_did() {
+        let mut rng = Lcg(7);
+        for page_size in [MIN_PAGE_SIZE * 8, 4096, 16384] {
+            // Empty, one, many — as many as the page holds.
+            for count in [0, 1, 2, 3, 9, 17, 40] {
+                if count * 44 > page_size {
+                    continue;
+                }
+                let (source, entries) = mixed_entries(&mut rng, page_size, count);
+                let new = encode_leaf(page_size, &source, &entries).unwrap();
+                let old = legacy::encode_leaf(page_size, &source, &entries).unwrap();
+                assert_eq!(new, old, "page_size {page_size}, {count} cells");
+                assert_eq!(leaf_size(&source, &entries), decode_used(&new));
+            }
+            // One cell that fills the page exactly, and one byte over.
+            let overhead = HEADER_SIZE + SLOT_SIZE + 2 + 1 + 4;
+            let exact = [entry(b"", &alloc::vec![0x5A; page_size - overhead])];
+            assert_eq!(
+                encode_leaf(page_size, &[], &exact).unwrap(),
+                legacy::encode_leaf(page_size, &[], &exact).unwrap()
+            );
+            assert_eq!(
+                decode_used(&encode_leaf(page_size, &[], &exact).unwrap()),
+                page_size
+            );
+            let over = [entry(b"", &alloc::vec![0x5A; page_size - overhead + 1])];
+            assert!(encode_leaf(page_size, &[], &over).is_err());
+            assert!(legacy::encode_leaf(page_size, &[], &over).is_err());
+            // Many cells that fill the page exactly: the free-space cursor
+            // lands on the slot directory's end.
+            let cell = HEADER_SIZE + SLOT_SIZE + 2 + 1 + 1 + 4 + 3;
+            let count = (page_size - HEADER_SIZE) / (cell - HEADER_SIZE);
+            let mut full = (0..count)
+                .map(|i| entry(&[i as u8], &[1, 2, 3]))
+                .collect::<Vec<_>>();
+            let slack = page_size - leaf_size(&[], &full);
+            full[0] = entry(&[0], &alloc::vec![9; 3 + slack]);
+            assert_eq!(leaf_size(&[], &full), page_size);
+            assert_eq!(
+                encode_leaf(page_size, &[], &full).unwrap(),
+                legacy::encode_leaf(page_size, &[], &full).unwrap()
+            );
+            // Only overflow pointers.
+            let pointers = (0..5)
+                .map(|i| Entry {
+                    key: Key::Owned(alloc::vec![i]),
+                    value: ValueRef::Overflow {
+                        first: u64::MAX - i as u64,
+                        len: usize::MAX - i as usize,
+                    },
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                encode_leaf(page_size, &[], &pointers).unwrap(),
+                legacy::encode_leaf(page_size, &[], &pointers).unwrap()
+            );
+        }
+    }
+
+    /// A page past 64 KiB has offsets a u16 slot cannot always name: the
+    /// per-cell encoder accepted exactly a 64 KiB page with at least one
+    /// cell (every offset it writes is below 65536) and refused the empty
+    /// one (`free_start` is 65536) and anything larger. The direct writer
+    /// gives the same verdict, and the same bytes where the verdict is yes.
+    #[test]
+    fn a_page_past_64k_is_refused_exactly_where_it_always_was() {
+        let one = [entry(b"k", b"v")];
+        let sep = [Separator {
+            key: Key::Owned(b"k".to_vec()),
+            child: 1,
+        }];
+        let mut verdicts = Vec::new();
+        for page_size in [1 << 16, 1 << 17] {
+            for (old, new) in [
+                (
+                    legacy::encode_leaf(page_size, &[], &[]),
+                    encode_leaf(page_size, &[], &[]),
+                ),
+                (
+                    legacy::encode_leaf(page_size, &[], &one),
+                    encode_leaf(page_size, &[], &one),
+                ),
+                (
+                    legacy::encode_internal(page_size, &[], 1, &sep),
+                    encode_internal(page_size, &[], 1, &sep),
+                ),
+            ] {
+                match (old, new) {
+                    (Ok(old), Ok(new)) => {
+                        assert_eq!(old, new);
+                        verdicts.push(true);
+                    }
+                    (Err(_), Err(_)) => verdicts.push(false),
+                    (old, new) => panic!("verdicts differ at {page_size}: {old:?} vs {new:?}"),
+                }
+            }
+        }
+        assert_eq!(verdicts, [false, true, true, false, false, false]);
+    }
+
+    /// `page_size - free_start + header + slots`: the bytes a decoded page says
+    /// its cells occupy, which must be what `leaf_size` predicted.
+    fn decode_used(page: &[u8]) -> usize {
+        let count = get_u16(page, OFF_CELL_COUNT).unwrap() as usize;
+        let free_start = get_u16(page, OFF_FREE_START).unwrap() as usize;
+        HEADER_SIZE + SLOT_SIZE * count + page.len() - free_start
+    }
+
+    #[test]
+    fn the_internal_encoder_writes_the_bytes_the_per_cell_encoder_did() {
+        let mut rng = Lcg(11);
+        for page_size in [MIN_PAGE_SIZE * 8, 4096] {
+            for count in [0, 1, 2, 5, 15, 30] {
+                if count * 24 > page_size {
+                    continue;
+                }
+                let cells = separators(&mut rng, count);
+                // Half the keys borrowed from a real internal page.
+                let source = encode_internal(page_size, &[], 1, &cells).unwrap();
+                let Node::Internal { cells: decoded, .. } = decode(page_size, &source).unwrap()
+                else {
+                    panic!("not internal");
+                };
+                let cells = cells
+                    .into_iter()
+                    .zip(decoded)
+                    .enumerate()
+                    .map(|(i, (owned, borrowed))| if i % 2 == 0 { owned } else { borrowed })
+                    .collect::<Vec<_>>();
+                for leftmost in [0, 1, u64::MAX] {
+                    let new = encode_internal(page_size, &source, leftmost, &cells).unwrap();
+                    let old =
+                        legacy::encode_internal(page_size, &source, leftmost, &cells).unwrap();
+                    assert_eq!(new, old, "page_size {page_size}, {count} cells");
+                }
+            }
+            // A separator that fills the page exactly, and one byte over.
+            let overhead = HEADER_SIZE + SLOT_SIZE + 2 + 8;
+            let exact = [Separator {
+                key: Key::Owned(alloc::vec![b'x'; page_size - overhead]),
+                child: 4,
+            }];
+            assert_eq!(
+                encode_internal(page_size, &[], 2, &exact).unwrap(),
+                legacy::encode_internal(page_size, &[], 2, &exact).unwrap()
+            );
+            let over = [Separator {
+                key: Key::Owned(alloc::vec![b'x'; page_size - overhead + 1]),
+                child: 4,
+            }];
+            assert!(encode_internal(page_size, &[], 2, &over).is_err());
+            assert!(legacy::encode_internal(page_size, &[], 2, &over).is_err());
+        }
     }
 
     /// Every prefix length of a random sequence of cell sizes — tiny cells,
