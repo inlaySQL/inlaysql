@@ -379,6 +379,7 @@ fn inlaysql_join(
     ys: &[Option<i64>],
     left: bool,
     path: InnerPath,
+    suffix: &str,
 ) -> Result<Vec<Vec<String>>, inlaysql::Error> {
     let mut db = Database::open_in_memory()?;
     db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)", &[])?;
@@ -414,7 +415,7 @@ fn inlaysql_join(
     db.execute("ANALYZE", &[])?;
     let kind = if left { "LEFT JOIN" } else { "JOIN" };
     let result = db.query(
-        &format!("SELECT a.id, b.id FROM a {kind} b ON {}", path.on()),
+        &format!("SELECT a.id, b.id FROM a {kind} b ON {}{suffix}", path.on()),
         &[],
     )?;
     let mut rows: Vec<Vec<String>> = result
@@ -434,6 +435,7 @@ fn sqlite_join(
     ys: &[Option<i64>],
     left: bool,
     path: InnerPath,
+    suffix: &str,
 ) -> rusqlite::Result<Vec<Vec<String>>> {
     let conn = rusqlite::Connection::open_in_memory()?;
     conn.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)", [])?;
@@ -457,7 +459,7 @@ fn sqlite_join(
     }
     let kind = if left { "LEFT JOIN" } else { "JOIN" };
     let mut statement = conn.prepare(&format!(
-        "SELECT a.id, b.id FROM a {kind} b ON {}",
+        "SELECT a.id, b.id FROM a {kind} b ON {}{suffix}",
         path.on()
     ))?;
     let columns = statement.column_count();
@@ -490,8 +492,8 @@ fn joins_agree(left: bool) {
         let mut rng = SeededRng::new(seed);
         let (xs, ys) = generate_pairs(&mut rng);
         for path in [InnerPath::Scan, InnerPath::Index, InnerPath::RowId] {
-            let ours = inlaysql_join(&xs, &ys, left, path).expect("InlaySQL join must answer");
-            let theirs = sqlite_join(&xs, &ys, left, path).expect("SQLite is the oracle");
+            let ours = inlaysql_join(&xs, &ys, left, path, "").expect("InlaySQL join must answer");
+            let theirs = sqlite_join(&xs, &ys, left, path, "").expect("SQLite is the oracle");
             assert_eq!(
                 ours, theirs,
                 "seed {seed}: {kind} on {path:?} disagreed\nx: {xs:?}\ny: {ys:?}"
@@ -687,9 +689,75 @@ fn nocase_key_joins_agree_with_sqlite() {
     typed_joins_agree(KeyClass::NoCaseText, true);
 }
 
+/// The same generated joins under a `LIMIT` — the shape `BENCHMARK.md`
+/// publishes, and since AHL-549 the one answered by a borrowed-cell operator
+/// (`inlaysql_core::exec::BorrowedJoin`) rather than by the owned nested loop.
+///
+/// Two properties, because a bare `LIMIT` has two different kinds of answer:
+///
+/// * **Ordered.** `ORDER BY a.id, b.id LIMIT n OFFSET m` picks one determined
+///   set of rows, so SQLite is a straight oracle for it. This is the strong
+///   check, and it is the one that would catch a probe that lost or invented a
+///   pair under a `LIMIT`.
+/// * **Unordered.** `LIMIT n` on its own may legitimately answer *different*
+///   rows on the two engines — neither dialect promises an order without
+///   `ORDER BY` — so the oracle for it is the join itself: it must deliver
+///   exactly `min(n, all)` rows, and every one of them must be a pair the
+///   unlimited join produced. That is the shape the streamed operator actually
+///   runs, and it is where a `LIMIT` that stopped the outer scan one row early
+///   (or an `OFFSET` that skipped a row the `ON` had rejected) would show.
+fn limited_joins_agree(left: bool) {
+    let kind = if left { "LEFT JOIN" } else { "INNER JOIN" };
+    for seed in 0..rounds() {
+        let mut rng = SeededRng::new(seed);
+        let (xs, ys) = generate_pairs(&mut rng);
+        for path in [InnerPath::Scan, InnerPath::Index, InnerPath::RowId] {
+            let all = inlaysql_join(&xs, &ys, left, path, "").expect("InlaySQL join must answer");
+            for (limit, offset) in [(1usize, 0usize), (3, 0), (10, 2), (1, 5), (1_000, 0)] {
+                let ordered = format!(" ORDER BY a.id, b.id LIMIT {limit} OFFSET {offset}");
+                let ours =
+                    inlaysql_join(&xs, &ys, left, path, &ordered).expect("InlaySQL must answer");
+                let theirs =
+                    sqlite_join(&xs, &ys, left, path, &ordered).expect("SQLite is the oracle");
+                assert_eq!(
+                    ours, theirs,
+                    "seed {seed}: {kind} on {path:?} disagreed under `{ordered}`\nx: {xs:?}\ny: {ys:?}"
+                );
+
+                let bare = format!(" LIMIT {limit} OFFSET {offset}");
+                let limited =
+                    inlaysql_join(&xs, &ys, left, path, &bare).expect("InlaySQL must answer");
+                assert_eq!(
+                    limited.len(),
+                    all.len().saturating_sub(offset).min(limit),
+                    "seed {seed}: {kind} on {path:?} returned {} rows for `{bare}` out of {}",
+                    limited.len(),
+                    all.len()
+                );
+                for row in &limited {
+                    assert!(
+                        all.contains(row),
+                        "seed {seed}: {kind} on {path:?} invented the row {row:?} under `{bare}`"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn inner_joins_agree_with_sqlite() {
     joins_agree(false);
+}
+
+#[test]
+fn limited_inner_joins_agree_with_sqlite() {
+    limited_joins_agree(false);
+}
+
+#[test]
+fn limited_left_joins_agree_with_sqlite() {
+    limited_joins_agree(true);
 }
 
 #[test]
