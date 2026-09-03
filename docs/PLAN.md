@@ -49,7 +49,14 @@ current execution order without relying on local conversation history.
   decoded for the life of a transaction, encoded once at commit; batch
   insert 1.29–1.44x; five DST sweeps green), AHL-543 (C1 design brief,
   `docs/research/commit-group-logical.md`; first slice is rebase-only
-  absorption).
+  absorption), AHL-544 (**C1 slice 1 landed behind an off-by-default
+  flag**: the gate holder judges the writers parked behind it. Cohorts
+  form — 5.4–8.9 members, 81–95% of commits absorbed at 8–32 writers, so
+  the brief's premise holds — and it measures flat, which the slice's own
+  plan predicted before the run, because every follower still enters the
+  gate to encode and append. `EngineOptions::commit_absorption` stays off;
+  the decision ordering, the chain seal and the crash sweeps are what
+  Slice 3 needed proving first. `PERF.md` AHL-544).
 - 2026-09-03, small hours: AHL-538 (streamed aggregate by callback off the
   borrowed leaf, walk stops at the last wanted column; aggregate 1.08–1.12x
   at every row width), AHL-539 (in-memory rows shared, 0 allocations per

@@ -4287,6 +4287,91 @@ commit on this shape. After the fix, `committed_node` is 1.2% inclusive and
 which is under the measurement floor of §4. It stays available if a
 write-then-read shape ever makes it visible.
 
+### Commit-side absorption, slice 1: cohorts form, and it measures flat (AHL-544, 2026-09-03)
+
+`docs/research/commit-group-logical.md`'s C1 brief has two open questions its
+Slice 1 exists to answer before anything riskier is built. Both are answered
+here, and they answer differently.
+
+**Question 1 — do cohorts form at all?** The brief's model needs 6-10 writers
+piled up behind the reservation gate for a leader to have anything to
+amortise, and states plainly that if the number comes back near 1 "the whole
+premise of this design is wrong and nothing past this slice should be built."
+It comes back well clear of 1. Counted directly by
+`FileDevice::absorption_stats` over the concurrency suite, 150 transactions
+per writer, `Durability::Full`:
+
+| Writers | Cohorts | Members judged | Members per cohort | Share of commits absorbed |
+| --- | --- | --- | --- | --- |
+| 1 | 0 | 0 | — | 0.0% |
+| 8 | 166-182 | 975-993 | 5.4-5.9 | 81-83% |
+| 16 | 246-277 | 2,171-2,191 | 7.8-8.9 | 90-91% |
+| 32 | 639-736 | 4,519-4,538 | 6.1-7.1 | 94-95% |
+
+So the queue behind the gate is real and it is the size the model assumed:
+**at 16 writers a leader finds around eight transactions parked behind it, and
+94-95% of all commits at 32 writers are judged by somebody else's thread.**
+The single-writer row is 0 by construction and not by luck — a solo writer
+never has company, which is the same reason `coalesce_normal_commits`'
+emptiness check fires before any yield there.
+
+**Question 2 — does moving the decision pay?** No. Two independent
+interleaved sets of three repetitions, control re-run inside each repetition,
+`WRITER_LEVELS=1,8,16,32 --suite concurrency --txns 150`, host load 4.8-10.9
+of 18 (M-series, macOS, `F_FULLFSYNC`). Median of three, with the three raw
+values beside it:
+
+| Writers | Off, commits/s | On, commits/s | Ratio | Off p99 | On p99 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 252 `[251 252 257]` | 250 `[216 250 251]` | 0.99x | 6.94 ms | 7.94 ms |
+| 8 | 1,421 `[1420 1421 1449]` | 1,395 `[1350 1395 1420]` | 0.98x | 32.9 ms | 30.1 ms |
+| 16 | 1,709 `[1645 1709 1729]` | 1,729 `[1652 1729 1779]` | 1.01x | 45.1 ms | 48.0 ms |
+| 32 | 1,623 `[1550 1623 1627]` | 1,576 `[1474 1576 1601]` | 0.97x | 60.2 ms | 65.3 ms |
+
+The earlier set, run before the single-writer hint below was added, disagrees
+with this one in *sign* at every level (1.09x at 8 writers, 1.00x at 16,
+1.08x at 32, 0.96x at 1) with overlapping ranges throughout. Two sets that
+disagree about the sign is the definition of flat: **absorption changes
+nothing measurable at any writer count, and §4's floor is the reason to say
+so rather than pick the flattering set.**
+
+**Why flat is the expected answer, and was written down before the run.**
+`docs/research/commit-group-slice1.md` §5 predicted it: this slice cannot
+reduce the number of gate acquisitions. Every follower still enters the gate
+to rebase, encode, append and publish its own ticket; all absorption removes
+from a follower's own hold is `rebase_pending`'s comparison, which §3's
+profiling already measures as too fast to appear as its own bucket, and the
+leader pays that same comparison for the whole cohort inside *its* hold
+instead. The work is moved, not removed. What the brief's model predicts a
+gain from is Slice 3 — the leader owning the encode and append for the whole
+cohort, so N transactions cost one gate acquisition instead of N — and this
+slice's job was to prove the decision ordering is safe and the cohorts are
+there before that is built. Both are now true.
+
+**The one real cost, found and removed.** In the first set, one writer
+measured 0.96x — small, but it should have been exactly 1.00x, because a solo
+writer is never absorbed. It was: `absorb_offer` was moving the transaction's
+operations into the coordinator and claiming them straight back on every
+commit, gate holder or not. `FileDevice::absorb_offer` now returns `None`
+without touching anything when `normal_inflight` is zero — nobody holds the
+gate, so this writer is about to acquire it rather than park behind it, and
+there is no leader to judge the offer. A hint, not a guarantee: a wrong guess
+either way costs a missed absorption and never correctness. With it, the
+single-writer path with the flag *on* is one relaxed atomic load away from
+the flag being off, and the row above is 0.99x.
+
+**Kept, off.** `EngineOptions::commit_absorption` defaults to `false`, so
+`main` carries this without changing the shipped protocol, and every
+published number in `BENCHMARK.md` continues to describe the flag-off engine.
+What lands with it is the part a measurement cannot supply: the decision
+ordering is a checked property rather than a doc-comment claim
+(`absorption_matches_serial_commit_order` compares outcome vectors and final
+bytes over 200 seeded workloads), the chain seal that makes a stale decision
+unusable is pinned transition by transition, and the crash-at-every-step
+sweep asserts no member's rows ever reach the file without that member having
+been told it committed. Slice 3 needs all of it and none of it has to be
+rebuilt.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness

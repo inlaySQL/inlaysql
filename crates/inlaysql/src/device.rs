@@ -1692,6 +1692,19 @@ impl Device for FileDevice {
     /// costs one uncontended lock and no allocation.
     fn absorb_offer(&self, root: PageId, ops: &mut PendingOps) -> Option<u64> {
         let coordinator = self.coordinator.as_ref()?;
+        // Nobody is holding the gate, so this writer is about to acquire it
+        // rather than park behind it — there is no leader to judge the offer
+        // and it would only have to claim it straight back. A hint, not a
+        // guarantee: a writer that loses the race after reading zero here
+        // simply commits the way it does today, and one that reads non-zero
+        // and then finds the gate free has its offer returned to it
+        // unjudged. What it buys is that a single writer, which by
+        // construction never has company, pays nothing at all for this
+        // feature being switched on — `PERF.md`'s AHL-544 section measured
+        // the version without it ~4% below the control at one writer.
+        if coordinator.normal_inflight.load(Ordering::Acquire) == 0 {
+            return None;
+        }
         coordinator.absorption_state().offer(root, ops)
     }
 
