@@ -2874,7 +2874,8 @@ impl<D: Device> CowBTree<D> {
                             else {
                                 return Err(kind_changed(left_id));
                             };
-                            let mid = internal_split_point(&bytes, &new_cells, self.page_size);
+                            let mid =
+                                page::internal_split_point(&bytes, &new_cells, self.page_size);
                             let right_cells = new_cells.split_off(mid);
                             let promoted = right_cells[0].key.resolve(&bytes).to_vec();
                             let right_leftmost = right_cells[0].child;
@@ -2950,7 +2951,7 @@ impl<D: Device> CowBTree<D> {
                     else {
                         return Err(kind_changed(left_id));
                     };
-                    let mid = leaf_split_point(&bytes, &left, self.page_size);
+                    let mid = page::leaf_split_point(&bytes, &left, self.page_size);
                     let right = left.split_off(mid);
                     // The promoted separator is copied out of the leaf's bytes:
                     // the parent's page is a different buffer, so the key cannot
@@ -4860,30 +4861,6 @@ fn key_fits(page_size: usize, key: &[u8]) -> bool {
     let leaf = 16 + 2 + 2 + key.len() + 1 + 16;
     let internal = 16 + 2 + 2 + key.len() + 8;
     leaf <= page_size / 2 && internal <= page_size / 2
-}
-
-/// The split point for an overfull leaf: the largest number of leading entries
-/// that still fit a page. Splitting here packs the left half as full as
-/// possible, which keeps the right half small enough to fit — important when
-/// entries have very different sizes (e.g. small metadata rows next to large
-/// rows carrying a vector). Every entry fits alone — either inline or as an
-/// overflow pointer (see [`key_fits`]) — so the result is always at least one.
-fn leaf_split_point(bytes: &[u8], entries: &[Entry], page_size: usize) -> usize {
-    let mut split = 1;
-    while split < entries.len() && page::leaf_size(bytes, &entries[..split]) <= page_size {
-        split += 1;
-    }
-    split - 1
-}
-
-/// The split point for an overfull internal node: the largest number of leading
-/// separators that still fit a page.
-fn internal_split_point(bytes: &[u8], cells: &[Separator], page_size: usize) -> usize {
-    let mut split = 1;
-    while split < cells.len() && page::internal_size(bytes, &cells[..split]) <= page_size {
-        split += 1;
-    }
-    split - 1
 }
 
 fn encode_header(page_size: usize) -> Vec<u8> {

@@ -263,8 +263,59 @@ pub fn internal_size(source: &[u8], cells: &[Separator]) -> usize {
         + SLOT_SIZE * cells.len()
         + cells
             .iter()
-            .map(|c| 2 + key_bytes(source, &c.key).len() + 8)
+            .map(|c| internal_cell_size(key_bytes(source, &c.key)))
             .sum::<usize>()
+}
+
+/// The split point for an overfull leaf: the largest number of leading
+/// entries that still fit a page, never the whole slice. Splitting here packs
+/// the left half as full as possible, which keeps the right half small enough
+/// to fit — important when entries have very different sizes (e.g. small
+/// metadata rows next to large rows carrying a vector). Every entry fits
+/// alone — either inline or as an overflow pointer (see `key_fits` in
+/// `btree/tree.rs`) — so the result is always at least one for a slice of
+/// two or more.
+///
+/// One pass over the cells, accumulating the size [`leaf_size`] would report
+/// for each prefix (AHL-545). It used to call `leaf_size` once per candidate
+/// prefix — quadratic in the cell count, and the only per-row cost the
+/// batch-insert profile still charged to the split after AHL-542.
+pub fn leaf_split_point(source: &[u8], entries: &[Entry], page_size: usize) -> usize {
+    split_point(page_size, entries, |entry| {
+        leaf_cell_size(key_bytes(source, &entry.key), &entry.value)
+    })
+}
+
+/// The split point for an overfull internal node: the largest number of
+/// leading separators that still fit a page, never the whole slice. See
+/// [`leaf_split_point`].
+pub fn internal_split_point(source: &[u8], cells: &[Separator], page_size: usize) -> usize {
+    split_point(page_size, cells, |cell| {
+        internal_cell_size(key_bytes(source, &cell.key))
+    })
+}
+
+/// The largest `n < cells.len()` such that the first `n` cells fit a page.
+///
+/// The header and one slot per cell are counted exactly as [`leaf_size`] and
+/// [`internal_size`] count them, so the answer is the one their per-prefix
+/// caller used to compute, in one pass instead of one per prefix.
+fn split_point<T>(page_size: usize, cells: &[T], cell_size: impl Fn(&T) -> usize) -> usize {
+    let mut size = HEADER_SIZE;
+    let mut split = 0;
+    for cell in &cells[..cells.len().saturating_sub(1)] {
+        size += SLOT_SIZE + cell_size(cell);
+        if size > page_size {
+            break;
+        }
+        split += 1;
+    }
+    split
+}
+
+/// Bytes one internal cell occupies on the page.
+fn internal_cell_size(key: &[u8]) -> usize {
+    2 + key.len() + 8
 }
 
 /// Encode a leaf page.
@@ -1104,5 +1155,162 @@ mod tests {
                 }
             }
         }
+    }
+    /// The split points as they were before AHL-545 — `leaf_size`/
+    /// `internal_size` called once per candidate prefix — kept verbatim so
+    /// the one-pass versions can be held to their answer. Nothing outside the
+    /// tests reaches them.
+    mod legacy {
+        use super::super::*;
+
+        pub fn leaf_split_point(bytes: &[u8], entries: &[Entry], page_size: usize) -> usize {
+            let mut split = 1;
+            while split < entries.len() && leaf_size(bytes, &entries[..split]) <= page_size {
+                split += 1;
+            }
+            split - 1
+        }
+
+        pub fn internal_split_point(bytes: &[u8], cells: &[Separator], page_size: usize) -> usize {
+            let mut split = 1;
+            while split < cells.len() && internal_size(bytes, &cells[..split]) <= page_size {
+                split += 1;
+            }
+            split - 1
+        }
+    }
+
+    /// A small deterministic generator for the parity tests: the shapes have
+    /// to cover cells near the page's ceiling as well as tiny ones, and a
+    /// fixed seed makes a failure reproducible.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// A page of `count` leaf cells to borrow from, plus entries that borrow
+    /// their keys and values from it — the shape a decoded page has — mixed
+    /// with owned keys, owned values and overflow pointers, the shapes the
+    /// write path produces.
+    fn mixed_entries(rng: &mut Lcg, page_size: usize, count: usize) -> (Vec<u8>, Vec<Entry>) {
+        let borrowed = (0..count)
+            .map(|i| {
+                let key = alloc::format!("k{i:05}").into_bytes();
+                let value = alloc::vec![i as u8; rng.below(24)];
+                entry(&key, &value)
+            })
+            .collect::<Vec<_>>();
+        let source = encode_leaf(page_size, &[], &borrowed).unwrap();
+        let Node::Leaf { entries, .. } = decode(page_size, &source).unwrap() else {
+            panic!("not a leaf");
+        };
+        let entries = entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| match rng.below(4) {
+                0 => e,
+                1 => Entry {
+                    key: Key::Owned(e.key.resolve(&source).to_vec()),
+                    value: e.value,
+                },
+                2 => Entry {
+                    key: e.key,
+                    value: ValueRef::Owned(Arc::from(alloc::vec![0xAB; rng.below(40)])),
+                },
+                _ => Entry {
+                    key: Key::Owned(alloc::format!("o{i:05}").into_bytes()),
+                    value: ValueRef::Overflow {
+                        first: 1000 + i as u64,
+                        len: 100_000 + i,
+                    },
+                },
+            })
+            .collect();
+        (source, entries)
+    }
+
+    /// Every prefix length of a random sequence of cell sizes — tiny cells,
+    /// cells near half a page, overflow pointers — splits where the
+    /// per-prefix `leaf_size` loop split it.
+    #[test]
+    fn the_split_point_is_the_one_the_per_prefix_loop_chose() {
+        let mut rng = Lcg(3);
+        for page_size in [MIN_PAGE_SIZE * 4, 4096] {
+            let ceiling = page_size / 2 - (HEADER_SIZE + SLOT_SIZE + 2 + 1 + 4);
+            for round in 0..40 {
+                let entries = (0..(1 + rng.below(60)))
+                    .map(|i| {
+                        let key = alloc::vec![i as u8; 1 + rng.below(8)];
+                        match rng.below(3) {
+                            // Near the limit: the value fills the cell to half
+                            // a page, give or take a few bytes.
+                            0 => entry(&key, &alloc::vec![1; ceiling - key.len() - rng.below(4)]),
+                            1 => entry(&key, &alloc::vec![2; rng.below(64)]),
+                            _ => Entry {
+                                key: Key::Owned(key),
+                                value: ValueRef::Overflow {
+                                    first: 9,
+                                    len: 1 << 20,
+                                },
+                            },
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                for prefix in 0..=entries.len() {
+                    let slice = &entries[..prefix];
+                    assert_eq!(
+                        leaf_split_point(&[], slice, page_size),
+                        legacy::leaf_split_point(&[], slice, page_size),
+                        "page_size {page_size}, round {round}, prefix {prefix}"
+                    );
+                }
+                let cells = (0..(1 + rng.below(60)))
+                    .map(|i| Separator {
+                        key: Key::Owned(alloc::vec![
+                            i as u8;
+                            match rng.below(3) {
+                                0 => page_size / 2 - (HEADER_SIZE + SLOT_SIZE + 2 + 8) - rng.below(4),
+                                _ => 1 + rng.below(16),
+                            }
+                        ]),
+                        child: i as u64,
+                    })
+                    .collect::<Vec<_>>();
+                for prefix in 0..=cells.len() {
+                    let slice = &cells[..prefix];
+                    assert_eq!(
+                        internal_split_point(&[], slice, page_size),
+                        legacy::internal_split_point(&[], slice, page_size),
+                        "page_size {page_size}, round {round}, prefix {prefix}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The chosen prefix fits and the next one does not: the property the
+    /// tree's split relies on, stated without reference to either encoder.
+    #[test]
+    fn the_split_point_is_the_largest_fitting_prefix() {
+        let mut rng = Lcg(5);
+        let page_size = 1024;
+        let (source, entries) = mixed_entries(&mut rng, 16384, 300);
+        let split = leaf_split_point(&source, &entries, page_size);
+        assert!(split >= 1 && split < entries.len());
+        assert!(leaf_size(&source, &entries[..split]) <= page_size);
+        assert!(leaf_size(&source, &entries[..split + 1]) > page_size);
+        assert_eq!(leaf_split_point(&source, &entries[..1], page_size), 0);
+        assert_eq!(leaf_split_point(&source, &[], page_size), 0);
     }
 }
