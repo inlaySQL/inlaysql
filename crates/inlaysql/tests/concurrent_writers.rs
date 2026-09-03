@@ -712,3 +712,131 @@ fn a_table_without_an_integer_primary_key_still_reports_its_assigned_row_id() {
         .unwrap();
     assert_eq!(db.last_insert_row_id(), Some(2));
 }
+
+/// Commit-side absorption (AHL-544) with real threads: the gate holder judges
+/// the transactions parked behind it instead of each of them re-entering the
+/// gate to judge itself.
+///
+/// The property is that nothing observable changes. This is
+/// `parallel_file_handles_commit_disjoint_rows_without_false_conflicts`'s
+/// workload run at both flag settings, asserting the same three things each
+/// time — every `Ok` write is in the file, disjoint writes never falsely
+/// conflict, and CDC versions stay a gap-free commit order — plus the two
+/// things only this test can say: with the flag on, cohorts actually form
+/// (otherwise the run proves nothing), and with it off, none ever do.
+///
+/// Eight writers rather than four, and a `Barrier` per round, because a
+/// cohort only exists when writers are genuinely queued behind the gate. See
+/// `docs/research/commit-group-slice1.md`.
+fn absorption_writers(absorption: bool) -> (Vec<i64>, usize, u64) {
+    use std::sync::{Arc, Barrier};
+
+    const WRITERS: usize = 8;
+    const PER_WRITER: i64 = 25;
+
+    let temp = TempDb::new(if absorption {
+        "absorption-on"
+    } else {
+        "absorption-off"
+    });
+    let options = inlaysql::EngineOptions {
+        commit_absorption: absorption,
+        ..inlaysql::EngineOptions::default()
+    };
+    let mut creator =
+        Database::open_on_with_options(FileDevice::open(temp.path()).unwrap(), options).unwrap();
+    creator
+        .execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, n INTEGER)", &[])
+        .unwrap();
+    drop(creator);
+    // The coordinator — and with it the absorption counters — lives only as
+    // long as some handle on this file does. Hold one open across the whole
+    // run, or the stats read below come from a coordinator created after the
+    // fact and are zero whatever happened.
+    let keeper = FileDevice::open(temp.path()).unwrap();
+
+    let barrier = Arc::new(Barrier::new(WRITERS));
+    let conflicts: usize = std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for index in 0..WRITERS {
+            let barrier = barrier.clone();
+            let path = temp.path().to_path_buf();
+            workers.push(scope.spawn(move || {
+                let mut db =
+                    Database::open_on_with_options(FileDevice::open(&path).unwrap(), options)
+                        .unwrap();
+                let mut conflicts = 0;
+                for round in 0..PER_WRITER {
+                    let id = round * WRITERS as i64 + index as i64 + 1;
+                    // Line the writers up so there is a queue behind the gate
+                    // for a leader to find; without this they mostly arrive
+                    // alone and no cohort ever exists.
+                    barrier.wait();
+                    loop {
+                        match insert(&mut db, id) {
+                            Ok(()) => break,
+                            Err(Error::Conflict) => conflicts += 1,
+                            Err(other) => panic!("writer {index} failed on id {id}: {other}"),
+                        }
+                    }
+                }
+                conflicts
+            }));
+        }
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .sum()
+    });
+
+    let (_, members) = keeper.absorption_stats().unwrap();
+    let device = Rc::new(RefCell::new(keeper));
+    let rows = ids(&device);
+
+    let reader = Database::open(temp.path()).unwrap();
+    let changes = reader.changes(0).unwrap();
+    let versions: Vec<u64> = changes
+        .changes
+        .iter()
+        .map(|change| change.version)
+        .collect();
+    assert_eq!(
+        versions,
+        (1..=rows.len() as u64).collect::<Vec<_>>(),
+        "absorption = {absorption}: CDC versions must stay a gap-free commit order"
+    );
+    (rows, conflicts, members)
+}
+
+#[test]
+fn absorbed_parallel_writers_lose_nothing_and_form_cohorts() {
+    let expected: Vec<i64> = (1..=200).collect();
+
+    let (rows, conflicts, members) = absorption_writers(false);
+    assert_eq!(
+        rows, expected,
+        "flag off: every Ok write must be in the file"
+    );
+    assert_eq!(
+        conflicts, 0,
+        "flag off: disjoint writes must rebase cleanly"
+    );
+    assert_eq!(
+        members, 0,
+        "flag off: nothing may be offered to a gate holder at all"
+    );
+
+    let (rows, conflicts, members) = absorption_writers(true);
+    assert_eq!(
+        rows, expected,
+        "flag on: every Ok write must be in the file"
+    );
+    assert_eq!(conflicts, 0, "flag on: disjoint writes must rebase cleanly");
+    // A cohort forms only when a writer reaches the gate while another holds
+    // it. That is a race, so this asserts that it happened at all rather than
+    // how often — but if it never happens, the run above proves nothing.
+    assert!(
+        members > 0,
+        "flag on: no cohort ever formed, so this test exercised nothing"
+    );
+}
