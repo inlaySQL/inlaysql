@@ -113,13 +113,17 @@ published row without a gated regeneration.
    `Vec`. Angles: the inner side borrows (AHL-535's buffer applied to the
    join's probed row), the match buffer is reused across outer rows, and a
    probe that reseeks from the retained cursor's parent on a leaf miss.
-2. **Range scan vs SQLite (0.67x).** After AHL-535: residual filter ~16%
-   with `from_utf8` ~5% re-validating text validated at insert, `memcmp`
-   ~21%. Angles: `BINARY` text compare on borrowed cells without UTF-8
-   re-validation; a pre-compiled comparator per predicate instead of the
-   general `evaluate_ref` walk. Do not re-propose a dense walk or a
-   covering scan (both measured negative) without a borrowed-entry index
-   walk first.
+2. **Range scan vs SQLite (0.67x).** After AHL-550: the residual filter
+   is compiled per execution and is ~7% of the shape (1.22–1.36x on
+   `indexed-range`, `PERF.md` 2026-09-03); reading the filter-only `TEXT`
+   column raw to skip its `from_utf8` was built and measured flat — the
+   removable share is ~2 points, the returned column's validation is the
+   `&str` API's, and a second row walk costs more than it saves (same
+   section; do not re-propose without fusing it into the decoder, and
+   even then it is under §4's floor). What is left is the descent:
+   `memcmp` ~24–27% is B-tree key comparison, `get_from` ~5%. Angle: a
+   borrowed-entry index walk. Do not re-propose a dense walk or a
+   covering scan (both measured negative) without that first.
 3. **Point-read ops/s vs SQLite WAL (0.69x; p50 already ahead).** The gap
    is the tail (p95 4.67 vs 1.04 µs). First an instrument — a tail
    profiler that records stacks only for queries over 2 µs — then the fix

@@ -5038,6 +5038,97 @@ needs. What is left on the shape: `_platform_memcmp` 27.2% (descent, per the
 `decode_value_ref` 4.8%, `decode_row_ref_masked_into` 4.4%. The `from_utf8`
 is item (a).
 
+### The filter-only `TEXT` column read raw, without `from_utf8` — built, measured, not landed (AHL-550 (a), 2026-09-03)
+
+`PLAN.md`'s second angle on the range scan: `from_utf8` ~5% of the shape,
+"re-validating text validated at insert". Built on top of (b), measured, and
+left out; this is what it found.
+
+**What can and cannot be skipped, in safe Rust.** `ValueRef::Text` is a
+`&str`, and under `#![forbid(unsafe_code)]` there is exactly one way to make
+one from bytes: `core::str::from_utf8`, which walks every byte. So a column
+the statement *returns* — `body`, 64 bytes of the 90-byte row — cannot stop
+being validated without either `unsafe` or a different result type; that
+share of the 5% is the API's, not the filter's. The removable part is the
+column read *only* by the filter: `email`, ~20 bytes, whose only use is a
+comparison, and a comparison does not need the `str`. The insert side was
+checked first: `encode_value` is the only writer of `TAG_TEXT` into a row
+and takes a `Value::Text`, whose payload is an `Arc<str>` Rust would not let
+exist unless it were UTF-8 (`index.rs`'s `TAG_TEXT` is an index-key
+encoding, read by different code), so every `TEXT` cell in a row *was*
+validated when written, and under `BINARY` — `str`'s own `Ord`, which is
+bytewise because UTF-8 was designed so byte order is code-point order —
+comparing the bytes is the same function as comparing the `str`. `NOCASE`
+and `RTRIM` were bytewise already (`Collation::compare` calls `as_bytes()`
+first thing). What would be given up is the accidental corruption check the
+walk amounted to for that one column, which a masked decode already skips
+for every column the mask leaves out and which no `INTEGER`, `REAL` or
+`BLOB` cell has.
+
+**What was built.** `row::RawCell` — `Null`/`Integer`/`Real`/`Text(&[u8])`/
+`Blob`/`Vector`, read by `raw_cell_at(bytes, ordinal)` with the same
+`skip_value` walk the decoder uses — and `CompiledFilter::plan_decode`,
+which after (b)'s compile takes the mask of everything the statement reads
+*except* through the filter, adds the general conjuncts' columns (they go
+through `evaluate_ref` over the decoded row), and marks each compiled
+conjunct raw exactly when the mask still does not want its column. A raw
+`TEXT` cell under `Numeric` affinity is validated once and parsed, because
+the parser wants a `str`; against a `TEXT` constant it compares under the
+collation on the bytes (`Collation::compare_bytes`, the function `compare`
+always was underneath); against a number or a blob it is stage two's class
+order without looking at the bytes. The decode mask then leaves `email`
+out, so its `from_utf8` never runs. The tie test ran both routes — every
+conjunct decoded, and every conjunct raw with the narrowed decode — against
+`evaluate_ref` and both agreed over the same 20,000 rounds; a pin test
+fixed which columns go raw (a projected column does not; a column a general
+conjunct reads does not; a mask that cannot narrow leaves everything
+decoded). The patch is kept at `/tmp/w2-ahl550a.patch` on the machine it
+was built on; nothing of it is in the tree.
+
+**What the profile said** (4,311 samples, `indexed-range --rows 20000`,
+against (b)'s 3,831): `from_utf8` **5.1% → 3.1%** — `email`'s share, gone
+as designed. But `CompiledFilter::admits` **6.9% → 12.2% inclusive**: the
+raw read is a *second* walk over the row per conjunct — `Cursor::count` 2.3%,
+`skip_value` 2.5%, `raw_cell_at` 1.7% self, `Cursor::u32` 1.2%,
+`Cursor::take` 1.1% — none of it inlined into the caller the way the
+decoder's own use of the same helpers is, and paid twice because the range
+predicate has two conjuncts on the same column. The walk cost more than the
+validation it replaced.
+
+**Measured**, (b)'s binary against this one, interleaved, order alternated,
+control re-run per repetition, `--seconds 4`:
+
+| Suite | AHL-550 (b) | (b) + (a) | Verdict |
+| --- | --- | --- | --- |
+| `indexed-range`, 20k | 96.6 / 111.5 / 126.0k | 106.0 / 95.1 / 122.0k | **flat, mixed sign** (load 5.5–9.9) |
+| `indexed`, 20k | 479 / 471 / 455k | 493 / 470 / 486k | flat |
+| `points`, 20k | 3.24 / 2.54 / 2.99M | 3.10 / 3.16 / 1.31M | the control; third repetition under a load spike to 33 |
+| `joins-limit`, 20k | 136 / 165 / 75k | 146 / 163 / 161k | same spike |
+| `aggregate`, 20k | 1,975 / 1,962 / 2,168 | 2,087 / 2,210 / 2,160 | no `WHERE`; noise |
+
+The bench binary's own range row: 103.5 / 115.0 / 104.6k → 76.3 / 109.3 /
+103.5k, p50 9.04 / 8.46 / 9.08 µs → 10.04 / 8.88 / 9.13 µs. Flat where the
+profile predicts flat.
+
+**Why the fused version was not built either.** The obvious repair is one
+walk instead of two: have `decode_row_ref_masked_into` hand the raw cells
+out as it steps over the columns the mask does not want, so the raw read
+costs a slice instead of a walk. Its best case is the whole of what (a)
+removed and nothing more: the 2.0 points of `from_utf8` that were `email`'s.
+Section 4's floor for this suite is ~7% CoV on a quiet machine and ~20% on
+this one as used; a 2% change is not a result this project reports, and the
+acceptance rule (3/3 non-overlapping) cannot be met by a change that size
+however well it is built. The remaining 3.1% is `body`'s, and `body` is the
+answer.
+
+**What this leaves for the range scan.** After (b) the residual filter is
+~7% of the shape; `_platform_memcmp` at 24–27% is B-tree key comparison
+during descent (the 2026-09-01 attribution stands), `get_from` ~5–6%, the
+decode ~14% inclusive of which the returned `body`'s validation is 3%. The
+lead is the descent, not the filter: a borrowed-entry index walk, which
+`PLAN.md` already names as the precondition for re-proposing anything on
+this shape.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness
