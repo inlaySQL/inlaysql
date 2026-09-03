@@ -40,7 +40,7 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
-use crate::btree::{BackupSummary, Device};
+use crate::btree::{BackupSummary, Device, Diagnostics};
 use crate::error::Result;
 use crate::row::RowBuf;
 use crate::traits::{RowId, Storage};
@@ -124,6 +124,10 @@ impl Storage for SharedStorage {
     /// everything else forwards this too.
     fn first_in_table(&self, table: &str) -> Result<Option<(RowId, RowBuf)>> {
         self.inner.borrow().first_in_table(table)
+    }
+
+    fn diagnostics(&self) -> Diagnostics {
+        self.inner.borrow().diagnostics()
     }
 
     fn last_in_table(&self, table: &str) -> Result<Option<(RowId, RowBuf)>> {

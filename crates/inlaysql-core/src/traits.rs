@@ -22,7 +22,7 @@ use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 
-use crate::btree::{BackupSummary, Device};
+use crate::btree::{BackupSummary, Device, Diagnostics};
 use crate::error::Result;
 use crate::hnsw::VectorMetric;
 use crate::row::RowBuf;
@@ -424,6 +424,17 @@ pub trait Storage {
     /// map, a backend that reads through on every call — is already current.
     fn refresh(&mut self) -> Result<bool> {
         Ok(false)
+    }
+
+    /// A snapshot of this backend's lifetime cache and read counters — see
+    /// [`Diagnostics`] for what each one means and how a harness attributes
+    /// one query with them.
+    ///
+    /// The default is all zeros: a backend with no page cache and no device
+    /// has nothing to count, and a wrapper that forwards everything else
+    /// should forward this too or its inner backend's counters are lost.
+    fn diagnostics(&self) -> Diagnostics {
+        Diagnostics::default()
     }
 
     /// Discard the buffered writes of the open transaction, leaving the

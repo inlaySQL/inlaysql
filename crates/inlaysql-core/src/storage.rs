@@ -10,8 +10,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::btree::{
-    BackupSummary, CommitOutcome, CowBTree, Device, Durability, DEFAULT_PAGE_CACHE_BYTES,
-    DEFAULT_PAGE_SIZE,
+    BackupSummary, CommitOutcome, CowBTree, Device, Diagnostics, Durability,
+    DEFAULT_PAGE_CACHE_BYTES, DEFAULT_PAGE_SIZE,
 };
 use crate::collation::{self, Collation};
 use crate::error::{Error, Result};
@@ -451,6 +451,10 @@ impl<D: Device> Storage for TreeStorage<D> {
     /// state block is behind are not replayed here.
     fn refresh(&mut self) -> Result<bool> {
         self.tree.refresh()
+    }
+
+    fn diagnostics(&self) -> Diagnostics {
+        self.tree.diagnostics()
     }
 
     /// True once the open transaction has grown past half the log region —

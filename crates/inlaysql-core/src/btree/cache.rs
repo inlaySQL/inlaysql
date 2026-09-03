@@ -169,6 +169,9 @@ struct SlotIndex {
     slots: Vec<u32>,
     /// Occupied buckets.
     len: usize,
+    /// How many times the table has doubled. Diagnostic — see
+    /// [`PageCache::index_grows`].
+    grows: u64,
 }
 
 /// A vacant bucket.
@@ -180,6 +183,7 @@ impl SlotIndex {
             keys: Vec::new(),
             slots: Vec::new(),
             len: 0,
+            grows: 0,
         }
     }
 
@@ -292,6 +296,7 @@ impl SlotIndex {
     }
 
     fn grow(&mut self) {
+        self.grows += 1;
         let capacity = (self.keys.len() * 2).max(64);
         let keys = core::mem::replace(&mut self.keys, alloc::vec![0; capacity]);
         let slots = core::mem::replace(&mut self.slots, alloc::vec![EMPTY; capacity]);
@@ -350,6 +355,12 @@ pub struct PageCache {
     index: SlotIndex,
     /// The clock hand: the next slot index eviction will examine.
     hand: usize,
+    /// How many entries the clock has evicted since the cache was created.
+    /// Diagnostic — see [`PageCache::evictions`].
+    evictions: u64,
+    /// How many entries have been made resident. Diagnostic — see
+    /// [`PageCache::inserts`].
+    inserts: u64,
 }
 
 impl PageCache {
@@ -362,6 +373,8 @@ impl PageCache {
             free: Vec::new(),
             index: SlotIndex::new(),
             hand: 0,
+            evictions: 0,
+            inserts: 0,
         }
     }
 
@@ -383,6 +396,30 @@ impl PageCache {
     /// Whether the cache holds nothing.
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
+    }
+
+    /// How many entries the clock hand has evicted over this cache's lifetime.
+    ///
+    /// A counter, not a gauge: it only ever grows, so a caller snapshots it
+    /// before and after a query to learn whether that query evicted. This is
+    /// the question AHL-552's tail histogram asks — whether the point read's
+    /// slow outliers coincide with the clock sweep — and the counter costs one
+    /// increment on the eviction path, nothing on a hit.
+    pub fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    /// How many entries have been made resident over this cache's lifetime;
+    /// the insert path's counterpart of [`PageCache::evictions`].
+    pub fn inserts(&self) -> u64 {
+        self.inserts
+    }
+
+    /// How many times the page-id index has doubled its table. Each doubling
+    /// rehashes every resident id, which is the one `O(n)` step on the insert
+    /// path — worth knowing about when a slow query is being explained.
+    pub fn index_grows(&self) -> u64 {
+        self.index.grows
     }
 
     /// Drop every entry.
@@ -466,6 +503,7 @@ impl PageCache {
         };
         self.index.insert(id, at);
         self.bytes += footprint;
+        self.inserts += 1;
     }
 
     /// Evict one entry under the clock policy: sweep the hand forward,
@@ -499,6 +537,7 @@ impl PageCache {
             self.index.remove(slot.id);
             self.bytes = self.bytes.saturating_sub(slot.footprint);
             self.free.push(at);
+            self.evictions += 1;
             return true;
         }
         false

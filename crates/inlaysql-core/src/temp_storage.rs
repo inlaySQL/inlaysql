@@ -275,6 +275,12 @@ impl Storage for TempTableRouter {
         temp_result
     }
 
+    fn diagnostics(&self) -> crate::btree::Diagnostics {
+        // The in-memory side counts nothing; the durable side's page cache
+        // and device are what a harness is asking about.
+        self.durable.diagnostics()
+    }
+
     fn refresh(&mut self) -> Result<bool> {
         // Only the durable side has other handles to catch up to — a
         // temporary table belongs to this handle alone, the same as

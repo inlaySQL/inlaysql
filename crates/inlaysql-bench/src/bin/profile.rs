@@ -10,10 +10,13 @@
 //! rebuild it.
 //!
 //! What it does *not* do, on purpose:
-//! * **No SQLite.** `inlaysql-bench`'s suites open a `rusqlite::Connection`
-//!   in the same process to produce a comparison row; that connection's own
-//!   file locking is what leaked into AHL-472's supposedly read-only sample.
-//!   This binary never links against SQLite at all.
+//! * **No SQLite in a sampled window.** `inlaysql-bench`'s suites open a
+//!   `rusqlite::Connection` in the same process to produce a comparison row;
+//!   that connection's own file locking is what leaked into AHL-472's
+//!   supposedly read-only sample. No suite here opens SQLite while the
+//!   [`PHASE_MARKER`] window is running. The one place SQLite appears at all
+//!   is `--tail` (below), which opens it *after* InlaySQL's timed loop has
+//!   finished, for a comparison histogram a sampler is not meant to see.
 //! * **No setup inside the sampled window.** Schema, bulk load and index
 //!   build all happen before this process prints the
 //!   [`PHASE_MARKER`] line. A profiler is meant to attach *after* that line
@@ -76,6 +79,30 @@
 //! per row — is invisible there and is ~99% of the work here. Same table,
 //! same `Durability::Full` (the engine default, one barrier per statement) and
 //! the same `--batch` rows per statement the external driver uses.
+//!
+//! # `--tail` (AHL-552): the histogram a profile cannot draw
+//!
+//! `points --tail true` replaces the batched loop with one that times every
+//! query on its own `Instant` pair and files the delta into a fixed
+//! log2 histogram (`<250 ns`, then doublings up to `≥1 ms`), printed at the
+//! end with the count *and the share of total time* in each bucket — a p99
+//! says how far the tail reaches, the time share says how much of the ops/s
+//! it is eating. For every query slower than `--tail-threshold` (µs, default
+//! 3) it also records the query's ordinal and the delta of
+//! [`inlaysql::Diagnostics`] across it — page-cache evictions, inserts,
+//! index doublings, raw-leaf admissions, decodes, device reads, state-block
+//! reads — so a slow query can say which rare event, if any, it paid for. The
+//! ordinals are printed and their gaps summarised so a periodic cause shows
+//! as a period. Then the same loop, the same histogram and the same seeded
+//! key sequence run against SQLite in WAL mode in the same process, so
+//! whatever share of the tail is the operating system's is visible on both
+//! sides; and a third histogram of back-to-back `Instant::now()` pairs with
+//! nothing between them shows what the harness's own timer contributes.
+//!
+//! A self-time profile could not have drawn this: a tail made of *rare*
+//! events (a clock sweep, a table doubling, a scheduler preemption) does not
+//! accumulate enough samples to appear as a frame, and the published bench
+//! reports only p50/p95/p99 with no record of what any one slow query did.
 //!
 //! And `retrieval`, 2026-08-30: `PERF.md`'s vector-kernel section named this
 //! the missing piece — "`bin/profile.rs` does not cover the retrieval suite
@@ -146,6 +173,21 @@ struct Config {
     /// PostgreSQL, so this suite profiles the shape the published batch cell
     /// compares.
     batch: usize,
+    /// `points` only: per-query tail histogram instead of the batched loop.
+    /// See the module note "`--tail`".
+    tail: bool,
+    /// `--tail` only: a query slower than this many microseconds is recorded
+    /// with its ordinal and its diagnostics delta.
+    tail_threshold_micros: f64,
+    /// `--tail` only: load the rows the way `crates/inlaysql-bench/src/points.rs`
+    /// does — one durable auto-committed `INSERT` per row — instead of one
+    /// batched transaction, so the handle enters the read loop in the state
+    /// the published bench reads from.
+    tail_durable: bool,
+    /// `--tail` only: stop each engine's loop after this many queries rather
+    /// than after `--seconds`; `0` means by seconds. `5000` with
+    /// `--tail-durable true` is the published bench's read phase exactly.
+    queries: u64,
 }
 
 impl Config {
@@ -162,6 +204,10 @@ impl Config {
             query: "vector".to_string(),
             quantized: false,
             batch: 100,
+            tail: false,
+            tail_threshold_micros: 3.0,
+            tail_durable: false,
+            queries: 0,
         };
         let args: Vec<String> = std::env::args().skip(1).collect();
         for pair in args.chunks(2) {
@@ -195,6 +241,21 @@ impl Config {
                     "false" | "0" => config.quantized = false,
                     other => eprintln!("bad --quantized {other:?}, expected true or false"),
                 },
+                "--tail" => match value.as_str() {
+                    "true" | "1" => config.tail = true,
+                    "false" | "0" => config.tail = false,
+                    other => eprintln!("bad --tail {other:?}, expected true or false"),
+                },
+                "--tail-threshold" => match value.parse::<f64>() {
+                    Ok(micros) if micros > 0.0 => config.tail_threshold_micros = micros,
+                    _ => eprintln!("bad --tail-threshold {value:?}, expected microseconds"),
+                },
+                "--tail-durable" => match value.as_str() {
+                    "true" | "1" => config.tail_durable = true,
+                    "false" | "0" => config.tail_durable = false,
+                    other => eprintln!("bad --tail-durable {other:?}, expected true or false"),
+                },
+                "--queries" => config.queries = value.parse().unwrap_or(config.queries),
                 other => eprintln!("unknown flag {other}"),
             }
         }
@@ -236,6 +297,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let outcome = match config.suite.as_str() {
+        "points" if config.tail => tail::run_points(&config, &path),
         "points" => run_points(&config, &path),
         "indexed" => run_indexed(&config, &path),
         "indexed-range" => run_indexed_range(&config, &path),
@@ -944,6 +1006,529 @@ fn run_retrieval(config: &Config, path: &Path) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+/// `--tail` (AHL-552): per-query latency histograms for the point read, on
+/// both engines, with a diagnostics delta for every slow query. See the
+/// module note "`--tail`".
+mod tail {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use inlaysql::{Diagnostics, Value};
+    use inlaysql_core::mem::SeededRng;
+    use inlaysql_core::Rng;
+
+    use super::{announce_query_phase, Config};
+
+    /// The histogram's first upper bound, in nanoseconds; every later bucket
+    /// doubles it. Twelve doublings from 250 ns is 1,024,000 ns, so the last
+    /// bounded bucket ends at ~1 ms and the final one is open.
+    const FIRST_BOUND_NS: u64 = 250;
+    /// Bounded buckets: `<250 ns`, then `[250 ns, 500 ns)` … `[512 µs, 1 ms)`.
+    const BOUNDED: usize = 13;
+    /// All buckets, the open `≥1 ms` one included.
+    const BUCKETS: usize = BOUNDED + 1;
+
+    /// Per-query samples and their log2 histogram.
+    struct Histogram {
+        counts: [u64; BUCKETS],
+        /// Nanoseconds summed per bucket, so the share of *time* can be
+        /// reported next to the share of *queries*.
+        nanos: [u64; BUCKETS],
+        /// Every sample, up to the capacity reserved before the loop began,
+        /// so p50/p95/p99 can be exact rather than bucket-resolution. Filled
+        /// only while it can grow without reallocating: the `Vec` of samples
+        /// is itself on the list of suspects, so it is never allowed to be
+        /// one.
+        samples: Vec<u32>,
+        /// Samples the capacity could not hold — reported, never silently
+        /// dropped.
+        overflow: u64,
+    }
+
+    impl Histogram {
+        fn with_capacity(samples: usize) -> Self {
+            Self {
+                counts: [0; BUCKETS],
+                nanos: [0; BUCKETS],
+                samples: Vec::with_capacity(samples),
+                overflow: 0,
+            }
+        }
+
+        #[inline]
+        fn bucket(ns: u64) -> usize {
+            let mut bound = FIRST_BOUND_NS;
+            for i in 0..BOUNDED {
+                if ns < bound {
+                    return i;
+                }
+                bound <<= 1;
+            }
+            BOUNDED
+        }
+
+        #[inline]
+        fn record(&mut self, ns: u64) {
+            let at = Self::bucket(ns);
+            self.counts[at] += 1;
+            self.nanos[at] += ns;
+            if self.samples.len() < self.samples.capacity() {
+                self.samples.push(ns.min(u32::MAX as u64) as u32);
+            } else {
+                self.overflow += 1;
+            }
+        }
+
+        fn total(&self) -> u64 {
+            self.counts.iter().sum()
+        }
+
+        fn total_nanos(&self) -> u64 {
+            self.nanos.iter().sum()
+        }
+
+        /// Count and nanoseconds of every sample at or above `threshold_ns`,
+        /// from the exact samples.
+        fn above(&self, threshold_ns: u64) -> (u64, u64) {
+            self.samples
+                .iter()
+                .filter(|&&ns| ns as u64 >= threshold_ns)
+                .fold((0, 0), |(n, t), &ns| (n + 1, t + ns as u64))
+        }
+
+        fn percentiles(&self) -> (u32, u32, u32, u32) {
+            let mut sorted = self.samples.clone();
+            sorted.sort_unstable();
+            let at = |q: f64| {
+                if sorted.is_empty() {
+                    0
+                } else {
+                    sorted[((sorted.len() - 1) as f64 * q) as usize]
+                }
+            };
+            (
+                at(0.50),
+                at(0.95),
+                at(0.99),
+                sorted.last().copied().unwrap_or(0),
+            )
+        }
+
+        fn print(&self, label: &str, threshold_ns: u64) {
+            let total = self.total().max(1);
+            let total_nanos = self.total_nanos().max(1);
+            let (p50, p95, p99, max) = self.percentiles();
+            println!(
+                "\n{label}: {} queries in {:.2?} ({:.0} ops/s), p50 {} p95 {} p99 {} max {}",
+                self.total(),
+                Duration::from_nanos(self.total_nanos()),
+                self.total() as f64 / (self.total_nanos() as f64 / 1e9).max(f64::EPSILON),
+                fmt_ns(p50 as u64),
+                fmt_ns(p95 as u64),
+                fmt_ns(p99 as u64),
+                fmt_ns(max as u64),
+            );
+            if self.overflow > 0 {
+                println!(
+                    "  ({} samples past the reserved capacity are in the buckets but not the percentiles)",
+                    self.overflow
+                );
+            }
+            println!(
+                "  {:<18} {:>10} {:>8} {:>12} {:>8}",
+                "bucket", "queries", "share", "time", "share"
+            );
+            for i in 0..BUCKETS {
+                let name = if i == 0 {
+                    format!("<{}", fmt_ns(FIRST_BOUND_NS))
+                } else if i == BOUNDED {
+                    format!(">={}", fmt_ns(FIRST_BOUND_NS << (BOUNDED - 1)))
+                } else {
+                    format!(
+                        "[{}, {})",
+                        fmt_ns(FIRST_BOUND_NS << (i - 1)),
+                        fmt_ns(FIRST_BOUND_NS << i)
+                    )
+                };
+                if self.counts[i] == 0 {
+                    continue;
+                }
+                println!(
+                    "  {:<18} {:>10} {:>7.2}% {:>12} {:>7.2}%",
+                    name,
+                    self.counts[i],
+                    100.0 * self.counts[i] as f64 / total as f64,
+                    format!("{:.2?}", Duration::from_nanos(self.nanos[i])),
+                    100.0 * self.nanos[i] as f64 / total_nanos as f64,
+                );
+            }
+            let (slow, slow_nanos) = self.above(threshold_ns);
+            println!(
+                "  >= {} (the threshold): {slow} queries, {:.3}% of queries, {:.2}% of time",
+                fmt_ns(threshold_ns),
+                100.0 * slow as f64 / total as f64,
+                100.0 * slow_nanos as f64 / total_nanos as f64,
+            );
+        }
+    }
+
+    fn fmt_ns(ns: u64) -> String {
+        format!("{:.2?}", Duration::from_nanos(ns))
+    }
+
+    /// One counter picked out of a [`Diagnostics`] snapshot.
+    type Counter<'a> = &'a dyn Fn(&Diagnostics) -> u64;
+
+    /// What one slow InlaySQL query did, as the counters moved across it.
+    struct SlowMark {
+        ordinal: u64,
+        ns: u64,
+        delta: Diagnostics,
+    }
+
+    /// `after - before`, field by field; the two residency gauges carry
+    /// `after`'s value.
+    fn delta(before: &Diagnostics, after: &Diagnostics) -> Diagnostics {
+        Diagnostics {
+            page_cache_evictions: after.page_cache_evictions - before.page_cache_evictions,
+            page_cache_inserts: after.page_cache_inserts - before.page_cache_inserts,
+            page_cache_index_grows: after.page_cache_index_grows - before.page_cache_index_grows,
+            page_cache_len: after.page_cache_len,
+            page_cache_bytes: after.page_cache_bytes,
+            raw_leaf_inserts: after.raw_leaf_inserts - before.raw_leaf_inserts,
+            decodes: after.decodes - before.decodes,
+            device_reads: after.device_reads - before.device_reads,
+            state_reads: after.state_reads - before.state_reads,
+        }
+    }
+
+    /// How many samples to reserve: a generous ceiling on what the loop can
+    /// produce in `seconds`, so the sample `Vec` never reallocates mid-run.
+    fn sample_capacity(seconds: u64) -> usize {
+        (seconds as usize).max(1) * 3_000_000
+    }
+
+    /// Slow marks kept in full; past this the count still grows but the
+    /// per-query record does not.
+    const MAX_MARKS: usize = 200_000;
+
+    pub(super) fn run_points(
+        config: &Config,
+        path: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let threshold_ns = (config.tail_threshold_micros * 1_000.0) as u64;
+        let payload = "x".repeat(config.payload);
+        let rows = config.rows as u64;
+        let budget = Duration::from_secs(config.seconds);
+
+        // --- InlaySQL ------------------------------------------------------
+        let mut db = config.open(path)?;
+        db.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)", &[])?;
+        let insert = db.prepare("INSERT INTO kv (id, body) VALUES (?, ?)")?;
+        if config.tail_durable {
+            for id in 1..=config.rows as i64 {
+                let bound = [Value::Integer(id), Value::Text(payload.clone().into())];
+                db.execute_prepared(&insert, &bound)?;
+            }
+        } else {
+            db.begin()?;
+            for id in 1..=config.rows as i64 {
+                let bound = [Value::Integer(id), Value::Text(payload.clone().into())];
+                if let Err(inlaysql::Error::Transaction(_)) = db.execute_prepared(&insert, &bound) {
+                    db.commit()?;
+                    db.begin()?;
+                    db.execute_prepared(&insert, &bound)?;
+                }
+            }
+            db.commit()?;
+        }
+        let lookup = db.prepare("SELECT body FROM kv WHERE id = ?")?;
+        let query_cap = if config.queries == 0 {
+            u64::MAX
+        } else {
+            config.queries
+        };
+
+        let mut rng = SeededRng::new(config.seed);
+        let mut checksum = 0u64;
+        let mut histogram = Histogram::with_capacity(sample_capacity(config.seconds));
+        let mut marks: Vec<SlowMark> = Vec::with_capacity(MAX_MARKS);
+        let mut slow_total: u64 = 0;
+        let mut ordinal: u64 = 0;
+        // One snapshot per query, taken *after* the timed pair so the pair
+        // brackets only the query; the delta is against the previous one.
+        let first_snapshot = db.diagnostics();
+        let mut last = first_snapshot;
+        println!(
+            "tail: rows={} seconds={} queries={} durable_setup={} threshold={} at start: {:?}",
+            config.rows,
+            config.seconds,
+            config.queries,
+            config.tail_durable,
+            fmt_ns(threshold_ns),
+            first_snapshot
+        );
+
+        announce_query_phase();
+        let started = Instant::now();
+        let deadline = started + budget;
+        loop {
+            let key = 1 + (rng.next_u64() % rows) as i64;
+            let at = Instant::now();
+            let delivered = db.query_prepared_each_ref(&lookup, &[Value::Integer(key)], |row| {
+                checksum += row[0].as_str().map_or(0, str::len) as u64;
+                Ok(())
+            })?;
+            let end = Instant::now();
+            debug_assert_eq!(delivered, 1);
+            let ns = (end - at).as_nanos() as u64;
+            histogram.record(ns);
+            let now = db.diagnostics();
+            if ns >= threshold_ns {
+                slow_total += 1;
+                if marks.len() < MAX_MARKS {
+                    marks.push(SlowMark {
+                        ordinal,
+                        ns,
+                        delta: delta(&last, &now),
+                    });
+                }
+            }
+            last = now;
+            ordinal += 1;
+            if end >= deadline || ordinal >= query_cap {
+                break;
+            }
+        }
+        let inlay_elapsed = started.elapsed();
+        std::hint::black_box(checksum);
+        let final_snapshot = db.diagnostics();
+
+        histogram.print("InlaySQL point read", threshold_ns);
+        println!(
+            "  wall {:.2?} for {ordinal} queries ({:.0} ops/s including the harness's timer pair)",
+            inlay_elapsed,
+            ordinal as f64 / inlay_elapsed.as_secs_f64().max(f64::EPSILON)
+        );
+        println!(
+            "  counters over the whole run: {:?}",
+            delta(&first_snapshot, &final_snapshot)
+        );
+        report_marks(&marks, slow_total, ordinal, threshold_ns);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+
+        // --- SQLite, WAL, same process, same loop, same keys ------------------
+        let sqlite_path = path.with_extension("sqlite");
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", sqlite_path.display()));
+        }
+        let conn = rusqlite::Connection::open(&sqlite_path)?;
+        conn.pragma_update(None, "journal_mode", "wal")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)", [])?;
+        {
+            let mut insert = conn.prepare("INSERT INTO kv (id, body) VALUES (?1, ?2)")?;
+            if !config.tail_durable {
+                conn.execute_batch("BEGIN")?;
+            }
+            for id in 1..=config.rows as i64 {
+                insert.execute(rusqlite::params![id, payload])?;
+            }
+            if !config.tail_durable {
+                conn.execute_batch("COMMIT")?;
+            }
+        }
+        let mut lookup = conn.prepare("SELECT body FROM kv WHERE id = ?1")?;
+        let mut rng = SeededRng::new(config.seed);
+        let mut checksum = 0u64;
+        let mut sqlite_hist = Histogram::with_capacity(sample_capacity(config.seconds));
+        let mut sqlite_ordinal: u64 = 0;
+        let mut sqlite_slow: Vec<u64> = Vec::with_capacity(MAX_MARKS);
+        let started = Instant::now();
+        let deadline = started + budget;
+        loop {
+            let key = 1 + (rng.next_u64() % rows) as i64;
+            let at = Instant::now();
+            lookup.query_row([key], |row| {
+                checksum += row.get_ref(0)?.as_str().map(str::len).unwrap_or(0) as u64;
+                Ok(())
+            })?;
+            let end = Instant::now();
+            let ns = (end - at).as_nanos() as u64;
+            sqlite_hist.record(ns);
+            if ns >= threshold_ns && sqlite_slow.len() < MAX_MARKS {
+                sqlite_slow.push(sqlite_ordinal);
+            }
+            sqlite_ordinal += 1;
+            if end >= deadline || sqlite_ordinal >= query_cap {
+                break;
+            }
+        }
+        let sqlite_elapsed = started.elapsed();
+        std::hint::black_box(checksum);
+        sqlite_hist.print("SQLite (WAL, sync=NORMAL) point read", threshold_ns);
+        println!(
+            "  wall {:.2?} for {sqlite_ordinal} queries ({:.0} ops/s including the harness's timer pair)",
+            sqlite_elapsed,
+            sqlite_ordinal as f64 / sqlite_elapsed.as_secs_f64().max(f64::EPSILON)
+        );
+        report_ordinals("SQLite", &sqlite_slow, sqlite_ordinal);
+        drop(lookup);
+        drop(conn);
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", sqlite_path.display()));
+        }
+
+        // --- The harness's own timer pair, nothing between ------------------
+        let mut floor = Histogram::with_capacity(sample_capacity(1));
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(1);
+        loop {
+            let at = Instant::now();
+            let end = Instant::now();
+            floor.record((end - at).as_nanos() as u64);
+            if end >= deadline {
+                break;
+            }
+        }
+        floor.print(
+            "harness floor (two Instant::now() calls, nothing between)",
+            threshold_ns,
+        );
+        Ok(())
+    }
+
+    /// Which counters moved on the slow queries, and where in the run they
+    /// fell.
+    fn report_marks(marks: &[SlowMark], slow_total: u64, total: u64, threshold_ns: u64) {
+        println!(
+            "\n  slow queries (>= {}): {slow_total} of {total}; {} recorded in full",
+            fmt_ns(threshold_ns),
+            marks.len()
+        );
+        if marks.is_empty() {
+            return;
+        }
+        let count = |f: Counter| marks.iter().filter(|m| f(&m.delta) > 0).count();
+        let nanos =
+            |f: Counter| -> u64 { marks.iter().filter(|m| f(&m.delta) > 0).map(|m| m.ns).sum() };
+        let named: [(&str, Counter); 7] = [
+            ("page_cache_evictions", &|d| d.page_cache_evictions),
+            ("page_cache_inserts", &|d| d.page_cache_inserts),
+            ("page_cache_index_grows", &|d| d.page_cache_index_grows),
+            ("raw_leaf_inserts", &|d| d.raw_leaf_inserts),
+            ("decodes", &|d| d.decodes),
+            ("device_reads", &|d| d.device_reads),
+            ("state_reads", &|d| d.state_reads),
+        ];
+        println!(
+            "  {:<24} {:>12} {:>8} {:>12}",
+            "counter moved", "slow queries", "share", "their time"
+        );
+        for (name, f) in named.iter() {
+            let n = count(f);
+            println!(
+                "  {:<24} {:>12} {:>7.2}% {:>12}",
+                name,
+                n,
+                100.0 * n as f64 / marks.len() as f64,
+                format!("{:.2?}", Duration::from_nanos(nanos(f)))
+            );
+        }
+        let quiet = marks
+            .iter()
+            .filter(|m| {
+                let d = &m.delta;
+                d.page_cache_evictions
+                    + d.page_cache_inserts
+                    + d.page_cache_index_grows
+                    + d.raw_leaf_inserts
+                    + d.decodes
+                    + d.device_reads
+                    + d.state_reads
+                    == 0
+            })
+            .count();
+        println!(
+            "  {:<24} {:>12} {:>7.2}%",
+            "no counter moved",
+            quiet,
+            100.0 * quiet as f64 / marks.len() as f64
+        );
+        let ordinals: Vec<u64> = marks.iter().map(|m| m.ordinal).collect();
+        report_ordinals("InlaySQL", &ordinals, total);
+        println!("  first slow queries (ordinal: latency, moved counters):");
+        for m in marks.iter().take(24) {
+            let d = &m.delta;
+            let mut moved = Vec::new();
+            if d.page_cache_evictions > 0 {
+                moved.push(format!("evictions={}", d.page_cache_evictions));
+            }
+            if d.page_cache_inserts > 0 {
+                moved.push(format!("inserts={}", d.page_cache_inserts));
+            }
+            if d.page_cache_index_grows > 0 {
+                moved.push(format!("index_grows={}", d.page_cache_index_grows));
+            }
+            if d.raw_leaf_inserts > 0 {
+                moved.push(format!("raw_leaf_inserts={}", d.raw_leaf_inserts));
+            }
+            if d.decodes > 0 {
+                moved.push(format!("decodes={}", d.decodes));
+            }
+            if d.device_reads > 0 {
+                moved.push(format!("device_reads={}", d.device_reads));
+            }
+            if d.state_reads > 0 {
+                moved.push(format!("state_reads={}", d.state_reads));
+            }
+            println!(
+                "    {:>9}: {:>10}  {}  (resident {} pages, {} bytes)",
+                m.ordinal,
+                fmt_ns(m.ns),
+                if moved.is_empty() {
+                    "-".to_string()
+                } else {
+                    moved.join(" ")
+                },
+                d.page_cache_len,
+                d.page_cache_bytes
+            );
+        }
+    }
+
+    /// Where the slow queries fell: the gaps between consecutive slow
+    /// ordinals (a periodic cause shows as a tight gap distribution) and a
+    /// twenty-slice timeline of the run (a burst shows as one hot slice).
+    fn report_ordinals(engine: &str, ordinals: &[u64], total: u64) {
+        if ordinals.len() < 2 {
+            return;
+        }
+        let mut gaps: Vec<u64> = ordinals.windows(2).map(|w| w[1] - w[0]).collect();
+        gaps.sort_unstable();
+        let at = |q: f64| gaps[((gaps.len() - 1) as f64 * q) as usize];
+        println!(
+            "  {engine} slow-query gaps (in queries): min {} p10 {} median {} p90 {} max {}; mean {:.0}",
+            gaps[0],
+            at(0.10),
+            at(0.50),
+            at(0.90),
+            gaps[gaps.len() - 1],
+            total as f64 / ordinals.len() as f64
+        );
+        let mut slices = [0u64; 20];
+        let width = (total / 20).max(1);
+        for &o in ordinals {
+            slices[((o / width) as usize).min(19)] += 1;
+        }
+        println!(
+            "  {engine} slow queries per twentieth of the run: {:?}",
+            slices
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Pins [`CDC_WARMUP_ROWS`] to the real, private
@@ -1032,6 +1617,10 @@ mod tests {
                 query: "vector".to_string(),
                 quantized: false,
                 batch: 100,
+                tail: false,
+                tail_threshold_micros: 3.0,
+                tail_durable: false,
+                queries: 0,
             };
 
             let mut db = config.open(&path).unwrap();

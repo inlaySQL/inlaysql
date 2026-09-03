@@ -66,6 +66,48 @@ pub const FORMAT_VERSION: u32 = 5;
 /// engine and checked at `CREATE TABLE`.
 const MIN_READABLE_FORMAT_VERSION: u32 = 3;
 
+/// Lifetime counters of one tree handle's caches and reads, for a harness
+/// that wants to know what a *particular* query did rather than what the
+/// average one does (AHL-552).
+///
+/// Every field is monotonic — a count since the handle was opened, never a
+/// rate or a gauge except the two `page_cache_*` residency figures — so the
+/// way to attribute one query is to snapshot before, snapshot after and
+/// subtract. A profile's self-time histogram cannot explain a tail made of
+/// rare events (an eviction sweep, a hash-table doubling, a state-block read),
+/// because rare events do not accumulate enough samples; a per-query delta
+/// of these counters can.
+///
+/// Reading a snapshot costs a few field copies. Maintaining the counters
+/// costs one increment on each of the paths named below and nothing on a
+/// cache hit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Diagnostics {
+    /// Entries the decoded page cache's clock hand has evicted.
+    pub page_cache_evictions: u64,
+    /// Entries made resident in the decoded page cache.
+    pub page_cache_inserts: u64,
+    /// Times the decoded page cache's page-id hash table doubled — each one
+    /// rehashes every resident id.
+    pub page_cache_index_grows: u64,
+    /// Decoded pages resident right now.
+    pub page_cache_len: usize,
+    /// Estimated bytes resident in the decoded page cache right now.
+    pub page_cache_bytes: usize,
+    /// Pages admitted to the raw-leaf cache the row scan fills — each
+    /// admission past the 64th shifts the whole `Vec` down by one.
+    pub raw_leaf_inserts: u64,
+    /// Pages run through the page decoder: every decoded-cache miss, whether
+    /// the bytes came from the device's shared cache or from a read.
+    pub decodes: u64,
+    /// Single-page device reads for data-area pages: decoded-cache misses the
+    /// device's shared cache did not answer either.
+    pub device_reads: u64,
+    /// Times [`CowBTree::refresh`] read the state block because the device's
+    /// commit generation had moved or could not be asked.
+    pub state_reads: u64,
+}
+
 /// How many raw leaf pages [`RawLeafCache`] holds.
 ///
 /// Small on purpose. This exists so a *repeated* statement stops re-reading the
@@ -95,12 +137,16 @@ const RAW_LEAF_CACHE_PAGES: usize = 64;
 /// the two bounds are the same one and the count needs no arithmetic.
 struct RawLeafCache {
     entries: Vec<(PageId, Arc<[u8]>)>,
+    /// How many pages have been admitted (not re-promoted) over this cache's
+    /// lifetime. Diagnostic — see [`Diagnostics::raw_leaf_inserts`].
+    inserts: u64,
 }
 
 impl RawLeafCache {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
+            inserts: 0,
         }
     }
 
@@ -120,8 +166,11 @@ impl RawLeafCache {
     fn insert(&mut self, id: PageId, bytes: &Arc<[u8]>) {
         if let Some(at) = self.entries.iter().position(|(page, _)| *page == id) {
             self.entries.remove(at);
-        } else if self.entries.len() >= RAW_LEAF_CACHE_PAGES {
-            self.entries.remove(0);
+        } else {
+            self.inserts += 1;
+            if self.entries.len() >= RAW_LEAF_CACHE_PAGES {
+                self.entries.remove(0);
+            }
         }
         self.entries.push((id, Arc::clone(bytes)));
     }
@@ -455,8 +504,18 @@ pub struct CowBTree<D: Device> {
     /// path, and nothing but a count can tell a fixed version from a version
     /// that got the right answer the slow way. `Cell` because the read paths
     /// that decode take `&self`.
-    #[cfg(test)]
+    ///
+    /// Always compiled, not `#[cfg(test)]`, since AHL-552: it is one of the
+    /// counters [`CowBTree::diagnostics`] snapshots, and the increment is a
+    /// `Cell` write on a path that has just decoded a page.
     decodes: core::cell::Cell<u64>,
+    /// How many single-page [`Device::read`] calls this handle has issued for
+    /// data-area pages — every decoded-cache miss the device's own shared
+    /// cache could not answer. See [`Diagnostics::device_reads`].
+    device_reads: core::cell::Cell<u64>,
+    /// How many times [`CowBTree::refresh`] went past its generation check
+    /// and read the state block. See [`Diagnostics::state_reads`].
+    state_reads: u64,
     /// The encoded commit record, kept between commits so the write path does
     /// not allocate a fresh ~26 KiB buffer every time it commits.
     ///
@@ -768,8 +827,9 @@ impl<D: Device> CowBTree<D> {
             next_seq: checkpoint_seq + 1,
             checkpoint_seq,
             dirty: BTreeMap::new(),
-            #[cfg(test)]
             decodes: core::cell::Cell::new(0),
+            device_reads: core::cell::Cell::new(0),
+            state_reads: 0,
             record_buf: Vec::new(),
             run_buf: Vec::new(),
             pending_root: 0,
@@ -994,6 +1054,28 @@ impl<D: Device> CowBTree<D> {
     /// eviction really happens.
     pub fn page_cache_len(&self) -> usize {
         self.cache.borrow().len()
+    }
+
+    /// A snapshot of this handle's lifetime counters — see [`Diagnostics`].
+    ///
+    /// Costs nothing when unread: every counter is a plain field or `Cell`
+    /// incremented on a path that already did the work being counted, and
+    /// this method only copies them out. A caller wanting to know what one
+    /// query did takes a snapshot before and after and subtracts.
+    pub fn diagnostics(&self) -> Diagnostics {
+        let cache = self.cache.borrow();
+        let raw_leaves = self.raw_leaves.borrow();
+        Diagnostics {
+            page_cache_evictions: cache.evictions(),
+            page_cache_inserts: cache.inserts(),
+            page_cache_index_grows: cache.index_grows(),
+            page_cache_len: cache.len(),
+            page_cache_bytes: cache.bytes(),
+            raw_leaf_inserts: raw_leaves.inserts,
+            decodes: self.decodes.get(),
+            device_reads: self.device_reads.get(),
+            state_reads: self.state_reads,
+        }
     }
 
     /// The committed root page id. Readers pin this for a snapshot.
@@ -1910,6 +1992,7 @@ impl<D: Device> CowBTree<D> {
         // than the rare one (AHL-468).
         let region = self.device.wal_region() % crate::wal::region_count(self.format_version);
         let floor_seq = self.next_seq.saturating_sub(1);
+        self.state_reads += 1;
         let Some((root, next, seq)) = resolve_state_at_least(
             &self.device,
             self.page_size,
@@ -4069,11 +4152,8 @@ impl<D: Device> CowBTree<D> {
         self.with_page_bytes(offset, page::decode)
     }
 
-    /// Record one page decode — see the `decodes` field. Compiled away
-    /// outside tests.
-    #[cfg_attr(not(test), allow(unused_variables))]
+    /// Record one page decode — see the `decodes` field.
     fn note_decode(&self) {
-        #[cfg(test)]
         self.decodes.set(self.decodes.get() + 1);
     }
 
@@ -4313,6 +4393,7 @@ impl<D: Device> CowBTree<D> {
         offset: usize,
         f: impl FnOnce(usize, &[u8]) -> Result<T>,
     ) -> Result<T> {
+        self.device_reads.set(self.device_reads.get() + 1);
         match self.scratch.try_borrow_mut() {
             Ok(mut buf) => {
                 if buf.len() != self.page_size {
