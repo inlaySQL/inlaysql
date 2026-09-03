@@ -36,7 +36,7 @@ use alloc::vec::Vec;
 
 use crate::collation::Collation;
 use crate::error::Result;
-use crate::eval::{self, Computed, Env};
+use crate::eval::{self, CompiledFilter, Computed, Env};
 use crate::index::KeyRange;
 use crate::plan::{Expr, JoinKind};
 use crate::row::{decode_row_masked, decode_row_ref_masked_into, ColumnMask, RowBuf};
@@ -387,7 +387,7 @@ impl Iterator for Filter<'_> {
 /// `decode_row_masked`'s allocation whether or not `Filter` went on to keep
 /// it. This decodes into borrowed [`ValueRef`] cells first — free for
 /// `NULL`/`INTEGER`/`REAL`, a slice into the row bytes for `TEXT`/`BLOB` — and
-/// tests the predicate against those with [`eval::evaluate_ref`]. Only a row
+/// tests the predicate against those with [`CompiledFilter::admits`]. Only a row
 /// that survives is turned into owned [`Value`]s, once, for [`ExecRow`]: "a
 /// projected row allocates once at the boundary."
 ///
@@ -402,7 +402,9 @@ impl Iterator for Filter<'_> {
 pub(crate) struct DecodeFilter<'a> {
     source: RowBytes<'a>,
     mask: &'a ColumnMask,
-    predicate: &'a Expr,
+    /// The predicate, compiled once for this execution (AHL-550): the same
+    /// verdict [`eval::evaluate_ref`] gives, without the per-row tree walk.
+    predicate: CompiledFilter<'a>,
     env: &'a Env<'a>,
     /// The buffer every candidate row decodes into, parked here between rows.
     ///
@@ -425,7 +427,7 @@ impl<'a> DecodeFilter<'a> {
         Self {
             source,
             mask,
-            predicate,
+            predicate: CompiledFilter::compile(predicate, env),
             env,
             scratch: Vec::new(),
         }
@@ -446,13 +448,13 @@ impl Iterator for DecodeFilter<'_> {
             // yet, and `park` empties it again before it is stored back.
             let mut cells: Vec<ValueRef<'_>> = core::mem::take(&mut self.scratch);
             let verdict = decode_row_ref_masked_into(&bytes, self.mask, &mut cells)
-                .and_then(|()| eval::evaluate_ref(self.predicate, &cells, Computed::NONE, self.env))
-                .map(|truth| {
+                .and_then(|()| self.predicate.admits(&cells, self.env))
+                .map(|admitted| {
                     // "A projected row allocates once at the boundary": only a
                     // surviving row is turned into owned `Value`s, and this is
                     // that boundary. A rejected row leaves this arm with the
                     // borrowed cells and nothing else.
-                    eval::is_truthy(&truth).then(|| {
+                    admitted.then(|| {
                         cells
                             .iter()
                             .map(ValueRef::to_owned_value)

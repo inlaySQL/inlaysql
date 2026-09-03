@@ -30,7 +30,7 @@ use crate::catalog::{
 use crate::cdc::{self, ChangeKind, Changes, CDC_FLOOR_KEY, CDC_RETENTION};
 use crate::collation::Collation;
 use crate::error::{Error, Result};
-use crate::eval::{self, Computed, Env, SharedRng, SubqueryRunner};
+use crate::eval::{self, CompiledFilter, Computed, Env, SharedRng, SubqueryRunner};
 use crate::exec::{
     collect_bounded, fnv1a, mix64, park, AggregateInput, Decode, DecodeFilter, ExecRow, Filter,
     HashJoin, HashJoinTable, IndexProbe, JoinInner, NestedLoopJoin, ProbeKind, RowBytes, RowStream,
@@ -73,6 +73,10 @@ struct BorrowScratch {
     cells: Vec<ValueRef<'static>>,
     /// The projected row handed to the callback.
     out: Vec<ValueRef<'static>>,
+    /// The compiled `WHERE`'s conjunct buffer, parked between executions
+    /// (AHL-550): compiling is one allocation per execution otherwise, and
+    /// a point read is one execution.
+    filter: CompiledFilter<'static>,
 }
 
 /// Metadata key holding the next row id to hand out.
@@ -1496,6 +1500,11 @@ impl Engine {
         };
         let source =
             self.candidate_bytes(&driving.table, &plan.filter, env.params(), first_batch)?;
+        // The predicate, compiled once for this execution into the parked
+        // buffer; `DecodeFilter` compiles the same way on the owned path.
+        let filter = plan.filter.as_ref().map(|filter| {
+            CompiledFilter::compile_into(core::mem::take(&mut scratch.filter), filter, env)
+        });
 
         // Whether a projected cell can be *moved* out of the decoded row or has
         // to be cloned. Only `ValueRef::Vector` owns anything, so this is about
@@ -1522,9 +1531,8 @@ impl Engine {
             // stored back. Same argument as `DecodeFilter::next`.
             let mut cells: Vec<ValueRef<'_>> = core::mem::take(&mut parked_cells);
             let verdict = decode_row_ref_masked_into(bytes.as_slice(), &driving_mask, &mut cells)
-                .and_then(|()| match &plan.filter {
-                    Some(filter) => eval::evaluate_ref(filter, &cells, Computed::NONE, env)
-                        .map(|truth| eval::is_truthy(&truth)),
+                .and_then(|()| match &filter {
+                    Some(filter) => filter.admits(&cells, env),
                     None => Ok(true),
                 });
             // A failure ends the scan, so the buffer is dropped rather than
@@ -1559,6 +1567,9 @@ impl Engine {
         }
         scratch.cells = parked_cells;
         scratch.out = parked_out;
+        if let Some(filter) = filter {
+            scratch.filter = filter.park();
+        }
         Ok(delivered)
     }
 

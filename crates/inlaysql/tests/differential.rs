@@ -277,6 +277,230 @@ fn random_predicates_agree_with_sqlite() {
     );
 }
 
+// ------------------------------------------------- indexed range filters
+
+/// One row of the indexed-range table: a `TEXT` column with case variety, an
+/// `INTEGER`, a `REAL` and a `NOCASE` `TEXT`, each nullable, each indexed.
+#[derive(Debug, Clone)]
+struct RangeRow {
+    e: Option<&'static str>,
+    n: Option<i64>,
+    r: Option<f64>,
+    c: Option<&'static str>,
+}
+
+/// Texts with the properties the comparison rules turn on: ASCII case
+/// (`NOCASE` folds it, `BINARY` orders upper before lower), a trailing space
+/// (`RTRIM`), a numeral and a near-numeral (affinity), the empty string,
+/// and a prefix of another entry (the length tie-break).
+const RANGE_TEXTS: [&str; 12] = [
+    "alpha", "Alpha", "ALPHA", "beta", "beta ", "gamma", "delta", "1", "10", "1x", "", "gam",
+];
+
+const RANGE_REALS: [f64; 7] = [-1.5, 0.0, 0.5, 1.0, 2.0, 2.5, 7.0];
+
+fn generate_range_rows(rng: &mut SeededRng) -> Vec<RangeRow> {
+    (0..ROWS * 2)
+        .map(|_| RangeRow {
+            e: (!rng.next_u64().is_multiple_of(5))
+                .then(|| RANGE_TEXTS[(rng.next_u64() as usize) % RANGE_TEXTS.len()]),
+            n: (!rng.next_u64().is_multiple_of(5)).then(|| (rng.next_u64() % VALUE_RANGE) as i64),
+            r: (!rng.next_u64().is_multiple_of(5))
+                .then(|| RANGE_REALS[(rng.next_u64() as usize) % RANGE_REALS.len()]),
+            c: (!rng.next_u64().is_multiple_of(5))
+                .then(|| RANGE_TEXTS[(rng.next_u64() as usize) % RANGE_TEXTS.len()]),
+        })
+        .collect()
+}
+
+/// A bound parameter for a range bound or a residual: every storage class,
+/// so a `TEXT` bound meets a numeric column and a `REAL` bound meets an
+/// `INTEGER` one — the affinity rules the compiled comparator hoists to
+/// compile time and must still get right (AHL-550).
+fn range_param(rng: &mut SeededRng) -> Value {
+    match rng.next_u64() % 12 {
+        0 => Value::Null,
+        1..=3 => Value::Text(RANGE_TEXTS[(rng.next_u64() as usize) % RANGE_TEXTS.len()].into()),
+        4..=6 => Value::Integer((rng.next_u64() % VALUE_RANGE) as i64),
+        7..=9 => Value::Real(RANGE_REALS[(rng.next_u64() as usize) % RANGE_REALS.len()]),
+        10 => Value::Text(format!("{}", rng.next_u64() % VALUE_RANGE).into()),
+        _ => Value::Blob(vec![(rng.next_u64() % 4) as u8]),
+    }
+}
+
+/// A `WHERE` over one indexed column, as the range scan's residual filter
+/// sees it: an index-bounded range on `col` — one bound, two bounds, a bound
+/// with the constant on the left — with, sometimes, a residual conjunct the
+/// index cannot answer. The parameters are positional (`?`), one per `?`
+/// in order, so the same clause and the same bindings go to both engines.
+fn range_clause(rng: &mut SeededRng) -> (String, usize) {
+    let column = ["e", "n", "r", "c", "id"][(rng.next_u64() % 5) as usize];
+    let (range, bound) = match rng.next_u64() % 6 {
+        0 => (format!("{column} >= ? AND {column} < ?"), 2),
+        1 => (format!("{column} > ? AND {column} <= ?"), 2),
+        2 => (format!("? <= {column} AND {column} < ?"), 2),
+        3 => (format!("{column} >= ?"), 1),
+        4 => (format!("{column} < ?"), 1),
+        _ => (format!("{column} = ?"), 1),
+    };
+    let (residual, extra) = match rng.next_u64() % 8 {
+        0 => (String::new(), 0),
+        1 => (" AND n <> ?".to_string(), 1),
+        2 => (" AND e IS NOT NULL".to_string(), 0),
+        3 => (" AND r IS NULL".to_string(), 0),
+        4 => (" AND (n = ? OR e = ?)".to_string(), 2),
+        5 => (" AND c >= ?".to_string(), 1),
+        6 => (" AND NOT (r < ?)".to_string(), 1),
+        _ => (" AND e < ? AND n >= ?".to_string(), 2),
+    };
+    (format!("{range}{residual}"), bound + extra)
+}
+
+const RANGE_SCHEMA: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, e TEXT, n INTEGER, r REAL, \
+                            c TEXT COLLATE NOCASE)";
+const RANGE_INDEXES: [&str; 4] = [
+    "CREATE INDEX t_e ON t (e)",
+    "CREATE INDEX t_n ON t (n)",
+    "CREATE INDEX t_r ON t (r)",
+    "CREATE INDEX t_c ON t (c)",
+];
+
+/// The ids both InlaySQL read paths answer for `clause`: the borrowing
+/// callback (`run_borrowed_select`) and the owned pipeline (`DecodeFilter`),
+/// which compile the residual filter separately and must agree with each
+/// other as well as with SQLite.
+fn inlaysql_range_ids(
+    rows: &[RangeRow],
+    clause: &str,
+    params: &[Value],
+) -> Result<(Vec<i64>, Vec<i64>), inlaysql::Error> {
+    let mut db = Database::open_in_memory()?;
+    db.execute(RANGE_SCHEMA, &[])?;
+    for (index, row) in rows.iter().enumerate() {
+        db.execute(
+            "INSERT INTO t (id, e, n, r, c) VALUES (?, ?, ?, ?, ?)",
+            &[
+                Value::Integer(index as i64 + 1),
+                row.e.map_or(Value::Null, |e| Value::Text(e.into())),
+                row.n.map_or(Value::Null, Value::Integer),
+                row.r.map_or(Value::Null, Value::Real),
+                row.c.map_or(Value::Null, |c| Value::Text(c.into())),
+            ],
+        )?;
+    }
+    for index in RANGE_INDEXES {
+        db.execute(index, &[])?;
+    }
+    let borrowed_statement = db.prepare(&format!("SELECT id FROM t WHERE {clause}"))?;
+    let mut borrowed = Vec::new();
+    db.query_prepared_each_ref(&borrowed_statement, params, |row| {
+        borrowed.push(row[0].as_i64().expect("id is an integer"));
+        Ok(())
+    })?;
+    borrowed.sort_unstable();
+    let owned = db
+        .query(
+            &format!("SELECT id FROM t WHERE {clause} ORDER BY id"),
+            params,
+        )?
+        .rows
+        .iter()
+        .map(|row| row[0].as_i64().expect("id is an integer"))
+        .collect();
+    Ok((borrowed, owned))
+}
+
+fn sqlite_param(value: &Value) -> rusqlite::types::Value {
+    match value {
+        Value::Null => rusqlite::types::Value::Null,
+        Value::Integer(i) => rusqlite::types::Value::Integer(*i),
+        Value::Real(r) => rusqlite::types::Value::Real(*r),
+        Value::Text(s) => rusqlite::types::Value::Text(s.to_string()),
+        Value::Blob(b) => rusqlite::types::Value::Blob(b.clone()),
+        Value::Vector(_) => unreachable!("no vector parameter is generated"),
+    }
+}
+
+fn sqlite_range_ids(
+    rows: &[RangeRow],
+    clause: &str,
+    params: &[Value],
+) -> rusqlite::Result<Vec<i64>> {
+    let conn = rusqlite::Connection::open_in_memory()?;
+    conn.execute(RANGE_SCHEMA, [])?;
+    for (index, row) in rows.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO t (id, e, n, r, c) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![index as i64 + 1, row.e, row.n, row.r, row.c],
+        )?;
+    }
+    for index in RANGE_INDEXES {
+        conn.execute(index, [])?;
+    }
+    let mut statement = conn.prepare(&format!("SELECT id FROM t WHERE {clause} ORDER BY id"))?;
+    let bound: Vec<rusqlite::types::Value> = params.iter().map(sqlite_param).collect();
+    let ids = statement
+        .query_map(rusqlite::params_from_iter(bound), |row| {
+            row.get::<_, i64>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    Ok(ids)
+}
+
+/// The indexed range scan's residual filter, against the oracle: a range on
+/// an indexed column of each storage class and collation, bound by parameters
+/// of every storage class, with and without a residual conjunct, read through
+/// both of InlaySQL's read paths. This is the shape AHL-550 compiles — the
+/// filter that still runs over every row the index yields — and the one the
+/// point-and-range generator above cannot roll, since it has no index, no
+/// bound parameter and no `REAL` or `NOCASE` column.
+#[test]
+fn indexed_range_filters_agree_with_sqlite() {
+    let total = rounds();
+    let mut unsupported = 0;
+    let mut matched = 0usize;
+    for seed in 0..total {
+        let mut rng = SeededRng::new(0x5500_0000 + seed);
+        let rows = generate_range_rows(&mut rng);
+        let (clause, arity) = range_clause(&mut rng);
+        let params: Vec<Value> = (0..arity).map(|_| range_param(&mut rng)).collect();
+
+        let (borrowed, owned) = match inlaysql_range_ids(&rows, &clause, &params) {
+            Ok(ids) => ids,
+            Err(inlaysql::Error::Unsupported(_)) | Err(inlaysql::Error::Parse(_)) => {
+                unsupported += 1;
+                continue;
+            }
+            Err(error) => {
+                panic!("seed {seed}: InlaySQL failed on `{clause}` with {params:?}: {error}")
+            }
+        };
+        let theirs = sqlite_range_ids(&rows, &clause, &params)
+            .expect("SQLite is the oracle and must answer");
+
+        assert_eq!(
+            owned, theirs,
+            "seed {seed}: `SELECT id FROM t WHERE {clause}` with {params:?} disagreed with \
+             SQLite\nrows: {rows:?}"
+        );
+        assert_eq!(
+            borrowed, theirs,
+            "seed {seed}: the borrowing read of `SELECT id FROM t WHERE {clause}` with \
+             {params:?} disagreed with SQLite\nrows: {rows:?}"
+        );
+        matched += theirs.len();
+    }
+
+    assert!(
+        unsupported * 4 < total,
+        "{unsupported} of {total} generated range predicates were unsupported"
+    );
+    assert!(
+        matched > total as usize,
+        "only {matched} rows matched over {total} rounds: the ranges are missing everything"
+    );
+}
+
 // ---------------------------------------------------------------- joins
 
 /// Canonical form of an InlaySQL value, so both engines' answers compare as

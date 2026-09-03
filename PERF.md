@@ -4918,6 +4918,126 @@ leader that panics after taking a cohort. `docs/recovery.md` now documents the
 blast-radius trade. None of that has to be rebuilt if the two preconditions
 above are ever met.
 
+### The residual filter is compiled once per execution, not rediscovered per row (AHL-550 (b), 2026-09-03)
+
+`PLAN.md`'s item 2 named two angles on the range scan's residual filter after
+AHL-535/541: `evaluate_ref` at ~16% of the shape, and `from_utf8` at ~5%
+re-validating text that was validated at insert. This is the first, and it
+is *not* A1 — the filter still runs on every row every access path yields
+(`Engine::candidate_bytes`'s invariant is untouched, and the 2026-09-01
+section above is still the recommendation not to touch it). It is cheaper,
+not absent.
+
+**What the walk was paying for.** `SELECT id, body FROM users WHERE
+email >= ? AND email < ?` reaches `evaluate_ref` once per fetched row. The
+predicate's shape never changes between rows, but the walk rediscovers it
+every time: match the `AND`, recurse into two `Binary`s, `eval_operand` each
+side — a `Column` is a bounds-checked lookup and a `ValueRef` clone, a
+`Param` is `env.params.get(i).cloned()`, which for `TEXT` is an `Arc` bump
+and, when the `Operand` drops, an `Arc` release — then `compare_cells` runs
+`affinity_conversion` on *both* operands (the parameter's answer is the same
+every row), dispatches the class ranking through `&dyn Cell`, boxes the
+verdict into a `Value::Integer`, and `logical_and` unboxes two of them
+through `truth`. Profiled before this change (4,499 samples, `--rows
+20000`), that cluster was **21.8% inclusive** — `evaluate_ref` 5.6% self,
+`compare_cells` 4.9%, `eval_operand` 3.1%, `Operand::as_text_cell` 1.8%,
+`affinity_conversion` 1.7%, `drop_in_place<Operand>` 1.2%, `as_f64_cell`
+1.1%, `truth` 1.0%.
+
+**What is there now.** `eval::CompiledFilter`: the top-level conjunction is
+flattened once per execution, and each conjunct of the shape `column op
+constant` (either way round, the constant a literal or a bound parameter),
+or `column IS [NOT] NULL`, becomes a small record — ordinal, operator,
+which side the column is on, the constant *already converted* under the
+comparison's affinity, the collation. Per row a compiled comparison is a
+`NULL` test, `affinity_conversion` on the cell alone (which returns `None`
+without allocating for every cell already of the affinity's class — the
+common case), and `class_compare` monomorphised to `ValueRef` against the
+constant. Anything else — `OR`, `NOT`, `LIKE`, `IN`, a column-to-column
+compare, a bare column, an unbound parameter — stays the expression it was
+and is evaluated by `evaluate_ref` per row, so the general path is still the
+general path and a shape this does not recognise is exact rather than
+refused. `DecodeFilter` (the owned pipeline) and `run_borrowed_select` (the
+callback API) both compile through it; the borrowed path parks the compiled
+conjunct buffer on the handle beside its cell buffers, so a point read still
+makes zero allocations (`a_borrowing_consumer_allocates_nothing_per_row`
+counts it).
+
+*Why the answer is the same one.* Three things had to hold and each is
+stated in the code: the conjuncts are evaluated left to right and none is
+skipped, so the first error is `evaluate_ref`'s first error and a `NULL` or
+false anywhere fails the row exactly as `logical_and` folded through
+`is_truthy` did (Kleene's `AND` is associative, so flattening changes
+nothing); the operands are handed to `class_compare` in their written
+order rather than flipping the operator, so the ordering, the verdict and
+even the type error's wording are the ones the walk produces; and hoisting
+the constant's stage-one conversion is legitimate because
+`affinity_conversion` is idempotent — a `TEXT` it turned into a number is no
+longer `TEXT`, a number it rendered as `TEXT` is no longer numeric, and
+everything it returned `None` for it returns `None` for again.
+
+*Tested by tie, and mutation-checked five ways.*
+`a_compiled_filter_agrees_with_evaluate_ref` runs 20,000 seeded rounds of
+random rows (every storage class including a vector, integers past 2^53,
+numeric-looking and case-varying texts, blobs, `NULL`), random predicates
+(compiled shapes mixed with `OR`/`NOT`/bare-column/column-to-column ones,
+constants on either side, parameters bound and unbound, columns past the
+row), random operators, collations and affinities, and requires the
+compiled verdict to equal `is_truthy(evaluate_ref(..))` — `Ok` for `Ok`,
+and the same `Error` variant and wording for an error — while asserting
+that both verdicts, errors, and both kinds of conjunct were actually
+exercised. `the_profiled_shapes_compile_and_the_rest_stay_general` pins
+which shapes compile, so a `CompiledFilter` that kept everything general
+would fail it rather than pass the tie and buy nothing. Each of the
+following fails the tie: short-circuiting on the first false conjunct
+(masks a later conjunct's error), admitting a `NULL` conjunct, flipping the
+ordering instead of the operand order (the error's wording), dropping the
+per-row cell conversion, and dropping the compile-time constant conversion
+(which also fails the third test).
+`crates/inlaysql/tests/differential.rs` gains
+`indexed_range_filters_agree_with_sqlite`: a range on an indexed column of
+each storage class and collation (`TEXT`, `INTEGER`, `REAL`, `TEXT COLLATE
+NOCASE`, the rowid), bound by parameters of every storage class, with and
+without a residual conjunct, read through *both* InlaySQL paths and
+required to match sqlite3 — the shape the point-and-range generator above
+it cannot roll, having no index, no bound parameter and no `REAL` or
+`NOCASE` column.
+
+**Measured**, `6adfaf7` (main) against this branch, both built from source
+in separate worktrees, interleaved, order alternated and control re-run
+every repetition, `--seconds 4`, two other agents on the machine. A first
+run was discarded whole: its third repetition coincided with a load spike
+to 20 that halved the *control* (`points` 2.74M against 0.90M). The second:
+
+| Suite | `6adfaf7` | AHL-550 (b) | Verdict |
+| --- | --- | --- | --- |
+| `indexed-range`, 20k | 94.9 / 91.3 / 89.2k | **116.1 / 121.2 / 121.3k** | **1.22–1.36x**, 3/3, non-overlapping by 21k (load 4.5–9.6) |
+| `indexed`, 20k | 392 / 425 / 416k | 404 / 426 / 400k | flat, mixed sign |
+| `points`, 20k | 2.63 / 2.76 / 2.76M | 3.06 / 2.95 / 2.90M | above 3/3 here (`id = ?` compiles too), mixed in the discarded run — read as flat-to-positive, the control |
+| `joins-limit`, 20k | 166.7 / 153.3 / 163.9k | 165.9 / 153.3 / 164.6k | flat |
+| `aggregate`, 20k | 2,150 / 2,020 / 2,048 | 2,130 / 1,942 / 2,051 | flat — no `WHERE`, nothing compiled |
+
+The bench binary's own `indexed` suite, both engines, same runs. Its range
+row: InlaySQL 99.1 / 96.2 / 69.0k → **107.7 / 102.8 / 99.3k** (p50 9.75 /
+10.00 / 11.17 µs → **8.92 / 9.21 / 9.50 µs**), against SQLite WAL 219 /
+202 / 211k → 202 / 233 / 150k in the same runs (p50 4.29 / 4.58 / 4.42 →
+4.58 / 4.08 / 5.08 µs) — SQLite's own number moves ±20% between runs, which
+is the harness's noise, not a change to SQLite. Its point row (20,000
+lookups, ~50 ms of work): 472 / 454 / 314k → 386 / 340 / 344k, with its
+SQLite side 680 / 598 / 579k → 645 / 710 / 511k; `bin/profile`'s `indexed`
+suite runs the same statement for four seconds and is flat over six
+repetitions across the two runs, so the point row is read as the short
+phase's noise rather than a regression.
+
+**The profile afterwards** (3,831 samples, same shape): the filter cluster
+is one entry, `CompiledFilter::admits`, **5.2% self and 6.9% inclusive** —
+everything below it inlined — against 21.8% inclusive before.
+`Collation::compare` is 1.9%, which is the `memcmp` the comparison actually
+needs. What is left on the shape: `_platform_memcmp` 27.2% (descent, per the
+2026-09-01 attribution), `get_from` 6.1%, `from_utf8` 5.1%,
+`decode_value_ref` 4.8%, `decode_row_ref_masked_into` 4.4%. The `from_utf8`
+is item (a).
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness

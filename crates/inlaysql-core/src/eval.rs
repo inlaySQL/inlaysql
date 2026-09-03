@@ -550,12 +550,7 @@ pub fn evaluate_ref<'r>(
         Expr::Column(index) => row
             .get(*index)
             .map(ValueRef::to_owned_value)
-            .ok_or_else(|| {
-                Error::Corrupt(alloc::format!(
-                    "expression references column {index}, but the row has {} value(s)",
-                    row.len()
-                ))
-            }),
+            .ok_or_else(|| missing_column(*index, row.len())),
         Expr::Outer(index) => env.outer.get(*index).cloned().ok_or_else(|| {
             Error::Corrupt(alloc::format!(
                 "a subquery reads outer value {index}, but only {} were captured",
@@ -654,12 +649,11 @@ fn eval_operand<'r>(
     env: &Env<'_>,
 ) -> Result<Operand<'r>> {
     match expr {
-        Expr::Column(index) => row.get(*index).cloned().map(Operand::Ref).ok_or_else(|| {
-            Error::Corrupt(alloc::format!(
-                "expression references column {index}, but the row has {} value(s)",
-                row.len()
-            ))
-        }),
+        Expr::Column(index) => row
+            .get(*index)
+            .cloned()
+            .map(Operand::Ref)
+            .ok_or_else(|| missing_column(*index, row.len())),
         _ => Ok(Operand::Owned(evaluate_ref(expr, row, computed, env)?)),
     }
 }
@@ -842,13 +836,35 @@ fn compare_cells<L: Cell, R: Cell>(
         None => right,
     };
 
-    // Stage two. Storage classes rank the way SQLite's do, and the way
-    // [`mem_cmp`] does — numbers < text < blobs — so a pair still cross-class
-    // after stage one answers by class instead of raising. Keeping this in
-    // step with `mem_cmp` is what stops a borrowed fast-path answer from
-    // differing from the owned one, the same way AHL-477 stopped an indexed
-    // answer from differing from a scanned one.
-    fn class(cell: &dyn Cell) -> Option<u8> {
+    // Stage two, shared with the compiled path — see `class_compare`.
+    let ordering = class_compare(left, right, collation)?;
+    Ok(Value::Integer(i64::from(verdict(op, ordering))))
+}
+
+/// Stage two of the comparison rule: rank two cells that stage one has
+/// already converted.
+///
+/// Storage classes rank the way SQLite's do, and the way [`mem_cmp`] does —
+/// numbers < text < blobs — so a pair still cross-class after stage one
+/// answers by class instead of raising. Keeping this in step with `mem_cmp`
+/// is what stops a borrowed fast-path answer from differing from the owned
+/// one, the same way AHL-477 stopped an indexed answer from differing from
+/// a scanned one.
+///
+/// Generic over both cells rather than taking `&dyn Cell` so that a caller
+/// which knows its operand types — [`CompiledFilter`], comparing a borrowed
+/// [`ValueRef`] with a constant fixed for the statement — gets a copy
+/// specialised to them; [`compare_cells`] calls it through `&dyn Cell`
+/// because its operands may or may not have been converted, and `?Sized` is
+/// what lets one body serve both. Neither `NULL` is checked here: the
+/// callers do that first, since a `NULL` is the one input whose answer is
+/// not an ordering.
+fn class_compare<L: Cell + ?Sized, R: Cell + ?Sized>(
+    left: &L,
+    right: &R,
+    collation: Collation,
+) -> Result<Ordering> {
+    fn class<C: Cell + ?Sized>(cell: &C) -> Option<u8> {
         if cell.as_f64_cell().is_some() {
             Some(1)
         } else if cell.as_text_cell().is_some() {
@@ -869,7 +885,7 @@ fn compare_cells<L: Cell, R: Cell>(
         )));
     };
 
-    let ordering = match left_class.cmp(&right_class) {
+    Ok(match left_class.cmp(&right_class) {
         Ordering::Equal => match (left.as_text_cell(), right.as_text_cell()) {
             (Some(a), Some(b)) => collation.compare(a, b),
             _ => match (left.as_blob_cell(), right.as_blob_cell()) {
@@ -897,8 +913,12 @@ fn compare_cells<L: Cell, R: Cell>(
             },
         },
         class_ordering => class_ordering,
-    };
-    let result = match op {
+    })
+}
+
+/// What a comparison operator says about an ordering.
+fn verdict(op: BinaryOp, ordering: Ordering) -> bool {
+    match op {
         BinaryOp::Eq => ordering == Ordering::Equal,
         BinaryOp::NotEq => ordering != Ordering::Equal,
         BinaryOp::Lt => ordering == Ordering::Less,
@@ -906,8 +926,7 @@ fn compare_cells<L: Cell, R: Cell>(
         BinaryOp::Gt => ordering == Ordering::Greater,
         BinaryOp::GtEq => ordering != Ordering::Less,
         _ => unreachable!("non-comparison operator in comparison"),
-    };
-    Ok(Value::Integer(i64::from(result)))
+    }
 }
 
 /// Stage one of SQLite's comparison rule (AHL-486): the value `cell`
@@ -950,6 +969,289 @@ fn affinity_conversion<C: Cell>(cell: &C, affinity: CompareAffinity) -> Option<V
             Some(Value::Text(rendered.into()))
         }
     }
+}
+
+/// A `WHERE` compiled once per execution into the conjuncts it is made of,
+/// so that the rows it is tested against pay for the *comparison* and not for
+/// rediscovering the predicate's shape (AHL-550).
+///
+/// [`evaluate_ref`] is a tree walk: for `email >= ? AND email < ?` every row
+/// matches the `AND`, recurses into two `Binary`s, resolves each `Column` and
+/// each `Param` by lookup, clones the bound parameter (an `Arc` bump and
+/// release for `TEXT`), applies the affinity conversion to the parameter —
+/// again — and dispatches the class comparison through `&dyn Cell`. Nothing
+/// about that changes from one row to the next except the cell. This does
+/// the constant part once: the top-level conjunction is flattened, each
+/// conjunct of the shape `column op constant` (either way round), or
+/// `column IS [NOT] NULL`, becomes a [`Conjunct`] holding its ordinal, its
+/// operator, the constant *already converted* under the comparison's
+/// affinity, and the collation; every other conjunct is kept as the
+/// expression it was and evaluated by [`evaluate_ref`] per row, so the
+/// general path stays the general path and a shape this does not recognise
+/// is exact rather than refused.
+///
+/// **The answer is the same one, by construction.** A conjunction is
+/// evaluated the way `evaluate_ref` evaluates nested `AND`s: every conjunct
+/// in left-to-right order, none skipped — so the first error is the same
+/// error, and a `NULL` or a false anywhere fails the row, which is
+/// three-valued `AND` folded through [`is_truthy`]. Kleene's `AND` is
+/// associative, so flattening `(a AND b) AND c` changes nothing. A compiled
+/// comparison is [`compare_cells`] with its constant half hoisted: stage one
+/// on the cell per row, stage one on the constant once at compile time —
+/// legitimate because [`affinity_conversion`] is idempotent (a `TEXT` it
+/// turned into a number is not `TEXT` any more, a number it rendered as
+/// `TEXT` is no longer numeric, and a `NULL`, `BLOB` or already-matching
+/// cell it returned `None` for it returns `None` for again) — then
+/// [`class_compare`] specialised to a [`ValueRef`] against an [`Operand`].
+/// `a_compiled_filter_agrees_with_evaluate_ref` ties the two over random
+/// rows, constants, operators, collations and affinities, including the
+/// error cases.
+///
+/// **What it does not do.** It does not skip the filter, or any conjunct of
+/// it, when the index range was built from the same predicate — that is A1,
+/// measured and rejected (`PERF.md`, 2026-09-01), because the access paths'
+/// freedom to return a superset rests on the filter always running. Every
+/// row still passes through every conjunct; they are only cheaper.
+///
+/// The conjunct list is the one allocation, and it is made once per
+/// execution — or not at all on the borrowing read path, which keeps a parked
+/// [`CompiledFilter`] on the handle and re-lends its buffer through
+/// [`CompiledFilter::compile_into`] and [`CompiledFilter::park`], the same
+/// way it parks its cell buffers (`a_borrowing_consumer_allocates_nothing_per_row`
+/// counts it).
+#[derive(Default)]
+pub struct CompiledFilter<'e> {
+    conjuncts: Vec<Conjunct<'e>>,
+}
+
+/// One term of a compiled conjunction. See [`CompiledFilter`].
+enum Conjunct<'e> {
+    /// `column op constant` — a comparison whose one side is a bare column
+    /// and whose other is a literal or a bound parameter.
+    Compare {
+        /// The column's position in the decoded row.
+        ordinal: usize,
+        /// The comparison operator, as written.
+        op: BinaryOp,
+        /// Whether the column is the left operand. The operator is never
+        /// flipped: [`class_compare`] is called with the operands in their
+        /// written order, so the ordering, the verdict and even the type
+        /// error's wording are the ones `evaluate_ref` produces.
+        column_on_left: bool,
+        /// The other side, with [`affinity_conversion`] already applied.
+        /// Borrowed from the plan or the bound parameters where the
+        /// conversion left it alone, owned where it did not.
+        constant: Operand<'e>,
+        /// The collating sequence the comparison resolved to.
+        collation: Collation,
+        /// The affinity conversion still applied to the *cell*, per row.
+        affinity: CompareAffinity,
+    },
+    /// `column IS NULL` / `column IS NOT NULL`.
+    IsNull {
+        /// The column's position in the decoded row.
+        ordinal: usize,
+        /// `true` for `IS NOT NULL`.
+        negated: bool,
+    },
+    /// Anything else, evaluated by [`evaluate_ref`] per row.
+    General(&'e Expr),
+}
+
+impl<'e> CompiledFilter<'e> {
+    /// Compile `filter` for one execution under `env`'s bound parameters.
+    pub fn compile(filter: &'e Expr, env: &'e Env<'_>) -> Self {
+        Self::compile_into(CompiledFilter::default(), filter, env)
+    }
+
+    /// [`CompiledFilter::compile`] into a parked filter's buffer, so a caller
+    /// that compiles a predicate per execution reuses one allocation across
+    /// all of them. `parked` is empty — [`CompiledFilter::park`] made it so —
+    /// which is what lets its `'static` shorten to `'e` here.
+    pub fn compile_into(
+        parked: CompiledFilter<'static>,
+        filter: &'e Expr,
+        env: &'e Env<'_>,
+    ) -> Self {
+        let mut conjuncts: Vec<Conjunct<'e>> = parked
+            .conjuncts
+            .into_iter()
+            .map(|_| unreachable!())
+            .collect();
+        Self::flatten(filter, env, &mut conjuncts);
+        Self { conjuncts }
+    }
+
+    /// Give the buffer back with every borrow forgotten: the same allocation,
+    /// emptied, typed for the next execution. The same in-place collection
+    /// [`crate::exec::park`] relies on.
+    pub fn park(mut self) -> CompiledFilter<'static> {
+        self.conjuncts.clear();
+        CompiledFilter {
+            conjuncts: self.conjuncts.into_iter().map(|_| unreachable!()).collect(),
+        }
+    }
+
+    /// Split `expr`'s top-level `AND`s, left to right, into `out`.
+    fn flatten(expr: &'e Expr, env: &'e Env<'_>, out: &mut Vec<Conjunct<'e>>) {
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::And,
+                left,
+                right,
+                ..
+            } => {
+                Self::flatten(left, env, out);
+                Self::flatten(right, env, out);
+            }
+            other => out.push(Self::conjunct(other, env)),
+        }
+    }
+
+    /// Classify one conjunct.
+    fn conjunct(expr: &'e Expr, env: &'e Env<'_>) -> Conjunct<'e> {
+        // A literal or a bound parameter: the operands that are the same for
+        // every row. A parameter that was not bound is left to `evaluate_ref`,
+        // which reports it per row exactly as it does today.
+        let constant = |expr: &'e Expr| -> Option<&'e Value> {
+            match expr {
+                Expr::Literal(value) => Some(value),
+                Expr::Param(index) => env.params.get(*index),
+                _ => None,
+            }
+        };
+        match expr {
+            Expr::Binary {
+                op:
+                    op @ (BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq),
+                left,
+                right,
+                collation,
+                affinity,
+            } => {
+                let (ordinal, value, column_on_left) = match (&**left, &**right) {
+                    (Expr::Column(ordinal), other) => match constant(other) {
+                        Some(value) => (*ordinal, value, true),
+                        None => return Conjunct::General(expr),
+                    },
+                    (other, Expr::Column(ordinal)) => match constant(other) {
+                        Some(value) => (*ordinal, value, false),
+                        None => return Conjunct::General(expr),
+                    },
+                    _ => return Conjunct::General(expr),
+                };
+                // Stage one, once. `Operand::Ref` borrows the plan's or the
+                // parameter's bytes; only a conversion that produced a new
+                // value owns anything.
+                let constant = match affinity_conversion(value, *affinity) {
+                    Some(converted) => Operand::Owned(converted),
+                    None => Operand::Ref(ValueRef::from(value)),
+                };
+                Conjunct::Compare {
+                    ordinal,
+                    op: *op,
+                    column_on_left,
+                    constant,
+                    collation: *collation,
+                    affinity: *affinity,
+                }
+            }
+            Expr::Unary {
+                op: op @ (UnaryOp::IsNull | UnaryOp::IsNotNull),
+                expr: inner,
+            } => match &**inner {
+                Expr::Column(ordinal) => Conjunct::IsNull {
+                    ordinal: *ordinal,
+                    negated: matches!(op, UnaryOp::IsNotNull),
+                },
+                _ => Conjunct::General(expr),
+            },
+            other => Conjunct::General(other),
+        }
+    }
+
+    /// Whether `row` passes the filter: every conjunct true, in three-valued
+    /// logic — the same verdict as `is_truthy(evaluate_ref(filter, row))`,
+    /// and the same error when a conjunct raises one.
+    pub fn admits(&self, row: &[ValueRef<'_>], env: &Env<'_>) -> Result<bool> {
+        let mut all_true = true;
+        for conjunct in &self.conjuncts {
+            let truth = match conjunct {
+                Conjunct::Compare {
+                    ordinal,
+                    op,
+                    column_on_left,
+                    constant,
+                    collation,
+                    affinity,
+                } => {
+                    let cell = row
+                        .get(*ordinal)
+                        .ok_or_else(|| missing_column(*ordinal, row.len()))?;
+                    compare_compiled(*op, *column_on_left, cell, constant, *collation, *affinity)?
+                }
+                Conjunct::IsNull { ordinal, negated } => {
+                    let cell = row
+                        .get(*ordinal)
+                        .ok_or_else(|| missing_column(*ordinal, row.len()))?;
+                    Some(cell.is_null() != *negated)
+                }
+                Conjunct::General(expr) => truth(&evaluate_ref(expr, row, Computed::NONE, env)?),
+            };
+            // Never short-circuited: a later conjunct's error is still that
+            // row's error, as it is for `evaluate_ref`'s `AND`.
+            all_true &= truth == Some(true);
+        }
+        Ok(all_true)
+    }
+
+    /// The number of conjuncts, and how many of them were compiled rather
+    /// than kept general. For the tests that pin which shapes compile.
+    #[cfg(test)]
+    fn shape(&self) -> (usize, usize) {
+        let compiled = self
+            .conjuncts
+            .iter()
+            .filter(|conjunct| !matches!(conjunct, Conjunct::General(_)))
+            .count();
+        (self.conjuncts.len(), compiled)
+    }
+}
+
+/// One compiled comparison over one row: [`compare_cells`] with the
+/// constant's stage one already done. `None` is `NULL`, as it is there.
+fn compare_compiled(
+    op: BinaryOp,
+    column_on_left: bool,
+    cell: &ValueRef<'_>,
+    constant: &Operand<'_>,
+    collation: Collation,
+    affinity: CompareAffinity,
+) -> Result<Option<bool>> {
+    if cell.is_null() || constant.is_null_cell() {
+        return Ok(None);
+    }
+    let converted = affinity_conversion(cell, affinity);
+    let ordering = match (&converted, column_on_left) {
+        (Some(value), true) => class_compare(value, constant, collation),
+        (Some(value), false) => class_compare(constant, value, collation),
+        (None, true) => class_compare(cell, constant, collation),
+        (None, false) => class_compare(constant, cell, collation),
+    }?;
+    Ok(Some(verdict(op, ordering)))
+}
+
+/// The error a column reference past the end of the row raises — worded once,
+/// so the compiled path and [`evaluate_ref`] raise the same one.
+fn missing_column(index: usize, width: usize) -> Error {
+    Error::Corrupt(alloc::format!(
+        "expression references column {index}, but the row has {width} value(s)"
+    ))
 }
 
 /// Turn a subquery's rows into the value the enclosing expression wanted.
@@ -5233,5 +5535,332 @@ mod tests {
             .unwrap(),
             Value::Null
         );
+    }
+
+    // ------------------------------------------------------------ AHL-550
+
+    /// A cell or constant for the compiled-filter tie test: every storage
+    /// class, the numeric-looking and case-varying texts the affinity and
+    /// collation rules turn on, integers past 2^53, and a vector for the
+    /// error path.
+    fn random_operand(rng: &mut SeededRng, allow_vector: bool) -> Value {
+        const TEXTS: &[&str] = &[
+            "",
+            "1",
+            "1.0",
+            "1x",
+            "abc",
+            "ABC",
+            "abc  ",
+            "Abd",
+            "  1",
+            "9007199254740993",
+            "-0",
+            "1e3",
+            "2.0",
+        ];
+        const INTEGERS: &[i64] = &[-2, -1, 0, 1, 2, 1 << 53, (1 << 53) + 1, i64::MAX, i64::MIN];
+        const REALS: &[f64] = &[-1.5, 0.0, 1.0, 2.0, 1e300, 9007199254740992.0];
+        const BLOBS: &[&[u8]] = &[b"", b"\x01", b"\xff\x00", b"abc"];
+        match rng.next_u64() % if allow_vector { 11 } else { 10 } {
+            0 => Value::Null,
+            1..=3 => Value::Integer(INTEGERS[(rng.next_u64() % INTEGERS.len() as u64) as usize]),
+            4 => Value::Real(REALS[(rng.next_u64() % REALS.len() as u64) as usize]),
+            5..=8 => Value::Text(TEXTS[(rng.next_u64() % TEXTS.len() as u64) as usize].into()),
+            9 => Value::Blob(BLOBS[(rng.next_u64() % BLOBS.len() as u64) as usize].to_vec()),
+            _ => Value::Vector(vec![1.0]),
+        }
+    }
+
+    fn random_op(rng: &mut SeededRng) -> BinaryOp {
+        [
+            BinaryOp::Eq,
+            BinaryOp::NotEq,
+            BinaryOp::Lt,
+            BinaryOp::LtEq,
+            BinaryOp::Gt,
+            BinaryOp::GtEq,
+        ][(rng.next_u64() % 6) as usize]
+    }
+
+    fn random_collation(rng: &mut SeededRng) -> Collation {
+        [Collation::Binary, Collation::NoCase, Collation::RTrim][(rng.next_u64() % 3) as usize]
+    }
+
+    fn random_affinity(rng: &mut SeededRng) -> CompareAffinity {
+        [
+            CompareAffinity::None,
+            CompareAffinity::Numeric,
+            CompareAffinity::Text,
+        ][(rng.next_u64() % 3) as usize]
+    }
+
+    /// A constant operand: a literal, a bound parameter, or — one time in
+    /// ten — a parameter past the end of what was bound.
+    fn random_constant(rng: &mut SeededRng, params: &[Value]) -> Expr {
+        match rng.next_u64() % 10 {
+            0..=4 => Expr::Literal(random_operand(rng, true)),
+            5..=8 => Expr::Param((rng.next_u64() % params.len() as u64) as usize),
+            _ => Expr::Param(params.len()),
+        }
+    }
+
+    /// A column reference, one time in ten past the row's width.
+    fn random_column(rng: &mut SeededRng, width: usize) -> Expr {
+        if rng.next_u64().is_multiple_of(10) {
+            Expr::Column(width)
+        } else {
+            Expr::Column((rng.next_u64() % width as u64) as usize)
+        }
+    }
+
+    fn compare(rng: &mut SeededRng, left: Expr, right: Expr) -> Expr {
+        Expr::Binary {
+            op: random_op(rng),
+            left: Box::new(left),
+            right: Box::new(right),
+            collation: random_collation(rng),
+            affinity: random_affinity(rng),
+        }
+    }
+
+    /// One conjunct: the shapes `CompiledFilter` compiles, and the ones it
+    /// must leave to `evaluate_ref`.
+    fn random_leaf(rng: &mut SeededRng, width: usize, params: &[Value]) -> Expr {
+        match rng.next_u64() % 20 {
+            0..=7 => {
+                let column = random_column(rng, width);
+                let constant = random_constant(rng, params);
+                compare(rng, column, constant)
+            }
+            8..=10 => {
+                let constant = random_constant(rng, params);
+                let column = random_column(rng, width);
+                compare(rng, constant, column)
+            }
+            11..=12 => Expr::Unary {
+                op: if rng.next_u64().is_multiple_of(2) {
+                    UnaryOp::IsNull
+                } else {
+                    UnaryOp::IsNotNull
+                },
+                expr: Box::new(random_column(rng, width)),
+            },
+            13..=14 => {
+                let left = random_column(rng, width);
+                let right = random_column(rng, width);
+                compare(rng, left, right)
+            }
+            15 => Expr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(random_leaf(rng, width, params)),
+            },
+            16 => Expr::Literal(random_operand(rng, false)),
+            17 => random_column(rng, width),
+            _ => {
+                let left = random_leaf(rng, width, params);
+                let right = random_leaf(rng, width, params);
+                Expr::Binary {
+                    op: BinaryOp::Or,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    collation: Collation::Binary,
+                    affinity: CompareAffinity::None,
+                }
+            }
+        }
+    }
+
+    fn random_predicate(rng: &mut SeededRng, width: usize, params: &[Value], depth: u32) -> Expr {
+        if depth > 0 && rng.next_u64() % 5 < 3 {
+            let left = random_predicate(rng, width, params, depth - 1);
+            let right = random_predicate(rng, width, params, depth - 1);
+            Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(left),
+                right: Box::new(right),
+                collation: Collation::Binary,
+                affinity: CompareAffinity::None,
+            }
+        } else {
+            random_leaf(rng, width, params)
+        }
+    }
+
+    /// The compiled filter is `evaluate_ref` with the constant work hoisted,
+    /// and this is the tie that says so: over random rows, predicates,
+    /// constants, operators, collations and affinities the two agree on the
+    /// verdict, and on the error — same variant, same wording — when there
+    /// is one. Every class pairing the comparison rules distinguish is
+    /// generated: `NULL` on either side, `INTEGER` against `REAL` and past
+    /// 2^53, `TEXT` against a number under each affinity, `BLOB`, a vector
+    /// (the type error), a column past the row, a parameter past the
+    /// binding, and the general shapes (`OR`, `NOT`, a bare column, a
+    /// column-to-column compare) mixed in with compiled ones.
+    #[test]
+    fn a_compiled_filter_agrees_with_evaluate_ref() {
+        let mut rng = SeededRng::new(0x5500);
+        let mut admitted = 0usize;
+        let mut rejected = 0usize;
+        let mut errors = 0usize;
+        let mut compiled_conjuncts = 0usize;
+        let mut general_conjuncts = 0usize;
+        for round in 0..20_000u32 {
+            let width = 1 + (rng.next_u64() % 4) as usize;
+            let row: Vec<Value> = (0..width).map(|_| random_operand(&mut rng, true)).collect();
+            let params: Vec<Value> = (0..1 + rng.next_u64() % 3)
+                .map(|_| random_operand(&mut rng, true))
+                .collect();
+            let predicate = random_predicate(&mut rng, width, &params, 3);
+            let env = Env::new(&params, 0, generator());
+            let cells: Vec<ValueRef<'_>> = row.iter().map(ValueRef::from).collect();
+
+            let reference = evaluate_ref(&predicate, &cells, Computed::NONE, &env)
+                .map(|truth| is_truthy(&truth));
+            let compiled = CompiledFilter::compile(&predicate, &env);
+            let (conjuncts, compiled_count) = compiled.shape();
+            compiled_conjuncts += compiled_count;
+            general_conjuncts += conjuncts - compiled_count;
+            let verdict = compiled.admits(&cells, &env);
+
+            assert_eq!(
+                verdict, reference,
+                "round {round}: compiled and general verdicts differ over {row:?} with \
+                 {params:?} for {predicate:?}"
+            );
+            match verdict {
+                Ok(true) => admitted += 1,
+                Ok(false) => rejected += 1,
+                Err(_) => errors += 1,
+            }
+        }
+        // The tie cannot pass vacuously: both verdicts, errors, and both
+        // kinds of conjunct have to have been exercised.
+        assert!(admitted > 1_000, "only {admitted} rows admitted");
+        assert!(rejected > 1_000, "only {rejected} rows rejected");
+        assert!(errors > 500, "only {errors} rows raised");
+        assert!(
+            compiled_conjuncts > 10_000 && general_conjuncts > 2_000,
+            "{compiled_conjuncts} compiled and {general_conjuncts} general conjuncts"
+        );
+    }
+
+    /// Which shapes compile, pinned: without this a `CompiledFilter` that
+    /// kept every conjunct general would pass the tie above and buy nothing.
+    #[test]
+    fn the_profiled_shapes_compile_and_the_rest_stay_general() {
+        let email = || Expr::Column(1);
+        let params = [Value::Text("a".into()), Value::Text("b".into())];
+        let env = Env::new(&params, 0, generator());
+        let cmp = |op, left, right| Expr::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+            collation: Collation::Binary,
+            affinity: CompareAffinity::Text,
+        };
+        let and = |left, right| Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(left),
+            right: Box::new(right),
+            collation: Collation::Binary,
+            affinity: CompareAffinity::None,
+        };
+
+        // `email >= ? AND email < ?`: two compiled comparisons.
+        let range = and(
+            cmp(BinaryOp::GtEq, email(), Expr::Param(0)),
+            cmp(BinaryOp::Lt, email(), Expr::Param(1)),
+        );
+        assert_eq!(CompiledFilter::compile(&range, &env).shape(), (2, 2));
+
+        // `id = ?`, the point read; the constant on the left compiles too.
+        let point = cmp(BinaryOp::Eq, Expr::Column(0), Expr::Param(0));
+        assert_eq!(CompiledFilter::compile(&point, &env).shape(), (1, 1));
+        let flipped = cmp(BinaryOp::LtEq, Expr::Param(0), email());
+        assert_eq!(CompiledFilter::compile(&flipped, &env).shape(), (1, 1));
+
+        // `IS NULL` on a column compiles; nested `AND`s flatten either way.
+        let is_null = Expr::Unary {
+            op: UnaryOp::IsNotNull,
+            expr: Box::new(email()),
+        };
+        let nested = and(
+            and(point.clone(), is_null),
+            and(flipped.clone(), range.clone()),
+        );
+        assert_eq!(CompiledFilter::compile(&nested, &env).shape(), (5, 5));
+
+        // A parameter that was not bound, a column-to-column compare, an
+        // `OR`, and a `NOT` around an `AND` stay general.
+        let unbound = cmp(BinaryOp::Eq, email(), Expr::Param(2));
+        assert_eq!(CompiledFilter::compile(&unbound, &env).shape(), (1, 0));
+        let columns = cmp(BinaryOp::Eq, email(), Expr::Column(0));
+        assert_eq!(CompiledFilter::compile(&columns, &env).shape(), (1, 0));
+        let or = Expr::Binary {
+            op: BinaryOp::Or,
+            left: Box::new(point.clone()),
+            right: Box::new(flipped.clone()),
+            collation: Collation::Binary,
+            affinity: CompareAffinity::None,
+        };
+        assert_eq!(CompiledFilter::compile(&or, &env).shape(), (1, 0));
+        let not = Expr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(range.clone()),
+        };
+        assert_eq!(CompiledFilter::compile(&not, &env).shape(), (1, 0));
+        let mixed = and(or, point);
+        assert_eq!(CompiledFilter::compile(&mixed, &env).shape(), (2, 1));
+    }
+
+    /// The constant's affinity conversion happens at compile time, and the
+    /// buffer a parked filter hands back is the one it was compiled into.
+    #[test]
+    fn a_compiled_filter_converts_its_constant_once_and_parks_its_buffer() {
+        // `TEXT` affinity renders the numeric constant as text once; the row's
+        // `TEXT` cell then compares as text against it, per row, without an
+        // allocation — the same answer `evaluate_ref` computes by rendering
+        // the constant every row.
+        let params = [Value::Integer(1)];
+        let env = Env::new(&params, 0, generator());
+        let predicate = Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Column(0)),
+            right: Box::new(Expr::Param(0)),
+            collation: Collation::Binary,
+            affinity: CompareAffinity::Text,
+        };
+        let compiled = CompiledFilter::compile(&predicate, &env);
+        let hit = [ValueRef::Text("1")];
+        let miss = [ValueRef::Text("1.0")];
+        assert_eq!(compiled.admits(&hit, &env), Ok(true));
+        assert_eq!(compiled.admits(&miss, &env), Ok(false));
+        assert!(
+            matches!(
+                compiled.conjuncts.first(),
+                Some(Conjunct::Compare {
+                    constant: Operand::Owned(Value::Text(rendered)),
+                    ..
+                }) if &**rendered == "1"
+            ),
+            "the constant was not converted at compile time"
+        );
+
+        let capacity = compiled.conjuncts.capacity();
+        assert!(capacity >= 1);
+        let parked = compiled.park();
+        assert!(
+            parked.conjuncts.is_empty(),
+            "a parked filter holds no conjunct"
+        );
+        assert_eq!(
+            parked.conjuncts.capacity(),
+            capacity,
+            "parking reallocated instead of reusing the buffer"
+        );
+        let again = CompiledFilter::compile_into(parked, &predicate, &env);
+        assert_eq!(again.conjuncts.capacity(), capacity);
+        assert_eq!(again.admits(&hit, &env), Ok(true));
     }
 }
