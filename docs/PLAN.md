@@ -102,52 +102,49 @@ current execution order without relying on local conversation history.
 
 ## Next work, in order
 
-1. **Cross-engine tables: DONE 2026-09-03** — `repeat-compare.sh` median
-   of three clean runs and the read/batch drivers at REPS=5 (MySQL 8.4,
-   PG 17), plus the containerised batch-insert row. Still owed for a
-   like-for-like OLTP write row: nothing; both rows are published. The
-   quiet window on this machine is mid-morning; pre-build the bench binary
-   before any gated run.
+Done items are removed, not struck through; `PERF.md`'s dated sections and
+`git log` hold them. Every item below lands only with an interleaved A/B
+(3 reps, control re-run each rep, 3/3 non-overlapping) and touches no
+published row without a gated regeneration.
 
-2. **C1 is closed as a measured loss until the layers compose.** Slices
-   1 (AHL-544) and 2 (AHL-547) are in behind `EngineOptions::commit_absorption`
-   (default off); `PERF.md` AHL-547 has the mechanism: one record and one
-   sync per cohort ran **26% more barriers**, because the commit-side cohort
-   (~5.6 members) displaces the flush-side ticket gather that already
-   amortises fsync over 6–9 commits — 0.78x / 0.87x / 0.90x at 8 / 16 / 32
-   writers, 3/3. The next C1 item, if any, is a brief for one flush ticket
-   per cohort that the flush side gathers across leaders, plus cohorts that
-   survive a region boundary — measurement gate before code. A10 item 1 is
-   done (AHL-548: `COUNT(*)` from leaf cell counts; the scalar aggregate is
-   ~6x/~5x the servers); the live row count is declined until a delta-merge
-   metadata rule exists. The insert path's remaining per-row costs are
-   closed (AHL-545); B4's cell iteration is closed (AHL-541). **Remaining
-   published losses:** `LIMIT 10` joins vs SQLite (1.27x/1.59x), range scan
-   vs SQLite (0.67x), point-read ops/s vs SQLite WAL (0.69x; p50 already
-   ahead), batch insert vs PostgreSQL like for like (0.68x), server-to-server
-   writes at 8 connections.
+1. **`LIMIT 10` joins vs SQLite (1.27x / 1.59x slower).** Ten PK probes
+   are ten descents; the inner row is decoded through the owned path and
+   its column copied; each outer row's matches are collected into a fresh
+   `Vec`. Angles: the inner side borrows (AHL-535's buffer applied to the
+   join's probed row), the match buffer is reused across outer rows, and a
+   probe that reseeks from the retained cursor's parent on a leaf miss.
+2. **Range scan vs SQLite (0.67x).** After AHL-535: residual filter ~16%
+   with `from_utf8` ~5% re-validating text validated at insert, `memcmp`
+   ~21%. Angles: `BINARY` text compare on borrowed cells without UTF-8
+   re-validation; a pre-compiled comparator per predicate instead of the
+   general `evaluate_ref` walk. Do not re-propose a dense walk or a
+   covering scan (both measured negative) without a borrowed-entry index
+   walk first.
+3. **Point-read ops/s vs SQLite WAL (0.69x; p50 already ahead).** The gap
+   is the tail (p95 4.67 vs 1.04 µs). First an instrument — a tail
+   profiler that records stacks only for queries over 2 µs — then the fix
+   it names (clock sweeps, `RawLeafCache`'s shift, table growth, allocator
+   `madvise`, the shared cache's lock are the candidates).
+4. **Batch insert vs PostgreSQL like for like (0.68x).** ~1.0 ms of
+   engine work per hundred-row statement in the container vs PG's ~0.6 ms;
+   the page path is tiny now. Profile *in the container*: if the state
+   block's write + `sync` is a second barrier per commit, rewrite it lazily
+   at checkpoint (the record already carries root/next/seq — recovery's
+   chain must prove it); otherwise coalesce record + dirty pages into one
+   `pwritev`.
+5. **Server-to-server writes at 8 connections (0.30x MySQL 8.4; commits
+   per fsync at parity, barrier rate 375/s vs 1,280/s).** The C2
+   diagnostic first — socket-wait vs gate-wait vs commit-wait per
+   connection thread — then pipelining the next gate holder's prepare with
+   the current cohort's barrier; item 4's second barrier, if real, halves
+   the rate on its own.
 
-3. **`RangeCursor` extension (A3)** to `walk`/`scan_range_from` — the
-   cheapest first step is `colliding_rows` using `scan_index_row_ids`
-   (already cursor-backed, no per-key `Vec`); WITHOUT ROWID scans next.
-
-4. **B2's last piece**: index-probe access paths do not reorder. B3 is
-   closed (measured negative). A7 landed (AHL-535).
-
-5. **Server posture F3/F4** — refuse-to-expose defaults; fuzz the packet path.
-
-6. **Insert structural half (C7): LANDED (AHL-542)** — pages stay decoded
-   for the life of a transaction, encoded once at commit; batch insert
-   1.29–1.44x on the engine's own profile; five DST sweeps.
-
-7. **C1 commit-side logical group commit** — highest payoff, data-loss risk,
-   full DST rigor; only when it can be done carefully.
-
-8. **Serverless R13 brief → object-store prototype** — runs in parallel.
-
-Standing lesson from today, now in the root plan's rules: a suite-level
-number is not a per-shape number. A commit that changes a plan decision
-quotes every shape it can touch.
+Still open, not a published loss: B2's index-probe reorder, A3's WITHOUT
+ROWID cursor, B4's kernel copy (architecture: recycled `Arc` pool or an
+`mmap` device), C1 (closed as a measured loss until commit-side cohorts
+and the flush-side gather compose; slices 1–2 stay in behind the
+default-off flag), the live row count (needs a delta-merge metadata rule),
+F3/F4 server posture, the serverless brief.
 
 ## Acceptance and handoff
 
