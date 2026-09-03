@@ -5373,6 +5373,133 @@ its last key landed in could answer the next key with a bounds check instead
 of a walk. That is a change to the tree's read path with its own DST
 obligation, and it is a separate item rather than a tail on this one.
 
+### The point cursor remembers the whole path, not just the leaf (AHL-551, 2026-09-04)
+
+AHL-549b ended by naming item (c): the `LIMIT 10` join spends 37% of its query
+in `CowBTree::get_from`, and the retained read cursor — one leaf, with its span
+held as borrowed separators (AHL-527) — only answers when the next key is
+*inside that leaf*. Anything else is a full root-to-leaf walk: a `node_at` and
+a hashed `PageCache::get` per level, a `child_index` `partition_point` of
+`memcmp`s per level. The proposal was to retain the descent **path**, so a leaf
+miss climbs to the lowest retained ancestor whose span still admits the key and
+descends from there.
+
+**Measured first, because the premise was not obvious.** AHL-549b's own text
+says the ten probes are "ten *consecutive* keys that live in one leaf", which
+would make this item worth nothing. A counter says otherwise. Instrumenting
+where each committed point lookup starts (a throwaway process-global version of
+the `#[cfg(test)]` counters that landed) and running the profile suite's own
+two `LIMIT 10` shapes, 100 queries each:
+
+| Shape | Lookups per query | From the retained leaf | From the root node | From a deeper ancestor |
+| --- | --- | --- | --- | --- |
+| PK inner (`posts JOIN users`) | 10 | 4 | 2 | **4** (levels 2, 3, 4) |
+| secondary-index inner (`users JOIN posts`) | 16 | 0 | 8 | **8** (levels 1, 2) |
+| the two alternating, as the profile runs them | 13 | 2 | 4.5 | **6.5** |
+
+So: **half of every point lookup in this shape can start below the root**, and
+the levels it starts at are deep ones — this tree is five to six internal
+levels at 20,000 users and 160,000 posts, and a resume at level 4 skips four
+`node_at`s and four binary searches. The premise held; what the earlier note
+got wrong is that the ten PK probes are interleaved with the *other* shape's,
+which thrashes a single-leaf cursor, and that the secondary-index shape's row
+ids (`user_id` `n`'s posts are `n`, `n+20000`, `n+40000`, ...) are far apart by
+construction and never share a leaf at all.
+
+The same measurement inside the tree's own tests: an ascending sweep of 5,000
+keys is 4,501 leaf hits and 499 leaf crossings, and **all 499 crossings resume
+from an ancestor, none from the root**. Disable
+`PointCursor::deepest_admitting` and the identical run reports 499 root
+descents and zero resumes — which is what makes
+`a_neighbouring_leaf_probe_descends_from_an_ancestor_not_the_root` a
+measurement and not a restatement.
+
+**What the path holds.** `PointCursor` is one fixed-size struct: up to eight
+`PathStep`s, each an `Rc<Node>` refcount bump on a node
+[`PageCache`](crates/inlaysql-core/src/btree/cache.rs) already holds decoded
+and shared, plus two `(level, cell index)` pairs naming the separators that
+bound that node's subtree. No key bytes are copied at any level, nothing is
+heap-allocated, and the nodes it pins are pages the cache would very likely
+have kept anyway — the same argument AHL-527 made for the two bounds it kept,
+extended to the path. Eight levels is past anything this tree reaches; a
+descent deeper than that stops recording rather than retain a span it can no
+longer narrow, because a span that stops narrowing admits keys the leaf does
+not hold.
+
+**The first attempt built the path fresh per descent, and it measured behind.**
+That version assembled a `CursorPath` in a local, moved it into the cursor slot
+at the leaf, and dropped the previous one. Correct, and 3/3 slower on the one
+suite that must not move:
+
+| Suite | main (`0ce0953`) | attempt 1 | Verdict |
+| --- | --- | --- | --- |
+| `points` | 3.108 / 3.141 / 3.202M ops/s | 2.901 / 2.897 / 2.325M | **behind 3/3**, ~7% |
+| `joins-limit`, 20k | 177.7 / 162.2 / 176.7k | 169.8 / 165.7 / 165.5k | behind 2/3 |
+
+That is the honest shape of this cost: `points` is unrelated keys, so every
+lookup pays the bookkeeping and none of them ever gets a resume back. Eight
+`Option<PathStep>` moved and eight dropped per lookup is ~20 ns on a ~320 ns
+lookup, and 20/320 is the 7%.
+
+**The landed version mutates the path in place.** The cursor is borrowed once
+per descent, `begin` truncates the path to the level being resumed from without
+dropping the deeper steps, and `CursorPath::record` compares `Rc::ptr_eq`
+before it touches a refcount — so a re-descent that reaches the same root and
+the same level-1 node writes two `Option<PathBound>`s and nothing else. The
+cost is then proportional to the levels a descent actually re-walked, which for
+the shape this is for is one or two, and a lookup the leaf answers outright
+writes nothing at all. A descent that never retains — every write, every
+pending read — does not borrow the cursor at all.
+
+**On the clock, interleaved against a `0ce0953` binary, control re-run each
+repetition, order alternated, `--seconds 4`, load 2.5–7.2:**
+
+| Suite | main (`0ce0953`) | AHL-551 | Verdict |
+| --- | --- | --- | --- |
+| `indexed-range` | 130.6 / 128.3 / 131.3 / 128.9 / 127.9 / 130.9k ops/s | **132.7 / 137.0 / 135.4 / 132.7 / 134.8 / 136.5k** | **ahead 6/6, non-overlapping**, +3–7% |
+| `joins-limit`, 20k | 181.0 / 180.7 / 181.8 / 179.3 / 182.2 / 181.2k | 185.4 / 184.5 / 181.8 / 180.7 / 185.9 / 183.6k | ahead 5/6, one tie; ranges touch |
+| `points` | 3.405 / 2.807 / 3.336 / 3.286 / 3.308 / 3.245M | 3.350 / 2.928 / 3.269 / 3.313 / 3.303 / 3.309M | **flat**, mixed sign |
+| `joins`, 20k | 49 / 49 / 48 | 49 / 40 / 47 | flat, one run lost to load |
+| `indexed` | 517 / 512 / 491k | 509 / 409 / 509k | flat, one run lost to load |
+| `aggregate`, 20k | 2218 / 2159 / 2184 | 2213 / 2182 / 2191 | flat, mixed sign |
+
+`points` staying flat is the gate this had to pass, not a bonus: the point read
+is the shape the cursor was built for, and a retained path must not slow down a
+hit. The suite that separates is `indexed-range`, whose row fetches after the
+entry walk are exactly the "next key, one leaf over" pattern the path is for.
+
+**The published bench's two `LIMIT 10` p50s**, same interleaving, 200 queries
+per shape:
+
+| Shape (p50) | main (`0ce0953`) | AHL-551 |
+| --- | --- | --- |
+| PK inner, `LIMIT 10` | 3.46 / 3.50 / 3.42 µs | **3.38 / 3.33 / 3.29 µs** (ahead 3/3, non-overlapping) |
+| secondary-index inner, `LIMIT 10` | 5.83 / 5.63 / 5.58 µs | 5.96 / 5.58 / 6.63 µs (flat; the 6.63 run also lost 13% of its throughput) |
+
+**Where the time is now.** `bin/profile --suite joins-limit --rows 20000`,
+`sample` over the query phase, 17,687 samples, load 2.6:
+
+| Entry | Inclusive |
+| --- | --- |
+| `NestedLoopJoin::next` | 84.3% |
+| `IndexProbe::prepare_key` | 46.2% |
+| `Storage::get_row` → `CowBTree::get_from` | **35.5%** (was 37.3%) |
+| ...of which `descend_get`, the walk itself | 24.3% |
+| `Decode::next` (the driving scan) | 24.0% |
+
+with `_platform_memcmp` 19.6% self (was 20.9%), `CursorPath::admits` 3.0% self
+and `CursorPath::record` 1.8% self — the bookkeeping is visible and it is
+smaller than what it removes, which is the whole argument. The remaining 11
+points between `get_from` and `descend_get` are the leaf-hit path: a
+`PageCache::get` and a binary search, with no walk at all.
+
+**What is still owed.** The eleven points `get_from` keeps outside the walk are
+a page-cache lookup for a leaf the cursor could simply have held; retaining the
+leaf's `Rc<Node>` alongside its id is the obvious next slice and was
+deliberately not bundled here. And `memcmp` at ~20% self is unchanged by this
+item — the path removes *comparisons*, not the cost of each one, and a
+key-prefix or fixed-width row-id comparison is a different item.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness

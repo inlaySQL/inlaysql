@@ -457,6 +457,13 @@ pub struct CowBTree<D: Device> {
     /// that decode take `&self`.
     #[cfg(test)]
     decodes: core::cell::Cell<u64>,
+    /// Where this handle's committed point lookups started from — the retained
+    /// leaf, a retained ancestor, or the root. See [`CursorStats`]: it is what
+    /// a test asserts on to prove that neighbouring-leaf probes actually
+    /// resume from a parent instead of walking, which no assertion on the
+    /// *answers* can distinguish.
+    #[cfg(test)]
+    cursor_stats: core::cell::Cell<CursorStats>,
     /// The encoded commit record, kept between commits so the write path does
     /// not allocate a fresh ~26 KiB buffer every time it commits.
     ///
@@ -504,11 +511,12 @@ pub struct CowBTree<D: Device> {
     /// Sound to reuse because [`Device::read`] fills the whole buffer or fails:
     /// no implementation leaves part of it holding the previous page's bytes.
     scratch: RefCell<Vec<u8>>,
-    /// The root-to-leaf path the last committed-read point lookup descended,
-    /// so the next one can reseek from wherever it is still valid instead of
-    /// walking from the root again. See [`ReadCursor`] for the shape and
-    /// [`CowBTree::reseek`] for how it is used and invalidated.
-    cursor: RefCell<Option<ReadCursor>>,
+    /// The root-to-leaf path the last committed-read point lookup descended
+    /// and the leaf it ended on, so the next one can reseek from wherever it
+    /// is still valid instead of walking from the root again. See
+    /// [`PointCursor`] for the shape and [`CowBTree::reseek`] for how it is
+    /// used and invalidated.
+    cursor: RefCell<PointCursor>,
     /// The last committed row-id range leaf. A subsequent range wholly inside
     /// that leaf can skip the root-to-leaf walk; a range that is not covered
     /// falls back to the ordinary traversal. Kept separate from the point
@@ -770,6 +778,8 @@ impl<D: Device> CowBTree<D> {
             dirty: BTreeMap::new(),
             #[cfg(test)]
             decodes: core::cell::Cell::new(0),
+            #[cfg(test)]
+            cursor_stats: core::cell::Cell::new(CursorStats::default()),
             record_buf: Vec::new(),
             run_buf: Vec::new(),
             pending_root: 0,
@@ -779,7 +789,7 @@ impl<D: Device> CowBTree<D> {
             seen_generation: None,
             cache: RefCell::new(PageCache::new(DEFAULT_PAGE_CACHE_BYTES)),
             scratch: RefCell::new(vec![0u8; page_size]),
-            cursor: RefCell::new(None),
+            cursor: RefCell::new(PointCursor::default()),
             range_cursor: RefCell::new(None),
             row_scan_cursor: RefCell::new(None),
             raw_leaves: RefCell::new(RawLeafCache::new()),
@@ -954,7 +964,7 @@ impl<D: Device> CowBTree<D> {
             self.cache.borrow_mut().clear();
             self.raw_leaves.borrow_mut().clear();
             self.readahead.borrow_mut().clear();
-            *self.cursor.borrow_mut() = None;
+            self.cursor.borrow_mut().clear();
             *self.range_cursor.borrow_mut() = None;
             *self.row_scan_cursor.borrow_mut() = None;
         }
@@ -1120,63 +1130,118 @@ impl<D: Device> CowBTree<D> {
     /// descent this function does becomes the new retained leaf for next
     /// time.
     fn get_from(&self, root: PageId, key: &[u8], pending: bool) -> Result<Option<RowBuf>> {
-        if !pending && !self.device.page_reuse_enabled() {
-            if let Some(hit) = self.reseek(root, key)? {
-                return Ok(hit);
+        let retaining = !pending && !self.device.page_reuse_enabled();
+        if retaining {
+            match self.reseek(root, key)? {
+                Reseek::Answered(hit) => {
+                    self.note_cursor_leaf_hit();
+                    return Ok(hit);
+                }
+                Reseek::Resume(start) => {
+                    self.note_cursor_resume(start.level);
+                    return self.descend_get(root, key, pending, retaining, start);
+                }
+                Reseek::Miss => self.note_cursor_root_descent(),
             }
         }
-        let mut id = root;
-        // Which ancestor's separator currently supplies the cumulative lower
-        // (respectively upper) bound of `id`'s subtree — the internal node
-        // and the index into its cells, not the key bytes themselves. A
-        // level that routes through its leftmost (rightmost) child leaves
-        // the bound on that side exactly as its own parent left it, so most
-        // levels touch neither: kept this way, a descent that never reaches
-        // `retain_cursor` (every write, and every probe once `reseek` starts
-        // hitting) allocates nothing for it. Whichever bound is still active
-        // once a leaf is actually reached is kept in that same form by
-        // `retain_cursor` — two refcount bumps, no key bytes copied, no
-        // matter how deep the tree is.
-        let mut low_source: Option<(Rc<Node>, usize)> = None;
-        let mut high_source: Option<(Rc<Node>, usize)> = None;
+        self.descend_get(root, key, pending, retaining, DescentStart::at_root(root))
+    }
+
+    /// The walk itself, from wherever `start` says it may begin — the root, or
+    /// the deepest node of the previous lookup's retained path whose subtree
+    /// still contains `key` (see [`CowBTree::reseek`]).
+    ///
+    /// Every internal node it passes is recorded in the [`PointCursor`]'s
+    /// path, together with the cumulative key span that node's subtree covers,
+    /// so the *next* lookup can start from one of them in turn. A level that
+    /// routes through its leftmost (rightmost) child leaves that side's bound
+    /// exactly as its own parent left it, so most levels narrow only one side.
+    ///
+    /// The cursor is borrowed for the whole walk when it is being retained.
+    /// Nothing this reaches — `node_at`, `resolve_value_at`, the page cache,
+    /// the device — touches the cursor, and every other access to it goes
+    /// through `try_borrow`, so a re-entrant one would decline rather than
+    /// panic; `invalidate_for_reuse`, the one caller that must not decline,
+    /// only ever runs from `&mut self`.
+    fn descend_get(
+        &self,
+        root: PageId,
+        key: &[u8],
+        pending: bool,
+        retaining: bool,
+        start: DescentStart,
+    ) -> Result<Option<RowBuf>> {
+        let DescentStart {
+            mut level,
+            mut node,
+            mut id,
+            mut low,
+            mut high,
+        } = start;
+        // `None` for a descent that retains nothing — every write and every
+        // pending read — which is also what makes the path bookkeeping below
+        // free for them.
+        let mut cursor = match retaining {
+            true => self.cursor.try_borrow_mut().ok(),
+            false => None,
+        };
+        if let Some(cursor) = cursor.as_mut() {
+            cursor.begin(root, level);
+        }
         loop {
-            if id == 0 {
-                return Ok(None);
-            }
             // Borrowed, not owned: a cache hit hands back a shared decoded node
-            // and the descent only reads it, so nothing is copied per level.
-            let node = self.node_at(id, pending)?;
-            match &*node {
+            // and the descent only reads it, so nothing is copied per level. A
+            // resumed descent already holds its first node, so it does not even
+            // pay that lookup for it.
+            let current = match node.take() {
+                Some(node) => node,
+                None => {
+                    if id == 0 {
+                        return Ok(None);
+                    }
+                    self.node_at(id, pending)?
+                }
+            };
+            match &*current {
                 Node::Leaf { entries, .. } => {
-                    let result = match entries.binary_search_by(|e| node.key(&e.key).cmp(key)) {
+                    let result = match entries.binary_search_by(|e| current.key(&e.key).cmp(key)) {
                         Ok(i) => self
-                            .resolve_value_at(Some(node.bytes()), &entries[i].value, pending)
+                            .resolve_value_at(Some(current.bytes()), &entries[i].value, pending)
                             .map(Some)?,
                         Err(_) => None,
                     };
-                    if !pending && !self.device.page_reuse_enabled() {
-                        self.retain_cursor(root, id, low_source, high_source);
+                    if let Some(cursor) = cursor.as_mut() {
+                        cursor.leaf = Some(LeafSpan {
+                            leaf: id,
+                            low,
+                            high,
+                        });
                     }
                     return Ok(result);
                 }
                 Node::Internal {
                     leftmost, cells, ..
                 } => {
-                    let idx = child_index(node.bytes(), cells, key);
+                    let idx = child_index(current.bytes(), cells, key);
                     id = if idx == 0 {
                         *leftmost
                     } else {
                         cells[idx - 1].child
                     };
-                    // Skipped entirely for a pending read: it never reaches
-                    // `retain_cursor` below, so tracking a bound source for it
-                    // would only be a wasted refcount bump per level.
-                    if !pending {
-                        if idx > 0 {
-                            low_source = Some((Rc::clone(&node), idx - 1));
-                        }
-                        if idx < cells.len() {
-                            high_source = Some((Rc::clone(&node), idx));
+                    if let Some(slot) = cursor.as_mut() {
+                        if slot.path.record(level, &current, low, high) {
+                            if idx > 0 {
+                                low = Some(PathBound::new(level, idx - 1));
+                            }
+                            if idx < cells.len() {
+                                high = Some(PathBound::new(level, idx));
+                            }
+                            level += 1;
+                        } else {
+                            // Deeper than the path can hold: stop recording,
+                            // and leave behind the shallower prefix, which is
+                            // still a true path with true spans.
+                            cursor = None;
                         }
                     }
                 }
@@ -1184,39 +1249,49 @@ impl<D: Device> CowBTree<D> {
         }
     }
 
-    /// Try to answer `key` under `root` from the previous committed lookup's
-    /// retained leaf, when `key` is still inside the span that leaf covers —
-    /// the cursor behaviour SQLite gets by tracking `(page, position)` across
-    /// seeks of the same cursor, narrowed to the one case that is both by far
-    /// the most common for a join probe (the row ids
-    /// [`crate::exec::IndexProbe::prepare`] fetches are sorted, so consecutive
-    /// fetches are typically adjacent keys on the same leaf) and the cheapest
-    /// to keep correct: this tree's nodes carry no parent or sibling pointer,
-    /// so answering anything past "is it still on this exact leaf" would mean
-    /// walking back up a retained path, which is the more general design
-    /// `PERF.md` leaves as a further step if this narrower one stops paying.
+    /// Try to answer `key` under `root` from what the previous committed
+    /// lookup retained — the cursor behaviour SQLite gets by tracking
+    /// `(page, position)` across seeks of the same cursor, and then some.
     ///
-    /// Returns `Ok(None)` when the retained leaf cannot answer this lookup at
-    /// all — nothing retained yet, a different `root`, or `key` outside its
-    /// span — and the caller falls back to [`CowBTree::get_from`]'s full
-    /// descent from the root, which repopulates the cursor for next time. A
-    /// `root` mismatch is the common miss case across a write: `root` only
-    /// changes on [`CowBTree::commit`], [`CowBTree::refresh`] or a rebase, all
-    /// of which pass a *new* root value into the next call here, so a leaf
-    /// retained under the old one simply stops matching — there is no
-    /// separate invalidation step to remember.
+    /// Two answers, in descending order of value:
+    ///
+    /// * [`Reseek::Answered`] — `key` is inside the span the retained *leaf*
+    ///   covers, so that leaf resolves it, found or not, with no walk at all.
+    ///   This is the common case for a join probe, whose row ids
+    ///   ([`crate::exec::IndexProbe::prepare`]) arrive sorted, so consecutive
+    ///   fetches are typically adjacent keys on one leaf.
+    /// * [`Reseek::Resume`] — `key` is outside that leaf but inside the
+    ///   subtree of an *ancestor* on the retained path, so the walk restarts
+    ///   from that node. Consecutive keys that straddle a leaf boundary then
+    ///   cost one parent lookup and one child descent instead of a full
+    ///   root-to-leaf walk. This tree's nodes carry no parent pointer, which
+    ///   is why the path is retained on the way *down* rather than climbed on
+    ///   demand.
+    ///
+    /// [`Reseek::Miss`] — nothing retained, a different `root`, or a key
+    /// outside every recorded span — falls back to [`CowBTree::descend_get`]
+    /// from the root, which repopulates the cursor for next time. A `root`
+    /// mismatch is the common miss case across a write: `root` only changes on
+    /// [`CowBTree::commit`], [`CowBTree::refresh`] or a rebase, all of which
+    /// pass a *new* root value into the next call here, so a path retained
+    /// under the old one simply stops matching — there is no separate
+    /// invalidation step to remember.
     ///
     /// # Why this is sound without a page-reuse guard of its own
     ///
-    /// A retained cursor names a page id and the key span it answers for.
-    /// Reusing it later is exactly as sound as [`super::cache::PageCache`]
+    /// A retained cursor names page ids and the key spans they answer for.
+    /// Reusing them later is exactly as sound as [`super::cache::PageCache`]
     /// reusing a cached node for the same id — same reasoning, same
     /// prerequisite: a page id names one immutable sequence of bytes for the
     /// life of the file (`super::cache`'s "Why no invalidation protocol is
     /// needed", and [`CowBTree::adopt_next_page_id`] is what keeps it true
-    /// after AHL-406). Whoever lands the Phase 2 item 6 free list must extend
-    /// *this* cursor the same way it must extend the page cache: page reuse
-    /// makes a retained id stale exactly like it makes a cached node stale.
+    /// after AHL-406). That argument covers every node on the path exactly as
+    /// it covered the leaf alone. Whoever lands the Phase 2 item 6 free list
+    /// must extend *this* cursor the same way it must extend the page cache:
+    /// page reuse makes a retained id stale exactly like it makes a cached
+    /// node stale. Today that is [`CowBTree::invalidate_for_reuse`] clearing
+    /// the whole cursor, and the `page_reuse_enabled` guard in
+    /// [`CowBTree::get_from`] before it.
     ///
     /// # Why a pending write cannot invalidate this mid-scan
     ///
@@ -1230,63 +1305,51 @@ impl<D: Device> CowBTree<D> {
     /// `root` check above is what protects the case where the pipeline as a
     /// whole spans a commit (a later statement, a different handle after a
     /// `refresh`), not concurrent mutation during one scan.
-    fn reseek(&self, root: PageId, key: &[u8]) -> Result<Option<Option<RowBuf>>> {
-        let Ok(slot) = self.cursor.try_borrow() else {
-            return Ok(None);
+    fn reseek(&self, root: PageId, key: &[u8]) -> Result<Reseek> {
+        let Ok(cursor) = self.cursor.try_borrow() else {
+            return Ok(Reseek::Miss);
         };
-        let Some(cursor) = slot.as_ref() else {
-            return Ok(None);
-        };
-        if cursor.root != root || !cursor.admits(key) {
-            return Ok(None);
+        if cursor.root != root {
+            return Ok(Reseek::Miss);
         }
-        let leaf = cursor.leaf;
-        // Release the borrow before the lookup: `node_at` never touches
-        // `self.cursor`, but there is no reason to hold it any longer than
-        // this check needs.
-        drop(slot);
-        let node = self.node_at(leaf, false)?;
-        let Node::Leaf { entries, .. } = &*node else {
-            // A page id this cursor named is no longer a leaf. Unreachable
-            // under the invariant `reseek`'s doc comment states — a page id
-            // names one immutable node for the file's lifetime — but a full
-            // descent is always a correct answer, so fall back rather than
-            // trust a cursor that turned out not to describe a leaf.
-            return Ok(None);
-        };
-        let result = match entries.binary_search_by(|e| node.key(&e.key).cmp(key)) {
-            Ok(i) => Some(self.resolve_value_at(Some(node.bytes()), &entries[i].value, false)?),
-            Err(_) => None,
-        };
-        Ok(Some(result))
-    }
-
-    /// Retain `leaf` — reached under `root`, with its key span still named by
-    /// `low_source`/`high_source` — as the cursor to reseek from next time,
-    /// replacing whatever was there. The span's bytes are not copied: each
-    /// side is kept as the [`BoundSource`] naming the separator it came from,
-    /// so a point lookup that walks from the root allocates nothing here.
-    ///
-    /// Best-effort: if the cursor is somehow already borrowed, the retained
-    /// leaf is simply not updated rather than panic — the next lookup falls
-    /// back to a full descent, which is always correct, only slower.
-    fn retain_cursor(
-        &self,
-        root: PageId,
-        leaf: PageId,
-        low_source: Option<(Rc<Node>, usize)>,
-        high_source: Option<(Rc<Node>, usize)>,
-    ) {
-        let low = BoundSource::new(low_source);
-        let high = BoundSource::new(high_source);
-        if let Ok(mut slot) = self.cursor.try_borrow_mut() {
-            *slot = Some(ReadCursor {
-                root,
-                leaf,
-                low,
-                high,
-            });
+        if let Some(leaf) = cursor.leaf_for(key) {
+            // Release the borrow before the lookup: `node_at` never touches
+            // the cursor, but there is no reason to hold it any longer than
+            // this check needs.
+            drop(cursor);
+            let node = self.node_at(leaf, false)?;
+            let Node::Leaf { entries, .. } = &*node else {
+                // A page id this cursor named is no longer a leaf. Unreachable
+                // under the invariant this doc comment states — a page id
+                // names one immutable node for the file's lifetime — but a
+                // walk from the root is always a correct answer, so fall back
+                // rather than trust a cursor that turned out not to describe a
+                // leaf.
+                return Ok(Reseek::Miss);
+            };
+            let result = match entries.binary_search_by(|e| node.key(&e.key).cmp(key)) {
+                Ok(i) => {
+                    Some(self.resolve_value_at(Some(node.bytes()), &entries[i].value, false)?)
+                }
+                Err(_) => None,
+            };
+            return Ok(Reseek::Answered(result));
         }
+        let Some(level) = cursor.deepest_admitting(key) else {
+            return Ok(Reseek::Miss);
+        };
+        let Some((node, low, high)) = cursor.path.resume(level) else {
+            return Ok(Reseek::Miss);
+        };
+        Ok(Reseek::Resume(DescentStart {
+            level,
+            node: Some(node),
+            // Unread while `node` is `Some`, and the descent overwrites it
+            // with that node's chosen child before it reads it.
+            id: 0,
+            low,
+            high,
+        }))
     }
 
     /// Retain the last committed row-id range leaf reached by a walk.
@@ -4083,6 +4146,53 @@ impl<D: Device> CowBTree<D> {
         self.decodes.get()
     }
 
+    /// Record a lookup the retained leaf answered outright. Compiled away
+    /// outside tests, like [`CowBTree::note_decode`].
+    fn note_cursor_leaf_hit(&self) {
+        #[cfg(test)]
+        {
+            let mut stats = self.cursor_stats.get();
+            stats.leaf_hits += 1;
+            self.cursor_stats.set(stats);
+        }
+    }
+
+    /// Record a lookup that had to walk from the root.
+    fn note_cursor_root_descent(&self) {
+        #[cfg(test)]
+        {
+            let mut stats = self.cursor_stats.get();
+            stats.root_descents += 1;
+            self.cursor_stats.set(stats);
+        }
+    }
+
+    /// Record a lookup that resumed its walk at `level` of the retained path.
+    #[cfg_attr(not(test), allow(unused_variables))]
+    fn note_cursor_resume(&self, level: usize) {
+        #[cfg(test)]
+        {
+            let mut stats = self.cursor_stats.get();
+            if let Some(slot) = stats.resumes.get_mut(level) {
+                *slot += 1;
+            }
+            self.cursor_stats.set(stats);
+        }
+    }
+
+    /// Where this handle's committed point lookups have started from so far.
+    #[cfg(test)]
+    fn cursor_stats(&self) -> CursorStats {
+        self.cursor_stats.get()
+    }
+
+    /// Forget the counts, so a test can measure one phase of a workload
+    /// without the setup it needed.
+    #[cfg(test)]
+    fn reset_cursor_stats(&self) {
+        self.cursor_stats.set(CursorStats::default());
+    }
+
     /// A committed data-area page as the buffer the device itself holds it
     /// in, if it holds one — [`Device::read_shared`] behind the gates every
     /// cache on this handle answers under.
@@ -5297,92 +5407,322 @@ impl WalkBounds<'_> {
     }
 }
 
-/// A committed read's leaf, retained across [`CowBTree::get`] calls so the
-/// next lookup can try [`CowBTree::reseek`] before walking from the root. See
-/// `reseek`'s doc comment for the soundness argument and its relationship to
+/// How many internal levels of a descent a [`PointCursor`] retains.
+///
+/// The path is a fixed-size array so that keeping it costs no allocation and
+/// no `Vec` growth (see [`CowBTree::descend_get`]). Eight is far past anything
+/// reachable here — this tree's internal fanout is in the hundreds, so eight
+/// levels name more leaves than any workload holds — and a descent that
+/// somehow went deeper simply stops recording rather than record a span it
+/// could no longer narrow.
+const CURSOR_PATH_MAX: usize = 8;
+
+/// What the last committed point lookup left behind for the next one: the
+/// internal nodes it descended through, and the leaf it ended on.
+///
+/// Held and *mutated in place* rather than replaced. That is not a style
+/// choice: AHL-551's first attempt built a fresh path per descent and moved it
+/// into the slot, which measured 3/3 behind on `points` (~7%) because a
+/// workload of unrelated keys pays that bookkeeping on every lookup and gets
+/// nothing back. Updating in place, with [`CursorPath::record`] skipping the
+/// refcount traffic for a level whose node has not changed, makes the cost
+/// proportional to the levels a descent actually re-walked, which for the
+/// shape this is for is one or two.
+///
+/// See [`CowBTree::reseek`] for the soundness argument and its relationship to
 /// [`super::cache::PageCache`].
-struct ReadCursor {
-    /// The committed root `leaf` was reached under. Compared against on every
-    /// use; see `reseek`.
+#[derive(Default)]
+struct PointCursor {
+    /// The committed root every retained node was reached under. Compared
+    /// against on every use; see `reseek`. Zero — the empty-tree sentinel, and
+    /// never a real root — until a descent retains something.
     root: PageId,
-    /// The leaf a lookup that reseeks successfully will search.
-    leaf: PageId,
-    /// Inclusive lower bound of the key span `leaf` answers for — the
-    /// cumulative bound [`CowBTree::get_from`] tracked while descending to
-    /// it, not just its immediate parent's. `None` is unbounded.
-    low: Option<BoundSource>,
-    /// Exclusive upper bound, on the same terms.
-    high: Option<BoundSource>,
+    /// The leaf the last descent ended on and the span it answers for, when a
+    /// descent completed and retained one. `None` while a descent is in
+    /// flight, which is what keeps a path and a leaf span from ever
+    /// disagreeing: whatever goes wrong in between, the worst state left
+    /// behind is "no leaf, a correct partial path".
+    leaf: Option<LeafSpan>,
+    /// The internal nodes on the way there, root first.
+    path: CursorPath,
 }
 
-impl ReadCursor {
-    /// Whether `key` falls inside `leaf`'s span, and so is guaranteed to
-    /// resolve on `leaf` — found or not — without walking from the root.
+impl PointCursor {
+    /// Whether `key` falls inside the retained leaf's span, and so is
+    /// guaranteed to resolve on that leaf — found or not — without walking at
+    /// all. `None` if nothing is retained.
+    fn leaf_for(&self, key: &[u8]) -> Option<PageId> {
+        let span = self.leaf.as_ref()?;
+        self.path
+            .admits(span.low, span.high, key)
+            .then_some(span.leaf)
+    }
+
+    /// The deepest retained level whose subtree contains `key`: the node a
+    /// lookup the leaf cannot answer should resume its descent from.
+    ///
+    /// Spans nest, so searching from the deepest level up and stopping at the
+    /// first match finds it in one test in the case worth having — a key one
+    /// leaf over, still under the same parent — and in at most
+    /// [`CURSOR_PATH_MAX`] tests in the worst.
+    fn deepest_admitting(&self, key: &[u8]) -> Option<usize> {
+        (0..self.path.len)
+            .rev()
+            .find(|&level| self.path.admits_at(level, key))
+    }
+
+    /// Begin a descent under `root` that will re-walk everything from `level`
+    /// down, so the leaf span stops being current and the path stops at
+    /// `level`.
+    ///
+    /// The steps past `level` are left in the array rather than dropped: they
+    /// are unreachable (`len` is what bounds every read) and leaving them is
+    /// what lets [`CursorPath::record`] recognise an unchanged node and skip
+    /// its refcount traffic. At most [`CURSOR_PATH_MAX`] nodes are pinned
+    /// either way, all of them pages [`super::cache::PageCache`] would very
+    /// likely hold anyway.
+    fn begin(&mut self, root: PageId, level: usize) {
+        self.root = root;
+        self.leaf = None;
+        self.path.len = level;
+    }
+
+    /// Forget everything. See [`CowBTree::invalidate_for_reuse`].
+    fn clear(&mut self) {
+        self.root = 0;
+        self.leaf = None;
+        self.path.len = 0;
+        self.path.steps = Default::default();
+    }
+}
+
+/// The leaf a completed descent ended on, and the key span it answers for.
+struct LeafSpan {
+    /// The leaf a lookup that reseeks successfully will search.
+    leaf: PageId,
+    /// Inclusive lower bound of that span — the cumulative bound the descent
+    /// had narrowed to by the time it reached the leaf, named as a separator
+    /// on the path rather than copied. `None` is unbounded.
+    low: Option<PathBound>,
+    /// Exclusive upper bound, on the same terms.
+    high: Option<PathBound>,
+}
+
+/// One level of a retained descent path.
+struct PathStep {
+    /// The internal node visited at this level.
+    node: Rc<Node>,
+    /// Cumulative lower bound of `node`'s subtree, as a separator on a
+    /// shallower level of the same path. `None` is unbounded.
+    low: Option<PathBound>,
+    /// Exclusive upper bound, on the same terms.
+    high: Option<PathBound>,
+}
+
+/// One edge of a retained span, held as the separator that defines it rather
+/// than as a copy of its bytes.
+///
+/// A descent retains a bound on every committed point lookup that walks —
+/// which, for a random-key workload, is nearly every one — so the two
+/// `Vec<u8>` clones this used to be were two allocations and two frees per
+/// query for bounds that are usually compared once and then thrown away
+/// (AHL-527). A level and a cell index cost neither, and cost no refcount of
+/// their own either: the node they point into is already decoded, already
+/// shared with [`super::cache::PageCache`], and already held by the path.
+#[derive(Clone, Copy)]
+struct PathBound {
+    /// Which level of the path carries the separator.
+    level: u8,
+    /// Which of that node's cells. Resolved through a bounds check, so an
+    /// index that does not name a separator reads as "cannot answer", never as
+    /// the wrong key.
+    idx: u32,
+}
+
+impl PathBound {
+    /// The bound at `level`'s cell `idx`.
+    fn new(level: usize, idx: usize) -> Self {
+        Self {
+            level: level as u8,
+            idx: idx as u32,
+        }
+    }
+}
+
+/// The internal nodes of one root-to-leaf descent, root first.
+#[derive(Default)]
+struct CursorPath {
+    /// Level `i` of the descent, for `i < len`. Entries at or past `len` are
+    /// whatever a previous, deeper descent left there — never read, kept only
+    /// so [`CursorPath::record`] can reuse an unchanged node.
+    steps: [Option<PathStep>; CURSOR_PATH_MAX],
+    /// How many levels are currently recorded.
+    len: usize,
+}
+
+impl CursorPath {
+    /// Record `node` as level `level`, with the span its subtree covers.
+    ///
+    /// `false` when the path is already [`CURSOR_PATH_MAX`] deep and the
+    /// caller must stop recording: the bounds below here could no longer be
+    /// named as separators of recorded levels, and a span that stops narrowing
+    /// admits keys the leaf does not hold.
+    fn record(
+        &mut self,
+        level: usize,
+        node: &Rc<Node>,
+        low: Option<PathBound>,
+        high: Option<PathBound>,
+    ) -> bool {
+        // Levels are recorded strictly in descent order, so this is always
+        // the level right after the last recorded one. Refusing anything else
+        // is what keeps `len` from ever covering a stale step: a gap would
+        // leave a shallower level holding some previous descent's node, and
+        // `admits_at` would then answer for a subtree this descent never
+        // entered.
+        if level > self.len {
+            return false;
+        }
+        let Some(slot) = self.steps.get_mut(level) else {
+            return false;
+        };
+        match slot {
+            // The overwhelmingly common case on a re-descent: the same node,
+            // still shared with the page cache, at the same level. Two
+            // `Option<PathBound>` writes and no refcount traffic at all.
+            Some(step) if Rc::ptr_eq(&step.node, node) => {
+                step.low = low;
+                step.high = high;
+            }
+            slot => {
+                *slot = Some(PathStep {
+                    node: Rc::clone(node),
+                    low,
+                    high,
+                })
+            }
+        }
+        self.len = level + 1;
+        true
+    }
+
+    /// The node recorded at `level` and its span, ready to resume a descent
+    /// from. `None` if the level records nothing or does not hold an internal
+    /// node — unreachable, since only internal nodes are ever recorded, but a
+    /// node that cannot route is one to walk past rather than trust.
+    fn resume(&self, level: usize) -> Option<(Rc<Node>, Option<PathBound>, Option<PathBound>)> {
+        if level >= self.len {
+            return None;
+        }
+        let step = self.steps.get(level)?.as_ref()?;
+        if !matches!(&*step.node, Node::Internal { .. }) {
+            return None;
+        }
+        Some((Rc::clone(&step.node), step.low, step.high))
+    }
+
+    /// The separator `bound` names, borrowed straight out of the retained
+    /// page. `None` — a level that records nothing, an index past that node's
+    /// cells, or a level that is not an internal node — reads as "cannot
+    /// answer" at every use, exactly as an unresolvable bound did before.
+    fn separator(&self, bound: PathBound) -> Option<&[u8]> {
+        let level = usize::from(bound.level);
+        if level >= self.len {
+            return None;
+        }
+        let step = self.steps.get(level)?.as_ref()?;
+        match &*step.node {
+            Node::Internal { cells, .. } => cells
+                .get(bound.idx as usize)
+                .map(|cell| cell.key.resolve(step.node.bytes())),
+            Node::Leaf { .. } => None,
+        }
+    }
+
+    /// Whether `key` is inside the half-open span `low..high`.
     ///
     /// A bound that will not resolve is treated as "cannot answer" rather than
-    /// as unbounded: refusing the reseek only costs a descent from the root,
-    /// while widening the span would answer from the wrong leaf.
-    fn admits(&self, key: &[u8]) -> bool {
-        if let Some(low) = &self.low {
-            match low.key() {
+    /// as unbounded: refusing only costs a walk from the root, while widening
+    /// a span would answer from the wrong subtree.
+    fn admits(&self, low: Option<PathBound>, high: Option<PathBound>, key: &[u8]) -> bool {
+        if let Some(low) = low {
+            match self.separator(low) {
                 Some(low) if key >= low => {}
                 _ => return false,
             }
         }
-        if let Some(high) = &self.high {
-            match high.key() {
+        if let Some(high) = high {
+            match self.separator(high) {
                 Some(high) if key < high => {}
                 _ => return false,
             }
         }
         true
     }
-}
 
-/// One edge of a retained point cursor's span, held as the separator that
-/// defines it rather than as a copy of its bytes.
-///
-/// [`CowBTree::retain_cursor`] runs on every committed point lookup that walks
-/// from the root — which, for a random-key workload, is nearly every one — so
-/// the two `Vec<u8>` clones it used to make were two allocations and two frees
-/// per query for bounds that are usually compared once and then thrown away.
-/// An `Rc<Node>` bump costs neither: the node is already decoded and already
-/// shared with [`super::cache::PageCache`], and holding it only keeps a page
-/// that the cache would very likely have kept anyway. At most two internal
-/// nodes are retained at a time, no matter how deep the tree is.
-struct BoundSource {
-    /// The internal node whose cells carry the separator.
-    node: Rc<Node>,
-    /// Which of its cells. Checked in range by [`BoundSource::new`], so the
-    /// node being immutable for its lifetime keeps it in range forever.
-    idx: usize,
-}
-
-impl BoundSource {
-    /// Adopt the separator `source` names, if it names one.
-    ///
-    /// `None` — no bound on this side, or a source that does not resolve to a
-    /// separator — reads as "unbounded", exactly as [`bound_key`]'s `None`
-    /// did. [`CowBTree::get_from`] only ever records a source while looking at
-    /// an `Internal` node's own cells, so the non-separator cases are
-    /// unreachable rather than merely unlikely.
-    fn new(source: Option<(Rc<Node>, usize)>) -> Option<Self> {
-        let (node, idx) = source?;
-        match &*node {
-            Node::Internal { cells, .. } if idx < cells.len() => Some(Self { node, idx }),
-            _ => None,
+    /// Whether `key` is inside the subtree of the node recorded at `level`.
+    fn admits_at(&self, level: usize, key: &[u8]) -> bool {
+        match self.steps.get(level).and_then(Option::as_ref) {
+            Some(step) => self.admits(step.low, step.high, key),
+            None => false,
         }
     }
+}
 
-    /// The separator's key bytes, borrowed straight out of the retained page.
-    fn key(&self) -> Option<&[u8]> {
-        match &*self.node {
-            Node::Internal { cells, .. } => cells
-                .get(self.idx)
-                .map(|cell| cell.key.resolve(self.node.bytes())),
-            Node::Leaf { .. } => None,
+/// Where a point descent begins: the root, or a node of the previous
+/// descent's retained path.
+struct DescentStart {
+    /// Which level of the retained path this resumes at, and so the level the
+    /// descent starts recording at. Zero is the root.
+    level: usize,
+    /// The node to continue at, when the cursor already had it in hand.
+    node: Option<Rc<Node>>,
+    /// The page id to read instead, when `node` is `None`.
+    id: PageId,
+    /// Cumulative lower bound of the subtree the descent resumes in.
+    low: Option<PathBound>,
+    /// Exclusive upper bound, on the same terms.
+    high: Option<PathBound>,
+}
+
+impl DescentStart {
+    /// A full walk from `root`.
+    fn at_root(root: PageId) -> Self {
+        Self {
+            level: 0,
+            node: None,
+            id: root,
+            low: None,
+            high: None,
         }
     }
+}
+
+/// What [`CowBTree::reseek`] could make of the retained cursor.
+enum Reseek {
+    /// The retained leaf covers the key, and this is its answer.
+    Answered(Option<RowBuf>),
+    /// The leaf could not, but a retained node shortens the walk.
+    Resume(DescentStart),
+    /// Nothing retained applies; walk from the root.
+    Miss,
+}
+
+/// Where committed point lookups on one handle started from — the evidence
+/// AHL-551 is judged on, since a path that shortens no descent is a path not
+/// worth keeping. Compiled away outside tests, like the `decodes` counter.
+#[cfg(test)]
+#[derive(Clone, Copy, Default, Debug)]
+struct CursorStats {
+    /// Answered from the retained leaf, with no descent at all.
+    leaf_hits: u64,
+    /// Walked from the root: nothing retained, another root, or a key outside
+    /// every recorded span.
+    root_descents: u64,
+    /// Resumed at level `i` of the retained path. Level 0 is the root node
+    /// itself and saves only a page-cache lookup; levels `>= 1` are the ones
+    /// that skip real work.
+    resumes: [u64; CURSOR_PATH_MAX],
 }
 
 /// A committed range leaf that can answer another wholly-contained range.
@@ -5488,16 +5828,18 @@ struct RangeSpanSources {
     high: Option<(Rc<Node>, usize)>,
 }
 
-/// Clone the separator key `source` names, if any. The one place
-/// [`CowBTree::retain_cursor`] actually pays for a key byte copy.
+/// Clone the separator key `source` names, if any. The range and raw-scan
+/// cursors' way of holding a bound — the point cursor stopped copying key
+/// bytes in AHL-527 and holds a [`PathBound`] into its own retained path
+/// instead.
 fn bound_key(source: Option<(Rc<Node>, usize)>) -> Option<Vec<u8>> {
     let (node, idx) = source?;
     match &*node {
         Node::Internal { cells, .. } => cells
             .get(idx)
             .map(|cell| cell.key.resolve(node.bytes()).to_vec()),
-        // Unreachable: `get_from` only ever records a source while looking at
-        // an `Internal` node's own cells.
+        // Unreachable: a walk only ever records a source while looking at an
+        // `Internal` node's own cells.
         Node::Leaf { .. } => None,
     }
 }
@@ -8072,11 +8414,85 @@ mod tests {
         // Misses interleaved with hits: whatever leaf the cursor last landed
         // on, a key strictly between two present ones that is itself absent
         // must still answer `None`, not the neighbour's value.
+        db.reset_cursor_stats();
         for i in 0..n {
             let key = format!("key-{i:05}-missing").into_bytes();
             assert_eq!(db.get(&key).unwrap(), None, "key {i} should be absent");
             expect(&db, i);
         }
+        // Every one of those lookups took exactly one of the three routes —
+        // the retained leaf, a retained ancestor, or the root — so the
+        // agreement above is agreement across all of them, not across one
+        // route that happened to answer everything.
+        let stats = db.cursor_stats();
+        assert_eq!(
+            stats.leaf_hits + stats.root_descents + stats.resumes.iter().sum::<u64>(),
+            u64::from(n) * 2,
+            "every lookup is accounted for exactly once"
+        );
+    }
+
+    /// AHL-551: a sweep of keys that walks off the end of one leaf and onto
+    /// the next must resume its descent from a retained *ancestor*, not from
+    /// the root — the whole point of retaining the path rather than only the
+    /// leaf.
+    ///
+    /// This asserts on where the descents started, because nothing in the
+    /// answers can tell a resumed descent from a full one: the parity test
+    /// above passes either way. Disabling `PointCursor::deepest_admitting`
+    /// (returning `None`) turns every one of these into a `root_descents`,
+    /// which is what makes the two assertions below a real measurement rather
+    /// than a restatement.
+    #[test]
+    fn a_neighbouring_leaf_probe_descends_from_an_ancestor_not_the_root() {
+        let mut db = CowBTree::create(disk(), PAGE).unwrap();
+        // At this page size a leaf holds a handful of these keys, so 5,000 of
+        // them is hundreds of leaves under several internal levels — a tree
+        // where the difference between "from the root" and "from the parent"
+        // is more than one page read.
+        let n = 5_000u32;
+        for i in 0..n {
+            db.put(&format!("key-{i:05}").into_bytes(), &i.to_le_bytes())
+                .unwrap();
+            if i % 64 == 63 {
+                db.commit().unwrap();
+            }
+        }
+        db.commit().unwrap();
+
+        // Warm the cursor first, so the sweep measures the steady state and
+        // not the one lookup that has nothing retained to start from.
+        db.get(b"key-00000").unwrap();
+        db.reset_cursor_stats();
+        for i in 0..n {
+            let key = format!("key-{i:05}").into_bytes();
+            assert_eq!(
+                db.get(&key).unwrap(),
+                Some(RowBuf::Owned(i.to_le_bytes().to_vec())),
+                "key {i}"
+            );
+        }
+
+        let stats = db.cursor_stats();
+        let from_root_node = stats.resumes[0];
+        let from_ancestor: u64 = stats.resumes[1..].iter().sum();
+        assert_eq!(
+            stats.leaf_hits + stats.root_descents + from_root_node + from_ancestor,
+            u64::from(n),
+            "every lookup is accounted for exactly once"
+        );
+        assert_eq!(
+            stats.root_descents, 0,
+            "nothing invalidates the path here, so no lookup should walk from              scratch: {stats:?}"
+        );
+        assert!(
+            from_ancestor >= 20,
+            "an ascending sweep crosses hundreds of leaf boundaries and each              crossing should resume below the root: {stats:?}"
+        );
+        assert!(
+            from_ancestor > from_root_node * 8,
+            "only a crossing between two of the root's own children should              restart at the root node: {stats:?}"
+        );
     }
 
     /// A single retained cursor slot, thrashed between two different
@@ -8107,6 +8523,7 @@ mod tests {
         let new_root = db.root();
         assert_ne!(old_root, new_root, "an update must allocate a fresh root");
 
+        db.reset_cursor_stats();
         for i in 0..n {
             let key = format!("key-{i:05}").into_bytes();
             assert_eq!(
@@ -8120,6 +8537,20 @@ mod tests {
                 "key {i} under the new root"
             );
         }
+
+        // AHL-551: the guard is on the whole retained path, not only on its
+        // leaf. Alternating roots means every lookup finds a path retained
+        // under the *other* root, so none of them may reseek or resume at any
+        // level — each is a walk from the root, and the counter is what says
+        // so.
+        let stats = db.cursor_stats();
+        assert_eq!(
+            stats.root_descents,
+            u64::from(n) * 2,
+            "every lookup under an alternating root must walk from scratch:              {stats:?}"
+        );
+        assert_eq!(stats.leaf_hits, 0, "{stats:?}");
+        assert_eq!(stats.resumes.iter().sum::<u64>(), 0, "{stats:?}");
     }
 
     #[test]
