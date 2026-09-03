@@ -869,6 +869,146 @@ fn scalar_min_max_agrees_with_sqlite() {
     }
 }
 
+// ----------------------------------------------------- COUNT(*) (AHL-548)
+//
+// The leaf-cell-count `COUNT(*)` has to be exact under an open transaction:
+// the same statement list is run against both engines and the published
+// scalar shape is asked after every step — pending deletes, a pending
+// insert, an overwrite that must not move the count, a rollback that must
+// restore it, a commit that must keep it, and a table emptied outright.
+
+const COUNT_STAR_QUERY: &str = "SELECT COUNT(*), MIN(id), MAX(id) FROM t";
+
+const COUNT_STAR_STEPS: [&str; 11] = [
+    "BEGIN",
+    "DELETE FROM t WHERE v IS NULL",
+    "INSERT INTO t (id, g, v) VALUES (100000, 0, 1)",
+    "UPDATE t SET v = 7 WHERE g = 1",
+    "ROLLBACK",
+    "BEGIN",
+    "DELETE FROM t WHERE g = 2",
+    "INSERT INTO t (id, g, v) VALUES (100001, 0, 1)",
+    "COMMIT",
+    "DELETE FROM t WHERE g <> 3",
+    "DELETE FROM t",
+];
+
+/// `file` picks the on-disk tree backend, where `COUNT(*)` is the leaf-count
+/// walk over pending and committed pages; in memory it is the `Storage`
+/// trait's default scan. Both have to agree with sqlite3.
+fn inlaysql_count_star_steps(
+    groups: &[(i64, Option<i64>)],
+    file: bool,
+) -> Result<Vec<Vec<Vec<String>>>, inlaysql::Error> {
+    let path = std::env::temp_dir().join(format!(
+        "inlaysql-differential-count-star-{}-{}.inlay",
+        std::process::id(),
+        groups.len()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let mut db = if file {
+        Database::open(&path)?
+    } else {
+        Database::open_in_memory()?
+    };
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        &[],
+    )?;
+    for (index, (group, value)) in groups.iter().enumerate() {
+        db.execute(
+            "INSERT INTO t (id, g, v) VALUES (?, ?, ?)",
+            &[
+                Value::Integer(index as i64 + 1),
+                Value::Integer(*group),
+                value.map(Value::Integer).unwrap_or(Value::Null),
+            ],
+        )?;
+    }
+    let mut answers = Vec::with_capacity(COUNT_STAR_STEPS.len() + 1);
+    let ask = |db: &mut Database| -> Result<Vec<Vec<String>>, inlaysql::Error> {
+        Ok(db
+            .query(COUNT_STAR_QUERY, &[])?
+            .rows
+            .iter()
+            .map(|row| row.iter().map(canonical_inlaysql).collect())
+            .collect())
+    };
+    answers.push(ask(&mut db)?);
+    for step in COUNT_STAR_STEPS {
+        db.execute(step, &[])?;
+        answers.push(ask(&mut db)?);
+    }
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+    Ok(answers)
+}
+
+fn sqlite_count_star_steps(
+    groups: &[(i64, Option<i64>)],
+) -> rusqlite::Result<Vec<Vec<Vec<String>>>> {
+    let conn = rusqlite::Connection::open_in_memory()?;
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        [],
+    )?;
+    for (index, (group, value)) in groups.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO t (id, g, v) VALUES (?1, ?2, ?3)",
+            rusqlite::params![index as i64 + 1, group, value],
+        )?;
+    }
+    let ask = |conn: &rusqlite::Connection| -> rusqlite::Result<Vec<Vec<String>>> {
+        let mut statement = conn.prepare(COUNT_STAR_QUERY)?;
+        let columns = statement.column_count();
+        let mut rows = statement.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let mut values = Vec::with_capacity(columns);
+            for index in 0..columns {
+                values.push(canonical_sqlite(row.get_ref(index)?));
+            }
+            out.push(values);
+        }
+        Ok(out)
+    };
+    let mut answers = Vec::with_capacity(COUNT_STAR_STEPS.len() + 1);
+    answers.push(ask(&conn)?);
+    for step in COUNT_STAR_STEPS {
+        conn.execute(step, [])?;
+        answers.push(ask(&conn)?);
+    }
+    Ok(answers)
+}
+
+#[test]
+fn count_star_agrees_with_sqlite_through_a_transaction() {
+    for (seed, empty) in (0..rounds()).map(|seed| (seed, false)).chain([(0, true)]) {
+        let mut rng = SeededRng::new(seed);
+        let groups = if empty {
+            Vec::new()
+        } else {
+            generate_groups(&mut rng)
+        };
+        let theirs = sqlite_count_star_steps(&groups).expect("SQLite is the oracle");
+        for file in [false, true] {
+            let ours =
+                inlaysql_count_star_steps(&groups, file).expect("InlaySQL COUNT(*) must answer");
+            assert_eq!(ours.len(), theirs.len());
+            for (step, (ours, theirs)) in ours.iter().zip(&theirs).enumerate() {
+                let after = step
+                    .checked_sub(1)
+                    .map_or("(nothing)", |index| COUNT_STAR_STEPS[index]);
+                assert_eq!(
+                    ours, theirs,
+                    "seed {seed} (empty={empty}, file={file}): COUNT(*) disagreed after \
+                     `{after}`\ngroups: {groups:?}"
+                );
+            }
+        }
+    }
+}
+
 // --------------------------------------------------------- window functions
 //
 // AHL-494. Reuses `generate_groups`'s `(group, value)` rows and `t`'s exact

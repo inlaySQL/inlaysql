@@ -188,6 +188,37 @@ pub trait Storage {
         Ok(last)
     }
 
+    /// How many rows `table` holds, including the open transaction's own
+    /// writes — the answer to `COUNT(*)` with nothing else in the statement,
+    /// and exactly the number of rows [`Storage::scan_batch`] would hand out
+    /// end to end.
+    ///
+    /// **The default scans**: it drives [`Storage::scan_batch_with`] to the
+    /// end of the table and counts what it was given, which is correct for
+    /// any backend and no faster than the aggregate path it stands in for.
+    /// A backend that can count without visiting every row overrides it —
+    /// [`crate::storage::TreeStorage`] sums each leaf's cell count off the
+    /// page header (`CowBTree::count_in_prefix`, AHL-548) and decodes no
+    /// row. Never answered from `ANALYZE`'s statistics: those are a
+    /// snapshot, and a stale one here would be the silent wrong answer
+    /// `AGENTS.md` refuses. A wrapper that forwards everything else must
+    /// forward this by name too, or the default runs against the wrapper's
+    /// own `scan_batch_with` and the backend's override is never reached —
+    /// the trap [`Storage::scan_index_row_ids`]'s doc names.
+    fn count_rows(&self, table: &str) -> Result<u64> {
+        const BATCH: usize = 4096;
+        let mut total = 0u64;
+        let mut after = None;
+        loop {
+            let (seen, last) = self.scan_batch_with(table, after, BATCH, &mut |_, _| Ok(()))?;
+            total += seen as u64;
+            match last {
+                Some(id) if seen == BATCH => after = Some(id),
+                _ => return Ok(total),
+            }
+        }
+    }
+
     /// Write (or overwrite) a `WITHOUT ROWID` table's row, addressed by its
     /// primary key's encoded bytes rather than a [`RowId`] — there is no
     /// row id on such a table at all.

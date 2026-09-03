@@ -144,6 +144,16 @@ impl Storage for TempTableRouter {
         }
     }
 
+    // Routed like `first_in_table`, for the same reason: the durable side's
+    // leaf-count override is only reached by calling it by name.
+    fn count_rows(&self, table: &str) -> Result<u64> {
+        if self.is_temp(table) {
+            self.temp.count_rows(table)
+        } else {
+            self.durable.count_rows(table)
+        }
+    }
+
     // A `WITHOUT ROWID` temporary table is a real combination — nothing about
     // the two features conflicts — so the keyed methods route exactly like
     // the row-id ones above, by the same table name and the same flag.
@@ -290,6 +300,56 @@ mod tests {
 
     fn router() -> TempTableRouter {
         TempTableRouter::new(Box::new(MemStorage::new()))
+    }
+
+    /// A durable backend whose [`Storage::count_rows`] override is
+    /// distinguishable from the trait's default: it holds no rows, so the
+    /// default would count zero, and it answers a sentinel instead.
+    struct CountsFortyTwo;
+
+    impl Storage for CountsFortyTwo {
+        fn put_row(&mut self, _: &str, _: RowId, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn get_row(&self, _: &str, _: RowId) -> Result<Option<RowBuf>> {
+            Ok(None)
+        }
+        fn delete_row(&mut self, _: &str, _: RowId) -> Result<()> {
+            Ok(())
+        }
+        fn scan_batch(&self, _: &str, _: Option<RowId>, _: usize) -> Result<Vec<(RowId, RowBuf)>> {
+            Ok(Vec::new())
+        }
+        fn count_rows(&self, _: &str) -> Result<u64> {
+            Ok(42)
+        }
+        fn put_meta(&mut self, _: &str, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn get_meta(&self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn commit(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn rollback(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A durable table's count reaches the durable backend's own override;
+    /// a temporary table's is counted on the in-memory side, where its rows
+    /// actually are.
+    #[test]
+    fn count_rows_is_routed_to_the_side_that_holds_the_table() {
+        let mut router = TempTableRouter::new(Box::new(CountsFortyTwo));
+        assert_eq!(router.count_rows("durable_t").unwrap(), 42);
+        router.set_temp_table("temp_t", true);
+        router.put_row("temp_t", 1, b"temp").unwrap();
+        router.put_row("temp_t", 2, b"temp").unwrap();
+        assert_eq!(router.count_rows("temp_t").unwrap(), 2);
+        router.delete_row("temp_t", 1).unwrap();
+        assert_eq!(router.count_rows("temp_t").unwrap(), 1);
     }
 
     #[test]

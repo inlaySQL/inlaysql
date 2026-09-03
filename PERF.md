@@ -4618,6 +4618,168 @@ sweep asserts no member's rows ever reach the file without that member having
 been told it committed. Slice 3 needs all of it and none of it has to be
 rebuilt.
 
+### `COUNT(*)` answers from the leaves' cell counts, not from the rows (AHL-548, 2026-09-03)
+
+**Shape.** The published loss AHL-546 left standing: `SELECT COUNT(*),
+MIN(id), MAX(id) FROM users` over 100k rows, InlaySQL 225/s against MySQL 8.4
+300/s and PostgreSQL 17 362/s (`bin/profile --suite aggregate-scalar`,
+`MODE=agg sql_shapes`'s `agg_scalar`). AHL-546 answered the `MIN`/`MAX` pair
+in one descent each and measured the pair alone at ~1.2M/s — but `COUNT(*)`
+still forced the full scan-and-decode, and once one aggregate scans they all
+fold per row, so the published statement did not move (188 → 183/s, "flat,
+as predicted").
+
+**What a count actually needs.** Nothing in a row. A leaf's header carries
+its `cell_count`, which is the length of its slot directory
+(`btree/page.rs`; `docs/research/leaf-offset-table.md` documents the layout),
+and every cell of a table leaf is exactly one row — so a `COUNT(*)` with no
+`WHERE` over a stored rowid table is the sum of one `u16` per leaf, plus a
+key-by-key count on the two leaves that straddle the table's key range (a
+tree holds every table under one key space, so the first and last leaves
+of a table can share a page with a neighbour's rows). The leaf-count walk
+was suggested by AHL-546's audit as "a smaller constant on the same scan";
+it is a much smaller constant than that framing implied, because the
+per-row cost was never the scan — it was the fold.
+
+**Built.** `CowBTree::count_in_range`/`count_in_prefix` (`btree/tree.rs`,
+read-only): `walk`'s bounds, `walk`'s pruning over internal nodes, and a
+leaf branch that never decodes. A committed leaf is borrowed from the
+device's own buffer where it holds one (`shared_page`, AHL-536) or read
+through the read-ahead window otherwise; `WalkBounds::admits_whole_leaf`
+(AHL-528b's two-edge-key test) decides from its first and last key whether
+the whole leaf is inside the range, in which case `page::leaf_cell_count`
+(new, the header check `scan_leaf_cells` already makes, returning the count
+it already computes) is the answer; only an edge leaf is walked cell by cell,
+comparing keys and never touching a value. Under an open transaction the
+walk starts from the pending root and answers a dirtied page from the
+transaction's own copy first — a `DirtyPage::Decoded` leaf (AHL-542) knows
+its count as `entries.len()` with no encode-then-parse round trip — so
+inserts, deletes and overwrites in the open transaction are counted exactly
+as `scan_prefix` would return them, which the tree's own tests pin
+(`count_in_range_sees_the_open_transaction`: 200 committed, 300 pending
+inserts across leaf splits, 60 pending deletes, 50 overwrites, a rollback,
+a commit, a reopen, and a delete-everything, each compared to the scan).
+`a_count_decodes_internal_nodes_only` holds the count's page decodes under
+half the decoded scan's on a fresh handle — at this page size leaves are
+over ninety percent of the pages, so a count that decoded leaves could not
+pass it.
+
+Above the tree: `Storage::count_rows`, a new trait method whose default
+drives `scan_batch_with` to the end of the table and counts — correct for
+`MemStorage` and any test double, no faster than before — with
+`TreeStorage` overriding it as `count_in_prefix`, and `SharedStorage` and
+`TempTableRouter` forwarding it *by name*, the same trap AHL-546 walked into:
+a trait default runs against the wrapper's own `scan_batch_with` and the
+backend's override underneath is never reached. Two mock-backend tests
+(`count_rows_reaches_the_backend_s_override`,
+`count_rows_is_routed_to_the_side_that_holds_the_table`) make the forward an
+assertion rather than a convention.
+
+Above that: AHL-546's `min_max_scalar_shape`/`try_min_max_scalar` are now
+`scalar_aggregate_shape`/`try_scalar_aggregate`, and admit a plain,
+non-`DISTINCT`, `FILTER`-less `COUNT(*)` — `arg == None`, the star form
+exactly — alongside the `MIN`/`MAX` of a bare column they already admitted.
+Every other gate is unchanged: no `WHERE`/`GROUP BY`/`HAVING`/`DISTINCT`/
+join/window/score, one stored rowid table, no projected raw column.
+`COUNT(column)` is deliberately not `COUNT(*)`: it skips `NULL`s, which a
+leaf count cannot see, and it stays on the general path (pinned in the
+`EXPLAIN` tests and the sqllogictest). The rewrite is all-or-nothing: every
+access path is decided from the catalog before storage is read, so
+`COUNT(*), MIN(unindexed)` falls back whole rather than counting first and
+scanning anyway, and `EXPLAIN` — through the same two functions — reports
+`SCAN t USING LEAF CELL COUNTS (COUNT(*) OPTIMIZATION)` next to the two
+`SEARCH ... (MIN/MAX OPTIMIZATION)` lines, or a plain `SCAN t` when any one
+of them cannot fire. `WITHOUT ROWID` stays excluded: `COUNT(*)` on one would
+be the same walk under the same prefix, but through the keyed `Storage`
+path, which this change does not touch or prove.
+
+**Measured**, interleaved A/B against `48f4bad` (`main`, the commit this
+branch starts from), 3 reps, control re-run each rep, `--seconds 12`, both
+binaries built from the same harness on a machine at load 4-6 (one other
+agent building; the ratios, not the absolutes, are the evidence):
+
+| Shape | Base | New | |
+| --- | --- | --- | --- |
+| `aggregate-scalar --rows 100000` — the published shape | 209 / 209 / 194 ops/s | 2,013 / 2,070 / 1,978 ops/s | **9.6-10.2x, 3/3 non-overlapping** |
+| `aggregate --rows 100000` (the scalar and `GROUP BY` shapes, one cycle) | 203 / 191 / 199 | 358 / 358 / 356 | **1.76-1.87x, 3/3**; the `GROUP BY` half is untouched and now dominates |
+| `MODE=agg REPS=5 sql_shapes` `agg_scalar` | 206-214 / 205-218 per rep | 2,303-2,380 / 2,247-2,355 | **~11x**, two runs each side |
+| `sql_shapes` `agg_group` | 190-207 | 185-207 | flat |
+| `sql_shapes` `agg_minmax_only` | 1.17M (one cold rep at 0.77M) | 1.15M (one at 1.07M) | flat |
+| `points` | 2,858,360 / 3,049,252 / 3,019,184 | 2,690,629 / 3,022,011 / 2,886,799 | flat; -6/-1/-4%, inside §4's floor, and no code on the point path changed |
+| `joins-limit` | 152,774 / 166,638 / 154,281 | 158,811 / 162,757 / 167,788 | flat |
+| `batch-insert` | 24,480 / 24,554 / 24,646 | 24,881 / 24,794 / 24,423 | flat |
+| `writes` | 270 / 263 / 278 | 255 / 263 / 276 | flat |
+
+The `points`, `joins-limit`, `batch-insert` and `writes` rows come from the
+first A/B pass of the same day; the second pass (the aggregate rows and
+`sql_shapes` above) re-measured only the two suites the change between the
+passes could touch, because nothing on those four paths calls
+`count_rows` at all. **The published statement now answers at ~2,000-2,300/s
+against MySQL's 300/s and PostgreSQL's 362/s** — from a 1.3-1.6x loss to a
+6-7x win on the same machine class, without a row count being kept anywhere.
+
+**The one thing the profile moved.** The first cut asked the raw-leaf cache
+(`cached_raw_leaf`, the 64-entry list the `LIMIT`-join work added) before the device, the order
+`walk_raw_row_values` asks in. `sample` + the call-graph attribution script over the
+new binary: `pread` 51% (the read-ahead window's 16-page reads for the
+leaves the device's cache does not hold — the same reads the row scan
+makes, now the largest thing left), **`RawLeafCache::get` 19.3%**, `memcmp`
+6.6% (the two edge-key comparisons per leaf), `PageCache::get` 3.7%,
+`walk_count` itself 2.4%. The raw-leaf cache is a linear search over up to
+64 leaves the *row* scan read, and on a sweep of 3,730 leaves its hit rate
+is near zero; with the count's whole per-leaf cost down to a hash lookup and
+a header read, that search was a fifth of the query. The count walk no
+longer asks it — a leaf it would have found is read through the read-ahead
+window instead — and that is the difference between the two passes above:
+1,559-1,681/s before, 1,978-2,070/s after, on the same base.
+
+**Not built: the exact live row count (the brief's item 2).** The brief's own
+condition for it was "only if item 1 leaves the shape still losing", and
+item 1 does not — the shape wins by 6x. Two things were verified before
+stopping that are worth writing down for whoever revisits it. First, the
+metadata merge rule the brief pointed at (`mergeable_metadata_key` /
+`merge_monotonic_metadata` in `btree/tree.rs`, the rule `rebase_pending`
+applies to `NEXT_ROW_ID_META`, `WRITE_VERSION_META` and the CDC floor) is a
+**max-merge** — `merge_max_counter` keeps the larger of the pending and the
+committed value — which is exactly right for a monotonic allocator and
+exactly wrong for a row count: two writers inserting 5 and 3 rows onto a
+base of 100 must commit 108, and a max-merge commits 105 with no error. A
+live count would need a *delta* rule (`committed + (pending - the value at
+this transaction's own base root)`), a new merge kind with its own
+absorption-overlay story (`absorb_decisions` keeps mergeable keys out of the
+overlay precisely because the existing rule rewrites them at rebase), and
+its own DST coverage. Second, its write-path cost is not free: every
+`INSERT`/`DELETE` transaction would dirty the metadata key's own root-to-leaf
+path in addition to the row's, which on the one-row-per-commit `writes`
+suite is a second path of pages in every commit record. Neither is a reason
+it cannot be built; both are reasons not to build it to win a shape that has
+already been won, and the leaf walk above is the honest floor it would fall
+back to in any case (an older file, a schema change, a `VACUUM`-like path).
+
+**Gates.** `cargo fmt --all -- --check`, `cargo clippy --release --workspace
+--all-targets -- -D warnings`, `RUSTDOCFLAGS="-D warnings" cargo doc
+--workspace --no-deps --document-private-items`, `cargo test --release
+--workspace`, `cargo check -p inlaysql-wasm --target wasm32-unknown-unknown`,
+`cargo run -p inlaysql --bin sqllogictest -- crates/inlaysql/tests/sqllogictest/*.test`
+(the new `COUNT(*)` section of `aggregate.test`: empty table, inside a
+transaction with inserts, deletes and an overwrite, after a rollback, a
+delete-everything then insert then commit, `WHERE` fallback, `COUNT(col)`
+untouched, `WITHOUT ROWID` fallback, a temporary table — and the same file
+runs against the file-backed tree through `tests/backends.rs`, which is
+where the leaf walk itself is exercised at the SQL level), the
+`differential.rs` suite with the new
+`count_star_agrees_with_sqlite_through_a_transaction` (eleven statements —
+`BEGIN`, pending deletes, a pending insert, an overwrite, `ROLLBACK`, a
+second transaction committed, then the table emptied — asked after every
+one, on the in-memory backend *and* on the on-disk tree, against sqlite3),
+the `EXPLAIN` tests (the composed shape reports all three shortcuts and no
+row scan; twelve fallback shapes each report none), and the tree/`Storage`
+unit tests named above. DST sweeps not re-run, on the same judgement
+AHL-546 recorded: this change is read-only end to end — a new traversal
+over pages the raw scan already reads, plus a header accessor that is the
+check `scan_leaf_cells` already makes — and edits no write path, WAL record
+or on-disk format.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness

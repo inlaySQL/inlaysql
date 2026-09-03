@@ -87,13 +87,13 @@ fn run_agg(dir: &Path, reps: usize, queries: usize) -> Result<(), Box<dyn std::e
             1usize,
         ),
         // AHL-546: `agg_scalar` above keeps `COUNT(*)` because that is the
-        // exact statement `BENCHMARK.md` publishes against MySQL/PostgreSQL
-        // — but this engine keeps no transactionally exact row count, so
-        // `COUNT(*)` still scans and the `MIN`/`MAX` optimisation cannot fire
-        // for the whole statement (`Engine::try_min_max_scalar`'s doc). This
-        // shape isolates what the rewrite alone is worth: the same table,
-        // the same two aggregates, with the one function that forces a scan
-        // removed.
+        // exact statement `BENCHMARK.md` publishes against MySQL/PostgreSQL.
+        // When this shape was added, `COUNT(*)` still forced a scan and the
+        // `MIN`/`MAX` optimisation could not fire for the whole statement;
+        // since AHL-548 `COUNT(*)` answers from the leaves' cell counts
+        // (`Engine::try_scalar_aggregate`'s doc), and the two shapes differ
+        // by exactly that leaf walk. Kept so the walk's own cost stays
+        // visible next to the descents'.
         (
             "agg_minmax_only",
             "SELECT MIN(id), MAX(id) FROM users",

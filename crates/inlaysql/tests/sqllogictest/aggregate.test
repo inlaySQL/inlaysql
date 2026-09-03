@@ -281,3 +281,148 @@ query T nosort
 SELECT MIN(s) FROM nc
 ----
 ada
+
+# ------------------------------------------- COUNT(*) optimisation (AHL-548)
+#
+# A bare COUNT(*) over a rowid table with nothing else in the statement is
+# answered from the tree's leaf cell counts, composing with the MIN/MAX
+# rewrite above so the published `COUNT(*), MIN(id), MAX(id)` shape decodes
+# no row. Invisible to SQL, so these pin the answers the general path gives:
+# the empty table, an open transaction with inserts, deletes and overwrites,
+# a rollback, and every shape that must fall back (WHERE, COUNT(column),
+# WITHOUT ROWID, a temporary table).
+
+statement ok
+CREATE TABLE cs(id INTEGER PRIMARY KEY, n INTEGER)
+
+query I nosort
+SELECT COUNT(*) FROM cs
+----
+0
+
+query III nosort
+SELECT COUNT(*), MIN(id), MAX(id) FROM cs
+----
+0 NULL NULL
+
+statement ok
+INSERT INTO cs VALUES (1, 10), (2, NULL), (3, 30), (4, NULL), (5, 50)
+
+query I nosort
+SELECT COUNT(*) FROM cs
+----
+5
+
+query III nosort
+SELECT COUNT(*), MIN(id), MAX(id) FROM cs
+----
+5 1 5
+
+query II nosort
+SELECT COUNT(*) + 1, COUNT(*) * 2 FROM cs
+----
+6 10
+
+# COUNT(column) skips NULLs and is untouched by the rewrite.
+
+query I nosort
+SELECT COUNT(n) FROM cs
+----
+3
+
+query II nosort
+SELECT COUNT(*), COUNT(n) FROM cs
+----
+5 3
+
+# WHERE falls back to the general path.
+
+query I nosort
+SELECT COUNT(*) FROM cs WHERE n IS NOT NULL
+----
+3
+
+# Inside a transaction: inserts add, deletes subtract, an overwrite is not
+# a row, and the count is exact before anything is committed.
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO cs VALUES (6, 60), (7, 70), (8, 80)
+
+query III nosort
+SELECT COUNT(*), MIN(id), MAX(id) FROM cs
+----
+8 1 8
+
+statement ok
+DELETE FROM cs WHERE id IN (1, 7)
+
+query III nosort
+SELECT COUNT(*), MIN(id), MAX(id) FROM cs
+----
+6 2 8
+
+statement ok
+UPDATE cs SET n = 0 WHERE id = 3
+
+query I nosort
+SELECT COUNT(*) FROM cs
+----
+6
+
+statement ok
+ROLLBACK
+
+query III nosort
+SELECT COUNT(*), MIN(id), MAX(id) FROM cs
+----
+5 1 5
+
+statement ok
+BEGIN
+
+statement ok
+DELETE FROM cs
+
+query III nosort
+SELECT COUNT(*), MIN(id), MAX(id) FROM cs
+----
+0 NULL NULL
+
+statement ok
+INSERT INTO cs VALUES (9, 90)
+
+query I nosort
+SELECT COUNT(*) FROM cs
+----
+1
+
+statement ok
+COMMIT
+
+query III nosort
+SELECT COUNT(*), MIN(id), MAX(id) FROM cs
+----
+1 9 9
+
+# WITHOUT ROWID: excluded from the rewrite, answered by the general path.
+
+query I nosort
+SELECT COUNT(*) FROM wr
+----
+3
+
+# A temporary table lives on the in-memory side and is counted there.
+
+statement ok
+CREATE TEMPORARY TABLE cs_tmp(id INTEGER PRIMARY KEY)
+
+statement ok
+INSERT INTO cs_tmp VALUES (1), (2)
+
+query I nosort
+SELECT COUNT(*) FROM cs_tmp
+----
+2

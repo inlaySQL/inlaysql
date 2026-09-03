@@ -910,24 +910,105 @@ fn min_max_of_an_indexed_column_names_the_index_and_falls_back_without_one() {
     assert_says(&bare_plan, "SCAN t");
 }
 
-/// `COUNT(*)` forces a scan even alongside `MIN`/`MAX`, because this engine
-/// keeps no transactionally exact row count — see
-/// `Engine::try_min_max_scalar`'s doc.
+/// The published shape: `COUNT(*)` alongside `MIN`/`MAX` reports the leaf
+/// count and both descents, and never a row scan (AHL-548 composing with
+/// AHL-546) — see `Engine::try_scalar_aggregate`'s doc.
 #[test]
-fn count_star_alongside_min_max_still_scans() {
+fn count_star_alongside_min_max_reports_both_optimisations() {
     let mut engine = engine();
     run(&mut engine, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
     let plan = plan(
         &mut engine,
         "EXPLAIN SELECT COUNT(*), MIN(id), MAX(id) FROM t",
     );
-    assert_never_says(&plan, "MIN/MAX OPTIMIZATION");
-    assert_says(&plan, "SCAN t");
+    assert_says(&plan, "COUNT(*) OPTIMIZATION");
+    assert_says(&plan, "MIN/MAX OPTIMIZATION");
+    assert_says(&plan, "SCAN t USING LEAF CELL COUNTS");
+    assert!(
+        !plan.iter().any(|line| line.trim() == "SCAN t"),
+        "a row scan alongside the shortcuts: {plan:#?}"
+    );
+    assert_eq!(
+        plan.iter()
+            .filter(|line| line.contains("MIN/MAX OPTIMIZATION"))
+            .count(),
+        2,
+        "one descent per MIN/MAX, got {plan:#?}"
+    );
+}
+
+/// A bare `COUNT(*)` on its own reports the leaf count; a `COUNT(*)` that
+/// an un-indexed `MIN` would drag back to the general path falls back
+/// whole — the rewrite is all-or-nothing, never a count plus a scan.
+#[test]
+fn count_star_alone_reports_the_leaf_count_and_falls_back_whole() {
+    let mut engine = engine();
+    run(
+        &mut engine,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, bare INTEGER)",
+    );
+    let alone = plan(&mut engine, "EXPLAIN SELECT COUNT(*) FROM t");
+    assert_says(&alone, "COUNT(*) OPTIMIZATION");
+
+    let expression = plan(
+        &mut engine,
+        "EXPLAIN SELECT COUNT(*) + 1, 2 * COUNT(*) FROM t",
+    );
+    assert_says(&expression, "COUNT(*) OPTIMIZATION");
+
+    let mixed = plan(&mut engine, "EXPLAIN SELECT COUNT(*), MIN(bare) FROM t");
+    assert_never_says(&mixed, "COUNT(*) OPTIMIZATION");
+    assert_never_says(&mixed, "MIN/MAX OPTIMIZATION");
+    assert_says(&mixed, "SCAN t");
+}
+
+/// Every shape a leaf count cannot answer stays on the general path, one
+/// mutation each: `COUNT(column)` skips `NULL`s, `COUNT(DISTINCT ...)`
+/// folds, `FILTER` and `WHERE` narrow, `GROUP BY`/`HAVING` group, a join
+/// widens, a raw projected column needs a row, a derived table is not a
+/// tree, and a `WITHOUT ROWID` table is a different `Storage` path.
+#[test]
+fn count_star_falls_back_for_every_shape_the_leaf_count_cannot_answer() {
+    let mut engine = engine();
+    run(
+        &mut engine,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
+    );
+    run(
+        &mut engine,
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, t_id INTEGER)",
+    );
+    run(
+        &mut engine,
+        "CREATE TABLE wr (k INTEGER, v INTEGER, PRIMARY KEY (k)) WITHOUT ROWID",
+    );
+
+    for sql in [
+        "EXPLAIN SELECT COUNT(n) FROM t",
+        "EXPLAIN SELECT COUNT(id) FROM t",
+        "EXPLAIN SELECT COUNT(DISTINCT n) FROM t",
+        "EXPLAIN SELECT COUNT(*) FILTER (WHERE n > 0) FROM t",
+        "EXPLAIN SELECT COUNT(*) FROM t WHERE n > 0",
+        "EXPLAIN SELECT n, COUNT(*) FROM t GROUP BY n",
+        "EXPLAIN SELECT COUNT(*) FROM t HAVING COUNT(*) > 0",
+        "EXPLAIN SELECT DISTINCT COUNT(*) FROM t",
+        "EXPLAIN SELECT COUNT(*) FROM t JOIN u ON u.t_id = t.id",
+        "EXPLAIN SELECT n, COUNT(*) FROM t",
+        "EXPLAIN SELECT COUNT(*) FROM (SELECT * FROM t)",
+        "EXPLAIN SELECT COUNT(*) FROM wr",
+    ] {
+        let plan = plan(&mut engine, sql);
+        assert_never_says(&plan, "COUNT(*) OPTIMIZATION");
+        assert!(
+            plan.iter().any(|line| line.contains("SCAN")),
+            "{sql} should describe a scan, got {plan:#?}"
+        );
+    }
 }
 
 /// Every one of `WHERE`, `GROUP BY`, `DISTINCT` and a join sends the
 /// statement to the general path, mutation by mutation: dropping any one of
-/// `try_min_max_scalar`'s conditions has to fail one of these.
+/// `try_scalar_aggregate`'s conditions has to fail one of these.
 #[test]
 fn where_group_by_distinct_and_a_join_all_fall_back_to_the_general_path() {
     let mut engine = engine();
@@ -967,7 +1048,7 @@ fn a_raw_column_in_the_projection_falls_back() {
 
 /// `HAVING`, `COUNT(DISTINCT ...)`, `FILTER`, a non-column argument and a
 /// derived `FROM` each have to fall back too — the remaining conditions
-/// `min_max_scalar_shape` checks beyond the ones already covered above.
+/// `scalar_aggregate_shape` checks beyond the ones already covered above.
 #[test]
 fn having_distinct_filter_expression_and_a_derived_table_all_fall_back() {
     let mut engine = engine();

@@ -130,6 +130,13 @@ impl Storage for SharedStorage {
         self.inner.borrow().last_in_table(table)
     }
 
+    /// Forwarded by name for the same reason `first_in_table` is: the
+    /// default counts through a scan, and the inner backend's leaf-count
+    /// override (`TreeStorage`'s) is unreachable otherwise.
+    fn count_rows(&self, table: &str) -> Result<u64> {
+        self.inner.borrow().count_rows(table)
+    }
+
     fn put_row_keyed(&mut self, table: &str, key: &[u8], bytes: &[u8]) -> Result<()> {
         self.inner.borrow_mut().put_row_keyed(table, key, bytes)
     }
@@ -226,6 +233,50 @@ impl Storage for SharedStorage {
 mod tests {
     use super::*;
     use crate::mem::MemStorage;
+
+    /// A backend whose [`Storage::count_rows`] override is distinguishable
+    /// from the trait's default: it holds no rows, so the default would
+    /// count zero, and it answers a sentinel instead.
+    struct CountsFortyTwo;
+
+    impl Storage for CountsFortyTwo {
+        fn put_row(&mut self, _: &str, _: RowId, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn get_row(&self, _: &str, _: RowId) -> Result<Option<RowBuf>> {
+            Ok(None)
+        }
+        fn delete_row(&mut self, _: &str, _: RowId) -> Result<()> {
+            Ok(())
+        }
+        fn scan_batch(&self, _: &str, _: Option<RowId>, _: usize) -> Result<Vec<(RowId, RowBuf)>> {
+            Ok(Vec::new())
+        }
+        fn count_rows(&self, _: &str) -> Result<u64> {
+            Ok(42)
+        }
+        fn put_meta(&mut self, _: &str, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn get_meta(&self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn commit(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn rollback(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The wrapper reaches the backend's own `count_rows`, not the trait's
+    /// default over the wrapper's `scan_batch_with` — the trap every
+    /// forwarded-by-name method here exists to avoid.
+    #[test]
+    fn count_rows_reaches_the_backend_s_override() {
+        let shared = SharedStorage::new(Box::new(CountsFortyTwo));
+        assert_eq!(shared.count_rows("t").unwrap(), 42);
+    }
 
     #[test]
     fn every_clone_drives_the_same_backend_and_the_same_transaction() {
