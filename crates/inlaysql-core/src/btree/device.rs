@@ -211,10 +211,8 @@ pub struct AbsorbQueue {
     /// Taken by a leader and not yet answered.
     in_flight: Vec<u64>,
     /// Answered, waiting for their own thread to pick the answer up. The
-    /// operations ride along because a `Fallback` has to give them back, and
-    /// the `bool` is whether the answer is complete — see
-    /// [`AbsorbQueue::gate_released`].
-    resolved: BTreeMap<u64, (AbsorbResult, PendingOps, bool)>,
+    /// operations ride along because a `Fallback` has to give them back.
+    resolved: BTreeMap<u64, (AbsorbResult, PendingOps)>,
     /// Moved on by every gate release. See the field on [`Parked`].
     gate_generation: u64,
     /// Cohorts a leader has taken over this device's lifetime, so a test can
@@ -250,41 +248,18 @@ impl AbsorbQueue {
         self.gate_held = true;
     }
 
-    /// A normal commit has released the reservation gate, producing
-    /// `generation`.
+    /// A normal commit has released the reservation gate.
     ///
-    /// Three things happen here, and each closes a different hole.
-    ///
-    /// *Stamping.* A leader files its answers before it can know the
-    /// generation its own gate release will produce, so it files them
-    /// incomplete and this fills them in. A member is not allowed to see an
-    /// answer until then: adopting `None` would be correct but would cost it
-    /// a full log scan on its next statement, which is the cost
-    /// [`Device::commit_generation`] exists to avoid.
-    ///
-    /// *Moving `gate_generation` on.* That is what lets a member nobody took
-    /// stop waiting (rule 2 above).
-    ///
-    /// *Failing out anything still in flight.* The safety net for rule 1: a
-    /// leader answers its cohort before it releases, so on every ordinary
-    /// path there is nothing here to fail. It fires when the leader unwound,
-    /// and it is reached because the same guard that releases the gate on a
-    /// panic calls this too.
-    pub fn gate_released(&mut self, generation: Option<u64>) {
+    /// Moving `gate_generation` on is what lets a member nobody took stop
+    /// waiting (rule 2 above); clearing `gate_held` is what stops anyone
+    /// offering into a gate hold that is over. Neither touches a cohort a
+    /// leader has already taken: the leader answers that **after** its
+    /// barrier, which is outside the gate, and until then those members are
+    /// covered by rule 1 — see [`AbsorbQueue::fail_in_flight`] and the guard
+    /// on the owning device that calls it.
+    pub fn gate_released(&mut self) {
         self.gate_held = false;
         self.gate_generation += 1;
-        for (result, _, ready) in self.resolved.values_mut() {
-            if *ready {
-                continue;
-            }
-            match result {
-                AbsorbResult::Committed { generation: g, .. }
-                | AbsorbResult::Conflict { generation: g, .. } => *g = generation,
-                AbsorbResult::Failed(_) | AbsorbResult::Fallback => {}
-            }
-            *ready = true;
-        }
-        self.fail_in_flight("the commit leading this cohort did not finish");
     }
 
     /// [`Device::absorb_offer`]. Leaves `ops` untouched when it answers
@@ -338,7 +313,7 @@ impl AbsorbQueue {
             if matches!(result, AbsorbResult::Committed { .. }) {
                 self.committed += 1;
             }
-            self.resolved.insert(token, (result, ops, false));
+            self.resolved.insert(token, (result, ops));
         }
     }
 
@@ -350,10 +325,8 @@ impl AbsorbQueue {
     /// with bytes already on the file would apply its transaction twice.
     pub fn fail_in_flight(&mut self, reason: &'static str) {
         for token in core::mem::take(&mut self.in_flight) {
-            self.resolved.insert(
-                token,
-                (AbsorbResult::Failed(reason), PendingOps::new(), true),
-            );
+            self.resolved
+                .insert(token, (AbsorbResult::Failed(reason), PendingOps::new()));
         }
     }
 
@@ -365,15 +338,7 @@ impl AbsorbQueue {
     /// because there the leader has always already resolved by the time a
     /// follower's `commit()` is entered.
     pub fn wait_step(&mut self, token: u64, ops: &mut PendingOps) -> Option<AbsorbResult> {
-        if self
-            .resolved
-            .get(&token)
-            .is_some_and(|(_, _, ready)| *ready)
-        {
-            let (result, returned, _) = self
-                .resolved
-                .remove(&token)
-                .expect("just checked that this token is resolved");
+        if let Some((result, returned)) = self.resolved.remove(&token) {
             *ops = returned;
             return Some(result);
         }
@@ -840,22 +805,15 @@ pub trait Device {
     /// [`AbsorbResult::Fallback`] and empty for every other answer.
     fn absorb_resolve(&self, _results: Vec<(u64, AbsorbResult, PendingOps)>) {}
 
-    /// [`Device::sync_commit`]'s barrier, for a leader that is still holding
-    /// the reservation gate.
+    /// Answer every member of a cohort this thread took and could not finish,
+    /// with [`AbsorbResult::Failed`].
     ///
-    /// One thing separates it from [`Device::sync_commit`]: it must not wait
-    /// for other normal committers to publish their tickets. A leader syncing
-    /// inside the gate is itself the only normal committer that can be in
-    /// flight, and the gather window `inlaysql`'s coordinator opens on the
-    /// ordinary path would spin against its own caller until its yield budget
-    /// ran out. Checkpoints already take a non-coalescing barrier for exactly
-    /// this reason.
-    ///
-    /// The default forwards to [`Device::sync_commit`], which is right for
-    /// every device that has only one barrier.
-    fn sync_commit_in_gate(&mut self) -> Result<()> {
-        self.sync_commit()
-    }
+    /// The leader's own error paths call it. It is also what the owning
+    /// device's RAII guard calls when a leader unwinds between
+    /// [`Device::absorb_take`] and [`Device::absorb_resolve`] — the one span
+    /// where the promise "a leader answers everything it took" cannot be kept
+    /// by the leader's own code, because the leader is no longer running.
+    fn absorb_fail_cohort(&self, _reason: &'static str) {}
 
     /// Whether page ids may already be reused on this device.
     ///
@@ -987,7 +945,7 @@ impl<T: Device> Device for Rc<RefCell<T>> {
         self.borrow().absorb_resolve(results);
     }
 
-    fn sync_commit_in_gate(&mut self) -> Result<()> {
-        self.borrow_mut().sync_commit_in_gate()
+    fn absorb_fail_cohort(&self, reason: &'static str) {
+        self.borrow().absorb_fail_cohort(reason);
     }
 }

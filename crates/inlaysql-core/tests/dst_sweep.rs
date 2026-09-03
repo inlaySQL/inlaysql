@@ -375,7 +375,7 @@ impl<D: Device> Device for AbsorbingDevice<D> {
     }
 
     fn end_normal_commit(&self) -> Option<u64> {
-        self.gate.borrow_mut().gate_released(None);
+        self.gate.borrow_mut().gate_released();
         None
     }
 
@@ -400,6 +400,10 @@ impl<D: Device> Device for AbsorbingDevice<D> {
 
     fn absorb_resolve(&self, results: Vec<(u64, AbsorbResult, PendingOps)>) {
         self.gate.borrow_mut().resolve(results);
+    }
+
+    fn absorb_fail_cohort(&self, reason: &'static str) {
+        self.gate.borrow_mut().fail_in_flight(reason);
     }
 }
 
@@ -744,7 +748,7 @@ fn a_member_no_leader_took_is_handed_back_and_commits_itself() {
     writers[1].put(b"y", b"9").unwrap();
     assert!(writers[1].park_for_absorption());
     gate.borrow_mut().gate_acquired();
-    gate.borrow_mut().gate_released(None);
+    gate.borrow_mut().gate_released();
 
     assert_eq!(writers[1].commit().unwrap(), CommitOutcome::Committed);
     assert_eq!(

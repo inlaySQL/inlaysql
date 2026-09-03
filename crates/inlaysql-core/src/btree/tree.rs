@@ -1611,42 +1611,45 @@ impl<D: Device> CowBTree<D> {
             }
         }
 
-        // The cohort's barrier runs *inside* the gate, which is the only shape
-        // in which "no member is acknowledged before the leader's sync" needs
-        // no watchdog: the guard that releases the gate on an unwind is the
-        // same one that answers a member the leader never got to. A commit
-        // with no cohort takes today's path instead and syncs outside the
-        // gate, so a solo writer pays nothing for this.
-        let synced_in_gate = written && !cohort.is_empty();
-        let cohort_sync = if synced_in_gate {
-            match self.device.sync_commit_in_gate() {
-                Ok(()) => Ok(()),
-                Err(err) => {
-                    written = false;
-                    Err(err)
-                }
-            }
-        } else {
-            Ok(())
-        };
-        self.resolve_cohort(cohort, written);
+        // The gate is released here, before the barrier, exactly as it always
+        // has been — and that is the whole reason this protocol pays. The
+        // expensive part of a commit is the one thing parallel writers are
+        // allowed to overlap: while this cohort's `fsync` runs, the *next*
+        // cohort is already forming and doing its gate work. Holding the gate
+        // across the barrier instead was tried and measured, and it costs more
+        // than the gate acquisitions it saves — see `PERF.md`'s AHL-547
+        // section.
         let generation = self.device.end_normal_commit();
-        cohort_sync?;
-        let Some(seq) = outcome? else {
-            return self.finish_conflict(region, observed_floor);
+        // A leader that conflicted or failed before its records reached the
+        // device still owes every member it took an answer. Nothing was
+        // written on anyone's behalf on either path, so they all fall back and
+        // commit for themselves.
+        let seq = match outcome {
+            Ok(Some(seq)) => seq,
+            Ok(None) => {
+                self.resolve_cohort(cohort, false, generation);
+                return self.finish_conflict(region, observed_floor);
+            }
+            Err(err) => {
+                self.resolve_cohort(cohort, false, generation);
+                return Err(err);
+            }
         };
 
         if !written {
             unreachable!("a commit that reached its sequence number always wrote its record");
         }
-        // The commit record is already ordered and lives in this writer's own
-        // region. Durability is intentionally outside the reservation gate:
-        // this is the expensive operation parallel writers are allowed to
-        // overlap. A cohort leader has already synced, inside the gate, and
-        // its own ticket was covered by that same barrier.
-        if !synced_in_gate {
-            self.device.sync_commit()?;
-        }
+        // Every member's record and every member's pages are on the device,
+        // and every member's ticket is published, so this one barrier covers
+        // the whole cohort. **No member has been told anything yet** — that is
+        // the next statement, and it is unconditionally after this one
+        // returns. A failure here is reported to every member as an error
+        // rather than as "commit again", because the records may be on the
+        // file: the same ambiguity a solo commit whose own sync failed has
+        // always handed its caller.
+        let synced = self.device.sync_commit();
+        self.resolve_cohort(cohort, synced.is_ok(), generation);
+        synced?;
 
         self.next_seq = seq + 1;
         self.root = self.pending_root;
@@ -2785,10 +2788,6 @@ impl<D: Device> CowBTree<D> {
                     stopped = true;
                     cohort.push((token, CohortMember::Declined, ops));
                 }
-                CohortStep::Failed(reason) => {
-                    stopped = true;
-                    cohort.push((token, CohortMember::Failed(reason), PendingOps::new()));
-                }
             }
         }
         (root, next, seq)
@@ -2812,6 +2811,16 @@ impl<D: Device> CowBTree<D> {
         available: usize,
     ) -> CohortStep {
         let (base_root, base_next, base_seq) = base;
+        // The one copy this protocol makes, and it is what lets every way a
+        // member can fail to be *refused* rather than failed. Anything past
+        // the rebase has spent the transaction — the replay consumes it and
+        // `finalize_free_list` then mixes this leader's own free-list rows
+        // into what is left — so without a pristine copy, a member whose
+        // record turns out not to fit the region's remainder would have to be
+        // handed an error for a transaction that never reached the disk. It
+        // is the offered map, which is one row's worth of keys for the
+        // workloads this exists for, against a tree replay and a page write.
+        let offered = txn.ops.clone();
         self.root = txn.root;
         self.pending_root = txn.root;
         self.pending_next = self.next_page_id;
@@ -2825,9 +2834,8 @@ impl<D: Device> CowBTree<D> {
                 return CohortStep::Conflict(ops);
             }
             Err(_) => {
-                let ops = core::mem::take(&mut self.pending_ops);
                 self.reset_to(base_root, base_next);
-                return CohortStep::Declined(ops);
+                return CohortStep::Declined(offered);
             }
         }
         let seq = base_seq + 1;
@@ -2837,10 +2845,14 @@ impl<D: Device> CowBTree<D> {
             self.materialize_dirty()?;
             records.reserve(self.pending_record_len());
             self.encode_pending_record(records, seq, base_seq, base_root);
+            // The region's remainder shrinks as the cohort grows, so this is
+            // an ordinary event near the end of a region rather than an edge
+            // case: the cohort ends here and this member — and everyone after
+            // it — commits the ordinary way, wrapping the region for itself
+            // if that is what it needs. A cohort never wraps mid-flight.
             if records.len() > available
                 || records.len() - start > crate::wal::max_record_len(self.page_size)
             {
-                records.truncate(start);
                 return Ok(None);
             }
             self.write_dirty_pages()?;
@@ -2849,14 +2861,14 @@ impl<D: Device> CowBTree<D> {
         })();
         match step {
             Ok(Some(state)) => CohortStep::Committed(state.0, state.1, state.2),
-            Ok(None) => {
-                self.reset_to(base_root, base_next);
-                CohortStep::Failed("a cohort member's record did not fit its log region")
-            }
-            Err(_) => {
+            // Nothing this member produced reached the record buffer, and any
+            // pages it did write are unreferenced — exactly what a commit that
+            // failed between its pages and its record leaves behind today, and
+            // exactly what the next `next_page_id` walks over.
+            Ok(None) | Err(_) => {
                 records.truncate(start);
                 self.reset_to(base_root, base_next);
-                CohortStep::Failed("a cohort member's commit failed inside the gate")
+                CohortStep::Declined(offered)
             }
         }
     }
@@ -2908,7 +2920,12 @@ impl<D: Device> CowBTree<D> {
     /// every member that had a decision hears an error rather than a wrong
     /// outcome and every member that had none simply commits the ordinary
     /// way.
-    fn resolve_cohort(&self, cohort: Vec<(u64, CohortMember, PendingOps)>, written: bool) {
+    fn resolve_cohort(
+        &self,
+        cohort: Vec<(u64, CohortMember, PendingOps)>,
+        written: bool,
+        generation: Option<u64>,
+    ) {
         if cohort.is_empty() {
             return;
         }
@@ -2916,9 +2933,6 @@ impl<D: Device> CowBTree<D> {
             .into_iter()
             .map(|(token, member, ops)| match member {
                 CohortMember::Declined => (token, AbsorbResult::Fallback, ops),
-                CohortMember::Failed(reason) => {
-                    (token, AbsorbResult::Failed(reason), PendingOps::new())
-                }
                 // A conflicting member wrote nothing, so a cohort that failed
                 // as a whole leaves it free to try again rather than owing it
                 // an error.
@@ -2934,11 +2948,12 @@ impl<D: Device> CowBTree<D> {
                         root,
                         next,
                         seq,
-                        // Stamped by the device when the gate is released:
-                        // the generation this hold produces is not known
-                        // until then, and a member that adopted `None` would
-                        // rescan the whole log on its next statement.
-                        generation: None,
+                        // The one generation this whole gate hold produced —
+                        // `Device::commit_generation` now means "one gate
+                        // hold ended, having covered 1..=N attempts" rather
+                        // than "one attempt happened". Nothing reads it as a
+                        // count; `refresh` only asks whether it moved.
+                        generation,
                     },
                     PendingOps::new(),
                 ),
@@ -5365,9 +5380,15 @@ enum CohortMember {
     },
     /// Not attempted, or cleanly abandoned before anything was written. Its
     /// operations ride back with it and it commits the ordinary way.
+    ///
+    /// There is deliberately no per-member "failed" outcome beside this one.
+    /// Every way a single member can go wrong — a conflict, a device error, a
+    /// record that will not fit the region's remainder — leaves nothing of
+    /// that member on the file, so refusing it is always both safe and
+    /// kinder than an error. The only failure a member can be told about is
+    /// the cohort's own, and that one is decided after the records and the
+    /// barrier, in `CowBTree::resolve_cohort`.
     Declined,
-    /// Attempted and failed after its operations were already spent.
-    Failed(&'static str),
 }
 
 /// What `CowBTree::absorb_member` did with one member, before its token is
@@ -5379,10 +5400,9 @@ enum CohortStep {
     Committed(PageId, PageId, u64),
     /// Conflicted; the transaction is untouched.
     Conflict(PendingOps),
-    /// Refused before anything was written; the transaction is untouched.
+    /// Refused before anything was written; the transaction comes home
+    /// exactly as it was offered.
     Declined(PendingOps),
-    /// Failed after the transaction was spent.
-    Failed(&'static str),
 }
 
 fn merge_monotonic_metadata<D: Device>(

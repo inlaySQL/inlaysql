@@ -362,6 +362,18 @@ fn inlaysql_writers(
             100.0 * members as f64 / (committed.max(1)) as f64,
         );
     }
+    // Barriers per commit is the number this slice moves most directly — one
+    // `fsync` for a whole cohort instead of one each — so it is reported at
+    // both flag settings rather than only the one being advertised.
+    if let Some(stats) = keeper.commit_stats() {
+        println!(
+            "  barriers: {writers} writers, {} normal flushes over {committed} commits \
+             ({:.3} syncs/commit, {:.2} commits/sync)",
+            stats.normal_flushes,
+            stats.normal_flushes as f64 / (committed.max(1)) as f64,
+            stats.normal_tickets_flushed as f64 / (stats.normal_flushes.max(1)) as f64,
+        );
+    }
     drop(keeper);
     let _ = std::fs::remove_file(path);
     Ok(Outcome {

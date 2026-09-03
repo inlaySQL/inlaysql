@@ -134,6 +134,59 @@ that never survives a torn write is simply not a commit.
 The state block is *not* rewritten on every commit. It is rewritten on
 checkpoint (see below), which keeps the hot path to one sync.
 
+### Commit-side absorption: one gate hold, N records, one barrier (opt-in, off by default)
+
+`EngineOptions::commit_absorption` — off unless a caller asks, and off in
+every published number — changes *who* runs steps 1-4 for a transaction,
+and nothing about what they write. A writer that opts in hands its open
+transaction to whichever writer holds the gate and waits for an outcome
+instead of waiting for the gate. That leader judges every parked
+transaction in gate-arrival order with the same first-committer-wins
+comparison, replays the clean ones through its own tree, writes their
+pages, appends **one self-contained record per member, back to back in the
+leader's own region, as a single write**, runs **one** barrier — still
+inside the gate — and only then hands each member its outcome. See
+`docs/research/commit-group-slice2.md` for the protocol step by step and
+its crash-point table.
+
+**No format change, and none is possible from this.** The records are byte
+for byte what those writers would have appended separately: same layout,
+same length prefix, same checksum, same `prev_seq`/`prev_root` link to the
+record before them. `scan_region` walks them one at a time and stops at the
+first that fails, so a torn write during a cohort loses transactions **from
+the tear onward and no further** — the leader's own record tearing loses the
+whole cohort, a member's tearing keeps everything before it. Recovery needs
+no new logic because the per-writer region invariant above was always a
+claim about *logical* order: one handle's region already carried other
+handles' records whenever more than four handles shared a file, and merging
+by `seq` with chain validation never asked which region a record came from.
+
+**What it does change is blast radius, and that is the whole of the trade.**
+Batching converts N independent single-transaction torn-write exposures into
+one shared exposure whose size scales with cohort size. It creates no new
+*kind* of loss and violates no bound stated here — the bound was always
+"commits since the last checkpoint", never "one commit" — but the typical
+loss on a busy file goes from about one commit to about a cohort's worth.
+That is why the flag is off by default.
+
+**Two things it is careful not to change.** A member is never told anything
+before the barrier covering its bytes has returned; the barrier runs inside
+the gate precisely so that the guard which releases the gate on an unwind is
+also the one that answers a member the leader never got to. And each member
+adopts **its own** sequence number as its reader watermark, never the
+cohort's last, because `Device::min_reader_seq` feeds the free list's
+liveness proof below and has to stay conservative for the oldest live
+reader.
+
+A cohort never straddles a WAL-region wrap: the leader's own record may wrap
+exactly as today, and from the first member onward a record that would
+overflow the region ends the cohort instead, leaving that member and every
+one after it to commit the ordinary way. So the "forget the cached commit
+point before rewriting the state block, republish only once the wrap
+completes" rule above keeps its existing scope of one gate hold. A
+checkpoint is never absorbed and never leads a cohort — it takes the gate
+through a different entry point and never advertises itself as a leader.
+
 ## Durability levels
 
 Step 4 above names the barrier a normal commit's `sync_commit` waits on:
@@ -184,7 +237,10 @@ not slipped in beside this change.
   the drive's own volatile write cache but never reached the platter. Loss
   is bounded to commits **since the last checkpoint or WAL-region wrap** —
   the same bound a crash under `Durability::Full` already has for the
-  *unsynced* tail, just reached by a different, rarer fault. Recovery never
+  *unsynced* tail, just reached by a different, rarer fault. With
+  commit-side absorption on (off by default, above), that bound is unchanged
+  but the *typical* loss is a cohort rather than a single commit, because a
+  cohort's records are contiguous and share one barrier. Recovery never
   invents or tears state at this level either: chain validation
   (`decode_record_for_version`, `read_committed_state`'s "break at the first
   gap") is unaffected by which barrier produced the bytes it validates, so
