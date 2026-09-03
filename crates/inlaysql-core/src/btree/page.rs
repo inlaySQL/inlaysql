@@ -799,6 +799,19 @@ pub fn leaf_edge_keys(bytes: &[u8], page_size: usize) -> Result<Option<(&[u8], &
     )))
 }
 
+/// How many cells a raw leaf page holds, read from its header alone.
+///
+/// The slot directory's length *is* the leaf's row count: every cell is one
+/// `(key, value)` pair and the header's `cell_count` is the directory's
+/// length, so a `COUNT(*)` that has established a leaf lies wholly inside
+/// its range (`CowBTree::count_in_range`, AHL-548) adds this number and
+/// decodes no cell at all. Held to the same header checks [`scan_leaf_cells`]
+/// makes, so a page whose directory overlaps its cell area is refused here
+/// rather than counted.
+pub fn leaf_cell_count(bytes: &[u8], page_size: usize) -> Result<usize> {
+    check_leaf_header(bytes, page_size)
+}
+
 /// The header checks a raw leaf read repeats from [`decode`]: page length,
 /// and the slot directory not overlapping the cell area. Returns the cell
 /// count.

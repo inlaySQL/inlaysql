@@ -5668,14 +5668,15 @@ impl Engine {
         let driving = &plan.from[0];
         let is_aggregate = !plan.group_by.is_empty() || !plan.aggregates.is_empty();
 
-        // The `MIN`/`MAX` optimisation: a scalar `MIN`/`MAX` over the rowid
-        // or an indexed leading column answers from one tree descent per
-        // aggregate, with no row scanned at all. See
-        // `Engine::try_min_max_scalar`'s doc for exactly which statements
+        // The scalar-aggregate shortcuts: a scalar `MIN`/`MAX` over the
+        // rowid or an indexed leading column answers from one tree descent
+        // per aggregate, and a bare `COUNT(*)` from the leaves' own cell
+        // counts, with no row decoded at all. See
+        // `Engine::try_scalar_aggregate`'s doc for exactly which statements
         // qualify; everything else falls through to the ordinary pipeline
         // below unchanged.
         if is_aggregate {
-            if let Some(rows) = self.try_min_max_scalar(plan)? {
+            if let Some(rows) = self.try_scalar_aggregate(plan)? {
                 return self.finish_blocking(plan, rows, env, offset, limit, sink);
             }
         }
@@ -6865,13 +6866,20 @@ impl Engine {
         Ok(rows)
     }
 
-    /// The `MIN`/`MAX` optimisation (`AHL-546`): a scalar (no `GROUP BY`)
-    /// query whose every aggregate is `MIN`/`MAX` over the table's rowid or a
-    /// column carrying a leading B-tree index answers from one descent per
-    /// aggregate to the first or last key of that access path — sqlite3's own
-    /// "min/max optimization" — instead of decoding every row to fold three
-    /// accumulators that never move once the first (or last) row has been
-    /// seen.
+    /// The scalar-aggregate shortcuts: `MIN`/`MAX` from one tree descent
+    /// (`AHL-546`) and `COUNT(*)` from the leaves' cell counts (`AHL-548`).
+    ///
+    /// A scalar (no `GROUP BY`) query whose every aggregate is either
+    /// `MIN`/`MAX` over the table's rowid or a column carrying a leading
+    /// B-tree index, or a bare `COUNT(*)`, answers without decoding a row:
+    /// each `MIN`/`MAX` is one descent to the first or last key of its
+    /// access path — sqlite3's own "min/max optimization" — and `COUNT(*)`
+    /// is [`Storage::count_rows`], which for the tree backend walks the
+    /// table's leaves summing each one's slot-directory length
+    /// (`CowBTree::count_in_prefix`) instead of decoding every cell to fold
+    /// a counter that only ever goes up by one. The general path would
+    /// otherwise scan-and-decode the whole table once any aggregate needs a
+    /// scan, and fold all of them per row.
     ///
     /// Fires only when nothing else in the statement forces a scan:
     ///
@@ -6881,10 +6889,14 @@ impl Engine {
     ///   `WITHOUT ROWID` — such a table has no rowid at all, and its primary
     ///   key's own index is exactly the general indexed-column case below, so
     ///   nothing is lost by excluding it here and it stays out of this
-    ///   already-narrow rewrite's proof obligation.
+    ///   already-narrow rewrite's proof obligation. (`COUNT(*)` on one would
+    ///   be a walk of the same tree under the same prefix, but the keyed
+    ///   scan is a different `Storage` path and is not proven here.)
     /// * Every aggregate is a plain, non-`DISTINCT`, filter-less `MIN` or
     ///   `MAX` of a bare stored column — see [`Engine::min_max_boundary`] for
-    ///   which columns qualify.
+    ///   which columns qualify — or a plain, non-`DISTINCT`, filter-less
+    ///   `COUNT(*)`. `COUNT(column)` is not `COUNT(*)`: it skips `NULL`s,
+    ///   which the leaf count cannot see, so it stays on the general path.
     /// * Every projected expression is answerable from the aggregates alone
     ///   — no bare column. This path never holds a representative row the
     ///   general aggregate path would have picked as the table's first row
@@ -6892,38 +6904,64 @@ impl Engine {
     ///   `NULL` instead, which is not what the general path returns for a
     ///   non-empty table.
     ///
-    /// **`COUNT(*)` is deliberately not answered here.** This engine keeps no
-    /// transactionally exact row count — `ANALYZE`'s statistics are a
-    /// snapshot of whatever was last collected, not the live count, and using
-    /// a stale number to answer `COUNT(*)` would be exactly the silent wrong
-    /// answer `AGENTS.md` refuses. Without one, `COUNT(*)` still needs a scan,
-    /// and a statement that mixes it with `MIN`/`MAX` still scans as a whole
-    /// — so a `COUNT(*)` anywhere in `plan.aggregates` sends the whole
-    /// statement to the general path below, `MIN`/`MAX` included in it.
+    /// `COUNT(*)` is exact under an open transaction: the count walks the
+    /// pending tree, which already holds this transaction's inserts, deletes
+    /// and overwrites — the same tree every scan reads. It is never taken
+    /// from `ANALYZE`'s statistics, which are a snapshot and would be exactly
+    /// the silent wrong answer `AGENTS.md` refuses.
     ///
     /// Returns `None` — never an error — for every shape this does not cover,
     /// so [`Engine::run_select_to`] just runs the ordinary pipeline instead.
     /// An error here is reserved for a corrupt index that names a row that no
     /// longer exists — the same "this should be impossible" case
     /// [`Engine::indexed_candidates`]'s siblings raise rather than mask.
-    fn try_min_max_scalar(&self, plan: &SelectPlan) -> Result<Option<Vec<ExecRow>>> {
-        let Some(table) = min_max_scalar_shape(plan) else {
+    fn try_scalar_aggregate(&self, plan: &SelectPlan) -> Result<Option<Vec<ExecRow>>> {
+        let Some(table) = scalar_aggregate_shape(plan) else {
             return Ok(None);
         };
 
-        let mut answers = Vec::with_capacity(plan.aggregates.len());
+        // Every access path is decided before any storage is read, so a
+        // statement that mixes an answerable `COUNT(*)` with an un-indexed
+        // `MIN` falls back whole rather than counting first and scanning
+        // anyway — the same all-or-nothing `EXPLAIN` reports through
+        // `scalar_aggregate_lines`.
+        let mut accesses = Vec::with_capacity(plan.aggregates.len());
         for aggregate in &plan.aggregates {
-            // `min_max_scalar_shape` has already checked every aggregate is a
-            // plain, non-`DISTINCT`, filter-less `MIN`/`MAX` of a bare column
-            // — see its doc — so only the boundary read can still say no.
-            let take_max = aggregate.func == AggFunc::Max;
-            let Some(Expr::Column(ordinal)) = &aggregate.arg else {
-                unreachable!("min_max_scalar_shape only admits a bare column argument")
-            };
-            let Some(access) = self.min_max_access(table, *ordinal, aggregate.collation) else {
-                return Ok(None);
-            };
-            answers.push(self.min_max_boundary(table, *ordinal, take_max, access)?);
+            // `scalar_aggregate_shape` has already checked every aggregate is
+            // a plain, non-`DISTINCT`, filter-less `MIN`/`MAX` of a bare
+            // column or a bare `COUNT(*)` — see its doc — so only the
+            // catalog can still say no.
+            accesses.push(match &aggregate.arg {
+                None => ScalarAccess::Count,
+                Some(Expr::Column(ordinal)) => {
+                    let Some(access) = self.min_max_access(table, *ordinal, aggregate.collation)
+                    else {
+                        return Ok(None);
+                    };
+                    ScalarAccess::MinMax(*ordinal, aggregate.func == AggFunc::Max, access)
+                }
+                Some(_) => {
+                    unreachable!("scalar_aggregate_shape only admits a bare column argument")
+                }
+            });
+        }
+
+        let mut answers = Vec::with_capacity(accesses.len());
+        for access in accesses {
+            answers.push(match access {
+                ScalarAccess::Count => {
+                    let count = self.storage.count_rows(&table.name)?;
+                    Value::Integer(i64::try_from(count).map_err(|_| {
+                        Error::Corrupt(alloc::format!(
+                            "`{}` holds {count} rows, more than COUNT(*) can report",
+                            table.name
+                        ))
+                    })?)
+                }
+                ScalarAccess::MinMax(ordinal, take_max, access) => {
+                    self.min_max_boundary(table, ordinal, take_max, access)?
+                }
+            });
         }
 
         Ok(Some(alloc::vec![ExecRow {
@@ -8080,16 +8118,40 @@ impl MinMaxAccess<'_> {
     }
 }
 
-/// Whether `plan` is a scalar `MIN`/`MAX` query the [`Engine::try_min_max_scalar`]
-/// rewrite may answer, and if so, its one source table.
+/// How one aggregate of a [`scalar_aggregate_shape`]-approved query is
+/// answered by [`Engine::try_scalar_aggregate`]: a boundary descent, or the
+/// leaf-count walk.
+enum ScalarAccess<'a> {
+    /// A bare `COUNT(*)`, from [`Storage::count_rows`].
+    Count,
+    /// `MIN` (`false`) or `MAX` (`true`) of the column at this ordinal, from
+    /// [`Engine::min_max_boundary`] over this access path.
+    MinMax(usize, bool, MinMaxAccess<'a>),
+}
+
+/// `EXPLAIN`'s line for the `COUNT(*)` half of the scalar-aggregate rewrite:
+/// the table's leaves are still visited, so it is a `SCAN`, but of cell
+/// counts rather than rows. One place, shared by [`crate::explain`] alone,
+/// so the wording and the executor's rule cannot drift apart.
+pub(crate) fn count_star_detail(table: &Table) -> String {
+    alloc::format!(
+        "SCAN {} USING LEAF CELL COUNTS (COUNT(*) OPTIMIZATION)",
+        table.name
+    )
+}
+
+/// Whether `plan` is a scalar `MIN`/`MAX`/`COUNT(*)` query the
+/// [`Engine::try_scalar_aggregate`] rewrite may answer, and if so, its one
+/// source table.
 ///
 /// Purely structural — no catalog, no storage — so both the executor and
 /// [`crate::explain`] can ask it before either commits to anything: it is the
-/// complete list of conditions from [`Engine::try_min_max_scalar`]'s doc
-/// except whether an access path actually exists for each aggregate's column,
-/// which needs the catalog and is [`Engine::min_max_access`]'s question
-/// alone.
-pub(crate) fn min_max_scalar_shape(plan: &SelectPlan) -> Option<&Table> {
+/// complete list of conditions from [`Engine::try_scalar_aggregate`]'s doc
+/// except whether an access path actually exists for each `MIN`/`MAX`
+/// column, which needs the catalog and is [`Engine::min_max_access`]'s
+/// question alone. `COUNT(*)` needs no access path: every stored rowid
+/// table can be counted.
+pub(crate) fn scalar_aggregate_shape(plan: &SelectPlan) -> Option<&Table> {
     if plan.filter.is_some()
         || !plan.group_by.is_empty()
         || plan.having.is_some()
@@ -8109,23 +8171,29 @@ pub(crate) fn min_max_scalar_shape(plan: &SelectPlan) -> Option<&Table> {
     let table = &driving.table;
 
     for aggregate in &plan.aggregates {
-        if !matches!(aggregate.func, AggFunc::Min | AggFunc::Max) {
-            // `COUNT`/`SUM`/`AVG`/`GROUP_CONCAT` all need a scan — see
-            // `Engine::try_min_max_scalar`'s doc for why `COUNT(*)` is not
-            // special-cased even though the executor could answer it cheaply
-            // once the engine keeps an exact count.
-            return None;
-        }
         if aggregate.distinct || aggregate.filter.is_some() {
             return None;
         }
-        if !matches!(aggregate.arg, Some(Expr::Column(_))) {
-            return None;
+        match aggregate.func {
+            // `COUNT(*)` alone — `arg` is `None` exactly for the star form.
+            // `COUNT(column)` skips `NULL`s and needs the rows; `SUM`/`AVG`/
+            // `GROUP_CONCAT` need every value.
+            AggFunc::Count => {
+                if aggregate.arg.is_some() {
+                    return None;
+                }
+            }
+            AggFunc::Min | AggFunc::Max => {
+                if !matches!(aggregate.arg, Some(Expr::Column(_))) {
+                    return None;
+                }
+            }
+            AggFunc::Sum | AggFunc::Avg | AggFunc::GroupConcat => return None,
         }
     }
 
     // No projected expression may read a raw column: see
-    // `Engine::try_min_max_scalar`'s doc for why that would disagree with the
+    // `Engine::try_scalar_aggregate`'s doc for why that would disagree with the
     // general path's answer. Reuses `Expr::columns_read` — the same walker
     // projection pushdown trusts to find every column an expression can
     // observe — rather than a second one that could disagree about a variant

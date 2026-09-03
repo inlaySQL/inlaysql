@@ -294,6 +294,14 @@ impl<D: Device> Storage for TreeStorage<D> {
         Ok(Some((row_id_from_key(&key)?, value)))
     }
 
+    /// The leaf-cell-count walk (`AHL-548`): [`CowBTree::count_in_prefix`]
+    /// sums a header field per leaf under this table's prefix instead of
+    /// [`Storage::count_rows`]'s default row-by-row scan, and decodes no
+    /// row at all.
+    fn count_rows(&self, table: &str) -> Result<u64> {
+        self.tree.count_in_prefix(&table_prefix(table))
+    }
+
     fn put_row_keyed(&mut self, table: &str, key: &[u8], bytes: &[u8]) -> Result<()> {
         let mut full = table_prefix(table);
         full.extend_from_slice(key);
@@ -464,7 +472,58 @@ impl<D: Device> Storage for TreeStorage<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::SimDisk;
     use alloc::string::ToString;
+
+    /// [`TreeStorage::count_rows`]'s leaf-count walk against the rows
+    /// [`Storage::scan_batch`] hands out for the same table, committed and
+    /// pending, with a neighbouring table's rows and index entries in the
+    /// same tree to be kept out of the count.
+    #[test]
+    fn count_rows_counts_exactly_what_a_scan_of_the_table_returns() {
+        let mut storage = TreeStorage::open_on(SimDisk::with_block_size(512, 8 << 20)).unwrap();
+        let scanned = |storage: &TreeStorage<SimDisk>, table: &str| -> u64 {
+            let mut total = 0;
+            let mut after = None;
+            loop {
+                let batch = storage.scan_batch(table, after, 7).unwrap();
+                total += batch.len() as u64;
+                match batch.last() {
+                    Some((id, _)) if batch.len() == 7 => after = Some(*id),
+                    _ => return total,
+                }
+            }
+        };
+
+        assert_eq!(storage.count_rows("users").unwrap(), 0);
+        for id in 0..1000u64 {
+            storage.put_row("users", id, b"a row").unwrap();
+            storage.put_row("user", id, b"a neighbour").unwrap();
+            storage.put_row("usersx", id, b"another").unwrap();
+        }
+        storage.put_index_entry(b"\x02users.email\0abc").unwrap();
+        // Pending: the count already sees this transaction's own writes.
+        assert_eq!(storage.count_rows("users").unwrap(), 1000);
+        assert_eq!(scanned(&storage, "users"), 1000);
+        storage.commit().unwrap();
+        assert_eq!(storage.count_rows("users").unwrap(), 1000);
+
+        // Deletes, an overwrite and inserts in one open transaction.
+        for id in 0..300u64 {
+            storage.delete_row("users", id).unwrap();
+        }
+        storage.put_row("users", 500, b"rewritten").unwrap();
+        for id in 5000..5100u64 {
+            storage.put_row("users", id, b"new").unwrap();
+        }
+        assert_eq!(storage.count_rows("users").unwrap(), 800);
+        assert_eq!(scanned(&storage, "users"), 800);
+        storage.rollback().unwrap();
+        assert_eq!(storage.count_rows("users").unwrap(), 1000);
+        assert_eq!(storage.count_rows("user").unwrap(), 1000);
+        assert_eq!(storage.count_rows("usersx").unwrap(), 1000);
+        assert_eq!(storage.count_rows("nobody").unwrap(), 0);
+    }
 
     /// The whole point of [`RowKeyBuf`] is that it changes nothing: a row
     /// written before it existed has to be found by a key built with it. Every

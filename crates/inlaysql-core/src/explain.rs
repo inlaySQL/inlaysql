@@ -293,14 +293,15 @@ impl<'e> Explainer<'e> {
 
         let driving = &plan.from[0];
 
-        // The `MIN`/`MAX` optimisation (`AHL-546`): reported straight from
-        // `Engine::min_max_scalar_shape`/`Engine::min_max_access` — the same
-        // two functions `Engine::try_min_max_scalar` asks — rather than a
-        // second guess at the same rule, so `EXPLAIN` cannot say this rewrite
-        // fired when the executor in fact fell back to a scan, or the other
-        // way round.
-        if let Some(table) = crate::engine::min_max_scalar_shape(plan) {
-            if let Some(lines) = self.min_max_access_lines(table, plan)? {
+        // The scalar-aggregate shortcuts (`MIN`/`MAX`, AHL-546; `COUNT(*)`,
+        // AHL-548): reported straight from
+        // `Engine::scalar_aggregate_shape`/`Engine::min_max_access` — the
+        // same two functions `Engine::try_scalar_aggregate` asks — rather
+        // than a second guess at the same rule, so `EXPLAIN` cannot say this
+        // rewrite fired when the executor in fact fell back to a scan, or the
+        // other way round.
+        if let Some(table) = crate::engine::scalar_aggregate_shape(plan) {
+            if let Some(lines) = self.scalar_aggregate_lines(table, plan)? {
                 for line in lines {
                     self.push(parent, line);
                 }
@@ -430,13 +431,15 @@ impl<'e> Explainer<'e> {
 
     // ---------------------------------------------------------- access paths
 
-    /// One `SEARCH ... (MIN/MAX OPTIMIZATION)` line per aggregate in a query
-    /// [`crate::engine::min_max_scalar_shape`] already approved structurally,
-    /// or `None` if any aggregate's column has no ordered access path — the
-    /// one condition that function cannot check without the catalog, so this
-    /// falls back to describing the general path instead, exactly as
-    /// [`Engine::try_min_max_scalar`] falls back to running it.
-    fn min_max_access_lines(
+    /// One `SEARCH ... (MIN/MAX OPTIMIZATION)` or `SCAN ... (COUNT(*)
+    /// OPTIMIZATION)` line per aggregate in a query
+    /// [`crate::engine::scalar_aggregate_shape`] already approved
+    /// structurally, or `None` if any `MIN`/`MAX` column has no ordered
+    /// access path — the one condition that function cannot check without
+    /// the catalog, so this falls back to describing the general path
+    /// instead, exactly as [`Engine::try_scalar_aggregate`] falls back to
+    /// running it.
+    fn scalar_aggregate_lines(
         &self,
         table: &Table,
         plan: &SelectPlan,
@@ -444,9 +447,11 @@ impl<'e> Explainer<'e> {
         let mut lines = Vec::with_capacity(plan.aggregates.len());
         for aggregate in &plan.aggregates {
             let Some(Expr::Column(ordinal)) = &aggregate.arg else {
-                // Unreachable: `min_max_scalar_shape` only admits a bare
-                // column argument.
-                return Ok(None);
+                // `scalar_aggregate_shape` admits exactly two argument
+                // shapes: a bare column for `MIN`/`MAX`, and none at all for
+                // `COUNT(*)`.
+                lines.push(crate::engine::count_star_detail(table));
+                continue;
             };
             let Some(access) = self
                 .engine

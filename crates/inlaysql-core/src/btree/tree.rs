@@ -2171,6 +2171,220 @@ impl<D: Device> CowBTree<D> {
         }
     }
 
+    /// How many entries have a key in `[start, end)`, including the open
+    /// transaction's own writes.
+    ///
+    /// The tree half of the `COUNT(*)` optimisation (AHL-548, `crate::engine`'s
+    /// scalar-aggregate rewrite): a leaf's slot directory length *is* its row
+    /// count (`page::leaf_cell_count`), so a count over a range walks the
+    /// tree's leaves and sums a header field per leaf rather than decoding a
+    /// cell per row. Bounds are [`CowBTree::walk`]'s exactly — the same
+    /// [`WalkBounds`] prune the same internal nodes and admit the same leaf
+    /// entries, so this counts precisely the entries
+    /// [`CowBTree::scan_range_from`] would return, only without materialising
+    /// any of them. A leaf whose two edge keys both fall inside the range is
+    /// counted from its header; only a leaf straddling an edge of the range
+    /// has its keys compared one by one.
+    ///
+    /// Committed leaves are read as the borrowed pages the raw scan already
+    /// reads (`shared_page`, AHL-536); a leaf the open transaction has
+    /// dirtied is answered from its decoded cells (`DirtyPage::Decoded`,
+    /// AHL-542), which know their count directly. Internal nodes are decoded
+    /// and navigated exactly as every other walk decodes them, once each.
+    pub fn count_in_range(&self, start: &[u8], end: Option<&[u8]>) -> Result<u64> {
+        if end.is_some_and(|end| end <= start) {
+            return Ok(0);
+        }
+        let bounds = WalkBounds {
+            start,
+            end,
+            after: None,
+            limit: usize::MAX,
+        };
+        let mut total = 0u64;
+        self.walk_count(self.read_root(), &bounds, self.has_pending, &mut total)?;
+        Ok(total)
+    }
+
+    /// How many entries have a key starting with `prefix` —
+    /// [`CowBTree::count_in_range`] over the prefix's own range, the way
+    /// [`CowBTree::scan_prefix`] is [`CowBTree::scan_range`]'s.
+    pub fn count_in_prefix(&self, prefix: &[u8]) -> Result<u64> {
+        let upper = prefix_upper_bound(prefix);
+        self.count_in_range(prefix, upper.as_deref())
+    }
+
+    /// [`CowBTree::walk`]'s counting sibling, for [`CowBTree::count_in_range`].
+    ///
+    /// Reads a page the way [`CowBTree::walk_raw_row_values`] reads it —
+    /// the open transaction's dirty copy first, then the decoded cache, the
+    /// device's own buffer, and the device last (the raw-leaf cache is
+    /// skipped; see the body) — but a leaf reached through any of them is
+    /// only ever *counted*
+    /// ([`CowBTree::count_leaf`]), never decoded into a [`Node`] or parsed
+    /// cell by cell unless it straddles a bound.
+    fn walk_count(
+        &self,
+        id: PageId,
+        bounds: &WalkBounds<'_>,
+        pending: bool,
+        total: &mut u64,
+    ) -> Result<()> {
+        if id == 0 {
+            return Ok(());
+        }
+
+        // This transaction's own pages. A page still held as cells knows its
+        // count without an encode-then-parse round trip, which is what
+        // `with_raw_page_from_device` would pay to hand out its bytes.
+        if pending {
+            if let Some(dirty) = self.dirty.get(&id) {
+                let node = match dirty {
+                    DirtyPage::Decoded(node) => Rc::clone(node),
+                    DirtyPage::Encoded(bytes) => {
+                        self.note_decode();
+                        Rc::new(page::decode(self.page_size, bytes)?)
+                    }
+                };
+                return self.count_node(&node, bounds, pending, total);
+            }
+        }
+
+        if let Some(node) = self.cached_page(id, pending) {
+            return self.count_node(&node, bounds, pending, total);
+        }
+
+        // The raw-leaf cache (`cached_raw_leaf`) is deliberately not asked.
+        // It holds at most 64 leaves the *row* scan read through the device
+        // path, found by a linear search, and a count's whole per-leaf cost
+        // is a hash lookup and a header read: asked here, that search was
+        // 20% of the count's self time for a hit rate near zero on a sweep
+        // of thousands of leaves (`PERF.md`, AHL-548). A leaf it would have
+        // found is read from the device's read-ahead window instead.
+        let internal = match self.shared_page(id, pending) {
+            Some(shared) => match shared[page::OFF_KIND] {
+                page::KIND_LEAF => {
+                    self.note_page_served(id);
+                    *total += self.count_leaf(&shared, bounds)?;
+                    return Ok(());
+                }
+                page::KIND_INTERNAL => {
+                    self.note_page_served(id);
+                    self.note_decode();
+                    let node = Rc::new(page::decode_shared(self.page_size, &shared)?);
+                    self.cache_committed(id, pending, &node);
+                    node
+                }
+                other => {
+                    return Err(Error::Corrupt(alloc::format!("unknown node kind {other}")));
+                }
+            },
+            None => {
+                // The internal node comes back out of the closure and is
+                // descended from here, not inside it: the scratch buffer the
+                // closure reads from is the one every page read below would
+                // want.
+                let decoded = self.with_raw_page_from_device(id, pending, |page_size, bytes| {
+                    match bytes[page::OFF_KIND] {
+                        page::KIND_LEAF => {
+                            *total += self.count_leaf(bytes, bounds)?;
+                            Ok(None)
+                        }
+                        page::KIND_INTERNAL => {
+                            self.note_decode();
+                            Ok(Some(Rc::new(page::decode(page_size, bytes)?)))
+                        }
+                        other => Err(Error::Corrupt(alloc::format!("unknown node kind {other}"))),
+                    }
+                })?;
+                let Some(node) = decoded else {
+                    return Ok(());
+                };
+                self.cache_committed(id, pending, &node);
+                node
+            }
+        };
+        self.count_node(&internal, bounds, pending, total)
+    }
+
+    /// Count through a decoded node: a leaf's admitted entries, or an internal
+    /// node's qualifying children, pruned exactly as [`CowBTree::walk`] prunes.
+    fn count_node(
+        &self,
+        node: &Rc<Node>,
+        bounds: &WalkBounds<'_>,
+        pending: bool,
+        total: &mut u64,
+    ) -> Result<()> {
+        match &**node {
+            Node::Leaf { entries, .. } => {
+                // The same edge test `WalkBounds::admits_whole_leaf` makes on
+                // raw bytes, on the decoded cells: both edges in means every
+                // sorted key between them is in too.
+                let whole = match (entries.first(), entries.last()) {
+                    (Some(first), Some(last)) => {
+                        bounds.admits(node.key(&first.key)) && bounds.admits(node.key(&last.key))
+                    }
+                    _ => false,
+                };
+                if whole {
+                    *total += entries.len() as u64;
+                } else {
+                    *total += entries
+                        .iter()
+                        .filter(|entry| bounds.admits(node.key(&entry.key)))
+                        .count() as u64;
+                }
+                Ok(())
+            }
+            Node::Internal {
+                leftmost, cells, ..
+            } => {
+                if cells.is_empty() || bounds.starts_below(node.key(&cells[0].key)) {
+                    self.walk_count(*leftmost, bounds, pending, total)?;
+                }
+                for (i, separator) in cells.iter().enumerate() {
+                    let below_upper = match bounds.end {
+                        Some(end) => node.key(&separator.key) < end,
+                        None => true,
+                    };
+                    let above_lower = match cells.get(i + 1) {
+                        Some(next) => bounds.starts_below(node.key(&next.key)),
+                        None => true,
+                    };
+                    if below_upper && above_lower {
+                        self.walk_count(separator.child, bounds, pending, total)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// How many cells of the raw leaf `bytes` the bounds admit.
+    ///
+    /// A leaf inside the range answers from its header
+    /// ([`page::leaf_cell_count`]) with no cell decoded; a leaf on an edge of
+    /// the range is walked with [`page::scan_leaf_cells`], comparing keys
+    /// and never touching a value.
+    fn count_leaf(&self, bytes: &[u8], bounds: &WalkBounds<'_>) -> Result<u64> {
+        let count = page::leaf_cell_count(bytes, self.page_size)?;
+        if count == 0 {
+            return Ok(0);
+        }
+        if bounds.admits_whole_leaf(bytes, self.page_size)? {
+            return Ok(count as u64);
+        }
+        let mut admitted = 0u64;
+        page::scan_leaf_cells(bytes, self.page_size, |key, _value| {
+            if bounds.admits(key) {
+                admitted += 1;
+            }
+            Ok(())
+        })?;
+        Ok(admitted)
+    }
+
     /// At most `limit` row ids among entries in `[start, end)` and strictly
     /// greater than `after`, in the order the walk visits them.
     ///
@@ -6092,6 +6306,169 @@ mod tests {
         assert_eq!(
             db.last_in_prefix(b"t\0").unwrap(),
             Some((b"t\0a".to_vec(), RowBuf::Owned(b"1".to_vec())))
+        );
+    }
+
+    /// [`CowBTree::count_in_range`]/[`CowBTree::count_in_prefix`] against
+    /// enough keys and levels for pruning to matter, cross-checked against
+    /// the same range's [`CowBTree::scan_range`] (whose length is, by
+    /// definition, the answer this method exists to reach without
+    /// materialising a row).
+    #[test]
+    fn count_in_range_agrees_with_the_scan_it_would_otherwise_replace() {
+        let mut db = CowBTree::create(disk(), PAGE).unwrap();
+        for i in 0..400u32 {
+            for table in ["a", "b", "c"] {
+                let mut key = table.as_bytes().to_vec();
+                key.push(0);
+                key.extend_from_slice(&i.to_be_bytes());
+                db.put(&key, &i.to_le_bytes()).unwrap();
+            }
+            db.commit().unwrap();
+        }
+
+        let whole = db.scan_prefix(b"b\0").unwrap();
+        assert_eq!(whole.len(), 400);
+        assert_eq!(db.count_in_prefix(b"b\0").unwrap(), 400);
+
+        // A bounded sub-range whose edges land mid-leaf on both sides, so
+        // both the header-count and the key-by-key leaf paths run.
+        let mut low = b"b\0".to_vec();
+        low.extend_from_slice(&37u32.to_be_bytes());
+        let mut high = b"b\0".to_vec();
+        high.extend_from_slice(&291u32.to_be_bytes());
+        let ranged = db.scan_range(&low, Some(&high)).unwrap();
+        assert_eq!(ranged.len(), 291 - 37);
+        assert_eq!(
+            db.count_in_range(&low, Some(&high)).unwrap(),
+            ranged.len() as u64
+        );
+
+        // Open-ended above: everything from `low` to the end of the key
+        // space, which crosses into table `c`.
+        let open = db.scan_range(&low, None).unwrap();
+        assert_eq!(db.count_in_range(&low, None).unwrap(), open.len() as u64);
+
+        // A prefix nothing starts with counts nothing.
+        assert_eq!(db.count_in_prefix(b"z\0").unwrap(), 0);
+
+        // An empty range (`end <= start`) is empty, not the whole tree.
+        assert_eq!(db.count_in_range(b"b\0", Some(b"b\0")).unwrap(), 0);
+
+        // An empty tree counts nothing.
+        assert_eq!(
+            CowBTree::create(disk(), PAGE)
+                .unwrap()
+                .count_in_prefix(b"b\0")
+                .unwrap(),
+            0
+        );
+    }
+
+    /// The uncommitted half of a transaction is counted exactly as
+    /// [`CowBTree::scan_prefix`] would return it: inserts add, deletes
+    /// subtract, an overwrite changes nothing, a rollback restores — the
+    /// tree half of "`COUNT(*)` is exact under an open transaction", which
+    /// the `COUNT(*)` rewrite (`AHL-548`) relies on. The pending insert is
+    /// large enough to split leaves, so the count also runs through dirty
+    /// pages held as decoded cells and through committed pages reached
+    /// from a dirty internal node.
+    #[test]
+    fn count_in_range_sees_the_open_transaction() {
+        let mut db = CowBTree::create(disk(), PAGE).unwrap();
+        let key = |i: u32| {
+            let mut key = b"t\0".to_vec();
+            key.extend_from_slice(&i.to_be_bytes());
+            key
+        };
+        for i in 0..200u32 {
+            db.put(&key(i), b"seed").unwrap();
+        }
+        db.commit().unwrap();
+        assert_eq!(db.count_in_prefix(b"t\0").unwrap(), 200);
+
+        // Pending inserts, spanning several leaf splits.
+        for i in 1000..1300u32 {
+            db.put(&key(i), b"pending").unwrap();
+        }
+        assert_eq!(db.count_in_prefix(b"t\0").unwrap(), 500);
+        assert_eq!(db.scan_prefix(b"t\0").unwrap().len(), 500);
+
+        // Pending deletes of committed rows and of this transaction's own.
+        for i in 0..50u32 {
+            db.delete(&key(i)).unwrap();
+        }
+        for i in 1000..1010u32 {
+            db.delete(&key(i)).unwrap();
+        }
+        assert_eq!(db.count_in_prefix(b"t\0").unwrap(), 440);
+
+        // Overwrites change values, not the count.
+        for i in 100..150u32 {
+            db.put(&key(i), b"rewritten").unwrap();
+        }
+        assert_eq!(db.count_in_prefix(b"t\0").unwrap(), 440);
+        assert_eq!(db.scan_prefix(b"t\0").unwrap().len(), 440);
+
+        // Rolling back restores the committed count; committing keeps the
+        // pending one.
+        db.rollback();
+        assert_eq!(db.count_in_prefix(b"t\0").unwrap(), 200);
+        for i in 1000..1100u32 {
+            db.put(&key(i), b"pending").unwrap();
+        }
+        db.delete(&key(0)).unwrap();
+        assert_eq!(db.count_in_prefix(b"t\0").unwrap(), 299);
+        assert_eq!(db.commit().unwrap(), CommitOutcome::Committed);
+        assert_eq!(db.count_in_prefix(b"t\0").unwrap(), 299);
+        assert_eq!(reopen(&db).count_in_prefix(b"t\0").unwrap(), 299);
+
+        // Deleting everything in the open transaction counts to zero.
+        for (k, _) in db.scan_prefix(b"t\0").unwrap() {
+            db.delete(&k).unwrap();
+        }
+        assert_eq!(db.count_in_prefix(b"t\0").unwrap(), 0);
+    }
+
+    /// A committed count decodes the tree's internal nodes and none of its
+    /// leaves: the leaves are counted off their headers. Measured against
+    /// the decoded scan of the same prefix on an identical fresh handle,
+    /// which decodes every page it visits. (`walk_count` notes its internal
+    /// decodes on the same counter `node_at` does, so the two walks are
+    /// counted alike.)
+    #[test]
+    fn a_count_decodes_internal_nodes_only() {
+        let mut db = CowBTree::create(disk(), PAGE).unwrap();
+        for i in 0..600u32 {
+            let mut key = b"t\0".to_vec();
+            key.extend_from_slice(&i.to_be_bytes());
+            db.put(&key, &i.to_le_bytes()).unwrap();
+        }
+        db.commit().unwrap();
+
+        let counting = reopen(&db);
+        let before = counting.decodes();
+        assert_eq!(counting.count_in_prefix(b"t\0").unwrap(), 600);
+        let count_decodes = counting.decodes() - before;
+
+        let scanning = reopen(&db);
+        let before = scanning.decodes();
+        assert_eq!(scanning.scan_prefix(b"t\0").unwrap().len(), 600);
+        let scan_decodes = scanning.decodes() - before;
+
+        // The scan decodes every internal node and every leaf; the count
+        // decodes only the former. At this page size a leaf holds about a
+        // dozen entries and an internal node about a dozen children, so
+        // leaves are over ninety percent of the pages — a count that decoded
+        // leaves too could not be under half the scan's total.
+        assert!(
+            count_decodes > 0,
+            "a multi-level tree has internal nodes to decode"
+        );
+        assert!(
+            count_decodes * 2 < scan_decodes,
+            "the count decoded {count_decodes} pages against the scan's {scan_decodes}: \
+             leaves are being decoded rather than counted off their headers"
         );
     }
 
