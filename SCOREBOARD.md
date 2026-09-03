@@ -131,7 +131,7 @@ configuration changed.
 | Batch insert | UNKNOWN — no SQLite-batched comparison published | WIN ~1.2x like for like (containerised InlaySQL 67,484 rows/s vs 56,700; on the host, LOSS ~2.4x on the barrier, §3.4) | LOSS ~1.5x like for like (67,484 vs 99,212; on the host ~4.1x, §3.4) |
 | Concurrent commits, 4/8/16 writers | WIN ~10-17x across 4/8/16 | LOSS @1,4,16 (~1.4-2.4x/~1.1-3.0x/~3.1-5.4x, widening with concurrency, 5 interleaved reps); LOSS @8 ~0.30x (gated median of 3 vs MySQL 8.4, 2026-09-02/03; batching at parity, barrier rate ~3.4x behind) | UNKNOWN — no server exists (§3.4) |
 | Two-table join | MIXED: WIN one shape (~5-9x), LOSS three shapes (~1.1-3.5x) | WIN all four shapes: ~4x on both full joins; several-x on `LIMIT`, on a smaller LIMIT than theirs (§3.6) | WIN all four shapes: ~2.7-2.9x on both full joins; several-x on `LIMIT`, same caveat (§3.6) |
-| Aggregate / `GROUP BY` | UNKNOWN — no harness | WIN ~1.9x group / LOSS ~0.75x scalar (§3.7) | WIN ~1.26x group / LOSS ~0.62x scalar (§3.7) |
+| Aggregate / `GROUP BY` | UNKNOWN — no harness | WIN ~1.9x group / WIN ~6x scalar (§3.7) | WIN ~1.26x group / WIN ~5x scalar (§3.7) |
 | Vector search, exact | N/A (stock) / WIN ~8-10x vs `sqlite-vec` ext., iso-recall | N/A — no vector capability | TIE — 129 vs 148 µs, gap inside InlaySQL's own 36% three-run spread (§3.8) |
 | Vector search, int8 | UNKNOWN — no cross-engine harness | N/A — no vector capability | UNKNOWN — no cross-engine harness |
 | p99 commit latency | LOSS ~7-9x at high writer counts | TIE @1 (mixed sign, 4/5 reps); LOSS @4,16 (~1.5-4.5x/~2.4-8.9x, widening, 5 interleaved reps) | UNKNOWN — no server exists (§3.4) |
@@ -596,13 +596,14 @@ InlaySQL side is `sql_shapes --mode agg` on the host, same sitting):
 | Shape | InlaySQL | MySQL 8.4 | PostgreSQL 17 |
 | --- | --- | --- | --- |
 | `GROUP BY n` (100 groups) | **210/s** (207–212) | 110/s (109–110) | 167/s (165–167) |
-| scalar (`COUNT/MIN/MAX`) | 225/s (221–226) | 300/s (289–301) | **362/s** (358–366) |
+| scalar (`COUNT/MIN/MAX`) | **1,914/s** (1,624–2,026; remeasured 15:26 at `8cd65c7`) | 300/s (289–301) | 362/s (358–366) |
 
 **`GROUP BY`: WIN ~1.9x vs MySQL 8.4, WIN ~1.26x vs PostgreSQL** — 5/5
 reps non-overlapping, and the 1.26x clears the quiet floor (it would not
 have cleared 2026-08-31's 20.2% desktop floor, which is why this sitting's
-quiet matters). **Scalar: LOSS ~0.75x vs MySQL, ~0.62x vs PostgreSQL** —
-5/5 the other way, non-overlapping. On 2026-08-31 this row read 29/s
+quiet matters). **Scalar: WIN ~6x vs MySQL, ~5x vs PostgreSQL** since AHL-546/548
+(`MIN`/`MAX` by descent, `COUNT(*)` from leaf cell counts) — at 03:15 the
+same cell read 225/s, LOSS 0.75x/0.62x, 5/5 the other way. On 2026-08-31 this row read 29/s
 (26–31) and 53/s (49–57) vs 98/147 and 275/317 — LOSS 3.4–6.0x, "the
 single largest multiple against InlaySQL in the matrix outside points".
 InlaySQL's cells moved 7.2x and 4.2x; the servers' moved 9–14% (the quiet
@@ -902,7 +903,7 @@ this disadvantage; every cell that stays a library call (§3.1, §3.2, §3.6,
 5. **(Medium, new harness) `GROUP BY`/aggregate suite, all three engines.**
    ~~Does not exist against anyone today~~ — **MySQL and PostgreSQL cells
    filled 2026-08-31, regenerated gated 2026-09-02/03** (§3.7: `GROUP BY`
-   now WIN 1.9x/1.26x, scalar still LOSS 0.75x/0.62x; the shape is defined in
+   now WIN 1.9x/1.26x, scalar WIN ~6x/~5x since 15:26; the shape is defined in
    `bench/external/read_driver.py` and measured InlaySQL-side through
    `inlaysql-bench --bin sql_shapes --mode agg`). **The SQLite cell is the
    remaining half of this item**: extend `read_driver.py` or add an

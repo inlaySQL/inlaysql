@@ -1712,17 +1712,30 @@ per rep, 5 reps, median (min–max).
 | Shape | InlaySQL | MySQL 8.4 | PostgreSQL 17 |
 | --- | --- | --- | --- |
 | `GROUP BY n` (100 groups) | **210/s** (207–212) | 110/s (109–110) | 167/s (165–167) |
-| scalar `COUNT/MIN/MAX` | 225/s (221–226) | 300/s (289–301) | **362/s** (358–366) |
+| scalar `COUNT/MIN/MAX` | **1,914/s** (1,624–2,026) | 300/s (289–301) | 362/s (358–366) |
 
 **`GROUP BY`: WIN 1.9x MySQL 8.4 and 1.26x PostgreSQL** — every InlaySQL
 rep above every server rep, 5 of 5, ranges not overlapping; the 1.26x
 clears the quiet-machine floor and would not clear the desktop-load one,
 which is a reason this sitting's quiet is worth having. **Scalar aggregate:
-LOSS, 0.75x MySQL and 0.62x PostgreSQL** — 5 of 5 the other way, ranges
-not overlapping. A whole-table `COUNT/MIN/MAX` over 100,000 rows at 225/s
-is 4.4 ms, ~44 ns per row, against PostgreSQL's 2.75 ms; the executor still
-pays per row where the servers' do not, and the win on `GROUP BY` is the
-grouping getting cheap, not the scan.
+WIN ~6x vs MySQL 8.4, ~5x vs PostgreSQL** — remeasured 2026-09-03 15:26
+at `8cd65c7` (`sql_shapes`, REPS=5, load 4.3 with a build agent on the
+host, so its 21% spread is that sitting's; raw
+`bench/results/20260902T191343Z-scoreboard/sql-shapes-inlaysql-agg-8cd65c7.txt`).
+Earlier the same day this cell read **225/s (221–226), a LOSS of 0.75x and
+0.62x**, 5 of 5 the other way: a whole-table `COUNT/MIN/MAX` over 100,000
+rows at 4.4 ms, ~44 ns per row, the executor paying per row where the
+servers' do not. Two landings turned it: AHL-546 answers `MIN`/`MAX` of the
+rowid (or an indexed leading column) by one descent to each end of the
+tree, and AHL-548 answers a bare `COUNT(*)` from the leaves' cell counts —
+every leaf's slot directory is its row count, so the walk borrows pages and
+decodes nothing, and is exact under an open transaction because the
+pending tree's decoded dirty leaves answer directly. Both are SQLite's own
+optimisations; both refuse and fall back the moment a `WHERE`, `GROUP BY`,
+`DISTINCT`, `FILTER`, join, `COUNT(col)` or `WITHOUT ROWID` table is in the
+statement, and `EXPLAIN` names them. `PERF.md` has each step interleaved:
+the `aggregate-scalar` profile shape went 209 → ~2,000/s, 3 of 3.
+The servers' cells are the 03:15 sitting's; only InlaySQL's was rerun.
 
 **What moved, and why it is not one commit.** On 2026-08-31 these cells
 read 29/s (26–31) and 53/s (49–57) — "the worst multiples in the matrix",

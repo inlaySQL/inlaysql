@@ -1140,7 +1140,7 @@ unix socket).** Four workloads that had no harness on either side until
 | Join, secondary-index inner, full | **3.49 ms** p50 | 13.71 ms (**~4x**) | 9.42 ms (**~2.7x**) |
 | Join, PK inner, full | **3.23 ms** p50 | 13.68 ms (**~4x**) | 9.36 ms (**~2.9x**) |
 | `GROUP BY n`, 100 groups | **210/s** | 110/s (**~1.9x**) | 167/s (**~1.26x**) |
-| Scalar `COUNT/MIN/MAX`, 100k rows | 225/s | 300/s (we lose ~1.3x) | 362/s (we lose ~1.6x) |
+| Scalar `COUNT/MIN/MAX`, 100k rows | **1,914/s** | 300/s (**~6x**) | 362/s (**~5x**) |
 | Batch insert, 100 rows/statement, containerised like the servers | **67,484 rows/s** | 56,700 rows/s (**~1.2x**) | 99,212 rows/s (we lose ~1.5x) |
 | Batch insert, same, InlaySQL on the host (`F_FULLFSYNC`) | 24,102 rows/s | (we lose ~2.4x) | (we lose ~4.1x) |
 
@@ -1154,9 +1154,11 @@ both on 2026-08-31 — and is now a win against both, 5 of 5 repetitions
 non-overlapping; that is the aggregate work of 2026-09-02/03 (AHL-513
 through AHL-541, each step measured in `PERF.md`), not one commit, and
 about a tenth of it is the quieter machine, since the servers' own cells
-rose 9-14% too. **The scalar aggregate still loses**, 0.75x MySQL and
-0.62x PostgreSQL, 5 of 5 the other way: the executor still pays per row
-where theirs do not. **Batch insert has two rows now.** Like for like — InlaySQL in a
+rose 9-14% too. **The scalar aggregate flipped the same day**: it read 225/s
+(0.75x/0.62x, a loss) at 03:15; by 15:26 `MIN`/`MAX` of the rowid answer
+by one descent each and `COUNT(*)` from the leaves' cell counts (AHL-546,
+AHL-548 — SQLite's own optimisations, refused the moment a `WHERE` or a
+`COUNT(col)` appears), and the cell reads 1,914/s. **Batch insert has two rows now.** Like for like — InlaySQL in a
 container on the same volume class as the servers — it is ~1.2x MySQL 8.4
 and ~0.68x PostgreSQL 17; on the host it loses 2.4x/4.1x, and
 `BENCHMARK.md` says why: the host cell pays one `F_FULLFSYNC` per
