@@ -136,9 +136,9 @@ current execution order without relying on local conversation history.
 
 5. **Server posture F3/F4** — refuse-to-expose defaults; fuzz the packet path.
 
-6. **Insert structural half (C7)**: dirty pages held as decoded `Node`s
-   across a transaction, encoded once at commit. Both release DST sweeps
-   mandatory.
+6. **Insert structural half (C7): LANDED (AHL-542)** — pages stay decoded
+   for the life of a transaction, encoded once at commit; batch insert
+   1.29–1.44x on the engine's own profile; five DST sweeps.
 
 7. **C1 commit-side logical group commit** — highest payoff, data-loss risk,
    full DST rigor; only when it can be done carefully.
