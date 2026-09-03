@@ -255,6 +255,16 @@ struct CommitCoordinator {
     /// release that would otherwise hand it straight back. See
     /// `docs/research/commit-group-slice2.md`.
     absorption: Mutex<AbsorbQueue>,
+    /// [`AbsorbQueue::enabled`], readable without the mutex.
+    ///
+    /// Not a cache for convenience: with the flag off — the default, and
+    /// every published number — a commit would otherwise take this
+    /// coordinator's absorption lock three times (offer, gate acquire, gate
+    /// release) to learn each time that there is nothing to do. One-way, like
+    /// the flag it mirrors, so a relaxed load is enough: the only transition
+    /// is `false` → `true`, and a writer that reads the stale `false` simply
+    /// commits the way it does today.
+    absorption_enabled: AtomicBool,
     /// Where an offered writer waits for its outcome — the wait that, under
     /// absorption, *replaces* [`CommitCoordinator::reservation_done`] for
     /// that writer rather than being added to it. Woken by
@@ -848,13 +858,11 @@ fn release_normal_reservation(coordinator: &CommitCoordinator) -> u64 {
     // waiting for a leader that is never coming. A cohort already *taken* is
     // untouched — its answers come after the barrier, which is outside this
     // gate, and [`CohortGuard`] is what covers that span.
-    {
+    if coordinator.absorption_enabled.load(Ordering::Acquire) {
         let mut absorption = coordinator.absorption_state();
-        if absorption.enabled {
-            absorption.gate_released();
-            drop(absorption);
-            coordinator.absorption_done.notify_all();
-        }
+        absorption.gate_released();
+        drop(absorption);
+        coordinator.absorption_done.notify_all();
     }
     let mut reserved = coordinator
         .reserved
@@ -1090,18 +1098,26 @@ impl FileDevice {
         Ok(self.file.metadata().map_err(io_error)?.len() == 0)
     }
 
-    /// How many absorption cohorts have formed on this file, and how many
-    /// transactions they judged — `(cohorts, members)`.
+    /// How many absorption cohorts have formed on this file, how many
+    /// transactions they took, and how many of those a leader actually
+    /// committed — `(cohorts, members, committed)`.
+    ///
+    /// The third number is not the second: a member a leader took and then
+    /// refused (a record that would not fit the region's remainder, a device
+    /// error, everyone after the first refusal) goes back to committing for
+    /// itself, gate hold and barrier included. Anything reasoning about what
+    /// absorption *saved* has to use `committed`; `members` is what it
+    /// *attempted*.
     ///
     /// Diagnostic, and load-bearing for the tests rather than for the engine:
     /// a test that turns `EngineOptions::commit_absorption` on proves nothing
     /// unless cohorts actually formed, which is the same reason
     /// `CowBTree::pages_reused` is public. `None` for a read-only handle,
     /// which shares no coordinator and commits nothing.
-    pub fn absorption_stats(&self) -> Option<(u64, u64)> {
+    pub fn absorption_stats(&self) -> Option<(u64, u64, u64)> {
         let coordinator = self.coordinator.as_ref()?;
         let absorption = coordinator.absorption_state();
-        Some((absorption.cohorts, absorption.members))
+        Some((absorption.cohorts, absorption.members, absorption.committed))
     }
 
     /// A live snapshot of this file's [`CommitCoordinator`] flush/ticket
@@ -1517,11 +1533,8 @@ impl Device for FileDevice {
             // Advertise this hold to writers that have not reached the gate
             // yet: only while this is set will anyone hand its transaction
             // over rather than queue behind the reservation.
-            {
-                let mut absorption = coordinator.absorption_state();
-                if absorption.enabled {
-                    absorption.gate_acquired();
-                }
+            if coordinator.absorption_enabled.load(Ordering::Acquire) {
+                coordinator.absorption_state().gate_acquired();
             }
             self.gate_started_ns.store(now_nanos(), Ordering::Relaxed);
             let racing = coordinator
@@ -1757,6 +1770,9 @@ impl Device for FileDevice {
         }
         if let Some(coordinator) = &self.coordinator {
             coordinator.absorption_state().enabled = true;
+            coordinator
+                .absorption_enabled
+                .store(true, Ordering::Release);
         }
     }
 
@@ -1774,6 +1790,9 @@ impl Device for FileDevice {
     /// being switched on.
     fn absorb_offer(&self, root: PageId, ops: &mut PendingOps) -> Option<u64> {
         let coordinator = self.coordinator.as_ref()?;
+        if !coordinator.absorption_enabled.load(Ordering::Acquire) {
+            return None;
+        }
         let mut absorption = coordinator.absorption_state();
         if !absorption.gate_held() {
             return None;
@@ -1815,6 +1834,9 @@ impl Device for FileDevice {
         let Some(coordinator) = &self.coordinator else {
             return Vec::new();
         };
+        if !coordinator.absorption_enabled.load(Ordering::Acquire) {
+            return Vec::new();
+        }
         let cohort = coordinator.absorption_state().take();
         if !cohort.is_empty() {
             // Armed for as long as this leader owes answers — across the gate
@@ -1992,6 +2014,7 @@ fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator
         reuse_enabled: AtomicBool::new(false),
         durability: AtomicU8::new(DURABILITY_UNSET),
         absorption: Mutex::new(AbsorbQueue::default()),
+        absorption_enabled: AtomicBool::new(false),
         absorption_done: Condvar::new(),
     });
     registry.insert(file_id, Arc::downgrade(&coordinator));
@@ -2143,6 +2166,7 @@ mod group_commit_tests {
             reuse_enabled: AtomicBool::new(false),
             durability: AtomicU8::new(DURABILITY_UNSET),
             absorption: Mutex::new(AbsorbQueue::default()),
+            absorption_enabled: AtomicBool::new(false),
             absorption_done: Condvar::new(),
         }
     }

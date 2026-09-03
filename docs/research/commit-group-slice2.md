@@ -553,3 +553,46 @@ prediction on record is **1.9-2.7x at 32 writers**.
 And whatever the number: **the default stays `false`.** Turning it on is a
 call about a protocol whose worst case is "lose a cohort instead of a
 commit", and that is the user's to make, not the measurement's.
+
+## 12. What the measurement said (added after the fact, 2026-09-03)
+
+**0.90x at 32 writers, not 1.9-2.7x**, and two of this document's own
+arguments were wrong. The full write-up, with the tables, is `PERF.md`'s
+AHL-547 section; the corrections belong here, next to the claims they
+falsify.
+
+**§3 is retracted.** The in-gate barrier was argued four ways and measured at
+787 commits/s against a 1,689 control at 16 writers, with p99 at 187 ms
+against 49 ms. Holding the gate across the `fsync` stops the next cohort
+doing its gate work while this one syncs, and that overlap is where this
+engine's concurrent throughput comes from. The barrier belongs outside the
+gate, and the watchdog §3 was written to avoid had to be built after all:
+`CohortGuard`, an RAII guard in the leader's own `FileDevice` covering the
+gate release and the barrier after it, which is exactly the span
+`NormalCommitGuard` cannot reach.
+
+**§1's `Failed`-for-a-record-that-does-not-fit was wrong too**, and not
+rarely: the region's remaining room shrinks as a cohort's buffer grows, so at
+16 writers the bench stopped outright on it. Nothing of such a member reaches
+the disk, so it is refused and handed its transaction back instead — which
+costs one copy of the offered map per member, the only copy this protocol
+makes.
+
+**The finding the measurement is actually for.** Cohorts form (4.3-5.8
+members), the median commit really does get faster (28.2 ms against 36.0 ms
+at 16 writers, exactly as §11 predicted the gate saving would look), and the
+engine nonetheless runs **26% more barriers**. The flush-side group commit
+was already amortising the `fsync` over 6-9 transactions by gathering tickets
+from writers publishing them independently — and a follower under absorption
+never reaches `sync_commit`, so it never publishes one. The commit-side
+cohort is 5.6 transactions; the flush-side cohort it displaces is 9.2. **The
+two group-commit layers are not composable as built; they compete for the
+same population, and the earlier one gathers less.** Section 5 of the brief
+priced the gate and never priced that.
+
+So the flag stays off, and this is a "do not turn this on" result rather than
+a "left to the caller" one. What would flip it is in `PERF.md`: the layers
+have to compose (the brief's Slice 4, which this measurement reclassifies
+from an optimisation on top of Slice 3 to a precondition for Slice 3 paying
+at all), and a cohort has to survive a WAL-region boundary rather than losing
+a third of its members to one.

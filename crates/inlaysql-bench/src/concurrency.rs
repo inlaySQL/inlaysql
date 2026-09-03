@@ -354,12 +354,12 @@ fn inlaysql_writers(
     // suite reports it rather than leaving a flat measurement ambiguous
     // between "it does not help" and "it never ran".
     if absorption {
-        let (cohorts, members) = keeper.absorption_stats().unwrap_or((0, 0));
+        let (cohorts, members, absorbed) = keeper.absorption_stats().unwrap_or((0, 0, 0));
         println!(
-            "  absorption: {writers} writers, {cohorts} cohorts, {members} members judged \
-             ({:.2} members/cohort, {:.1}% of commits absorbed)",
+            "  absorption: {writers} writers, {cohorts} cohorts, {members} members taken, \
+             {absorbed} committed by a leader ({:.2} members/cohort, {:.1}% of commits absorbed)",
             members as f64 / (cohorts.max(1)) as f64,
-            100.0 * members as f64 / (committed.max(1)) as f64,
+            100.0 * absorbed as f64 / (committed.max(1)) as f64,
         );
     }
     // Barriers per commit is the number this slice moves most directly — one

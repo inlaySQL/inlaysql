@@ -789,7 +789,7 @@ fn absorption_writers(absorption: bool) -> (Vec<i64>, usize, u64) {
             .sum()
     });
 
-    let (_, members) = keeper.absorption_stats().unwrap();
+    let (_, members, _) = keeper.absorption_stats().unwrap();
     let device = Rc::new(RefCell::new(keeper));
     let rows = ids(&device);
 
@@ -850,7 +850,7 @@ fn absorbed_parallel_writers_lose_nothing_and_form_cohorts() {
 /// times and causes none — its leader's single barrier covers it. So
 ///
 /// ```text
-/// normal_flushes <= committed - members_absorbed
+/// normal_flushes <= committed - members_a_leader_committed
 /// ```
 ///
 /// must hold with the flag on, and a member that slipped through and synced
@@ -863,8 +863,8 @@ fn absorbed_parallel_writers_lose_nothing_and_form_cohorts() {
 /// section where a noisy number belongs.
 #[test]
 fn a_cohort_member_never_runs_a_barrier_of_its_own() {
-    let (committed, members, flushes) = barrier_counts(false);
-    assert_eq!(members, 0, "flag off: nothing may be absorbed at all");
+    let (committed, absorbed, flushes) = barrier_counts(false);
+    assert_eq!(absorbed, 0, "flag off: nothing may be absorbed at all");
     assert!(
         flushes <= committed,
         "flag off: {flushes} barriers for {committed} commits"
@@ -883,7 +883,7 @@ fn a_cohort_member_never_runs_a_barrier_of_its_own() {
 }
 
 /// Run the absorption workload and report (commits, members absorbed,
-/// normal-commit barriers).
+/// members a leader committed, normal-commit barriers).
 fn barrier_counts(absorption: bool) -> (u64, u64, u64) {
     use std::sync::{Arc, Barrier};
 
@@ -938,7 +938,7 @@ fn barrier_counts(absorption: bool) -> (u64, u64, u64) {
         stats.normal_flushes > 0,
         "absorption = {absorption}: no barrier ran at all"
     );
-    let (_, members) = keeper.absorption_stats().unwrap_or((0, 0));
+    let (_, _, absorbed) = keeper.absorption_stats().unwrap_or((0, 0, 0));
     // Every acknowledged row must still be in the file, whatever the counters
     // say — a cheap barrier that lost a commit would be no bargain.
     let device = Rc::new(RefCell::new(keeper));
@@ -949,7 +949,7 @@ fn barrier_counts(absorption: bool) -> (u64, u64, u64) {
     );
     (
         (WRITERS as i64 * PER_WRITER) as u64,
-        members,
+        absorbed,
         stats.normal_flushes,
     )
 }
