@@ -1126,7 +1126,8 @@ unix socket).** Four workloads that had no harness on either side until
 | Join, PK inner, full | **3.23 ms** p50 | 13.68 ms (**~4x**) | 9.36 ms (**~2.9x**) |
 | `GROUP BY n`, 100 groups | **210/s** | 110/s (**~1.9x**) | 167/s (**~1.26x**) |
 | Scalar `COUNT/MIN/MAX`, 100k rows | 225/s | 300/s (we lose ~1.3x) | 362/s (we lose ~1.6x) |
-| Batch insert, 100 rows/statement | 24,102 rows/s | 56,700 rows/s (we lose ~2.4x) | 99,212 rows/s (we lose ~4.1x) |
+| Batch insert, 100 rows/statement, containerised like the servers | **67,484 rows/s** | 56,700 rows/s (**~1.2x**) | 99,212 rows/s (we lose ~1.5x) |
+| Batch insert, same, InlaySQL on the host (`F_FULLFSYNC`) | 24,102 rows/s | (we lose ~2.4x) | (we lose ~4.1x) |
 
 The range scan we lose to SQLite is a shape we *win* against both servers,
 so "our row iteration is slow" is a statement about SQLite specifically,
@@ -1140,11 +1141,13 @@ through AHL-541, each step measured in `PERF.md`), not one commit, and
 about a tenth of it is the quieter machine, since the servers' own cells
 rose 9-14% too. **The scalar aggregate still loses**, 0.75x MySQL and
 0.62x PostgreSQL, 5 of 5 the other way: the executor still pays per row
-where theirs do not. **The batch-insert loss widened** (was 1.6x/3.1x),
-and `BENCHMARK.md` says why: InlaySQL's cell runs on the host at one
-`F_FULLFSYNC` per statement — 241 commits/s, 4.1 ms each, 98% of that
-barrier's ceiling — while the servers commit against the Docker volume's
-cheaper barrier (2.5x cheaper on this machine, measured InlaySQL against
+where theirs do not. **Batch insert has two rows now.** Like for like — InlaySQL in a
+container on the same volume class as the servers — it is ~1.2x MySQL 8.4
+and ~0.68x PostgreSQL 17; on the host it loses 2.4x/4.1x, and
+`BENCHMARK.md` says why: the host cell pays one `F_FULLFSYNC` per
+statement — 241 commits/s, 4.1 ms each, 98% of that barrier's ceiling —
+while the servers commit against the Docker volume's cheaper barrier (2.5x
+cheaper on this machine, measured InlaySQL against
 itself), and a quiet machine let their side rise. AHL-542 removed the
 engine's own per-row page round trip from that statement (1.29-1.44x on
 its own profile); what is published is the barrier, not the engine. The

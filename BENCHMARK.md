@@ -1744,7 +1744,7 @@ tally on the engine's 100k aggregate profile is 85 ops/s before AHL-521 to
 210 after AHL-541 — the same 210 `sql_shapes` reads here, on a different
 harness, which is as close to a cross-check as this page has.
 
-### Batch insert — LOSS both, and wider than the previous edition, for a stated reason
+### Batch insert — like for like, a WIN against MySQL 8.4 and a LOSS against PostgreSQL; on the host, the barrier
 
 100 rows per multi-row `INSERT` statement, autocommitted, 100 statements per
 rep (10,000 rows per rep), explicit ids, 5 reps, durability aligned (MySQL
@@ -1759,11 +1759,21 @@ That is the asymmetry this row is about.
 | Engine | rows/s (median, range) | commits/s | c/fsync |
 | --- | --- | --- | --- |
 | InlaySQL (host, `F_FULLFSYNC`) | 24,102 (23,219–24,736) | 241 | 1.00 |
+| **InlaySQL (containerised, same volume class as the servers)** | **67,484** (60,453–70,943) | 675 | 1.00 |
 | MySQL 8.4 (containerised) | 56,700 (45,244–68,901) | 567 | 0.71 (0.62–0.76) |
 | PostgreSQL 17 (containerised) | **99,212** (93,776–100,749) | 992 | 1.00 |
 
-**LOSS ~2.4x vs MySQL 8.4, ~4.1x vs PostgreSQL** (was ~1.6x/~3.1x on
-2026-08-31). **The published ratio is the barrier, not the engine.**
+**Like for like — the containerised row against the containerised servers
+— InlaySQL is ~1.2x MySQL 8.4 and ~0.68x PostgreSQL 17.** That row was
+measured on 2026-09-03 at 10:16 (load 2.88 before, 6.36 after — three
+build agents were running on the host, so its spread of 17% is wider than
+the servers' sitting; five reps, medians): `sql_shapes` in the
+`inlaysql-oltp` service of `bench/external/compose.yml`, the database on the
+`inlaysql-oltp-data` named volume, `DIR=/data MODE=batch REPS=5`, raw
+`bench/results/20260902T191343Z-scoreboard/sql-shapes-inlaysql-batch-container.txt`.
+**On the host the row is LOSS ~2.4x vs MySQL 8.4, ~4.1x vs PostgreSQL**
+(was ~1.6x/~3.1x on 2026-08-31), and **that ratio is the barrier, not the
+engine.**
 InlaySQL's 241 commits/s is 4.1 ms per statement, and the host single-row
 write in the OLTP table above pays the same barrier at 246.8 ops/s, 3.91 ms
 p50 — a hundred-row statement costs what a one-row statement costs, because
@@ -1790,13 +1800,16 @@ change), PostgreSQL 81,229 → 99,212 — while a barrier-bound row cannot.
 MySQL's c/fsync of 0.71 is InnoDB's log layer flushing ~1.4 times per
 commit at this batch size, its background flush counted, as before.
 
-What this row still owes, stated rather than estimated: a containerised
-InlaySQL batch-insert cell, `sql_shapes --mode batch` run inside the
-compose network on the same volume class as the OLTP table's containerised
-row. It was not run tonight. The arithmetic of a 2.5x cheaper barrier at an
-85% barrier share says such a row should land well above the host's but
-still short of PostgreSQL's; that is an expectation, not a number, and it
-is not on this page until it is measured.
+The containerised row above is what this section used to owe. The
+arithmetic said a 2.5x cheaper barrier at an 85% barrier share should land
+it well above the host's and short of PostgreSQL's; it landed at 2.8x the
+host's (67,484 against 24,102) and 0.68x PostgreSQL's, which is the same
+statement with a number on it. What separates it from PostgreSQL now is
+not the barrier: both pay one per statement (c/fsync 1.00 on both sides);
+it is the ~1.0 ms of engine work per hundred-row statement that remains
+after AHL-542, against PostgreSQL's ~0.6 ms, and that is a per-row engine
+item again — the insert path's remaining costs the root plan lists
+(`leaf_split_point`, `encode_leaf`, index maintenance).
 
 ---
 

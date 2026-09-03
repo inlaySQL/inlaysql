@@ -128,7 +128,7 @@ configuration changed.
 | Point read by PK | WIN ~2-4x vs durable config; LOSS ~2x vs WAL/NORMAL | WIN ~67x (structural, §3.1) | WIN ~12x (structural, §3.1) |
 | Indexed range scan | LOSS ~1.5x (durable) / ~2.5x (WAL) | WIN ~7x (§3.2) | WIN ~4.5x (§3.2) |
 | Single-row insert (durable) | WIN ~2.7x | LOSS ~1.5x (containerised, 3/3 runs; not floor-bound, §3.3) | LOSS ~1.2x (containerised, 3/3 runs; not floor-bound, §3.3) |
-| Batch insert | UNKNOWN — no SQLite-batched comparison published | LOSS ~2.4x (host barrier vs container barrier, §3.4) | LOSS ~4.1x (same, §3.4) |
+| Batch insert | UNKNOWN — no SQLite-batched comparison published | WIN ~1.2x like for like (containerised InlaySQL 67,484 rows/s vs 56,700; on the host, LOSS ~2.4x on the barrier, §3.4) | LOSS ~1.5x like for like (67,484 vs 99,212; on the host ~4.1x, §3.4) |
 | Concurrent commits, 4/8/16 writers | WIN ~10-17x across 4/8/16 | LOSS @1,4,16 (~1.4-2.4x/~1.1-3.0x/~3.1-5.4x, widening with concurrency, 5 interleaved reps); LOSS @8 ~0.30x (gated median of 3 vs MySQL 8.4, 2026-09-02/03; batching at parity, barrier rate ~3.4x behind) | UNKNOWN — no server exists (§3.4) |
 | Two-table join | MIXED: WIN one shape (~5-9x), LOSS three shapes (~1.1-3.5x) | WIN all four shapes: ~4x on both full joins; several-x on `LIMIT`, on a smaller LIMIT than theirs (§3.6) | WIN all four shapes: ~2.7-2.9x on both full joins; several-x on `LIMIT`, same caveat (§3.6) |
 | Aggregate / `GROUP BY` | UNKNOWN — no harness | WIN ~1.9x group / LOSS ~0.75x scalar (§3.7) | WIN ~1.26x group / LOSS ~0.62x scalar (§3.7) |
