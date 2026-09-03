@@ -577,7 +577,7 @@ impl CommitCoordinator {
     /// immediately and never reaches [`Condvar::wait`], so a single writer
     /// still fsyncs on its own turn with no batching delay or timeout.
     fn make_durable(&self, ticket: u64, sync: impl FnOnce() -> Result<()>) -> Result<()> {
-        self.make_durable_with_cohort(ticket, false, sync)
+        self.make_durable_with_cohort(ticket, false, false, sync)
     }
 
     /// The post-reservation variant used by a normal user commit. It may give
@@ -586,13 +586,30 @@ impl CommitCoordinator {
     /// reservation itself. Checkpoints use [`Self::make_durable`] because they
     /// may be syncing while holding that reservation.
     fn make_commit_durable(&self, ticket: u64, sync: impl FnOnce() -> Result<()>) -> Result<()> {
-        self.make_durable_with_cohort(ticket, true, sync)
+        self.make_durable_with_cohort(ticket, true, true, sync)
+    }
+
+    /// The barrier a commit-side absorption leader runs while still holding
+    /// the reservation gate.
+    ///
+    /// It is a normal commit's barrier and is counted as one — the
+    /// `normal_tickets_flushed / normal_flushes` ratio has to keep meaning
+    /// "commits landed per `fsync`", and under absorption most of them land
+    /// here — but it does **not** open the gather window. That window yields
+    /// for as long as a normal commit is inflight or queued, and this caller
+    /// is itself that inflight commit: nobody else can reach the gate to
+    /// publish a ticket while it is held, so the window could only spin
+    /// against its own caller until its yield budget ran out and gather
+    /// nothing. The cohort *is* the gather, done one phase earlier.
+    fn make_cohort_durable(&self, ticket: u64, sync: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.make_durable_with_cohort(ticket, false, true, sync)
     }
 
     fn make_durable_with_cohort(
         &self,
         ticket: u64,
         coalesce_normal_commits: bool,
+        normal: bool,
         sync: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         loop {
@@ -669,7 +686,7 @@ impl CommitCoordinator {
                 let covered = target.saturating_sub(durable_before);
                 self.flushes.fetch_add(1, Ordering::Relaxed);
                 self.tickets_flushed.fetch_add(covered, Ordering::Relaxed);
-                if coalesce_normal_commits {
+                if normal {
                     self.normal_flushes.fetch_add(1, Ordering::Relaxed);
                     self.normal_tickets_flushed
                         .fetch_add(covered, Ordering::Relaxed);
@@ -1800,7 +1817,7 @@ impl Device for FileDevice {
         }
         let file = &self.file;
         let level = coordinator.effective_durability();
-        coordinator.make_durable(ticket, || commit_barrier(file, level))
+        coordinator.make_cohort_durable(ticket, || commit_barrier(file, level))
     }
 
     /// Raise this file's [`Device::sync_commit`] barrier toward `durability`
@@ -2367,7 +2384,7 @@ mod group_commit_tests {
             // blocks there until this test releases it.
             let leader = scope.spawn(move || {
                 let ticket = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
-                coordinator.make_durable_with_cohort(ticket, true, || {
+                coordinator.make_durable_with_cohort(ticket, true, true, || {
                     leading_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
                     leader_flushed.store(true, Ordering::SeqCst);
@@ -2623,6 +2640,170 @@ mod group_commit_tests {
         );
 
         drop(coordinator);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A leader that unwinds after taking a cohort must leave every member
+    /// with an answer, not parked forever — `AbsorbQueue`'s first liveness
+    /// rule, and the one that cannot be met by the leader's own code because
+    /// the leader is no longer running.
+    ///
+    /// The answer is deliberately [`AbsorbResult::Failed`] and not
+    /// `Fallback`: a leader that got as far as writing the cohort's records
+    /// and then unwound has bytes on the file, and a member told to commit
+    /// again would apply its transaction twice.
+    #[test]
+    fn a_leader_panic_after_taking_a_cohort_fails_every_member_rather_than_hanging() {
+        let path = std::env::temp_dir().join(format!(
+            "inlaysql-cohort-panic-{}-{}.inlay",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let member = FileDevice::open(&path).expect("open");
+        member.set_commit_absorption(true);
+
+        let mut ops = PendingOps::new();
+        ops.insert(b"k".to_vec(), Some(b"v".to_vec()));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Opened *inside* the closure, because the guard that answers a
+            // panicking leader's cohort lives in the leader's own
+            // `FileDevice` and runs when that handle is torn down by the
+            // unwind — which is how a thread that panics mid-commit really
+            // ends (nothing in this workspace catches such a panic and keeps
+            // the handle alive).
+            let leader = FileDevice::open(&path).expect("open");
+            leader.begin_normal_commit().expect("begin normal commit");
+            // Only now can anyone hand a transaction over — the offer is
+            // refused while no normal commit holds the gate.
+            let token = member
+                .absorb_offer(0, &mut ops)
+                .expect("a leader is holding the gate, so the offer is taken");
+            assert_eq!(token, 1, "the first offer on a fresh coordinator");
+            assert!(ops.is_empty(), "an accepted offer moves the operations out");
+            assert_eq!(
+                leader.absorb_take().len(),
+                1,
+                "the leader must see the transaction parked behind it"
+            );
+            panic!("simulated leader panic after taking a cohort and before answering it");
+        }));
+        assert!(result.is_err(), "the closure above must have panicked");
+
+        // `absorb_wait` returns immediately: the unwind already filed the
+        // answer through `NormalCommitGuard::drop` →
+        // `release_normal_reservation` → `AbsorbQueue::gate_released`.
+        let mut back = PendingOps::new();
+        match member.absorb_wait(1, &mut back) {
+            AbsorbResult::Failed(_) => {}
+            other => panic!("a member of a panicking leader's cohort got {other:?}"),
+        }
+
+        drop(member);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A checkpoint is never absorbed and never leads a cohort.
+    ///
+    /// It takes the gate through [`FileDevice::begin_commit`], not
+    /// `begin_normal_commit`, so it never advertises itself as a leader — and
+    /// a writer arriving behind it therefore parks on the reservation exactly
+    /// as it does today rather than handing its transaction to something that
+    /// will never commit it. That is the whole of why the brief's
+    /// "a checkpoint must not be absorbed into a batch" needs no code: the
+    /// two gate entries were already separate, for the flush side's sake, and
+    /// absorption hangs off the normal one only.
+    #[test]
+    fn a_checkpoint_holding_the_gate_is_never_offered_a_transaction() {
+        let path = std::env::temp_dir().join(format!(
+            "inlaysql-cohort-checkpoint-{}-{}.inlay",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let writer = FileDevice::open(&path).expect("open");
+        writer.set_commit_absorption(true);
+        let checkpointer = FileDevice::open(&path).expect("open");
+
+        let mut ops = PendingOps::new();
+        ops.insert(b"k".to_vec(), Some(b"v".to_vec()));
+
+        checkpointer
+            .begin_commit()
+            .expect("checkpoint takes the gate");
+        assert!(
+            writer.absorb_offer(0, &mut ops).is_none(),
+            "a checkpoint must never be handed another writer's transaction"
+        );
+        assert_eq!(ops.len(), 1, "and the refusal must not touch it");
+        checkpointer.end_commit();
+
+        drop(writer);
+        drop(checkpointer);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A transaction offered into a gate hold that ends without taking it
+    /// comes home with its operations — `AbsorbQueue`'s second liveness rule.
+    /// This is the writer that arrived just after a leader fixed its cohort's
+    /// membership; it commits the ordinary way and typically leads the next
+    /// cohort itself.
+    #[test]
+    fn a_member_no_leader_took_is_handed_its_transaction_back() {
+        let path = std::env::temp_dir().join(format!(
+            "inlaysql-cohort-handback-{}-{}.inlay",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let member = FileDevice::open(&path).expect("open");
+        member.set_commit_absorption(true);
+        let leader = FileDevice::open(&path).expect("open");
+
+        let mut ops = PendingOps::new();
+        ops.insert(b"k".to_vec(), Some(b"v".to_vec()));
+
+        // No gate holder: nothing to hand the transaction to, and nothing is
+        // touched.
+        assert!(
+            member.absorb_offer(7, &mut ops).is_none(),
+            "an offer with nobody holding the gate must be refused"
+        );
+        assert_eq!(ops.len(), 1, "a refused offer leaves the operations alone");
+
+        leader.begin_normal_commit().expect("begin");
+        let token = member.absorb_offer(7, &mut ops).expect("offer taken");
+        assert!(ops.is_empty());
+        // The leader releases without ever draining the queue.
+        leader.end_normal_commit();
+
+        let mut back = PendingOps::new();
+        assert_eq!(
+            member.absorb_wait(token, &mut back),
+            AbsorbResult::Fallback,
+            "a member nobody took must be told to commit for itself"
+        );
+        assert_eq!(
+            back.get(b"k".as_slice()),
+            Some(&Some(b"v".to_vec())),
+            "and it must get its transaction back to commit with"
+        );
+
+        drop(member);
+        drop(leader);
         let _ = std::fs::remove_file(&path);
     }
 

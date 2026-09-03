@@ -840,3 +840,95 @@ fn absorbed_parallel_writers_lose_nothing_and_form_cohorts() {
         "flag on: no cohort ever formed, so this test exercised nothing"
     );
 }
+
+/// **One barrier for the whole cohort**, measured on a real file rather than
+/// inferred from the code.
+///
+/// `CommitStats::normal_tickets_flushed / normal_flushes` is commits landed
+/// per `fsync`. The flush-side group commit already shipped (AHL-461) pushes
+/// that above 1 on its own, by batching barriers across records that were
+/// each appended under their own gate hold. Absorption is a second, earlier
+/// layer: one gate hold appends N records and runs **one** barrier, so the
+/// ratio it produces is bounded below by the cohort size rather than by how
+/// many writers happen to publish a ticket inside one gather window.
+///
+/// What this asserts is the direction, not a number — the cohort size is a
+/// race and pinning it would make the test flaky for reasons that have
+/// nothing to do with the protocol. The number itself is measured in
+/// `PERF.md`'s AHL-547 section.
+#[test]
+fn absorbed_writers_land_more_commits_per_barrier_than_unabsorbed_ones() {
+    let off = barrier_ratio(false);
+    let on = barrier_ratio(true);
+    assert!(
+        on > off,
+        "absorption must land more commits per fsync than the flush side does \
+         alone ({on:.2} vs {off:.2} commits per barrier)"
+    );
+}
+
+/// Run the absorption workload and report commits landed per barrier.
+fn barrier_ratio(absorption: bool) -> f64 {
+    use std::sync::{Arc, Barrier};
+
+    const WRITERS: usize = 8;
+    const PER_WRITER: i64 = 25;
+
+    let temp = TempDb::new(if absorption {
+        "barrier-ratio-on"
+    } else {
+        "barrier-ratio-off"
+    });
+    let options = inlaysql::EngineOptions {
+        commit_absorption: absorption,
+        ..inlaysql::EngineOptions::default()
+    };
+    let mut creator =
+        Database::open_on_with_options(FileDevice::open(temp.path()).unwrap(), options).unwrap();
+    creator
+        .execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, n INTEGER)", &[])
+        .unwrap();
+    drop(creator);
+    // The counters live on the coordinator, which lives only as long as some
+    // handle on this file does.
+    let keeper = FileDevice::open(temp.path()).unwrap();
+
+    let barrier = Arc::new(Barrier::new(WRITERS));
+    std::thread::scope(|scope| {
+        for index in 0..WRITERS {
+            let barrier = barrier.clone();
+            let path = temp.path().to_path_buf();
+            scope.spawn(move || {
+                let mut db =
+                    Database::open_on_with_options(FileDevice::open(&path).unwrap(), options)
+                        .unwrap();
+                for round in 0..PER_WRITER {
+                    let id = round * WRITERS as i64 + index as i64 + 1;
+                    barrier.wait();
+                    loop {
+                        match insert(&mut db, id) {
+                            Ok(()) => break,
+                            Err(Error::Conflict) => {}
+                            Err(other) => panic!("writer {index} failed on id {id}: {other}"),
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let stats = keeper.commit_stats().unwrap();
+    assert!(
+        stats.normal_flushes > 0,
+        "absorption = {absorption}: no barrier ran at all"
+    );
+    // Every acknowledged row must still be in the file, whatever the ratio
+    // says — a cheap barrier that lost a commit would be no bargain.
+    let device = Rc::new(RefCell::new(keeper));
+    assert_eq!(
+        ids(&device),
+        (1..=(WRITERS as i64 * PER_WRITER)).collect::<Vec<_>>(),
+        "absorption = {absorption}: every Ok write must survive"
+    );
+    stats.normal_tickets_flushed as f64 / stats.normal_flushes as f64
+}
