@@ -789,7 +789,7 @@ fn absorption_writers(absorption: bool) -> (Vec<i64>, usize, u64) {
             .sum()
     });
 
-    let (_, members) = keeper.absorption_stats().unwrap();
+    let (_, members, _) = keeper.absorption_stats().unwrap();
     let device = Rc::new(RefCell::new(keeper));
     let rows = ids(&device);
 
@@ -839,4 +839,117 @@ fn absorbed_parallel_writers_lose_nothing_and_form_cohorts() {
         members > 0,
         "flag on: no cohort ever formed, so this test exercised nothing"
     );
+}
+
+/// **A cohort member never runs a barrier of its own**, checked on a real
+/// file rather than inferred from the code.
+///
+/// The bound is exact and structural rather than a ratio, because a ratio is
+/// a race: every commit that is *not* absorbed takes the gate once and can
+/// cause at most one flush, and every absorbed member takes the gate zero
+/// times and causes none — its leader's single barrier covers it. So
+///
+/// ```text
+/// normal_flushes <= committed - members_a_leader_committed
+/// ```
+///
+/// must hold with the flag on, and a member that slipped through and synced
+/// for itself would break it. The flag-off run is the control: with nothing
+/// absorbed the bound degenerates to "no more flushes than commits", which
+/// the flush-side group commit already satisfies with room to spare.
+///
+/// The ratio itself — commits landed per `fsync`, and whether absorption
+/// improves it — is a measurement, and it lives in `PERF.md`'s AHL-547
+/// section where a noisy number belongs.
+#[test]
+fn a_cohort_member_never_runs_a_barrier_of_its_own() {
+    let (committed, absorbed, flushes) = barrier_counts(false);
+    assert_eq!(absorbed, 0, "flag off: nothing may be absorbed at all");
+    assert!(
+        flushes <= committed,
+        "flag off: {flushes} barriers for {committed} commits"
+    );
+
+    let (committed, members, flushes) = barrier_counts(true);
+    assert!(
+        members > 0,
+        "flag on: no cohort formed, so this proves nothing"
+    );
+    assert!(
+        flushes <= committed - members,
+        "flag on: {flushes} barriers for {committed} commits of which {members} were \
+         absorbed — an absorbed member must never run a barrier of its own"
+    );
+}
+
+/// Run the absorption workload and report (commits, members absorbed,
+/// members a leader committed, normal-commit barriers).
+fn barrier_counts(absorption: bool) -> (u64, u64, u64) {
+    use std::sync::{Arc, Barrier};
+
+    const WRITERS: usize = 8;
+    const PER_WRITER: i64 = 25;
+
+    let temp = TempDb::new(if absorption {
+        "barrier-ratio-on"
+    } else {
+        "barrier-ratio-off"
+    });
+    let options = inlaysql::EngineOptions {
+        commit_absorption: absorption,
+        ..inlaysql::EngineOptions::default()
+    };
+    let mut creator =
+        Database::open_on_with_options(FileDevice::open(temp.path()).unwrap(), options).unwrap();
+    creator
+        .execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, n INTEGER)", &[])
+        .unwrap();
+    drop(creator);
+    // The counters live on the coordinator, which lives only as long as some
+    // handle on this file does.
+    let keeper = FileDevice::open(temp.path()).unwrap();
+
+    let barrier = Arc::new(Barrier::new(WRITERS));
+    std::thread::scope(|scope| {
+        for index in 0..WRITERS {
+            let barrier = barrier.clone();
+            let path = temp.path().to_path_buf();
+            scope.spawn(move || {
+                let mut db =
+                    Database::open_on_with_options(FileDevice::open(&path).unwrap(), options)
+                        .unwrap();
+                for round in 0..PER_WRITER {
+                    let id = round * WRITERS as i64 + index as i64 + 1;
+                    barrier.wait();
+                    loop {
+                        match insert(&mut db, id) {
+                            Ok(()) => break,
+                            Err(Error::Conflict) => {}
+                            Err(other) => panic!("writer {index} failed on id {id}: {other}"),
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let stats = keeper.commit_stats().unwrap();
+    assert!(
+        stats.normal_flushes > 0,
+        "absorption = {absorption}: no barrier ran at all"
+    );
+    let (_, _, absorbed) = keeper.absorption_stats().unwrap_or((0, 0, 0));
+    // Every acknowledged row must still be in the file, whatever the counters
+    // say — a cheap barrier that lost a commit would be no bargain.
+    let device = Rc::new(RefCell::new(keeper));
+    assert_eq!(
+        ids(&device),
+        (1..=(WRITERS as i64 * PER_WRITER)).collect::<Vec<_>>(),
+        "absorption = {absorption}: every Ok write must survive"
+    );
+    (
+        (WRITERS as i64 * PER_WRITER) as u64,
+        absorbed,
+        stats.normal_flushes,
+    )
 }

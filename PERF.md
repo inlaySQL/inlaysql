@@ -4779,6 +4779,144 @@ AHL-546 recorded: this change is read-only end to end — a new traversal
 over pages the raw scan already reads, plus a header accessor that is the
 check `scan_leaf_cells` already makes — and edits no write path, WAL record
 or on-disk format.
+### Commit-side absorption, slice 2: the gate was not the constraint, and the cohort competes with the flush side (AHL-547, 2026-09-03)
+
+Slice 1 (AHL-544, above) proved cohorts form and measured flat, exactly as it
+predicted, because moving the first-committer-wins *decision* leaves every
+follower taking the gate, appending its own record and running its own
+`fsync`. Slice 2 removes all three: a writer hands its open transaction to
+whichever writer holds the gate and waits for an outcome; the leader judges
+every parked transaction in gate-arrival order, replays the clean ones through
+its own tree, appends one self-contained record per member back to back in its
+own region **as a single write**, syncs once, and only then hands each member
+its answer. N transactions cost one gate acquisition, one append and one
+barrier instead of N of each. `docs/research/commit-group-slice2.md` is the
+protocol; the on-disk format is unchanged and still version 5.
+
+**The brief predicted 1.9-2.7x at 32 writers. It is 0.90x, and the reason is
+worth more than the number.**
+
+Two independent things had to be fixed before there was a number at all, and
+both are recorded here because each was a design belief that measurement
+falsified.
+
+**The in-gate barrier, retracted.** The research doc argued four ways for
+running the cohort's `fsync` while still holding the gate, the first and best
+being that it is the only shape in which "no member is acknowledged before the
+leader's sync" needs no watchdog. Measured, it is a disaster:
+
+| Writers | Control | Barrier inside the gate | Barrier outside |
+| --- | --- | --- | --- |
+| 16 | 1,689 commits/s, p99 48.9 ms | 787, p99 187.7 ms | 1,445, p99 49.0 ms |
+| 32 | 1,638 commits/s, p99 66.1 ms | 690, p99 473.0 ms | 1,540, p99 73.9 ms |
+
+Holding the gate across the barrier stops the *next* cohort doing its gate
+work while this one syncs, and that overlap is where the engine's concurrent
+throughput comes from — `PERF.md`'s own AHL-497 accounting says the gate is
+busy 88-90% of the wall clock at 16 writers precisely because it is being used
+while barriers run. It also starves the flush side: 3.92 commits per barrier
+against the control's 8.66. So the watchdog had to be built after all
+(`CohortGuard`, an RAII guard in the leader's own `FileDevice` covering the
+gate release and the barrier that follows it, because `NormalCommitGuard` ends
+at the gate), and the barrier went back outside. Everything below is the
+outside-the-gate version.
+
+**The measurement.** Two modes interleaved, three repetitions, control re-run
+inside each repetition, `WRITER_LEVELS=1,8,16,32 --suite concurrency
+--txns 150`, `Durability::Full`, host load 3.3-3.8 of 10 (M-series, macOS,
+`F_FULLFSYNC`). Median of three, with the three raw values beside it:
+
+| Writers | Off, commits/s | On, commits/s | Ratio | Off p50 | On p50 | Off p99 | On p99 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 258 `[249 258 266]` | 249 `[247 249 257]` | 0.97x | 4.23 ms | 4.23 ms | 7.93 ms | 7.87 ms |
+| 8 | 1,344 `[1244 1344 1392]` | 1,053 `[992 1053 1107]` | 0.78x | 18.99 ms | 15.96 ms | 32.04 ms | 25.75 ms |
+| 16 | 1,713 `[1676 1713 1791]` | 1,484 `[1383 1484 1489]` | 0.87x | 35.95 ms | 28.15 ms | 48.30 ms | 40.09 ms |
+| 32 | 1,697 `[1659 1697 1735]` | 1,531 `[1486 1531 1607]` | 0.90x | 53.06 ms | 55.27 ms | 66.09 ms | 74.95 ms |
+
+The ranges do not overlap at 8, 16 or 32. Unlike slice 1 — where two sets
+disagreed in *sign* and "flat" was the honest reading — **this is a real,
+repeatable 10-22% loss**, and §4's floor is not what is being bumped into.
+
+**Cohorts form, and the sync count goes the wrong way. That is the whole
+finding:**
+
+| Writers | Cohorts | Members taken | Committed by a leader | Members/cohort | Share of commits absorbed | Off syncs/commit | On syncs/commit | Off commits/sync | On commits/sync |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 0 | 0 | — | 0.0% | 1.000 | 1.000 | 1.00 | 1.00 |
+| 8 | 211 | 916 | 793 | 4.3 | 66.1% | 0.165 | 0.223 | 6.08 | 4.28 |
+| 16 | 304 | 1,769 | 1,335 | 5.8 | 55.6% | 0.115 | 0.150 | 8.61 | 6.35 |
+| 32 | 580 | 3,223 | 2,092 | 5.6 | 43.6% | 0.111 | 0.140 | 9.17 | 7.59 |
+
+**Absorption makes the engine run *more* barriers, not fewer.** 0.140
+syncs/commit at 32 writers against the control's 0.111 — 26% more `fsync`
+calls for the same work — and the `fsync` is 97% of a commit. The commit-side
+cohort is **5.6 transactions; the flush-side cohort it displaces is 9.2**.
+
+That is the answer to the brief's model, and it is that the model measured the
+wrong thing. It priced the gate: N writers each paying an inflated 775 µs hold
+against one leader paying it once. What it never priced is that
+`coalesce_normal_commits` — the flush-side group commit shipped in AHL-461 and
+retuned on 2026-08-30 — was *already* amortising the barrier over 6-9
+transactions, and it does that by gathering **tickets from writers that
+publish them independently**. Absorption removes those writers. A follower
+under absorption never reaches `sync_commit`, so it never publishes a ticket a
+flush leader can gather; the only thing left to batch is what one gate hold
+produced. The two layers are not composable as built — **they are competing
+for the same population, and the earlier one gathers a smaller cohort than the
+later one it replaces.**
+
+The p50 column is the corroborating evidence that the gate work itself really
+did get cheaper: 15.96 ms against 18.99 ms at 8 writers, 28.15 against 35.95
+at 16. The median commit *is* faster, exactly as the model said it would be.
+It is the tail — where the extra barriers land — that eats the gain and more,
+and at 32 writers p99 is 74.95 ms against 66.09 ms.
+
+**A third of the members a leader takes are handed back.** 3,223 taken against
+2,092 committed at 32 writers. A cohort ends at a WAL-region boundary rather
+than wrapping inside one (the region's remaining room shrinks as the cohort's
+record buffer grows), and because absorption concentrates records in whichever
+regions lead, those boundaries arrive often. A handed-back member commits for
+itself, gate hold and barrier included — so the effective cohort is smaller
+than "members taken" suggests, and the published percentage above is the
+`committed`-by-a-leader one for that reason.
+
+**Kept, off, and what would flip it.** `EngineOptions::commit_absorption`
+stays `false`, so `main` carries this without changing the shipped protocol
+and every published number in `BENCHMARK.md` continues to describe the
+flag-off engine. Turning it on would be a deliberate call to trade 10-22%
+throughput and a bigger crash blast radius for nothing measurable, so this is
+not a "leave it to the user" recommendation — it is a "do not turn this on"
+result. Two things would have to change first, and they are the same thing
+seen from two sides:
+
+1. **The two group-commit layers have to compose rather than compete.** A
+   cohort leader's barrier has to be able to gather the *other* leaders'
+   cohorts, so commits per barrier goes to `cohort_size × flush_cohort_size`
+   rather than replacing one with the other. That is the brief's Slice 4, and
+   this measurement says it is not an optimisation on top of Slice 3 — it is a
+   precondition for Slice 3 paying at all.
+2. **A cohort has to survive a region boundary.** Losing a third of the
+   members to a wrap that has not even happened yet is a large, avoidable
+   fraction, and it caps the cohort at well under what is queued.
+
+Also worth stating: the single-writer row is 0.97x and should be 1.00x. With
+the flag off, a commit now takes no absorption lock at all — an `AtomicBool`
+mirrors the flag so the disabled path is one relaxed load — and with the flag
+*on* a solo writer is never offered, because an offer is refused unless a
+normal commit actually holds the gate. The residual is inside this suite's own
+run-to-run spread at one writer (`[249 258 266]` against `[247 249 257]`).
+
+**What lands regardless of the number.** The protocol is proven rather than
+argued: the parity sweep compares outcome vectors and final bytes across 200
+seeded cohort workloads with the flag off and on; a counting device asserts a
+cohort really is one write into the log and one barrier; the chain is
+truncated at every record boundary and recovery has to land on exactly that
+prefix; a crash at every step of a cohort must never leave a member's rows on
+the file that no member was told it had committed; and the three liveness
+rules that stop a parked writer waiting forever each have a test, including a
+leader that panics after taking a cohort. `docs/recovery.md` now documents the
+blast-radius trade. None of that has to be rebuilt if the two preconditions
+above are ever met.
 
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
