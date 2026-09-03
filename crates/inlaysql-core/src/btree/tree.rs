@@ -2515,8 +2515,28 @@ impl<D: Device> CowBTree<D> {
         limit: usize,
     ) -> Result<Vec<RowId>> {
         let mut out = Vec::new();
+        self.scan_range_row_ids_from_into(start, end, after, limit, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`CowBTree::scan_range_row_ids_from`] into a buffer the caller already
+    /// owns, cleared and refilled.
+    ///
+    /// Same walk, same ids, same order; only the `Vec` changes hands. An index
+    /// join probe runs this once per outer row (`crate::exec::IndexProbe`), and
+    /// the returning form made that one heap allocation per outer row for a
+    /// buffer whose contents die with the row.
+    pub fn scan_range_row_ids_from_into(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        after: Option<&[u8]>,
+        limit: usize,
+        out: &mut Vec<RowId>,
+    ) -> Result<()> {
+        out.clear();
         if limit == 0 || end.is_some_and(|end| end <= start) {
-            return Ok(out);
+            return Ok(());
         }
         let bounds = WalkBounds {
             start,
@@ -2535,9 +2555,9 @@ impl<D: Device> CowBTree<D> {
                     if cursor.root == root
                         && cursor.generation == generation
                         && cursor.covers(&bounds)
-                        && self.scan_row_ids_from_range_cursor(cursor, &bounds, &mut out)?
+                        && self.scan_row_ids_from_range_cursor(cursor, &bounds, out)?
                     {
-                        return Ok(out);
+                        return Ok(());
                     }
                 }
             }
@@ -2547,7 +2567,7 @@ impl<D: Device> CowBTree<D> {
             root,
             &bounds,
             pending,
-            &mut out,
+            out,
             RangeSpanSources::default(),
             &mut candidate,
         )?;
@@ -2556,7 +2576,7 @@ impl<D: Device> CowBTree<D> {
                 self.retain_range_cursor(root, generation, candidate);
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     /// Decoded-node parity oracle for [`CowBTree::scan_range_row_ids_from`].

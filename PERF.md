@@ -5128,6 +5128,250 @@ decode ~14% inclusive of which the returned `body`'s validation is 3%. The
 lead is the descent, not the filter: a borrowed-entry index walk, which
 `PLAN.md` already names as the precondition for re-proposing anything on
 this shape.
+### The probed inner row stops being a copy (AHL-549a, 2026-09-03)
+
+AHL-532 ended by naming what was left of the two `LIMIT 10` join rows: "the
+ten probes... ten root-to-leaf descents into `users` for ten consecutive keys
+that live in one leaf". That is item (c) below, and it is still open. This
+item is what the same profile put *around* those descents —
+`decode_row_masked` 5.5% and, under `Decode::next` and the projection, an
+allocator at 10% — and it is the join's half of what AHL-535 did for the point
+read.
+
+**What it was.** `IndexProbe::fetch` decoded every probed row into a fresh
+`Vec<Value>`, with an owned `String` for each `TEXT` cell, at probe time.
+`JoinInner::append_row_into` then moved those values into the pairing buffer,
+and the projection *cloned* the one cell the statement wanted back out of it —
+so `users.name` was copied out of the page once at decode and again at
+projection, and every candidate the `ON` went on to reject paid the first copy
+anyway.
+
+**What it is now.** `IndexProbe` keeps the rows it probed as their bytes
+(`RowBuf`, which for a cached page is an `Arc` clone and a range, so holding
+one costs nothing) and decodes each candidate *when the pairing loop reaches
+it*, straight onto whichever buffer is being filled:
+
+* `JoinInner::append_row_into` decodes owned cells onto the pairing buffer
+  (`decode_row_masked_onto`), which removes the per-candidate container the
+  iterator path used to allocate and then drain.
+* `JoinInner::append_candidate_ref` decodes *borrowed* cells
+  (`decode_row_ref_masked_onto`) onto a buffer whose first cells are the outer
+  row's — which is the new operator, `exec::BorrowedJoin`.
+
+`BorrowedJoin` is `NestedLoopJoin` with the ownership taken out of both
+halves. It drives the raw `RowBytes` of the driving table rather than a
+`Decode` stream, so the outer row is decoded into the same reusable buffer;
+`IndexProbe::prepare_ref` reads the join key off those borrowed cells; each
+candidate truncates the buffer back to the outer width and appends its own
+cells; the residual `ON` is tested on them with `eval::evaluate_ref`; and the
+projection *selects* cells rather than copying them. `park` re-lends the
+buffer to the next outer row, exactly as AHL-535's single-table path does.
+
+**Where the copy went.** `Engine::run_single_join_to` now takes a `JoinSink`
+rather than a `&[Value]` callback, with two arms. `JoinSink::Owned` — the
+internal push pipeline, which is what `query_prepared_each` and the published
+`crates/inlaysql-bench/src/joins.rs` use — turns the projected borrowed cells
+into owned ones **once**, at the boundary, where it used to pay a decode copy
+and then a projection copy. `JoinSink::Borrowed` is
+`Engine::run_query_each_ref`'s callback reached through the new
+`Engine::run_select_to_ref`, and it never copies at all: a join is no longer
+one of the shapes that API falls back on.
+
+**What it deliberately does not touch.** A hash or materialised inner side
+holds owned rows already — borrowing its candidates would save nothing — so
+those keep `NestedLoopJoin`, and so does a projection with an expression in
+it, whose value is in no page. `run_single_join_to` picks `BorrowedJoin` only
+for `JoinInner::Probe` with a direct-column projection. `borrowable_join` is
+the guard that decides, *before* the pipeline starts, whether a borrowed sink
+may be handed down at all: a borrowed sink that stopped reaching the join arm
+would deliver its rows to nobody, which is a wrong answer rather than a slow
+one, so the test is made where it can be made once rather than at whichever
+arm happens to terminate.
+
+**Measured**, against a baseline rebuilt from `6adfaf7` in a second worktree
+with the same toolchain, interleaved, control re-run every repetition, order
+alternated per repetition (A/B, B/A, A/B), `--seconds 4`, load 3.3–10 on an
+18-core machine with other work on it:
+
+| Suite | `6adfaf7` | AHL-549a | Verdict |
+| --- | --- | --- | --- |
+| `joins-limit`, 20k | 165.1 / 171.0 / 169.7k ops/s | **181.0 / 179.0 / 180.1k** | **1.07x, 3/3, non-overlapping** |
+| `joins`, 20k (full shapes) | 50 / 52 / 52 | 48 / 49 / 50 | 3/3 behind by ~4%, at the floor |
+| `points` | 3.168 / 3.358 / 3.384M | 3.217 / 3.353 / 3.310M | flat, mixed sign |
+| `indexed-range` | 98.4 / 104.0 / 101.1k | 104.3 / 104.9 / 103.9k | flat to slightly ahead |
+| `aggregate`, 20k | 2162 / 2207 / 2233 | 2224 / 2225 / 2199 | flat, mixed sign |
+
+**And the published bench's own shape**, `--suite joins --rows 20000 --queries
+200 --limit 10`, same interleaving, p50 per query because the wall-clock
+joins/s of a 200-query loop on a loaded machine is mostly the machine.
+SQLite's side runs in the same binary and is quoted from the same runs, so
+this is both engines rather than one:
+
+| Shape (p50) | `6adfaf7` | AHL-549a | SQLite (journal, sync=FULL) |
+| --- | --- | --- | --- |
+| PK inner, `LIMIT 10` | 4.42 / 4.33 / 5.54 µs | **3.71 / 3.83 / 3.71 µs** | 3.38–3.54 µs |
+| secondary-index inner, `LIMIT 10` | 6.42 / 6.38 / 6.25 µs | **6.08 / 6.04 / 6.08 µs** | 4.33–4.50 µs |
+| PK inner, no `LIMIT` | 3.15 / 3.55 / 3.30 ms | 3.26 / 3.71 / 3.50 ms | 10.3–11.0 ms |
+| secondary-index inner, no `LIMIT` | 3.60 / 4.10 / 3.60 ms | 4.12 / 4.22 / 4.12 ms | 31.6–33.2 ms |
+
+Both `LIMIT 10` rows improve 3/3 with non-overlapping ranges — **1.16x** on
+the PK shape, which takes it from 1.25–1.32x behind SQLite to within a few
+per cent of it, and **1.05x** on the secondary-index shape, which is still
+1.4x behind. Both unlimited rows are *behind* 3/3, by 3–5% and ~10%: the sign
+is consistent, so it is reported rather than rounded to flat. Neither of them
+runs the borrowed operator — an unlimited join over 20k users costs the model
+a hash build, and the hash side is untouched — so what they can have picked up
+is the one branch `JoinSink::emit_owned` adds per row over the direct callback
+that used to be there, or the machine. `bin/profile --suite joins`, which is
+the iterator path and has no `JoinSink` at all, is behind by the same ~4%,
+which argues for the machine; the `repeat.sh` regeneration on a quiet one is
+where it would settle, and that is still blocked (see §4).
+
+**A note on which path each harness measures, because they are not the same
+one.** `bin/profile --suite joins-limit` calls `query_prepared`, which has no
+sink and therefore runs the join as an *iterator* — so the table above
+measures only the `append_row_into` half of this change. The published bench
+calls `query_prepared_each`, which is `run_single_join_to` and does get the
+borrowed operator. Both are reported rather than one; the harness mismatch is
+left as it is here rather than fixed mid-measurement, since changing it would
+invalidate the A/B above.
+
+**Tests.** `crates/inlaysql/tests/joins_borrowed.rs` runs 49 join statements
+— 63 executions, since three of them run under six bound `LIMIT`/`OFFSET`
+pairs — through all *three* row APIs: `query_prepared` (the iterator),
+`query_prepared_each` (the owned sink) and `query_prepared_each_ref` (the
+borrowed one) — and requires them to agree row for row, cell for cell, in
+order. It reaches every inner side the planner can pick (row-id probe, index
+probe, hash, materialised), a `LEFT JOIN` that pads on each of them, a residual
+`ON` both inside and outside `evaluate_ref`'s borrowed sublanguage,
+`LIMIT`/`OFFSET` including a bound pair and `LIMIT 0`, a repeated column, a
+`WHERE` over both sides and an expression projection — the last two being the
+shapes that must *not* take the borrowed operator. `differential.rs` gains
+`limited_inner_joins_agree_with_sqlite` and its `LEFT` twin: the ordered
+`ORDER BY ... LIMIT n OFFSET m` form against SQLite as a straight oracle, and
+the bare `LIMIT n` form — which no dialect promises an order for — against the
+unlimited join, where it must deliver exactly `min(n, all)` rows and invent
+none of them.
+
+Mutation-checked three ways, each failing exactly the test it should and
+nothing else: not truncating the joined buffer back to the outer width between
+candidates (caught by the probed and bound-`LIMIT` shapes), dropping the
+`LEFT JOIN` padding from the borrowed loop (caught by the padding shapes — and
+the first version of the fixture was too small for the cost model to give a
+`LEFT JOIN` a probe at all, which is how that mutation also proved the branch
+is reached rather than dead), and letting `borrowable_join` admit a plan with
+a `WHERE` (caught by the general-pipeline shapes).
+
+### The join probe stops allocating for its own bookkeeping (AHL-549b, 2026-09-03)
+
+AHL-549a took the *rows* off the join's per-candidate path. This takes the
+bookkeeping off its per-**outer-row** path, and it is the item whose evidence
+is a counter rather than a clock.
+
+An index probe ran this per outer row: `KeyRange::equality` built the entry
+prefix into a fresh `Vec<u8>`, appended the key onto it (a second allocation
+when it grew), and copied the whole thing again for the range's upper bound;
+`Storage::scan_index_row_ids` returned the matching row ids in a fourth fresh
+`Vec` that was sorted and dropped. Four heap allocations per outer row for
+four buffers whose contents die with the row — 20,000 of them for the
+unlimited `users JOIN posts` shape.
+
+All four are now buffers the operator owns and refills:
+`KeyRange::equality_into` writes both edges in place (with `index_prefix_into`
+under it), and `Storage::scan_index_row_ids_into` fills the caller's id vector
+— defaulted on the trait in terms of the existing walk, so a backend that
+overrides neither still answers, and overridden on `TreeStorage` down to
+`CowBTree::scan_range_row_ids_from_into` so the row-id-only fast path
+(`AHL-479`) is not lost on the way. `IndexProbe` holds the three vectors, lends
+them to the probe and takes them back whatever happens, so an error on one
+outer row does not cost the next one its reuse.
+
+**Counted**, with the global-allocator harness from
+`crates/inlaysql/tests/borrowed_row_allocations.rs`, over one prepared
+statement with a *bound* `LIMIT` — one plan, one access path, one scan batch,
+so the only thing that differs between the two runs is how many rows reach the
+callback, and any difference in the count is a per-row cost and nothing else:
+
+| Shape, `query_prepared_each_ref` | 1 row | 40 rows | Growth over 39 rows |
+| --- | --- | --- | --- |
+| PK inner, `6adfaf7` | 21 | 181 | **+160** (~4.1 per row) |
+| PK inner, AHL-549a | 18 | 22 | +4 |
+| PK inner, AHL-549b | 18 | 22 | +4 |
+| secondary-index inner, `6adfaf7` | 44 | 144 | **+100** (~2.6 per row) |
+| secondary-index inner, AHL-549a | 26 | 51 | +25 |
+| secondary-index inner, AHL-549b | 26 | 31 | **+5** |
+| PK inner, owned `query_prepared` | — | 224 | — |
+
+**Zero per outer row, and what the residue actually is.** The two "+4"/"+5"
+figures are not per-row costs. A backtrace-capturing allocator run over the
+same query attributes every one of them to one of two things: the driving
+*scan* (one batch buffer and one separator key per leaf it crosses, so
+`O(rows / leaf)`), or a per-*query* cost that does not repeat — the plan's
+join decision, the `ResultSet`'s column names, and the first growth of each
+reused buffer, which is allocated once per execution because the operator is
+built per execution. Nothing in the candidate loop allocates at all. That is
+the sense in which "zero allocations per outer row" is met, stated with the
+number rather than as a claim.
+
+`crates/inlaysql/tests/join_row_allocations.rs` is that measurement as a test,
+in its own binary because the counting allocator is process-wide. It is
+mutation-checked against the pre-change engine itself: run on `6adfaf7` it
+fails with exactly the 160 its own message names.
+
+**Measured on the clock, and it is flat.** Interleaved against the AHL-549a
+binary, control re-run each repetition, order alternated, `--seconds 4`, load
+4.4–13.6:
+
+| Suite | AHL-549a | AHL-549b | Verdict |
+| --- | --- | --- | --- |
+| `joins-limit`, 20k | 174.6 / 173.5 / 172.9k ops/s | 175.3 / 172.7 / 169.5k | flat, mixed sign |
+| `joins`, 20k | 47 / 42 / 46 | 47 / 45 / 44 | flat, mixed sign |
+| `points` | 3.036 / 2.797 / 2.970M | 3.109 / 3.110 / 2.817M | flat, mixed sign |
+| `indexed-range` | 100.1 / 87.4 / 93.3k | 89.8 / 89.7 / 95.7k | flat, mixed sign |
+| `aggregate`, 20k | 2164 / 2074 / 2128 | 1985 / 1845 / 2133 | behind, but the run was the loudest of the day |
+
+The published bench's `LIMIT 10` p50s move the same way: PK inner
+3.67/3.75/3.63 → 3.67/3.67/3.67 µs (flat, and expected — that shape's probe is
+a row-id descent with no key range and no id list at all), secondary-index
+inner 6.08/5.96/5.88 → 5.88/5.83/5.88 µs (ahead 3/3, but by 1.5% with the
+ranges touching, which is inside §4's floor).
+
+**So this item is committed on the counter, not on the clock**, and that is
+stated rather than dressed up: a `LIMIT 10` query does two index probes, so
+eight allocations removed from it is below anything this machine can see. The
+shape it is for is the unlimited `users JOIN posts`, where it is 20,000 outer
+rows × four, and the honest position is that the `repeat.sh` regeneration on a
+quiet machine is where that would show.
+
+**Where the time is now, and what item (c) is.** `bin/profile --suite
+joins-limit --rows 20000`, `sample` over the query phase, 7,468 samples, load
+5.2/18:
+
+| Entry | Inclusive |
+| --- | --- |
+| `NestedLoopJoin::next` | 83.2% (was 87.3%) |
+| `IndexProbe::prepare_key` | 47.6% (was `JoinInner::prepare` 53.7%) |
+| `Storage::get_row` → `CowBTree::get_from` | **37.3%** (was ~32%) |
+| `Decode::next` (the driving scan) | 23.9% |
+| `scan_index_row_ids_into` | 5.9% (was `scan_index_row_ids` 7.4%) |
+| `decode_row_masked_onto` | 5.8% (was `decode_row_masked` 5.5%) |
+
+with `_platform_memcmp` 20.9% self and the allocator down to ~8.7% self
+(`_xzm_free_main` 4.0, `_xzm_xzone_malloc_tiny` 3.6, `_malloc_zone_malloc`
+1.1) from ~10%. **The ten descents are now unambiguously the item.** AHL-532
+named them and could not separate them from everything around them; with the
+decode and the bookkeeping gone they are 37% of the query on their own, and
+they are ten full root-to-leaf walks into `users` for ten *consecutive* keys
+that live in one leaf.
+
+**(c) The parent reseek — the next item, deliberately not built here.**
+`PLAN.md` §9a records B3 (a multi-slot cursor) as closed for these shapes, and
+the profile says full descents are still being paid, so the open question is
+whether the single-slot reseek is reached from `IndexProbe::fetch`'s `get_row`
+at all — and if not, whether a probe that remembered the leaf (or the parent)
+its last key landed in could answer the next key with a bounds check instead
+of a walk. That is a change to the tree's read path with its own DST
+obligation, and it is a separate item rather than a tail on this one.
 
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 

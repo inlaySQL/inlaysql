@@ -148,10 +148,20 @@ const TERMINATOR: u8 = 0x01;
 /// never be read as another's, however the names are spelled.
 pub fn index_prefix(index: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(INDEX_PREFIX.len() + index.len() + 1);
+    index_prefix_into(index, &mut out);
+    out
+}
+
+/// [`index_prefix`] appending onto a buffer the caller already owns.
+///
+/// Same bytes; only the `Vec` changes hands. A join probe builds one of these
+/// per outer row and can hand back the same buffer every time — see
+/// [`KeyRange::equality_into`].
+pub fn index_prefix_into(index: &str, out: &mut Vec<u8>) {
+    out.reserve(INDEX_PREFIX.len() + index.len() + 1);
     out.extend_from_slice(INDEX_PREFIX);
     out.extend(index.as_bytes().iter().map(u8::to_ascii_lowercase));
     out.push(0);
-    out
 }
 
 /// Append the memcomparable encoding of one value under one collation.
@@ -308,6 +318,45 @@ impl KeyRange {
             end: upper_bound(&start),
             start,
         })
+    }
+
+    /// [`KeyRange::equality`] into two buffers the caller already owns, both
+    /// cleared and refilled.
+    ///
+    /// `false` means the range has no upper bound — the [`KeyRange::end`] of
+    /// `None` this type carries — and `end` is then empty and meaningless.
+    ///
+    /// Identical bytes to [`KeyRange::equality`]; the difference is who owns
+    /// the two `Vec`s. A join probe builds one range per *outer row*
+    /// (`crate::exec::IndexProbe`), so the returning form was three heap
+    /// allocations per outer row — the prefix, the value appended onto it, and
+    /// the upper bound's copy — for keys that die with the row (`PERF.md`,
+    /// AHL-549).
+    pub fn equality_into(
+        index: &str,
+        values: &[&Value],
+        collations: &[Collation],
+        start: &mut Vec<u8>,
+        end: &mut Vec<u8>,
+    ) -> Result<bool> {
+        start.clear();
+        index_prefix_into(index, start);
+        for (position, value) in values.iter().enumerate() {
+            encode_value(start, value, collation::at(collations, position))?;
+        }
+        end.clear();
+        end.extend_from_slice(start);
+        // `upper_bound`'s rule, in place: strip trailing `0xff`s and bump the
+        // last byte that is not one. An all-`0xff` prefix has no upper bound,
+        // which for an index prefix never happens but is answered rather than
+        // assumed.
+        while let Some(last) = end.pop() {
+            if last != u8::MAX {
+                end.push(last + 1);
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Every entry of one index, in key order.

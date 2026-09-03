@@ -393,6 +393,18 @@ impl<D: Device> Storage for TreeStorage<D> {
             .scan_range_row_ids_from(start, end, None, usize::MAX)
     }
 
+    /// The same walk into the caller's buffer — see
+    /// [`Storage::scan_index_row_ids_into`] for why a join probe wants one.
+    fn scan_index_row_ids_into(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        out: &mut Vec<RowId>,
+    ) -> Result<()> {
+        self.tree
+            .scan_range_row_ids_from_into(start, end, None, usize::MAX, out)
+    }
+
     /// [`CowBTree::scan_range_from`] with `limit` `1`: the same one-descent
     /// read [`Storage::scan_batch`] already gets, for an index entry instead
     /// of a row.

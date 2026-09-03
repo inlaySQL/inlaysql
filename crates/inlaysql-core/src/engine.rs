@@ -32,8 +32,9 @@ use crate::collation::Collation;
 use crate::error::{Error, Result};
 use crate::eval::{self, CompiledFilter, Computed, Env, SharedRng, SubqueryRunner};
 use crate::exec::{
-    collect_bounded, fnv1a, mix64, park, AggregateInput, Decode, DecodeFilter, ExecRow, Filter,
-    HashJoin, HashJoinTable, IndexProbe, JoinInner, NestedLoopJoin, ProbeKind, RowBytes, RowStream,
+    collect_bounded, fnv1a, mix64, park, AggregateInput, BorrowedJoin, Decode, DecodeFilter,
+    ExecRow, Filter, HashJoin, HashJoinTable, IndexProbe, JoinInner, NestedLoopJoin, ProbeKind,
+    RowBytes, RowStream,
 };
 use crate::fusion::{reciprocal_rank_fusion, sort_by_score_desc};
 use crate::hnsw::VectorMetric;
@@ -61,6 +62,65 @@ use crate::value::{DataType, Value, ValueRef};
 
 /// A borrowed projected-row consumer used by the internal push pipeline.
 type RowSink<'a> = dyn FnMut(&[Value]) -> Result<()> + 'a;
+
+/// The same consumer with the cells still borrowed — [`Engine::run_query_each_ref`]'s
+/// callback, reached by the one pipeline arm that can hand it page bytes.
+type RefRowSink<'a> = dyn FnMut(&[ValueRef<'_>]) -> Result<()> + 'a;
+
+/// Where [`Engine::run_single_join_to`] puts a projected row.
+///
+/// The join is the only non-blocking shape whose rows are assembled from more
+/// than one source, and since AHL-549 it can assemble them *borrowed* — so it
+/// is also the only place where whether the caller wants owned cells or
+/// borrowed ones changes what the operator does rather than only what happens
+/// after it. An owned consumer copies once, here, at the projection; a
+/// borrowing one never copies at all.
+enum JoinSink<'s, 'e> {
+    /// The internal pipeline's consumer: cells owned, copied at projection.
+    Owned {
+        sink: &'s mut RowSink<'e>,
+        /// The projected row the copy lands in, reused for every row.
+        row: Vec<Value>,
+    },
+    /// [`Engine::run_query_each_ref`]'s consumer: cells still borrowed from
+    /// the pages they were decoded out of.
+    Borrowed {
+        each: &'s mut RefRowSink<'e>,
+        /// The buffer an owned row is lent to this consumer through, parked
+        /// between rows so the conversion costs no allocation.
+        cells: Vec<ValueRef<'static>>,
+    },
+}
+
+impl JoinSink<'_, '_> {
+    /// Deliver one projected row of borrowed cells.
+    fn emit(&mut self, projected: &[ValueRef<'_>]) -> Result<()> {
+        match self {
+            JoinSink::Owned { sink, row } => {
+                row.clear();
+                row.extend(projected.iter().map(ValueRef::to_owned_value));
+                sink(row)
+            }
+            JoinSink::Borrowed { each, .. } => each(projected),
+        }
+    }
+
+    /// Deliver one projected row the operator had to build owned anyway — the
+    /// hash-pair and expression-projection arms, which materialise a value that
+    /// no page holds.
+    fn emit_owned(&mut self, projected: &[Value]) -> Result<()> {
+        match self {
+            JoinSink::Owned { sink, .. } => sink(projected),
+            JoinSink::Borrowed { each, cells } => {
+                let mut lent: Vec<ValueRef<'_>> = core::mem::take(cells);
+                lent.extend(projected.iter().map(ValueRef::from));
+                let outcome = each(&lent);
+                *cells = park(lent);
+                outcome
+            }
+        }
+    }
+}
 
 /// The reusable buffers of [`Engine::run_borrowed_select`]. See
 /// [`Engine::borrow_scratch`] for why they outlive the call.
@@ -1379,10 +1439,27 @@ impl Engine {
             self.borrow_scratch.replace(scratch);
         }
 
-        // The fallback. The rows are built owned by the ordinary pipeline and
-        // borrowed for the callback, so this consumer sees one API whatever
-        // the query turned out to be — an `ORDER BY` costs what it always did
-        // rather than being refused.
+        // Every other `SELECT`. One of them — the single non-blocking join —
+        // still borrows all the way out of the operator; the rest are built
+        // owned by the ordinary pipeline and lent to the callback a row at a
+        // time, so this consumer sees one API whatever the query turned out to
+        // be and an `ORDER BY` costs what it always did rather than being
+        // refused. `run_select_to_ref` is where that fork is made.
+        if let Plan::Select(select) = statement.plan() {
+            self.refresh_indexes()?;
+            let env = self.read_env(params);
+            let mut count = 0usize;
+            let mut counted = |cells: &[ValueRef<'_>]| -> Result<()> {
+                each(cells)?;
+                count += 1;
+                Ok(())
+            };
+            self.run_select_to_ref(select, &env, None, &mut counted)?;
+            return Ok(count);
+        }
+
+        // A read-only statement that is not a `SELECT` — `PRAGMA`, `EXPLAIN` —
+        // has its rows already.
         let mut parked: Vec<ValueRef<'static>> = Vec::new();
         let mut borrowing = |row: &[Value]| -> Result<()> {
             let mut cells: Vec<ValueRef<'_>> = core::mem::take(&mut parked);
@@ -5655,7 +5732,58 @@ impl Engine {
         plan: &SelectPlan,
         env: &Env<'_>,
         cap: Option<usize>,
+        sink: Option<&mut RowSink<'_>>,
+    ) -> Result<ResultSet> {
+        self.run_select_body(plan, env, cap, sink, None)
+    }
+
+    /// [`Engine::run_select_to`] for a consumer that takes borrowed cells.
+    ///
+    /// One shape can hand it page bytes: the single non-blocking join, whose
+    /// operator assembles the joined row out of borrowed cells and never owns
+    /// it ([`crate::exec::BorrowedJoin`]). [`borrowable_join`] is the test for
+    /// that shape, and it is made *here* rather than deep in the pipeline
+    /// because the alternative — carrying both sinks down and converting at
+    /// whichever arm terminates — would let a shape that quietly stopped
+    /// reaching the join arm deliver its rows to nobody.
+    ///
+    /// Everything else builds its rows owned, exactly as it always did, and
+    /// they are lent to the callback one at a time through a parked buffer:
+    /// same answer, same allocations, one API.
+    fn run_select_to_ref(
+        &self,
+        plan: &SelectPlan,
+        env: &Env<'_>,
+        cap: Option<usize>,
+        each: &mut RefRowSink<'_>,
+    ) -> Result<ResultSet> {
+        if borrowable_join(plan) {
+            return self.run_select_body(plan, env, cap, None, Some(each));
+        }
+        let mut parked: Vec<ValueRef<'static>> = Vec::new();
+        let mut borrowing = move |row: &[Value]| -> Result<()> {
+            let mut cells: Vec<ValueRef<'_>> = core::mem::take(&mut parked);
+            cells.extend(row.iter().map(ValueRef::from));
+            let outcome = each(&cells);
+            parked = park(cells);
+            outcome
+        };
+        self.run_select_body(plan, env, cap, Some(&mut borrowing), None)
+    }
+
+    /// The body of [`Engine::run_select_to`] and [`Engine::run_select_to_ref`].
+    ///
+    /// At most one of `sink` and `ref_sink` is ever `Some`, and `ref_sink` only
+    /// for a plan [`borrowable_join`] admitted — which is exactly the condition
+    /// the join arm below tests, so a `ref_sink` that arrives here always
+    /// reaches it.
+    fn run_select_body(
+        &self,
+        plan: &SelectPlan,
+        env: &Env<'_>,
+        cap: Option<usize>,
         mut sink: Option<&mut RowSink<'_>>,
+        mut ref_sink: Option<&mut RefRowSink<'_>>,
     ) -> Result<ResultSet> {
         let ScanShape {
             limit,
@@ -5749,7 +5877,19 @@ impl Engine {
             && driving.derived.is_none()
             && plan.from[1].derived.is_none()
         {
-            if let Some(sink) = sink.take() {
+            let joined = ref_sink
+                .take()
+                .map(|each| JoinSink::Borrowed {
+                    each,
+                    cells: Vec::new(),
+                })
+                .or_else(|| {
+                    sink.take().map(|sink| JoinSink::Owned {
+                        sink,
+                        row: Vec::new(),
+                    })
+                });
+            if let Some(joined) = joined {
                 return self.run_single_join_to(
                     plan,
                     env,
@@ -5759,10 +5899,14 @@ impl Engine {
                     outer_rows,
                     offset,
                     limit,
-                    sink,
+                    joined,
                 );
             }
         }
+        debug_assert!(
+            ref_sink.is_none(),
+            "run_select_to_ref only hands a borrowed sink to a plan the join arm above takes"
+        );
 
         // A streamed aggregate over one stored table folds straight from the
         // row bytes: each row is decoded into one borrowed buffer the fold
@@ -6047,7 +6191,7 @@ impl Engine {
         outer_rows: Option<u64>,
         offset: usize,
         limit: Option<usize>,
-        sink: &mut dyn FnMut(&[Value]) -> Result<()>,
+        mut sink: JoinSink<'_, '_>,
     ) -> Result<ResultSet> {
         let columns = plan
             .items
@@ -6065,15 +6209,12 @@ impl Engine {
         let join = &plan.joins[0];
         // No filter on this path, so the join consumes at most `limit + offset`
         // driving rows — see `first_batch` in `run_select_to`.
-        let outer: RowStream<'_> = Box::new(Decode::new(
-            self.candidate_bytes(
-                &driving.table,
-                &None,
-                env.params(),
-                limit.map(|limit| limit.saturating_add(offset)),
-            )?,
-            driving_mask,
-        ));
+        let outer_bytes = self.candidate_bytes(
+            &driving.table,
+            &None,
+            env.params(),
+            limit.map(|limit| limit.saturating_add(offset)),
+        )?;
         let mut side = self.join_inner(
             &plan.from,
             1,
@@ -6145,7 +6286,7 @@ impl Engine {
                                 }
                             }
                         }
-                        sink(&projected)?;
+                        sink.emit_owned(&projected)?;
                         emitted += 1;
                         if limit.is_some_and(|limit| emitted >= limit) {
                             return Ok(ResultSet {
@@ -6162,6 +6303,66 @@ impl Engine {
             }
         }
 
+        // The probed inner side, projected as bare columns, never has to own
+        // anything: the outer row is decoded out of its page into one reusable
+        // buffer, the probed row onto the end of that same buffer out of the
+        // bytes the probe kept, and the projection selects cells rather than
+        // copying them. The copy — if the consumer wants one at all — happens
+        // once, in `JoinSink::emit`. See `BorrowedJoin`.
+        //
+        // A hash or materialised inner side is holding owned rows already, so
+        // it stays on `NestedLoopJoin` below; so does a projection with an
+        // expression in it, which produces a value no page holds.
+        if matches!(side, JoinInner::Probe(_)) && direct_projection {
+            let mut parked: Vec<ValueRef<'static>> = Vec::new();
+            BorrowedJoin::new(
+                outer_bytes,
+                driving_mask,
+                side,
+                join.kind,
+                join.on.as_ref(),
+                env,
+                &self.interrupt,
+            )
+            .try_for_each(|values| {
+                if skipped < offset {
+                    skipped += 1;
+                    return Ok(true);
+                }
+                let mut out: Vec<ValueRef<'_>> = core::mem::take(&mut parked);
+                for item in &plan.items {
+                    // Cloned rather than moved out of the joined row: the outer
+                    // half of that buffer is re-read by every later candidate
+                    // for the same outer row. A `ValueRef` clone is a pointer
+                    // copy for every type but `VECTOR`, which owns its
+                    // `Vec<f32>` — see `ValueRef`'s type-level doc.
+                    out.push(match item {
+                        SelectItem::Column { index, .. } => {
+                            values.get(*index).cloned().unwrap_or(ValueRef::Null)
+                        }
+                        // This path is only reached when `plan.score` is
+                        // `None` — `run_select_to`'s `non_blocking` requires it
+                        // — so a `score()` column is `NULL`, exactly as
+                        // `project_borrowed_row` makes it.
+                        SelectItem::Score { .. } => ValueRef::Null,
+                        SelectItem::Expr { .. } => {
+                            unreachable!("direct_projection excludes expressions")
+                        }
+                    });
+                }
+                let outcome = sink.emit(&out);
+                parked = park(out);
+                outcome?;
+                emitted += 1;
+                Ok(limit.is_none_or(|limit| emitted < limit))
+            })?;
+            return Ok(ResultSet {
+                columns,
+                rows: Vec::new(),
+            });
+        }
+
+        let outer: RowStream<'_> = Box::new(Decode::new(outer_bytes, driving_mask));
         let joiner = NestedLoopJoin::new(
             outer,
             side,
@@ -6177,7 +6378,7 @@ impl Engine {
                     return Ok(true);
                 }
                 project_split_row(&plan.items, outer, inner, score, &mut projected)?;
-                sink(&projected)?;
+                sink.emit_owned(&projected)?;
                 emitted += 1;
                 Ok(limit.is_none_or(|limit| emitted < limit))
             })?;
@@ -6188,7 +6389,7 @@ impl Engine {
                     return Ok(true);
                 }
                 project_borrowed_row(&plan.items, values, score, env, &mut projected)?;
-                sink(&projected)?;
+                sink.emit_owned(&projected)?;
                 emitted += 1;
                 Ok(limit.is_none_or(|limit| emitted < limit))
             })?;
@@ -10777,9 +10978,11 @@ fn project_one(item: &SelectItem, row: &ExecRow, env: &Env<'_>) -> Result<Value>
 ///   row, so the rows have to be held; a cell borrowed from a page cannot be,
 ///   because the scan moves on. These materialise, and say so.
 /// * **A join, a derived table, a scored retrieval.** Their rows are assembled
-///   from more than one source, and the assembly is where an owned row already
-///   exists. `run_single_join_to` is the borrowed-row join, and it borrows a
-///   reusable `Vec<Value>` rather than page bytes.
+///   from more than one source. A join is not *refused* — since AHL-549
+///   [`Engine::run_select_to_ref`] routes the single non-blocking one to
+///   [`borrowable_join`] and, under it, to [`crate::exec::BorrowedJoin`], which
+///   borrows the page for both halves — but it is not this function's shape,
+///   which is one stored table and one scan.
 /// * **A `WITHOUT ROWID` table.** Its scan is a different source
 ///   ([`Engine::without_rowid_stream`]) that yields decoded rows.
 /// * **A projection with an expression in it.** `a + 1` and `upper(body)`
@@ -10792,6 +10995,29 @@ fn project_one(item: &SelectItem, row: &ExecRow, env: &Env<'_>) -> Result<Value>
 /// correctness one, which is what
 /// `the_borrowing_path_ties_the_owned_one_row_for_row` checks across both
 /// sides of every one of these conditions.
+/// Whether [`Engine::run_select_to_ref`] may hand this plan's rows to a
+/// borrowing callback straight out of the join operator.
+///
+/// The exact condition [`Engine::run_select_body`]'s join arm tests, restated
+/// here so the decision is made before the pipeline starts rather than at
+/// whichever arm happens to terminate — a borrowed sink that never reaches an
+/// arm would deliver its rows to nobody, and that is a wrong answer rather than
+/// a slow one. Every field it reads survives `SelectPlan::swap_leading_join`,
+/// which is the one rewrite between this call and that arm.
+fn borrowable_join(plan: &SelectPlan) -> bool {
+    plan.joins.len() == 1
+        && plan.from.len() == 2
+        && plan.filter.is_none()
+        && plan.from[0].derived.is_none()
+        && plan.from[1].derived.is_none()
+        && plan.group_by.is_empty()
+        && plan.aggregates.is_empty()
+        && plan.windows.is_empty()
+        && !plan.distinct
+        && plan.order.is_empty()
+        && plan.score.is_none()
+}
+
 fn borrowed_projection(plan: &SelectPlan, projection: &mut Vec<usize>) -> bool {
     projection.clear();
     if !plan.joins.is_empty() || plan.from.len() != 1 {

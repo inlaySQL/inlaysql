@@ -39,7 +39,10 @@ use crate::error::Result;
 use crate::eval::{self, CompiledFilter, Computed, Env};
 use crate::index::KeyRange;
 use crate::plan::{Expr, JoinKind};
-use crate::row::{decode_row_masked, decode_row_ref_masked_into, ColumnMask, RowBuf};
+use crate::row::{
+    decode_row_masked, decode_row_masked_onto, decode_row_ref_masked_into,
+    decode_row_ref_masked_onto, ColumnMask, RowBuf,
+};
 use crate::traits::{Interrupt, RowId, RowScan, Storage};
 use crate::value::{DataType, Value, ValueRef};
 
@@ -492,9 +495,9 @@ pub(crate) fn park(mut cells: Vec<ValueRef<'_>>) -> Vec<ValueRef<'static>> {
 
 /// Where a join's inner rows come from.
 ///
-/// The operator asks only [`JoinInner::prepare`] and [`JoinInner::rows`] — "the
-/// rows that could match *this* outer row" — and both variants answer the same
-/// question, so [`NestedLoopJoin`] cannot tell which it was handed.
+/// The operator asks only [`JoinInner::prepare`] and [`JoinInner::candidates`]
+/// — "the rows that could match *this* outer row" — and every variant answers
+/// the same question, so [`NestedLoopJoin`] cannot tell which it was handed.
 ///
 /// The two answers differ only in how many inner rows are *read*, never in
 /// which pairs survive: the `ON` predicate is re-evaluated over every candidate
@@ -538,12 +541,34 @@ impl<'a> JoinInner<'a> {
         }
     }
 
-    /// The candidates [`JoinInner::prepare`] left.
-    fn rows(&self) -> &[Vec<Value>] {
+    /// Narrow a probed inner side to the rows an outer row of *borrowed* cells
+    /// names.
+    ///
+    /// Only the probe answers this: the borrowed pairing loop
+    /// ([`BorrowedJoin`]) is built for the probe, and the hash and materialised
+    /// sides keep the owned loop they had. A caller that reaches this with
+    /// either of those is a bug in that choice, not a shape to answer quietly —
+    /// but there is nothing to fail on, so it does what `prepare` would have
+    /// done with an outer row it cannot key on: nothing.
+    fn prepare_ref(&mut self, outer: &[ValueRef<'_>]) -> Result<()> {
         match self {
-            JoinInner::Materialised { rows, .. } => rows,
-            JoinInner::Probe(probe) => probe.rows(),
-            JoinInner::Hash(hash) => hash.rows(),
+            JoinInner::Probe(probe) => probe.prepare_ref(outer),
+            JoinInner::Materialised { .. } | JoinInner::Hash(_) => {
+                debug_assert!(
+                    false,
+                    "the borrowed pairing loop is only built over a probe"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// How many candidates [`JoinInner::prepare`] left.
+    fn candidates(&self) -> usize {
+        match self {
+            JoinInner::Materialised { rows, .. } => rows.len(),
+            JoinInner::Probe(probe) => probe.candidates(),
+            JoinInner::Hash(hash) => hash.rows().len(),
         }
     }
 
@@ -551,25 +576,60 @@ impl<'a> JoinInner<'a> {
     /// to survive to be paired again.
     ///
     /// A materialised side (and a probe's table-scan fallback) is replayed
-    /// once per outer row, so this clones, exactly as reading through
-    /// [`JoinInner::rows`] and cloning always has. A probe's matched rows are
-    /// rebuilt fresh by [`JoinInner::prepare`] for every outer row and never
-    /// read again after this outer row's pairing loop moves past them — they
-    /// were already decoded once, by `IndexProbe::fetch`, so cloning them a
-    /// second time into the pairing buffer was pure waste. Those are moved
-    /// instead. A hash join's rows are shared across every outer row that
-    /// reaches their bucket, so they clone, the same as the materialised side.
+    /// once per outer row, so this clones. A probe's matched rows are rebuilt
+    /// fresh by [`JoinInner::prepare`] for every outer row and never read again
+    /// after this outer row's pairing loop moves past them, so those are
+    /// decoded straight onto the caller's buffer out of the bytes the probe
+    /// kept — no intermediate row ever exists. A hash join's rows are shared
+    /// across every outer row that reaches their bucket, so they clone, the
+    /// same as the materialised side.
     ///
     /// Appending straight into the caller's buffer — rather than handing back a
     /// temporary `Vec<Value>` — is what saves one heap allocation per
     /// candidate: the caller's scratch is already sized for the outer plus
     /// inner width, and the temporary `Vec` this used to return was allocated
     /// only to be drained into that scratch.
-    fn append_row_into(&mut self, index: usize, out: &mut Vec<Value>) {
+    fn append_row_into(&mut self, index: usize, out: &mut Vec<Value>) -> Result<()> {
         match self {
-            JoinInner::Materialised { rows, .. } => out.extend(rows[index].iter().cloned()),
-            JoinInner::Probe(probe) => out.extend(probe.take_row(index)),
-            JoinInner::Hash(hash) => out.extend(hash.rows()[index].iter().cloned()),
+            JoinInner::Materialised { rows, .. } => {
+                out.extend(rows[index].iter().cloned());
+                Ok(())
+            }
+            JoinInner::Probe(probe) => probe.append_row_into(index, out),
+            JoinInner::Hash(hash) => {
+                out.extend(hash.rows()[index].iter().cloned());
+                Ok(())
+            }
+        }
+    }
+
+    /// Append one candidate onto a buffer of borrowed cells.
+    ///
+    /// The borrowed twin of [`JoinInner::append_row_into`], for
+    /// [`BorrowedJoin`]. A hash or materialised side borrows the owned rows it
+    /// is already holding; a probe decodes its kept bytes.
+    fn append_candidate_ref<'s>(&'s self, index: usize, out: &mut Vec<ValueRef<'s>>) -> Result<()> {
+        match self {
+            JoinInner::Materialised { rows, .. } => {
+                out.extend(rows[index].iter().map(ValueRef::from));
+                Ok(())
+            }
+            JoinInner::Probe(probe) => probe.append_candidate_ref(index, out),
+            JoinInner::Hash(hash) => {
+                out.extend(hash.rows()[index].iter().map(ValueRef::from));
+                Ok(())
+            }
+        }
+    }
+
+    /// The hash side's candidate rows, for the one loop that addresses the
+    /// outer and inner halves separately instead of concatenating them.
+    /// Anything else answers an empty slice, which the `debug_assert` in
+    /// [`NestedLoopJoin::try_for_each_hash_pair`] already rules out.
+    fn hash_rows(&self) -> &[Vec<Value>] {
+        match self {
+            JoinInner::Hash(hash) => hash.rows(),
+            JoinInner::Materialised { .. } | JoinInner::Probe(_) => &[],
         }
     }
 
@@ -659,11 +719,37 @@ pub(crate) struct IndexProbe<'a> {
     /// `NOCASE` `=` would.
     collation: Collation,
     kind: ProbeKind,
-    /// The candidates for the outer row [`IndexProbe::prepare`] last saw.
+    /// The candidates for the outer row [`IndexProbe::prepare`] last saw, as
+    /// the bytes the storage handed back rather than decoded rows.
     ///
     /// Reused rather than reallocated: a join probes once per outer row, and
     /// the buffer is the one allocation that would otherwise be per-row.
-    matched: Vec<Vec<Value>>,
+    ///
+    /// **Bytes, not `Vec<Value>`, since AHL-549.** A probed row used to be
+    /// decoded here, into a fresh `Vec<Value>` with an owned `String` for every
+    /// `TEXT` cell, and then moved into the pairing buffer — where the
+    /// projection copied the cell it wanted a second time. Holding the row's
+    /// bytes instead (a `RowBuf::Shared` is an `Arc` clone and a range, so
+    /// keeping one costs nothing) lets the pairing loop decode straight into
+    /// whichever buffer it is filling: borrowed cells for
+    /// [`IndexProbe::append_candidate_ref`], owned ones for
+    /// [`IndexProbe::append_row_into`]. Either way the row is decoded once and
+    /// copied at most once, at the boundary.
+    matched: Vec<RowBuf>,
+    /// The row ids one index probe named, reused across outer rows.
+    ///
+    /// [`Storage::scan_index_row_ids_into`] fills it and it is sorted in place;
+    /// before AHL-549 both the `Vec` and its sort were a fresh allocation per
+    /// outer row.
+    ids: Vec<RowId>,
+    /// The probed key range's two edges, reused across outer rows for the same
+    /// reason [`IndexProbe::ids`] is — [`KeyRange::equality_into`] rebuilt
+    /// them in place rather than returning three fresh `Vec<u8>`s.
+    ///
+    /// `key_end` is meaningful only when [`KeyRange::equality_into`] says the
+    /// range has an upper bound, which for an index prefix it always does.
+    key_start: Vec<u8>,
+    key_end: Vec<u8>,
     /// The whole inner table, for the keys the index cannot answer. `None`
     /// until the first such key, and read at most once.
     fallback: Option<Vec<Vec<Value>>>,
@@ -699,6 +785,9 @@ impl<'a> IndexProbe<'a> {
             collation,
             kind,
             matched: Vec::new(),
+            ids: Vec::new(),
+            key_start: Vec::new(),
+            key_end: Vec::new(),
             fallback: None,
             scanning: false,
             interrupt,
@@ -707,14 +796,33 @@ impl<'a> IndexProbe<'a> {
 
     /// Read the inner rows `outer`'s key could match.
     fn prepare(&mut self, outer: &[Value]) -> Result<()> {
+        // A joined row narrower than the plan's ordinals reads as `NULL`
+        // everywhere else in the engine, and `NULL` matches nothing.
+        self.prepare_key(outer.get(self.key))
+    }
+
+    /// [`IndexProbe::prepare`] against an outer row of borrowed cells.
+    ///
+    /// The key itself is materialised — one `Value`, which for the integer and
+    /// small-text keys a join is built on is a copy of a machine word or of the
+    /// key's own bytes and nothing else. Everything the probe does with it
+    /// (`indexable_probe`, [`row_id_of`], [`KeyRange::equality`]) is written
+    /// against `Value`, and one owned key per *outer row* is not the allocation
+    /// this exists to remove — one decoded row per *candidate* was.
+    fn prepare_ref(&mut self, outer: &[ValueRef<'_>]) -> Result<()> {
+        let key = outer.get(self.key).map(ValueRef::to_owned_value);
+        self.prepare_key(key.as_ref())
+    }
+
+    /// The body both [`IndexProbe::prepare`] and [`IndexProbe::prepare_ref`]
+    /// run, so the owned and borrowed pairing loops cannot select different
+    /// candidates.
+    fn prepare_key(&mut self, key: Option<&Value>) -> Result<()> {
         self.scanning = false;
         self.matched.clear();
 
-        let key = match outer.get(self.key) {
-            Some(key) => key,
-            // A joined row narrower than the plan's ordinals reads as `NULL`
-            // everywhere else in the engine, and `NULL` matches nothing.
-            None => return Ok(()),
+        let Some(key) = key else {
+            return Ok(());
         };
         if *key == Value::Null {
             return Ok(());
@@ -723,6 +831,32 @@ impl<'a> IndexProbe<'a> {
             return self.fall_back();
         }
 
+        // The three reusable buffers are lent out for the length of the probe
+        // and put back whatever happens, so an error on one outer row does not
+        // cost the next one its reuse.
+        let mut ids = core::mem::take(&mut self.ids);
+        let mut start = core::mem::take(&mut self.key_start);
+        let mut end = core::mem::take(&mut self.key_end);
+        let outcome = self.probe(key, &mut ids, &mut start, &mut end);
+        self.ids = ids;
+        self.key_start = start;
+        self.key_end = end;
+        outcome
+    }
+
+    /// Read the rows one non-`NULL`, indexable key names, into `self.matched`.
+    ///
+    /// Split out of [`IndexProbe::prepare_key`] only so the three reusable
+    /// buffers can be lent to it as plain `&mut` locals: `self.kind` is
+    /// borrowed for as long as the index's name is in use, which is the whole
+    /// probe.
+    fn probe(
+        &mut self,
+        key: &Value,
+        ids: &mut Vec<RowId>,
+        start: &mut Vec<u8>,
+        end: &mut Vec<u8>,
+    ) -> Result<()> {
         match &self.kind {
             ProbeKind::RowId => {
                 if let Some(id) = row_id_of(key) {
@@ -730,21 +864,28 @@ impl<'a> IndexProbe<'a> {
                 }
             }
             ProbeKind::Index(index) => {
-                let range = KeyRange::equality(index, &[key], &[self.collation])?;
-                // `scan_index_row_ids` (`AHL-479`), not `scan_index_range` plus
-                // a per-entry decode: a join probe never looks at anything but
-                // the row id an entry names, which is exactly the case the
-                // row-id-only walk exists for — see its doc comment.
-                let mut ids = self
-                    .storage
-                    .scan_index_row_ids(&range.start, range.end.as_deref())?;
+                let bounded =
+                    KeyRange::equality_into(index, &[key], &[self.collation], start, end)?;
+                // `scan_index_row_ids_into` (`AHL-479`, `AHL-549`), not
+                // `scan_index_range` plus a per-entry decode: a join probe never
+                // looks at anything but the row id an entry names, which is
+                // exactly the case the row-id-only walk exists for — see its doc
+                // comment. `_into` so the id buffer is the operator's, refilled
+                // per outer row rather than allocated per outer row.
+                self.storage.scan_index_row_ids_into(
+                    start,
+                    bounded.then_some(end.as_slice()),
+                    ids,
+                )?;
                 // Entries sort by value and only then by row id, so a probe of
                 // a composite index's leading column is not in row-id order.
                 // The materialising path replays the inner table in row-id
                 // order and the pairs come out in that order, so this is what
                 // keeps the two answers identical row for row.
                 ids.sort_unstable();
-                for id in ids {
+                // `ids` is the operator's own buffer lent in, not a field of
+                // `self`, so this iterates it while `fetch` takes `&mut self`.
+                for &id in ids.iter() {
                     self.interrupt.check()?;
                     self.fetch(id)?;
                 }
@@ -753,7 +894,7 @@ impl<'a> IndexProbe<'a> {
         Ok(())
     }
 
-    /// Fetch one row by id and keep it, skipping one that is not there.
+    /// Fetch one row by id and keep its bytes, skipping one that is not there.
     ///
     /// A row id with no row is skipped rather than reported, for the reason
     /// [`RowBytes::indexed`] gives: an index entry outliving its row would be a
@@ -761,7 +902,7 @@ impl<'a> IndexProbe<'a> {
     /// either.
     fn fetch(&mut self, id: RowId) -> Result<()> {
         if let Some(bytes) = self.storage.get_row(&self.table, id)? {
-            self.matched.push(decode_row_masked(&bytes, &self.mask)?);
+            self.matched.push(bytes);
         }
         Ok(())
     }
@@ -780,26 +921,45 @@ impl<'a> IndexProbe<'a> {
         Ok(())
     }
 
-    /// The candidates the last [`IndexProbe::prepare`] left.
-    fn rows(&self) -> &[Vec<Value>] {
+    /// How many candidates the last [`IndexProbe::prepare`] left.
+    fn candidates(&self) -> usize {
         match (self.scanning, &self.fallback) {
-            (true, Some(rows)) => rows,
-            _ => &self.matched,
+            (true, Some(rows)) => rows.len(),
+            _ => self.matched.len(),
         }
     }
 
-    /// Take ownership of one candidate at `index`.
+    /// Append one candidate's values onto `out` as owned cells.
     ///
-    /// The fallback table scan is cached and replayed for every outer row
-    /// that reaches it, so that clones, same as [`IndexProbe::rows`] always
-    /// did. `self.matched` is rebuilt by [`IndexProbe::prepare`] for every
-    /// outer row and each entry is read exactly once — by the pairing loop
-    /// that calls this — so taking it is sound: nothing later in this outer
-    /// row's iteration, or the next one, reads `self.matched[index]` again.
-    fn take_row(&mut self, index: usize) -> Vec<Value> {
-        match (self.scanning, &mut self.fallback) {
-            (true, Some(rows)) => rows[index].clone(),
-            _ => core::mem::take(&mut self.matched[index]),
+    /// The fallback table scan is decoded once and replayed for every outer
+    /// row that reaches it, so that clones. A probed row is decoded here,
+    /// straight onto the pairing buffer: before AHL-549 it was decoded into a
+    /// `Vec<Value>` of its own at probe time and moved across here, which cost
+    /// one heap allocation per candidate for a container that existed only to
+    /// be drained.
+    fn append_row_into(&self, index: usize, out: &mut Vec<Value>) -> Result<()> {
+        match (self.scanning, &self.fallback) {
+            (true, Some(rows)) => {
+                out.extend(rows[index].iter().cloned());
+                Ok(())
+            }
+            _ => decode_row_masked_onto(self.matched[index].as_slice(), &self.mask, out),
+        }
+    }
+
+    /// [`IndexProbe::append_row_into`] into a buffer of borrowed cells.
+    ///
+    /// A `TEXT` or `BLOB` candidate cell is a slice into the page its row was
+    /// read out of, held alive by the `RowBuf` in `self.matched` — which is why
+    /// the cells borrow `self` and why the pairing loop has to be done with
+    /// them before it prepares the next outer row.
+    fn append_candidate_ref<'s>(&'s self, index: usize, out: &mut Vec<ValueRef<'s>>) -> Result<()> {
+        match (self.scanning, &self.fallback) {
+            (true, Some(rows)) => {
+                out.extend(rows[index].iter().map(ValueRef::from));
+                Ok(())
+            }
+            _ => decode_row_ref_masked_onto(self.matched[index].as_slice(), &self.mask, out),
         }
     }
 }
@@ -1240,10 +1400,10 @@ impl<'a> NestedLoopJoin<'a> {
             let outer_width = joined.len();
             let mut matched = false;
 
-            for index in 0..self.inner.rows().len() {
+            for index in 0..self.inner.candidates() {
                 self.interrupt.check()?;
                 joined.truncate(outer_width);
-                self.inner.append_row_into(index, &mut joined);
+                self.inner.append_row_into(index, &mut joined)?;
                 let keep = match (hash_key_is_full_on, self.on) {
                     (true, Some(_)) => self
                         .inner
@@ -1291,7 +1451,7 @@ impl<'a> NestedLoopJoin<'a> {
             let id = row.id;
             let score = row.score;
             let mut matched = false;
-            for index in 0..self.inner.rows().len() {
+            for index in 0..self.inner.candidates() {
                 self.interrupt.check()?;
                 if !self
                     .inner
@@ -1301,7 +1461,7 @@ impl<'a> NestedLoopJoin<'a> {
                     continue;
                 }
                 matched = true;
-                let inner = &self.inner.rows()[index];
+                let inner = &self.inner.hash_rows()[index];
                 if !each(id, score, &row.values, Some(inner))? {
                     return Ok(());
                 }
@@ -1337,7 +1497,7 @@ impl Iterator for NestedLoopJoin<'_> {
                 }
             }
 
-            let count = self.inner.rows().len();
+            let count = self.inner.candidates();
             let outer = self.current.as_mut()?;
             while outer.next < count {
                 if let Err(error) = self.interrupt.check() {
@@ -1351,7 +1511,10 @@ impl Iterator for NestedLoopJoin<'_> {
                 // values are appended straight into the scratch, not cloned
                 // into a temporary row first — see `JoinInner::append_row_into`.
                 outer.joined.truncate(outer.values.len());
-                self.inner.append_row_into(index, &mut outer.joined);
+                if let Err(error) = self.inner.append_row_into(index, &mut outer.joined) {
+                    self.failed = true;
+                    return Some(Err(error));
+                }
                 let keep = match self.on {
                     Some(on) => match eval::evaluate(on, &outer.joined, Computed::NONE, self.env) {
                         Ok(value) => eval::is_truthy(&value),
@@ -1394,6 +1557,127 @@ impl Iterator for NestedLoopJoin<'_> {
                 }));
             }
         }
+    }
+}
+
+/// A probed join whose *whole* joined row is borrowed cells.
+///
+/// [`NestedLoopJoin`] pairs an owned outer `ExecRow` against candidates it
+/// appends as owned `Value`s. This is the same loop with the ownership taken
+/// out of both halves: the outer row is decoded out of its page bytes into one
+/// reusable buffer, the probed inner row is decoded onto the end of that same
+/// buffer out of the bytes [`IndexProbe`] kept, the `ON` residual is tested on
+/// those borrowed cells with [`eval::evaluate_ref`], and the consumer sees the
+/// concatenation. Nothing between the page and the callback is copied.
+///
+/// # What it is not built for
+///
+/// **Only a probed inner side.** A hash or materialised inner side holds owned
+/// rows already — its candidates cost nothing to borrow but nothing to clone
+/// either — and the operator that pairs them
+/// ([`NestedLoopJoin::try_for_each_borrowed`], [`NestedLoopJoin::try_for_each_hash_pair`])
+/// is untouched. The engine picks this one only for [`JoinInner::Probe`].
+///
+/// **Only a direct-column projection.** An `ON` or a projection outside
+/// [`eval::evaluate_ref`]'s borrowed sublanguage materialises the row it is
+/// handed, which is the owned pipeline with extra steps; the caller keeps that
+/// shape on [`NestedLoopJoin`].
+///
+/// The rows, their order, the `ON`'s three-valued truth and a `LEFT JOIN`'s
+/// padding are identical to [`NestedLoopJoin`]'s — `crates/inlaysql/tests/joins_borrowed.rs`
+/// is where every join shape is required to answer the same through both.
+pub(crate) struct BorrowedJoin<'a> {
+    /// The driving table's row bytes, straight off the access path.
+    outer: RowBytes<'a>,
+    /// The driving table's slice of the joined mask.
+    driving_mask: &'a ColumnMask,
+    inner: JoinInner<'a>,
+    kind: JoinKind,
+    on: Option<&'a Expr>,
+    env: &'a Env<'a>,
+    /// Where a cancelled statement is noticed — same reason
+    /// [`NestedLoopJoin`] holds one: the inner loop can run for many pairs
+    /// without pulling an outer row.
+    interrupt: &'a Interrupt,
+}
+
+impl<'a> BorrowedJoin<'a> {
+    /// Pair `outer`'s rows against `inner`'s candidates. Nothing is read until
+    /// [`BorrowedJoin::try_for_each`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        outer: RowBytes<'a>,
+        driving_mask: &'a ColumnMask,
+        inner: JoinInner<'a>,
+        kind: JoinKind,
+        on: Option<&'a Expr>,
+        env: &'a Env<'a>,
+        interrupt: &'a Interrupt,
+    ) -> Self {
+        Self {
+            outer,
+            driving_mask,
+            inner,
+            kind,
+            on,
+            env,
+            interrupt,
+        }
+    }
+
+    /// Deliver every joined row as borrowed cells, until `each` answers
+    /// `false`.
+    ///
+    /// One buffer holds the whole joined row and is [`park`]ed between outer
+    /// rows: the outer half is decoded once per outer row, and each candidate
+    /// truncates back to that half and appends its own cells. A pair that the
+    /// `ON` rejects therefore costs a decode and nothing else — no container,
+    /// no cell.
+    ///
+    /// A failure ends the scan, so the buffer is dropped rather than parked:
+    /// there is no next row to lend it to. Same argument as
+    /// `Engine::run_borrowed_select`.
+    pub fn try_for_each(
+        mut self,
+        mut each: impl FnMut(&[ValueRef<'_>]) -> Result<bool>,
+    ) -> Result<()> {
+        let mut parked: Vec<ValueRef<'static>> = Vec::new();
+        for row in self.outer.by_ref() {
+            let (_, bytes) = row?;
+            // The parked buffer is empty, so lending it to this row's cells
+            // only shortens `'static`; `park` empties it again below.
+            let mut cells: Vec<ValueRef<'_>> = core::mem::take(&mut parked);
+            decode_row_ref_masked_into(bytes.as_slice(), self.driving_mask, &mut cells)?;
+            self.inner.prepare_ref(&cells)?;
+            let outer_width = cells.len();
+            let mut matched = false;
+            for index in 0..self.inner.candidates() {
+                self.interrupt.check()?;
+                cells.truncate(outer_width);
+                self.inner.append_candidate_ref(index, &mut cells)?;
+                let keep = match self.on {
+                    Some(on) => {
+                        eval::is_truthy(&eval::evaluate_ref(on, &cells, Computed::NONE, self.env)?)
+                    }
+                    None => true,
+                };
+                if keep {
+                    matched = true;
+                    if !each(&cells)? {
+                        return Ok(());
+                    }
+                }
+            }
+            if !matched && self.kind == JoinKind::Left {
+                cells.truncate(outer_width);
+                cells.extend(core::iter::repeat_n(ValueRef::Null, self.inner.width()));
+                if !each(&cells)? {
+                    return Ok(());
+                }
+            }
+            parked = park(cells);
+        }
+        Ok(())
     }
 }
 

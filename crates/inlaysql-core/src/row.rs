@@ -354,18 +354,37 @@ impl ColumnMask {
 /// read and the cursor refuses to run past the end of the buffer, so a row that
 /// cannot be walked is still an [`Error::Corrupt`].
 pub fn decode_row_masked(bytes: &[u8], mask: &ColumnMask) -> Result<Vec<Value>> {
+    let mut values = Vec::new();
+    decode_row_masked_onto(bytes, mask, &mut values)?;
+    Ok(values)
+}
+
+/// [`decode_row_masked`] appending onto a buffer the caller already owns.
+///
+/// Identical cells, identical mask semantics, identical errors — the only
+/// difference is that the cells are pushed onto the end of `out` instead of
+/// into a fresh `Vec`. A join's pairing buffer already holds the outer row and
+/// wants the inner row's cells after it, so decoding into a temporary `Vec`
+/// only to move it across was one heap allocation per candidate pair
+/// (`PERF.md`, AHL-549).
+///
+/// `out` is *not* cleared: appending is the whole point. A decode that fails
+/// part-way leaves the cells read before the failure on the end of it, exactly
+/// as [`decode_row_ref_masked_into`] does, and every caller stops at the first
+/// error or truncates before the next row.
+pub fn decode_row_masked_onto(bytes: &[u8], mask: &ColumnMask, out: &mut Vec<Value>) -> Result<()> {
     let mut cursor = Cursor::new(bytes);
     let count = cursor.count(1)?;
-    let mut values = Vec::with_capacity(count);
+    out.reserve(count);
     for ordinal in 0..count {
         if mask.wants(ordinal) {
-            values.push(decode_value(&mut cursor)?);
+            out.push(decode_value(&mut cursor)?);
         } else {
             skip_value(&mut cursor)?;
-            values.push(Value::Null);
+            out.push(Value::Null);
         }
     }
-    Ok(values)
+    Ok(())
 }
 
 /// Decode a row into borrowed cells, materialising only the columns `mask`
@@ -410,6 +429,21 @@ pub fn decode_row_ref_masked_into<'a>(
     out: &mut Vec<ValueRef<'a>>,
 ) -> Result<()> {
     out.clear();
+    decode_row_ref_masked_onto(bytes, mask, out)
+}
+
+/// [`decode_row_ref_masked_into`] that appends rather than replacing.
+///
+/// The borrowed twin of [`decode_row_masked_onto`], and for the same caller: a
+/// join pairing an outer row against one probed inner row after another writes
+/// the inner cells onto the end of a buffer whose first `outer_width` cells are
+/// the outer row's, truncating back between candidates. Nothing is cleared
+/// here, so the outer half survives.
+pub fn decode_row_ref_masked_onto<'a>(
+    bytes: &'a [u8],
+    mask: &ColumnMask,
+    out: &mut Vec<ValueRef<'a>>,
+) -> Result<()> {
     let mut cursor = Cursor::new(bytes);
     let count = cursor.count(1)?;
     out.reserve(count);

@@ -211,7 +211,12 @@ fn every_shape_that_falls_back_still_answers_identically() {
         "SELECT id + 1 FROM kv",
         "SELECT upper(email) FROM kv WHERE id < 5",
         "SELECT id, length(body) FROM kv LIMIT 3",
-        // A join, and a derived table.
+        // A derived table. (A *join* no longer falls back — since AHL-549 a
+        // single non-blocking one is answered by a borrowed-cell operator,
+        // and `crates/inlaysql/tests/joins_borrowed.rs` is where every join
+        // shape is tied to the owned pipeline. It stays in this list because
+        // the shape still has to answer identically, which is what this file
+        // is for.)
         "SELECT kv.id, tags.tag FROM kv JOIN tags ON tags.kv_id = kv.id LIMIT 6",
         "SELECT id FROM (SELECT id FROM kv WHERE id < 6)",
         // A WITHOUT ROWID table, whose scan is a different source entirely.
