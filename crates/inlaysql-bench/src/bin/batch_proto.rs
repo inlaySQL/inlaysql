@@ -571,7 +571,7 @@ fn tight_leaf_cells(
         return Err(corrupt("slot directory overlaps cell area"));
     }
     let slots = &bytes[HEADER_SIZE..HEADER_SIZE + 2 * count];
-    for slot in slots.chunks_exact(2) {
+    for slot in slots.as_chunks::<2>().0 {
         let slot = u16::from_le_bytes([slot[0], slot[1]]) as usize;
         let Some(head) = bytes.get(slot..slot + 2) else {
             return Err(corrupt("leaf cell runs past end of page"));

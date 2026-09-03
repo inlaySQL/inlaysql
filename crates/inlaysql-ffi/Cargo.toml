@@ -1,0 +1,17 @@
+[package]
+name = "inlaysql-ffi"
+description = "A C ABI over the InlaySQL engine: the library every FFI-capable language embeds through."
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "inlaysql_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+inlaysql = { workspace = true }
+inlaysql-core = { workspace = true }

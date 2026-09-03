@@ -838,7 +838,7 @@ pub fn scan_leaf_cells<'a>(
     // In bounds by the header check: the directory ends at or before
     // `free_start`, which is at or before the page's end.
     let slots = &bytes[HEADER_SIZE..HEADER_SIZE + SLOT_SIZE * count];
-    for slot in slots.chunks_exact(SLOT_SIZE) {
+    for slot in slots.as_chunks::<SLOT_SIZE>().0 {
         let slot = u16::from_le_bytes([slot[0], slot[1]]) as usize;
         let (key, value) = parse_leaf_cell(bytes, slot)?;
         f(&bytes[key], value)?;

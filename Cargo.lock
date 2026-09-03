@@ -270,6 +270,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "inlaysql-ffi"
+version = "0.0.1"
+dependencies = [
+ "inlaysql",
+ "inlaysql-core",
+]
+
+[[package]]
 name = "inlaysql-mcp"
 version = "0.0.1"
 dependencies = [

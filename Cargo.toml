@@ -8,6 +8,7 @@ members = [
     "crates/inlaysql-core",
     "crates/inlaysql",
     "crates/inlaysql-uring",
+    "crates/inlaysql-ffi",
     "crates/inlaysql-mcp",
     "crates/inlaysql-server",
     "crates/inlaysql-wasm",
