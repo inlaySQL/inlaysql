@@ -476,8 +476,9 @@ for a composite key — builds an ordinary ordered B-tree over one or more
 `INTEGER`/`REAL`/`TEXT` columns (AHL-423), living in the same copy-on-write
 tree as the rows, so it gets WAL, crash recovery and MVCC rebase for free. A
 top-level equality or range predicate on an indexed column becomes a range
-probe instead of a full scan — worth 548.71x on point probes and 131.39x on
-range scans over the engine's own unindexed scan (`BENCHMARK.md`) — and `CREATE UNIQUE INDEX` enforces a
+probe instead of a full scan — worth roughly 500x on point probes and
+roughly 150x on range scans over the engine's own unindexed scan
+(`BENCHMARK.md`) — and `CREATE UNIQUE INDEX` enforces a
 uniqueness constraint at insert time. The same index also answers the inner
 side of a join: `FROM posts JOIN users ON posts.user_id = users.id` probes
 `users` by one tree descent per outer row instead of materialising and
@@ -1185,131 +1186,108 @@ Roughly in order of value. Every line here is a gap already named in
 [What this is not](#what-this-is-not) or in the benchmarks above — nothing
 below is a surprise to the project, it is the honest state of it:
 
-1. **The join and range miss path** — the last measured read loss to
-   SQLite, and still the biggest one. AHL-479 found the entry-range walk
-   itself was not the bottleneck — reading admitted entries without cloning
-   their keys moved the indexed-range case +15–18%, but a full join barely
-   moved (~4.5%), because the join workload's table plus index (~18 MiB)
-   exceeds the default 8 MiB page cache. [`PERF.md`](PERF.md) has the
-   profile and the cache-budget arithmetic that settled it, plus two
-   rejected attempts at the obvious fix (page/cell representation, AHL-493)
-   and why each traded the point-read win or a small-join regression for a
-   cold-path gain nobody asked for. A later, narrower fix — a probed join's
-   inner row was being cloned twice, once by the probe and again by the
-   pairing loop — landed a small, safe (zero risk to the point-read path by
-   construction), consistent-but-modest ~3–5% win on both full-join shapes,
-   measured on a quiet machine; it is not what closes this gap. A third
-   attempt — prefix-skipping key comparison during descent (`memcmp` is
-   12–21% of the miss path's self-time) — was also tried and was also a
-   wash: the mechanism measurably works, but its own bookkeeping cost erases
-   the gain, because this workload's dominant cost is re-descending from the
-   root once per outer row rather than comparing many entries per descent.
-   See [`PERF.md`](PERF.md) for the numbers and the next, different angle:
-   extending the point-read path's already-proven retained-cursor technique
-   to the entry-range walk itself, to attack the re-descend cost directly.
-2. ~~**The server's per-connection page cache.**~~ — **investigated twice,
-   and the diagnosis behind it did not hold up either time.** The
-   1-to-8-connection read drop this item used to cite (26,271 → 17,628, an
-   even earlier edition) could not be reproduced on a quiet machine with the
-   same client and driver; what did reproduce, independently, twice: the
-   Python MySQL client's *threaded* concurrency is GIL-bound, and that alone
-   explained a comparable-looking drop with nothing server-side involved. A
-   process-based driver now exists (2026-08-29) and closes that question for
-   good. Its first, single run found a smaller drop of its own (9,033.3 →
-   6,294.3 reads/s) where MySQL's stayed flat; two checks ruled out
-   `inlaysql-server`'s thread-per-connection model as the more likely cause
-   (it scales *up* cleanly both on the host and inside the compose network),
-   and the first gated, repeated edition of the table (2026-09-02/03, three
-   runs) reads that step as −4% to −12%, inside the floor — not reproduced,
-   not claimed fixed. What that table does measure three times the same
-   way is the *write* side: a ~3.4x barrier-rate deficit at eight
-   connections with commit batching at parity. See `BENCHMARK.md`'s
-   "Server-to-server" section and `PLAN.md`'s W5 for what is still open.
-3. ~~**The sequential-commit gap to MySQL.**~~ — as a library the write gap is
-   ~1.5x containerised against MySQL 8.4 and ~1.2x against PostgreSQL
-   (gated median of three, 2026-09-02/03); over the wire (server-to-server,
-   process-based, same sitting) it is ~1.6x at one connection and ~3.3x at
-   eight, thread-per-connection against a worker pool, and group
-   commit cannot fire on a single connection by design. This remains open.
-   `BENCHMARK.md`'s correction on the library figure is worth reading before
-   trusting the size of that gap: the transport asymmetry (no socket round
-   trip) that flatters the library rows is worth roughly as much as the
-   entire published PostgreSQL gap on its own.
-4. ~~**Wiring the free list into the public API.**~~ — **done.** The free
-   list and page reuse landed inside the engine (AHL-481); `EngineOptions::page_reuse`
-   now reaches it, and `inlaysql vacuum <path>` does whole-file compaction —
-   a copy into a fresh file and an atomic rename, the same algorithm real
-   SQLite's own `VACUUM` uses, so it never touches the copy-on-write tree's
-   crash-recovery path at all. See `docs/recovery.md` for what is and is not
-   done at the storage layer underneath it.
-5. ~~**A cost-based join planner.**~~ — **partially done.** `ANALYZE` records
-   table row counts and leading B-tree index cardinalities; given a complete,
-   current snapshot the planner costs a choice between the existing
-   hash-join and index-probe operators per join, still in written order
-   (`docs/research/cost-planner.md`). Missing, corrupt or stale stats fall
-   back to the old rule in
-   [Scalar indexes and joins that use them](#scalar-indexes-and-joins-that-use-them),
-   and join reordering is not implemented — that is what the join losses in
-   [Performance](#performance) whose fix needs a different physical order are
-   still waiting on.
-6. **A server-to-server benchmark with a corrected driver, on a quiet
-   machine.** The first server-to-server table exists (AHL-495, in
-   [Performance](#performance)), but item 2 above found its own driver
-   (threaded Python client concurrency) is a confound serious enough that a
-   repeat needs a process-based driver before the number can be trusted,
-   not just a quieter machine.
-7. ~~**Multi-column and composite retrieval indexes.**~~ — **the BM25 half is
-   done; ANN is scoped out, on purpose.** `CREATE INDEX idx ON docs (title,
-   body) USING FULLTEXT` now builds one combined BM25 index over the
-   concatenation of every named column's text — MySQL's `FULLTEXT(title,
-   body)`: a query term that only matches one column still ranks the row.
-   `bm25_score(title, body, ?)` finds it regardless of which order the
-   columns are named in, and a bare `CREATE INDEX idx ON docs (title, body)`
-   (no `USING`) still means a B-tree, exactly as it always has — inferring
-   `FullText` for it the way a single `TEXT` column already does would have
-   silently changed that long-standing default. This needed no on-disk
-   format change of its own: the multi-column column-list encoding the
-   scalar B-tree index already forces (`Catalog::required_version`) was
-   never B-tree-specific, and a single-column retrieval index's persisted key
-   (`index:<table>:<column>`) is untouched — a multi-column index's key is
-   additive, built so it can never collide with it. `VECTOR` stays
-   single-column: two embedding columns are generally two different vector
-   spaces, and there is no standard meaning for one HNSW graph over both —
-   concatenated or weighted-sum embeddings are technically possible but not a
-   default anyone should get without asking for it by name — so this was
-   left undone rather than guessed at.
-8. ~~**Filter-aware graph walks.**~~ — **done.** A restrictive `WHERE` on a
-   retrieval query is now pushed into the index walk rather than answered by
-   over-fetching: rejected rows are traversed but not returned or counted,
-   for the vector and BM25 indexes alike and on both sides of `fuse`.
-   Per-value sub-indexes — a further speedup on top of pushdown, for a
-   filter selective enough that even a single filtered walk is more work
-   than probing a per-value structure directly — remain later-stage work.
-9. ~~**Quantised paged index nodes.**~~ — **done.** `PagedHnswIndex` stored
-   exact `f32` even for an `INT8` column; it now shares the same
-   `Q8Vector`/`VectorEncoding` quantisation the in-memory index already had.
-   Measured: 2.14–2.16x smaller file, 3.96x smaller resident cache payload
-   (the same ratio the in-memory index publishes) — the file-size win is
-   larger than the in-memory index's 1.65x because every paged node stores
-   its vector inline, where the in-memory index recomputes a live node's
-   vector from its own embeddings map instead.
-10. **Deeper SQL Logic Test coverage, real SQLancer runs and continuous
-    fuzzing** beyond what `trust.yml` runs today (see
-    [`docs/sqlancer.md`](docs/sqlancer.md)).
-11. **Read replicas over the existing CDC log.** `cdc.rs` is already
-    pull-based and bounded, so the shape of the work is shipping records and
-    tracking replica position — the Turso model, no consensus and no fork.
-    The blocker to design around first: `open_read_only` takes no OS lock by
-    design, so a reader in another process cannot be proven absent — fine
-    on one machine today, unavoidable to answer once a second machine is
-    reading the same file. Durable storage/compute separation (an
-    object-storage-backed device, for corpora too large to ship as an edge
-    asset) is the same category of work, longer.
+1. **The `LIMIT` join shapes and the range scan against SQLite** — the read
+   losses that are left. The `LIMIT 10` form of both join shapes is 1.27x and
+   1.59x behind journal-mode SQLite, the 50-row indexed range scan is 0.67x of
+   it on p50 (and roughly 0.4x of WAL mode), and the point read's *throughput*
+   is 0.69x of SQLite WAL's even though its p50 is already ahead of it.
+   Everything else on the read side wins now: both *full* joins beat SQLite by
+   roughly 3x and 7-8x and both servers by roughly 2.7-4x, and the range scan
+   we lose to SQLite is one we win against MySQL 8.4 and PostgreSQL 17 by
+   roughly 7x and 4.5x — the loss is a statement about SQLite's row iteration
+   specifically, not about ours in general. What is left is per-row rather
+   than per-query, and it has been narrowed mostly by elimination: AHL-532
+   found per-execution planning is about 5% of a `LIMIT` join (the plan cache
+   it went in to build was measured unnecessary and never built) and sized a
+   limited scan's first batch to the `LIMIT`; AHL-535's borrowing row API took
+   the allocations out of the row loop entirely. After both, the profile is
+   ten full tree descents for ten consecutive keys in one leaf, and on the
+   range shape `memcmp` at 21% and the residual filter at about 16%. The next
+   angle is extending the point read's already-proven retained cursor to the
+   entry-range walk itself (`walk`/`scan_range_from`; the cheapest first step
+   is `colliding_rows` over the already cursor-backed `scan_index_row_ids`).
+   [`PERF.md`](PERF.md) carries what was built, measured and dropped on the
+   way here, each with the number that killed it: page/cell representation
+   twice (AHL-493), prefix-skipping key comparison during descent, a
+   per-statement join-plan cache, a dense-rowid leaf walk, a covering-index
+   scan and a 64 MiB shared read cache.
+2. **Write throughput at eight connections, server to server.** Over the wire
+   against MySQL 8.4 on the same driver and the same transport, writes are
+   ~0.64x at one connection and ~0.30x at eight: MySQL's write throughput
+   scales 4.8x from one connection to eight where this engine's reaches 2.3x.
+   Commit batching is not the gap — at eight connections our coordinator rides
+   4.06 commits per barrier to InnoDB's 3.90 — it is barrier *rate*, roughly
+   375 fsyncs/s against 1,280: thread-per-connection against a worker pool,
+   the same diagnosis the 1/4/16-connection sweeps reached on 2026-08-31. The
+   per-connection page cache this item used to be about is gone from it,
+   because the diagnosis behind it did not survive two investigations: the
+   read drop it cited was a GIL-bound threaded Python client, a process-based
+   driver has replaced it, and the first gated, repeated edition of that table
+   reads the 1-to-8 read step at −4% to −12%, inside the measurement floor —
+   not reproduced, not claimed fixed. As a library, containerised, single-row
+   durable writes are ~1.5x behind MySQL 8.4 and ~1.2x behind PostgreSQL 17,
+   and batch insert like for like is ~1.2x MySQL and 0.68x PostgreSQL.
+   `BENCHMARK.md`'s correction on the library figures is worth reading before
+   trusting the size of any of them: the transport asymmetry that flatters the
+   library rows (no socket round trip) is worth roughly as much as the entire
+   published PostgreSQL gap on its own.
+3. **Commit-side logical group commit (C1) — built, measured, and closed as a
+   loss until the two layers compose.** Both slices are in behind
+   `EngineOptions::commit_absorption`, off by default. Slice 1 (AHL-544) moved
+   the first-committer-wins decision to the gate holder and measured flat,
+   which its own plan predicted, because every follower still entered the gate
+   to encode and append. Slice 2 (AHL-547) removed all three — one gate
+   acquisition, one WAL append and one `fsync` per cohort, every member
+   acknowledged only after the barrier — and it is **0.78x / 0.87x / 0.90x at
+   8 / 16 / 32 writers, three runs of three, non-overlapping**. The mechanism
+   is the finding: absorption runs *more* barriers, not fewer (0.140
+   syncs/commit against 0.111 at 32 writers), because a commit-side cohort of
+   ~5.6 members displaces the flush-side ticket gather that was already
+   amortising each `fsync` over 6-9 commits — a follower under absorption
+   never publishes a ticket for a flush leader to gather. The two layers
+   compete for the same population and the earlier one gathers the smaller
+   cohort. A related belief died in the same measurement: holding the gate
+   across the cohort's barrier, which the design brief argued for, costs
+   roughly half the throughput and 3-7x the p99. The next C1 item, if there
+   is one, is one flush ticket per cohort gathered across leaders, plus
+   cohorts that survive a WAL-region boundary — with a measurement gate
+   before any code.
+4. **Reordering past the leading join.** The planner exchanges which table
+   drives a two-table inner join when a complete, current `ANALYZE` snapshot
+   says the other side is cheaper, and an `ORDER BY` with a `LIMIT` reorders
+   too. Nothing else does: three or more tables (a search problem, where this
+   is one comparison), any join after the first, a join with a derived table
+   on either side, an outer join, and any join whose driving table answers a
+   retrieval score all keep their written order and fall back to the
+   deterministic rule in
+   [Scalar indexes and joins that use them](#scalar-indexes-and-joins-that-use-them).
+5. **Deeper SQL Logic Test coverage, real SQLancer runs and continuous
+   fuzzing** beyond what `trust.yml` runs today (see
+   [`docs/sqlancer.md`](docs/sqlancer.md)).
+6. **Server posture: refuse to expose, and fuzz the packet path.** `127.0.0.1`
+   is the default bind and should stay the default; what is missing is the
+   loud path — binding to anything else while TLS is off, or while the only
+   credential is the bootstrap `--user`/`--password` pair, should *refuse*
+   rather than warn, because a database that is easy to expose by accident is
+   the failure mode the whole item exists to prevent. The wire parser is
+   attacker-facing by construction and young; the fuzzer has already found one
+   parser DoS in this project (AHL-500), and the server's own packet path
+   deserves the same treatment before the documentation stops saying
+   "localhost only".
+7. **Read replicas over the existing CDC log**, and the serverless work that
+   shares its shape. `cdc.rs` is already pull-based and bounded, so the work
+   is shipping records and tracking replica position — the Turso model, no
+   consensus and no fork. Two things have to be answered before any of it:
+   the CDC log deliberately carries no row payloads, so there is nothing for a
+   replica to apply yet, and `open_read_only` takes no OS lock by design, so a
+   reader in another process cannot be proven absent — fine on one machine
+   today, unavoidable once a second machine reads the same file. Durable
+   storage/compute separation (an object-storage-backed `Device`, for corpora
+   too large to ship as an edge asset) is the same category of work and starts
+   as a research brief with measured S3 and R2 latencies, not as code.
 
 Full Postgres parity is deliberately not on this list — see the last point in
-[What this is not](#what-this-is-not). Window functions and `WITH RECURSIVE`
-were in this paragraph until AHL-494 and semi-naive iteration implemented
-them, respectively.
+[What this is not](#what-this-is-not).
 
 ## What this is not
 
@@ -1324,28 +1302,45 @@ it was verified in this repository or reported by an audit and not yet
 reproduced. It is a less flattering document than this section and a more
 useful one.
 
-- **Retrieval indexes are explicit and single-column.** A `TEXT` column is
-  only full-text indexed after `CREATE INDEX idx ON t (body)` (or in a
-  database written before `CREATE INDEX` existed, whose columns are
-  grandfathered); the same for a `VECTOR` column and an ANN index. Composite
-  and multi-column *retrieval* indexes are not supported (see
-  [Next](#next)). A scalar index is a different structure: `CREATE INDEX` on
-  `INTEGER`/`REAL`/`TEXT` (`USING BTREE` on the last) is a real ordered
-  B-tree, may be declared `UNIQUE`, and may span more than one column — see
+- **Retrieval indexes are explicit, and a vector index is single-column on
+  purpose.** A `TEXT` column is only full-text indexed after
+  `CREATE INDEX idx ON t (body)` (or in a database written before
+  `CREATE INDEX` existed, whose columns are grandfathered); the same for a
+  `VECTOR` column and an ANN index. A BM25 index may span several columns —
+  `CREATE INDEX idx ON docs (title, body) USING FULLTEXT` builds one combined
+  index over the concatenation of every named column's text, MySQL's
+  `FULLTEXT(title, body)`, so a term matching one column still ranks the row,
+  and `bm25_score(title, body, ?)` finds it whichever order the columns are
+  named in; a bare `CREATE INDEX idx ON docs (title, body)` with no `USING`
+  still means a B-tree, exactly as it always has. `VECTOR` stays
+  single-column, and that is a decision rather than a gap: two embedding
+  columns are generally two different vector spaces, and there is no standard
+  meaning for one HNSW graph over both — concatenated or weighted-sum
+  embeddings are technically possible but not a default anyone should get
+  without asking for it by name. A scalar index is a different structure
+  again: `CREATE INDEX` on `INTEGER`/`REAL`/`TEXT` (`USING BTREE` on the last)
+  is a real ordered B-tree, may be declared `UNIQUE`, and may span more than
+  one column — see
   [Scalar indexes and joins that use them](#scalar-indexes-and-joins-that-use-them).
-- **Join order is still written order; only the operator choice is now
-  costed.** `ANALYZE` records row counts and leading-index cardinalities, and
-  a complete, current snapshot lets the planner choose between the existing
-  hash-join and index-probe operators for each join
-  (`docs/research/cost-planner.md`); missing or stale stats fall back to the
+- **Join order is costed for one join, and only one.** `ANALYZE` records row
+  counts and leading-index cardinalities, and a complete, current snapshot
+  lets the planner choose between the hash-join and index-probe operators for
+  each join (`docs/research/cost-planner.md`) *and* exchange which of a
+  two-table inner join's tables drives (AHL-512, cost model corrected in
+  AHL-524) — a plan rewrite with every ordinal remapped, so what runs is
+  byte-for-byte the plan the same query written the other way round would have
+  produced. An `ORDER BY` with a `LIMIT` may reorder as well (AHL-525); a
+  `LIMIT` with no `ORDER BY` never does, because there a different order is a
+  different result set. Everything past that keeps its written order: three or
+  more tables, joins after the first, a derived table on either side, an outer
+  join (`a LEFT JOIN b` is not `b LEFT JOIN a`) and any join whose driving
+  table answers a retrieval score. Missing or stale stats fall back to the
   narrow rule that already existed: a retrieval expression is answered by its
   index, a top-level equality on `INTEGER PRIMARY KEY` or a scalar-indexed
   column by a tree descent or range probe — including as the inner side of a
   join (AHL-464) — a full-scan equi-join by a hash build, and everything else
-  by a full scan. A two-table inner join may run with its tables exchanged
-  when statistics say the other side should drive (AHL-512/524/525); a
-  `LIMIT` without an `ORDER BY` never is. [Performance](#performance)
-  publishes both full-join shapes and the `LIMIT` shapes, wins and losses.
+  by a full scan. [Performance](#performance) publishes both full-join shapes,
+  which win, and the `LIMIT` shapes, which lose.
 - **Recall on uniformly random vectors is poor, and cannot be fixed by
   tuning.** On text-derived embeddings recall@10 stays flat across a 20x
   range of corpus sizes tested (0.998 at 5,000 rows, 1.000 at 20,000, 0.998
@@ -1407,11 +1402,6 @@ useful one.
   hundreds of kilobytes per document. `docs/indexes.md` has the layout and the
   full cost; `inlaysql serve --mysql --paged-text` is the server flag for it,
   documented in `docs/server.md` alongside `--paged-vectors`.
-- **A paged index stores exact `f32` vectors even for an int8 column.**
-  `VECTOR(n, INT8)` shrinks the row and the in-memory graph; the paged graph's
-  node records do not quantise yet, so on an int8 column the paged index trades
-  away the 4x the quantisation was for. Results are unaffected — queries are
-  `f32` on both paths.
 - **No clustering or multi-node replication.** InlaySQL runs in one process
   against one file — no leader election, no consensus, no built-in read
   replica. This is not the same gap as serverless: [On an edge
