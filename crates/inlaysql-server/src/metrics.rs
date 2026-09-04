@@ -116,6 +116,55 @@ pub enum Counter {
     /// Bytes written to the client's socket, packet headers included.
     BytesSent,
 
+    // ---------------------------------------------- per-thread timing
+    // AHL-555 (C2): where a connection thread's time actually goes, split at
+    // the two boundaries the server can see without reaching into the
+    // engine's commit path. See `crate::connection::Connection::serve` and
+    // `Connection::commit` for where each is measured, and this module's
+    // doc comment for the "one `Instant::now()` pair per phase, nothing
+    // when nobody reads" cost rule.
+    /// Nanoseconds a connection thread spent blocked in
+    /// [`std::io::Read::read`], waiting for the client to send its next
+    /// command. Measured around [`crate::packet::Stream::read_message`] in
+    /// the command loop — before dispatch, before any statement work.
+    InlaysqlThreadSocketWaitNs,
+    /// Nanoseconds spent inside `Connection::dispatch_command`
+    /// ([`crate::connection`]) — every command this server can be asked to
+    /// run, from whichever command byte
+    /// it was to the reply being ready to write.
+    ///
+    /// **For an autocommit write, this includes the commit.** The engine
+    /// performs an autocommit statement's execution and its commit inside
+    /// one opaque call ([`inlaysql::Database::execute_prepared`], which
+    /// reaches `Engine::run_refreshed` → `end_write` → `commit_storage` with
+    /// no seam this crate can see or time without adding a timestamp inside
+    /// the engine's own commit path — out of bounds for this instrument, see
+    /// `PERF.md`'s AHL-555 section). [`Counter::InlaysqlThreadCommitNs`]
+    /// below is the *separable* remainder: the portion of this bucket that
+    /// an explicit `COMMIT` spends inside [`inlaysql::Database::commit`], a
+    /// sub-interval of this counter rather than additional wall time. On a
+    /// purely-autocommit workload (this project's own OLTP write benchmark)
+    /// that remainder is zero and the whole cost of a write, execution and
+    /// commit together, is only visible here.
+    InlaysqlThreadExecuteNs,
+    /// Nanoseconds spent inside [`inlaysql::Database::commit`] specifically —
+    /// the separable case: an explicit `BEGIN` ... `COMMIT`, or one of the
+    /// places this server commits an open transaction before a statement
+    /// that needs to see it committed (an account statement, `OPTIMIZE
+    /// TABLE`, autocommit turning back on). Always a sub-interval of
+    /// [`Counter::InlaysqlThreadExecuteNs`] for the same command, never
+    /// counted twice as separate wall time.
+    InlaysqlThreadCommitNs,
+    /// How many commits this thread has caused — an explicit `COMMIT` that
+    /// found a transaction open, or an autocommit write statement, counted
+    /// the moment the engine call that performed it returns successfully.
+    /// The denominator [`Counter::InlaysqlThreadCommitNs`] divides by is
+    /// this counter restricted to the explicit case only; for the barrier
+    /// *rate* this counter's own delta over wall time (or, server-wide,
+    /// [`inlaysql::CommitStats::normal_tickets_flushed`]) is the number to
+    /// use.
+    InlaysqlThreadCommits,
+
     // --------------------------------------------------------- errors
     /// Every error packet this server sent. The sum of the ten below.
     InlaysqlErrorsTotal,
@@ -213,6 +262,10 @@ const DESCRIPTIONS: [(&str, bool); COUNT] = [
     ("Com_init_db", true),
     ("Bytes_received", true),
     ("Bytes_sent", true),
+    ("Inlaysql_thread_socket_wait_ns", true),
+    ("Inlaysql_thread_execute_ns", true),
+    ("Inlaysql_thread_commit_ns", true),
+    ("Inlaysql_thread_commits", true),
     ("Inlaysql_errors_total", true),
     ("Inlaysql_errors_access_denied", true),
     ("Inlaysql_errors_syntax", true),
@@ -400,7 +453,7 @@ pub fn status_variables(
     registry: &Registry,
     commit_stats: Option<inlaysql::CommitStats>,
 ) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::with_capacity(COUNT + 7);
+    let mut out: Vec<(String, String)> = Vec::with_capacity(COUNT + 20);
     for (index, (name, per_session)) in DESCRIPTIONS.iter().enumerate() {
         let from = if *per_session && scope == Scope::Session {
             session
@@ -447,6 +500,78 @@ pub fn status_variables(
         "Inlaysql_normal_commit_tickets".to_string(),
         stats.normal_tickets_flushed.to_string(),
     ));
+    // AHL-555 (C2): the rest of `inlaysql::CommitStats` — already computed
+    // by `CommitCoordinator` for every commit, on the assumption nothing
+    // outside `crates/inlaysql` could use it yet. It can: this is the answer
+    // to "is a writer's time going into the gate, into the barrier itself,
+    // or into waiting for someone else's barrier to finish" without adding a
+    // single timer to the engine's commit path — `gate_wait_ns` is time
+    // blocked *acquiring* the gate (queued behind another writer's hold),
+    // `gate_hold_ns` is time spent doing this writer's own work once it has
+    // the gate (rebase, WAL encode, the record and page writes), the
+    // `_racing_`/`_racing_start_` splits of `gate_hold_ns` say whether that
+    // hold started or ran while a flush was already in flight — the direct
+    // measurement of whether the next gate holder proceeds while a barrier
+    // is running rather than serialising behind it — `follower_wait_ns` is
+    // time spent parked waiting for someone else's flush to finish rather
+    // than leading one, `gather_spin_ns` is a leader's adaptive coalescing
+    // window, `fsync_ns` is the barrier call itself, `post_ns` is waking the
+    // followers it just satisfied, and `gap_ns` is dead time between one
+    // cycle ending and the next leader being elected. Every one of these is
+    // global, like the four above, for the same reason: one file, one
+    // `CommitCoordinator`, shared by every connection.
+    out.push((
+        "Inlaysql_commit_gate_wait_ns".to_string(),
+        stats.gate_wait_ns.to_string(),
+    ));
+    out.push((
+        "Inlaysql_commit_gate_waits".to_string(),
+        stats.gate_waits.to_string(),
+    ));
+    out.push((
+        "Inlaysql_commit_gate_hold_ns".to_string(),
+        stats.gate_hold_ns.to_string(),
+    ));
+    out.push((
+        "Inlaysql_commit_gate_hold_racing_ns".to_string(),
+        stats.gate_hold_racing_ns.to_string(),
+    ));
+    out.push((
+        "Inlaysql_commit_gate_hold_racing_count".to_string(),
+        stats.gate_hold_racing_count.to_string(),
+    ));
+    out.push((
+        "Inlaysql_commit_gate_hold_racing_start_ns".to_string(),
+        stats.gate_hold_racing_start_ns.to_string(),
+    ));
+    out.push((
+        "Inlaysql_commit_gate_hold_racing_start_count".to_string(),
+        stats.gate_hold_racing_start_count.to_string(),
+    ));
+    out.push((
+        "Inlaysql_commit_follower_wait_ns".to_string(),
+        stats.follower_wait_ns.to_string(),
+    ));
+    out.push((
+        "Inlaysql_commit_follower_waits".to_string(),
+        stats.follower_waits.to_string(),
+    ));
+    out.push((
+        "Inlaysql_commit_gather_spin_ns".to_string(),
+        stats.gather_spin_ns.to_string(),
+    ));
+    out.push((
+        "Inlaysql_commit_fsync_ns".to_string(),
+        stats.fsync_ns.to_string(),
+    ));
+    out.push((
+        "Inlaysql_commit_post_ns".to_string(),
+        stats.post_ns.to_string(),
+    ));
+    out.push((
+        "Inlaysql_commit_gap_ns".to_string(),
+        stats.gap_ns.to_string(),
+    ));
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
@@ -463,6 +588,63 @@ mod tests {
         names.dedup();
         assert_eq!(before, names.len(), "two counters share a name");
         assert_eq!(before, COUNT);
+    }
+
+    /// The same "no name twice" rule, but for the *whole* `SHOW STATUS`
+    /// surface — the [`DESCRIPTIONS`]-driven counters above, `Uptime`,
+    /// `Threads_connected`/`Threads_running`, and the `CommitStats`-derived
+    /// rows [`status_variables`] pushes by hand (AHL-555, C2). Those last
+    /// two groups are not covered by
+    /// `every_counter_has_a_name_and_no_name_is_used_twice`, which only
+    /// inspects [`DESCRIPTIONS`] — this is the test that would catch one of
+    /// them colliding with a `Counter` name or with each other.
+    #[test]
+    fn the_full_status_output_has_no_duplicate_name_either() {
+        let session = Metrics::new();
+        let global = Metrics::new();
+        let registry = Registry::new();
+        let rows = status_variables(Scope::Global, &session, &global, &registry, None);
+        let mut names: Vec<&str> = rows.iter().map(|(name, _)| name.as_str()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "two status rows share a name");
+    }
+
+    /// The per-thread timing counters this session added (AHL-555, C2):
+    /// `Inlaysql_thread_commit_ns` is a sub-interval of
+    /// `Inlaysql_thread_execute_ns`, never additional wall time, and both
+    /// are plain adds on `Metrics` like every other counter — this pins the
+    /// wiring (name, session/global split) the way
+    /// `session_scope_reports_this_connection_and_global_reports_the_server`
+    /// pins `Questions`.
+    #[test]
+    fn thread_timing_counters_accumulate_nanoseconds_session_and_global() {
+        let session = Metrics::new();
+        let global = Metrics::new();
+        let registry = Registry::new();
+
+        session.add(Counter::InlaysqlThreadSocketWaitNs, 1_500);
+        global.add(Counter::InlaysqlThreadSocketWaitNs, 1_500);
+        session.add(Counter::InlaysqlThreadExecuteNs, 9_000);
+        global.add(Counter::InlaysqlThreadExecuteNs, 9_000);
+        session.add(Counter::InlaysqlThreadCommitNs, 4_000);
+        global.add(Counter::InlaysqlThreadCommitNs, 4_000);
+        session.record(Counter::InlaysqlThreadCommits);
+        global.record(Counter::InlaysqlThreadCommits);
+
+        let read = |name: &str| -> String {
+            status_variables(Scope::Session, &session, &global, &registry, None)
+                .into_iter()
+                .find(|(variable, _)| variable == name)
+                .map(|(_, value)| value)
+                .unwrap_or_else(|| panic!("{name} is not reported"))
+        };
+
+        assert_eq!(read("Inlaysql_thread_socket_wait_ns"), "1500");
+        assert_eq!(read("Inlaysql_thread_execute_ns"), "9000");
+        assert_eq!(read("Inlaysql_thread_commit_ns"), "4000");
+        assert_eq!(read("Inlaysql_thread_commits"), "1");
     }
 
     /// The naming rule, enforced rather than remembered: a name that is not

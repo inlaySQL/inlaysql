@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
+use std::time::Instant;
 
 use inlaysql::{Database, Error, FileDevice, Outcome, ResultSet, Value};
 
@@ -152,9 +153,19 @@ impl<S: Read + Write + crate::tls::Upgradable> Connection<S> {
             }
         }
         loop {
+            // AHL-555 (C2): the first of the three buckets — how long this
+            // thread sat blocked in the socket read waiting for the client
+            // to send its next command, before any dispatch work starts.
+            // One `Instant::now()` pair per command, the same rule
+            // `crate::metrics` states for every other counter here.
+            let waited_since = Instant::now();
             let Some(message) = self.stream.read_message()? else {
                 return Ok(());
             };
+            self.record_ns(
+                Counter::InlaysqlThreadSocketWaitNs,
+                waited_since.elapsed().as_nanos() as u64,
+            );
             if !self.dispatch(&message)? {
                 return Ok(());
             }
@@ -590,6 +601,14 @@ impl<S: Read + Write + crate::tls::Upgradable> Connection<S> {
         // on a default server this is not even a lock.
         let info = self.control.info();
         let elapsed_ns = self.control.command_ended(began);
+        // AHL-555 (C2): the second bucket, reusing the elapsed time
+        // `Control` already measured for the process list and the slow
+        // query log rather than taking a second `Instant::now()` pair for
+        // the same interval. For an autocommit write this is execution
+        // *and* its commit together — see
+        // `Counter::InlaysqlThreadExecuteNs`'s doc comment for why the two
+        // cannot be split here.
+        self.record_ns(Counter::InlaysqlThreadExecuteNs, elapsed_ns);
         self.note_if_slow(doing, elapsed_ns, info);
         self.publish_traffic();
         outcome
@@ -693,6 +712,16 @@ impl<S: Read + Write + crate::tls::Upgradable> Connection<S> {
     fn count(&self, counter: Counter) {
         self.session_counters.record(counter);
         self.server_counters.record(counter);
+    }
+
+    /// Add `ns` nanoseconds to `counter`, on this session's tally and on the
+    /// server's — the timing counterpart to [`Self::count`], for the
+    /// per-thread buckets AHL-555 (C2) added: see `crate::metrics`'s
+    /// `InlaysqlThreadSocketWaitNs`/`InlaysqlThreadExecuteNs`/
+    /// `InlaysqlThreadCommitNs`.
+    fn record_ns(&self, counter: Counter, ns: u64) {
+        self.session_counters.add(counter, ns);
+        self.server_counters.add(counter, ns);
     }
 
     /// One statement is about to run: count it, and name it in the process
@@ -1067,11 +1096,36 @@ impl<S: Read + Write + crate::tls::Upgradable> Connection<S> {
                     .db
                     .execute_prepared(&fresh, params)
                     .map_err(|e| from_engine(&e))?;
+                self.note_commit_if_autocommitted(&fresh);
                 return Ok(self.finish(outcome, before, Some(&fresh)));
             }
             other => other.map_err(|e| from_engine(&e))?,
         };
+        self.note_commit_if_autocommitted(&plan);
         Ok(self.finish(outcome, before, Some(&plan)))
+    }
+
+    /// Count a commit that just happened *inside* [`Database::execute_prepared`]
+    /// rather than through [`Self::commit`] — the autocommit case.
+    ///
+    /// With autocommit on (MySQL's default, and this server's), a write
+    /// statement with no open transaction commits itself: the engine's own
+    /// `end_write` calls `commit_storage` before `execute_prepared` returns
+    /// (`crates/inlaysql-core/src/engine.rs`), and nothing between there and
+    /// here can see where execution ended and the commit began — that seam
+    /// is inside the engine's commit path, which this instrument does not
+    /// touch (AHL-555, C2; see `Counter::InlaysqlThreadExecuteNs`'s doc
+    /// comment). What *is* visible from out here is that a commit
+    /// happened at all, the moment this call returns successfully, so the
+    /// count is still real even though the nanoseconds it took cannot be
+    /// split out of `InlaysqlThreadExecuteNs`.
+    ///
+    /// Only called after `execute_prepared` has already succeeded — a
+    /// statement that failed did not commit, autocommit or not.
+    fn note_commit_if_autocommitted(&self, plan: &inlaysql::Statement) {
+        if !self.session.in_transaction && !plan.is_read_only() {
+            self.count(Counter::InlaysqlThreadCommits);
+        }
     }
 
     /// Run every statement a MySQL DDL translation expanded to, in order —
@@ -1182,7 +1236,20 @@ impl<S: Read + Write + crate::tls::Upgradable> Connection<S> {
 
     fn commit(&mut self) -> Result<(), MysqlError> {
         if self.session.in_transaction {
+            // AHL-555 (C2): the third bucket, and the one that is separable
+            // — an explicit transaction's commit is its own call, unlike an
+            // autocommit write's, which the engine fuses with execution
+            // inside `execute_prepared` (see
+            // `Counter::InlaysqlThreadExecuteNs`). Timed and counted
+            // regardless of the outcome: a commit that failed still ran the
+            // engine's commit path and still cost the wall time.
+            let started = Instant::now();
             let result = self.db.commit();
+            self.record_ns(
+                Counter::InlaysqlThreadCommitNs,
+                started.elapsed().as_nanos() as u64,
+            );
+            self.count(Counter::InlaysqlThreadCommits);
             // A failed commit still ends the transaction — the engine rolled
             // it back — so the session must not be left believing one is open.
             self.session.in_transaction = false;
