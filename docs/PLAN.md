@@ -19,6 +19,14 @@ current execution order without relying on local conversation history.
 
 ## Current state (2026-09-02, evening)
 
+- 2026-09-04: AHL-551 (a point lookup resumes from the ancestor it
+  descended through — half of all probes on the LIMIT-join shape start
+  below the root; `indexed-range` +3–7%, PK `LIMIT 10` 3.46 → 3.33 µs,
+  points flat) and AHL-552 (the point read's tail was the decoded page
+  cache full of superseded pages: a commit now admits its own pages and
+  drops the ones it replaced; evictions 151,635 → 0, p95/p99 3/3
+  non-overlapping better, at SQLite WAL's level). Both unpublished until
+  the regeneration that follows.
 - 2026-09-03 evening: AHL-549 (the probed inner row is decoded once where
   it is used, the borrowing API serves joins, an index probe's four
   per-outer-row buffers are reused: PK `LIMIT 10` join 4.4 → 3.7 µs vs
@@ -131,11 +139,11 @@ published row without a gated regeneration.
    `memcmp` ~24–27% is B-tree key comparison, `get_from` ~5%. Angle: a
    borrowed-entry index walk. Do not re-propose a dense walk or a
    covering scan (both measured negative) without that first.
-3. **Point-read ops/s vs SQLite WAL (0.69x; p50 already ahead).** The gap
-   is the tail (p95 4.67 vs 1.04 µs). First an instrument — a tail
-   profiler that records stacks only for queries over 2 µs — then the fix
-   it names (clock sweeps, `RawLeafCache`'s shift, table growth, allocator
-   `madvise`, the shared cache's lock are the candidates).
+3. **Point-read tail: fixed (AHL-552).** The instrument
+   (`--suite points --tail true`) named it — the decoded cache filled with
+   superseded pages while the live leaves were evicted — and the fix took
+   p95/p99 to SQLite WAL's level. What remains on this shape is the
+   published ops/s figure, which the next gated regeneration decides.
 4. **Batch insert vs PostgreSQL like for like (0.68x).** ~1.0 ms of
    engine work per hundred-row statement in the container vs PG's ~0.6 ms;
    the page path is tiny now. Profile *in the container*: if the state
