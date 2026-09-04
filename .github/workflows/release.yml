@@ -1,7 +1,8 @@
 name: Release
 
-# What a version tag produces: the `inlaysql` CLI, the WASM module, and a
-# GitHub Release with both attached and the module's size written down.
+# What a version tag produces: the `inlaysql` CLI, the WASM module, the C-ABI
+# shared libraries for the three desktop platforms, and a GitHub Release with
+# everything attached, checksummed, and the module's size written down.
 #
 # The size number already exists — `wasm.yml` computes it on every build — but
 # it lives in a job summary that scrolls away. A release is the one place the
@@ -57,6 +58,66 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: cli
+          path: dist/*.tar.gz*
+          retention-days: 7
+
+  ffi:
+    name: C-ABI library — ${{ matrix.target }}
+    # The SQLite-like adapter: one shared library per platform, each a
+    # first-class release artifact, because a language binding (PHP FFI,
+    # Python ctypes, Ruby FFI, .NET P/Invoke) can do nothing without the
+    # binary matching its OS and architecture.
+    #
+    # Three targets, not five: arm64 Windows exists but no Windows runner
+    # carries an arm64 toolchain worth pinning here yet, and an x86_64 macOS
+    # build is skipped until someone asks for it — Rosetta runs the arm64
+    # library. Adding a target is a matrix row and a `rustup target` line,
+    # nothing else; the packaging step is target-shape-agnostic.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            lib: libinlaysql_ffi.dylib
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib: libinlaysql_ffi.so
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            lib: inlaysql_ffi.dll
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/rust
+        with:
+          targets: ${{ matrix.target }}
+          cache: release-ffi-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release -p inlaysql-ffi --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = tag ] || version="$(git rev-parse --short HEAD)"
+          name="inlaysql-ffi-${version}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/${{ matrix.lib }}" "dist/$name/"
+          cp crates/inlaysql-ffi/include/inlaysql.h "dist/$name/"
+          cp LICENSE "dist/$name/"
+          # The PHP proof of concept is the worked example the header's
+          # consumers start from; it needs nothing but the library.
+          cp crates/inlaysql-ffi/examples/poc.php "dist/$name/"
+          tar -czf "dist/${name}.tar.gz" -C dist "$name"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          ls -l dist
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ffi-${{ matrix.target }}
           path: dist/*.tar.gz*
           retention-days: 7
 
@@ -120,7 +181,7 @@ jobs:
   release:
     name: GitHub Release
     runs-on: ubuntu-latest
-    needs: [cli, wasm]
+    needs: [cli, ffi, wasm]
     # Dispatch runs stop at the artifacts. Only a tag publishes.
     if: github.ref_type == 'tag'
     permissions:
@@ -137,18 +198,53 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          version="${GITHUB_REF_NAME#v}"
           {
             echo "## InlaySQL ${GITHUB_REF_NAME}"
+            echo
+            echo "The engine, three ways: the \`inlaysql\` CLI (and MCP server),"
+            echo "the WASM module for JavaScript, and the C-ABI shared libraries"
+            echo "any FFI language can load in-process — the SQLite-like shape,"
+            echo "no server."
+            echo
+            echo "### Artifacts"
+            echo
+            echo "| file | what it is |"
+            echo "| --- | --- |"
+            echo "| \`inlaysql-${version}-x86_64-unknown-linux-gnu.tar.gz\` | the CLI + MCP server (Linux) |"
+            echo "| \`inlaysql-ffi-${version}-aarch64-apple-darwin.tar.gz\` | C-ABI library (macOS, Apple silicon) |"
+            echo "| \`inlaysql-ffi-${version}-x86_64-unknown-linux-gnu.tar.gz\` | C-ABI library (Linux) |"
+            echo "| \`inlaysql-ffi-${version}-x86_64-pc-windows-msvc.tar.gz\` | C-ABI library (Windows) |"
+            echo "| \`inlaysql-wasm-${version}.tar.gz\` | WASM module + the JS glue |"
+            echo
+            echo "Each \`.tar.gz\` ships beside a \`.sha256\`; verify with"
+            echo "\`sha256sum -c <file>.sha256\`."
+            echo
+            echo "### Using the C-ABI libraries"
+            echo
+            echo "Each FFI archive carries the \`${version}\` library, the"
+            echo "\`inlaysql.h\` header, and \`poc.php\` — a working PHP FFI example"
+            echo "that is the fastest way to see the shape of the surface. A"
+            echo "Python \`ctypes\` binding is a dozen lines; see"
+            echo "[docs/clients.md](https://github.com/inlaySQL/inlaysql/blob/main/docs/clients.md)."
             echo
             echo "### WASM payload"
             echo
             cat dist/size.md
             echo
+            echo "### Status: beta"
+            echo
+            echo "The on-disk format is **pre-1.0 — recreate, not migrate**: a"
+            echo "database written by this version may not open in a later one."
+            echo "The MySQL server mode is plaintext and localhost-first unless"
+            echo "you configure TLS. Read"
+            echo "[What this is not](https://github.com/inlaySQL/inlaysql#what-this-is-not)"
+            echo "before relying on this for anything real."
+            echo
             echo "Reproduce every number in these notes with the scripts in"
             echo "[TESTING.md](TESTING.md) and \`bench/run.sh\`."
           } > notes.md
 
-          rm -f dist/size.md
           ls -l dist
           gh release create "$GITHUB_REF_NAME" \
             --title "InlaySQL $GITHUB_REF_NAME" \
