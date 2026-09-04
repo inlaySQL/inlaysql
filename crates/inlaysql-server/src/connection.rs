@@ -2286,7 +2286,19 @@ fn decode_time(reader: &mut Reader<'_>) -> Result<String, Malformed> {
     }
     let negative = reader.u8()? == 1;
     let days = reader.u32()?;
-    let hours = reader.u8()? as u32 + days * 24;
+    // The day count is four bytes straight off the wire and the hour count
+    // is one, and folding the first into the second is a multiplication and
+    // an addition on values a client chooses. Unchecked, `days = u32::MAX`
+    // panics the connection thread in any overflow-checked build and wraps
+    // silently in release — `packet.rs`'s promise that a hostile packet
+    // cannot panic a connection holds for `Reader` and stopped holding here.
+    // A count that does not fit is a malformed packet, which is what every
+    // other unparsable field in this function already is.
+    let hours = u32::from(reader.u8()?);
+    let hours = days
+        .checked_mul(24)
+        .and_then(|days| days.checked_add(hours))
+        .ok_or(Malformed)?;
     let minutes = reader.u8()?;
     let seconds = reader.u8()?;
     let sign = if negative { "-" } else { "" };
@@ -2419,6 +2431,45 @@ fn parse_handshake_response(payload: &[u8]) -> Result<HandshakeResponse, MysqlEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `TIME` parameter whose day count cannot be folded into hours is a
+    /// malformed packet, not a panic.
+    ///
+    /// The protocol sends days and hours separately and the server folds
+    /// them into one hour count. `days` is four client-chosen bytes, so
+    /// `days * 24` is client-chosen arithmetic: before this was checked it
+    /// panicked the connection thread in any overflow-checked build — every
+    /// `cargo test` build is one — and wrapped silently in release, which
+    /// answered a nonsense parameter with a plausible-looking time. Both
+    /// boundary cases are pinned: the largest day count that still fits is
+    /// parsed, and one more than it is refused.
+    #[test]
+    fn a_time_parameter_whose_days_do_not_fit_is_refused_rather_than_panicking() {
+        // length, negative, days (LE u32), hours, minutes, seconds.
+        let time = |days: u32, hours: u8| {
+            let mut packet = vec![8u8, 0];
+            packet.extend_from_slice(&days.to_le_bytes());
+            packet.extend_from_slice(&[hours, 0, 0]);
+            packet
+        };
+
+        let fits = u32::MAX / 24;
+        let packet = time(fits, 0);
+        let mut reader = Reader::new(&packet);
+        assert_eq!(
+            decode_binary_param(&mut reader, 0x0b, false).expect("the largest fitting day count"),
+            Value::Text(format!("{:02}:00:00", fits * 24).into())
+        );
+
+        for (days, hours) in [(fits + 1, 0), (fits, 24), (u32::MAX, 0)] {
+            let packet = time(days, hours);
+            let mut reader = Reader::new(&packet);
+            assert!(
+                decode_binary_param(&mut reader, 0x0b, false).is_err(),
+                "days={days} hours={hours} must be refused as malformed"
+            );
+        }
+    }
 
     #[test]
     fn a_text_row_marks_nulls_with_the_reserved_byte() {
