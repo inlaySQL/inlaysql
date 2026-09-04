@@ -526,7 +526,7 @@
           <td class="loss">~1.2× slower</td>
         </tr>
         <tr>
-          <td>Indexed range scan, 50 rows</td>
+          <td>Indexed range scan, 50 rows <span class="note">(servers answer a client over a socket; SQLite in-process is ~6-10× them on the same shape)</span></td>
           <td class="num">119,219 ops/s</td>
           <td>MySQL 8.4, PostgreSQL 17</td>
           <td class="win">~5-8× faster</td>

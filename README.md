@@ -1158,7 +1158,7 @@ unix socket).** Four workloads that had no harness on either side until
 
 | Shape | InlaySQL | MySQL 8.4 | PostgreSQL 17 |
 | --- | --- | --- | --- |
-| Indexed range scan, 50 rows | **119,219 ops/s** | 14,330 ops/s (**~8x**) | 21,824 ops/s (**~5.5x**) |
+| Indexed range scan, 50 rows (SQLite, in-process, answers it in 6.67 µs — see below) | **119,219 ops/s** | 14,330 ops/s (**~8x**) | 21,824 ops/s (**~5.5x**) |
 | Join, secondary-index inner, full | **3.63 ms** p50 | 13.71 ms (**~4x**) | 9.42 ms (**~2.6x**) |
 | Join, PK inner, full | **3.25 ms** p50 | 13.68 ms (**~4x**) | 9.36 ms (**~2.9x**) |
 | `GROUP BY n`, 100 groups | **210/s** | 110/s (**~1.9x**) | 167/s (**~1.26x**) |
@@ -1166,11 +1166,20 @@ unix socket).** Four workloads that had no harness on either side until
 | Batch insert, 100 rows/statement, containerised like the servers | **67,484 rows/s** | 56,700 rows/s (**~1.2x**) | 99,212 rows/s (we lose ~1.5x) |
 | Batch insert, same, InlaySQL on the host (`F_FULLFSYNC`) | 24,102 rows/s | (we lose ~2.4x) | (we lose ~4.1x) |
 
-The range scan we lose to SQLite is a shape we *win* against both servers,
-so "our row iteration is slow" is a statement about SQLite specifically,
-not about every engine (the InlaySQL range and join cells are this
-edition's gated `run.sh` figures from `1f7921a`, a different sitting and a
-later build than the server columns — `BENCHMARK.md` says so). **The `GROUP BY` row was the
+The range scan we lose to SQLite is a shape we *win* against both servers
+by 5-8x, and those two facts are less contradictory than they look: SQLite
+answers the same fifty-row range in 6.67 µs **in this process**, which is
+~10x MySQL 8.4 and ~6.5x PostgreSQL on the same shape. The server multiple
+is mostly the Python client and the socket round trip they pay and neither
+in-process engine does. So the honest reading is the narrow one: we are
+1.24x slower than SQLite at this shape, and that is the number to fix. Both
+harnesses assert the row count before timing and refuse to publish a wrong
+answer, so neither side of the comparison is broken — they measure
+different things, and `BENCHMARK.md`'s "Indexed range scan" section prints
+SQLite's in-process figure beside the servers' so the difference is visible
+rather than inferred. (The InlaySQL range and join cells are this edition's
+gated `run.sh` figures from `1f7921a`, a different sitting and a later
+build than the server columns — `BENCHMARK.md` says so.) **The `GROUP BY` row was the
 worst multiple we published against anyone** — 29/s, 3.4-5x slower than
 both on 2026-08-31 — and is now a win against both, 5 of 5 repetitions
 non-overlapping; that is the aggregate work of 2026-09-02/03 (AHL-513

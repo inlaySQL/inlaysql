@@ -1751,8 +1751,25 @@ generated with the same seeded xorshift64* the Rust suite uses.
 | Engine | ops/s (median, range) | p50 (median) |
 | --- | --- | --- |
 | **InlaySQL** (`run.sh` at `1f7921a`, gated median of three) | 119,219 (110k–120k) | 8.25 µs |
+| *SQLite, journal — reference, same in-process harness as InlaySQL* | *143,954* | *6.67 µs* |
 | PostgreSQL 17 | 21,824 (9,009–22,931) | 44 µs |
 | MySQL 8.4 | 14,330 (14,181–14,635) | 67 µs |
+
+**Read the SQLite row first.** It is the same statement over the same data,
+and it is *not* comparable to the server rows either: it runs in this
+process, as InlaySQL does, while MySQL and PostgreSQL answer a Python client
+over a unix socket. SQLite is ~10x MySQL 8.4 and ~6.5x PostgreSQL here, which
+is the same band InlaySQL is in — so **the multiple against the servers on
+this shape is mostly the client and the round trip, not the storage engine**,
+and the honest reading of the three numbers together is: InlaySQL is 1.24x
+slower than SQLite at reading a fifty-row range (the loss the point-read
+section owns), and both in-process engines are far ahead of two servers being
+asked the same question over a socket. A reader who sees "loses to SQLite,
+beats the servers by 8x" and suspects one of the two is broken is right to
+ask: neither is — both harnesses assert the row count before timing and
+refuse to publish a wrong answer (`indexed.rs`'s `debug_assert_eq!` on both
+sides, `read_driver.py`'s "refusing to time a wrong answer") — they simply
+measure different things.
 
 **~8x MySQL 8.4 and ~5.5x PostgreSQL at the medians** (was ~7x/~4.5x with
 the `3cf0d85` cell, ~3.7x/~2.3x on 2026-08-31). The servers' columns are

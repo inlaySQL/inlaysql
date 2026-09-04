@@ -211,7 +211,10 @@ sequence generated with the same seeded xorshift64* the Rust harness uses.
 InlaySQL 119,219 ops/s (110k–120k; the 2026-09-03 edition's gated `run.sh`
 median of three at `1f7921a`, reused for this cell as the two editions
 before it reused their own `run.sh` figures — a different sitting from,
-and a later build than, the server columns, disclosed) vs MySQL 8.4 14,330
+and a later build than, the server columns, disclosed) — with SQLite,
+in-process on the same harness, at 143,954 ops/s (6.67 µs), i.e. ~10x MySQL
+and ~6.5x PostgreSQL itself, so this WIN is mostly the servers' client and
+socket rather than a storage-engine gap — vs MySQL 8.4 14,330
 ops/s (14,181–14,635, p50 67 µs) and PostgreSQL 21,824 ops/s
 (9,009–22,931, one outlier rep; p50 44 µs). **WIN ~8x vs MySQL, WIN ~5.5x
 vs PostgreSQL** — far outside the quiet floor. The `3cf0d85` cell was
