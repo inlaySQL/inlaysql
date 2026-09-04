@@ -3092,6 +3092,12 @@ mod shared_read_cache_tests {
                     .expect("put");
             }
             tree.commit().expect("commit");
+            // Since AHL-552 a commit leaves its own written pages resident in
+            // the *decoded* cache, so a read of them is a hit and never
+            // reaches the device. This test is about the device-level shared
+            // cache, so the decoded one is taken out of the way rather than
+            // worked around: with no budget, every read is a device read.
+            tree.set_page_cache_bytes(0);
             tree.get(b"key-7").expect("read populates the cache");
             drop(tree);
             {
@@ -3227,6 +3233,10 @@ mod shared_read_cache_tests {
         let mut tree = CowBTree::open_or_create(device, DEFAULT_PAGE_SIZE).expect("create");
         tree.put(b"key", b"value").expect("put");
         tree.commit().expect("commit");
+        // The decoded cache would answer this read from the pages the commit
+        // just wrote (AHL-552); this test needs the read to reach the device,
+        // which is what fills the shared cache it is about.
+        tree.set_page_cache_bytes(0);
         tree.get(b"key").expect("read populates the cache");
         {
             let cache = coordinator.read_cache.read().unwrap();

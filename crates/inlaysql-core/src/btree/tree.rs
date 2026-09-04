@@ -1613,6 +1613,7 @@ impl<D: Device> CowBTree<D> {
             }
             *placement.borrow_mut() = (append_offset, region_end);
             self.write_dirty_pages()?;
+            self.admit_written_pages();
             self.dirty.clear();
             Ok(Some(seq))
         })();
@@ -3173,6 +3174,7 @@ impl<D: Device> CowBTree<D> {
                 return Ok(None);
             }
             self.write_dirty_pages()?;
+            self.admit_written_pages();
             self.dirty.clear();
             Ok(Some((self.pending_root, self.pending_next, seq)))
         })();
@@ -3514,6 +3516,15 @@ impl<D: Device> CowBTree<D> {
     fn supersede(&mut self, id: PageId) {
         if self.dirty.remove(&id).is_some() {
             return;
+        }
+        // A committed page this transaction has replaced is one this handle
+        // will not read again through any root it can reach, so it leaves
+        // the decoded cache now rather than crowding out live pages until the
+        // clock hand happens upon it — see `super::cache`'s "Dead pages are
+        // removed" note. A rollback or conflict makes the page live again,
+        // and the cost of having dropped it is one miss, not a wrong answer.
+        if let Ok(mut cache) = self.cache.try_borrow_mut() {
+            cache.remove(id);
         }
         if self.reuse_enabled {
             self.freed_this_txn.push(id);
@@ -4086,6 +4097,48 @@ impl<D: Device> CowBTree<D> {
             }
         }
         Ok(())
+    }
+
+    /// Make the pages [`CowBTree::write_dirty_pages`] has just written
+    /// resident in the decoded cache, so the next read of a path this commit
+    /// rewrote is a hit rather than a `pread` and a decode (AHL-552).
+    ///
+    /// Sound for the reason the cache needs no invalidation at all: a page id
+    /// names one immutable sequence of bytes for the life of the file, and
+    /// these bytes are on the device under these ids — whether or not the
+    /// commit record that will reference them is durable yet. If it never
+    /// becomes durable, the ids are simply never reached (the allocator does
+    /// not re-issue them, AHL-406) and the entries age out under the clock.
+    /// The gates are the read path's: data-area pages only, and never under
+    /// page reuse, where the cache is bypassed anyway.
+    ///
+    /// Each page is decoded from its encoded bytes rather than kept from the
+    /// write path's `Node`, so what is cached is byte-for-byte what a read
+    /// would have produced — the borrowed keys index into the page as
+    /// written. That decode is the same one the next read would have paid,
+    /// moved under a commit that is dominated by its barrier; a page that
+    /// does not decode as a node (an overflow page) is skipped.
+    fn admit_written_pages(&self) {
+        if self.device.page_reuse_enabled() {
+            return;
+        }
+        let Ok(mut cache) = self.cache.try_borrow_mut() else {
+            return;
+        };
+        if cache.budget() == 0 {
+            return;
+        }
+        for (&id, page) in &self.dirty {
+            if !cache::data_area_page(self.page_size, self.format_version, id) {
+                continue;
+            }
+            let Some(bytes) = page.bytes() else {
+                continue;
+            };
+            if let Ok(node) = page::decode(self.page_size, bytes) {
+                cache.insert(id, Rc::new(node));
+            }
+        }
     }
 
     /// Decode page `id`, taking the open transaction's copy when `pending` is
