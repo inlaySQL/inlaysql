@@ -19,6 +19,14 @@ current execution order without relying on local conversation history.
 
 ## Current state (2026-09-02, evening)
 
+- 2026-09-04 afternoon: AHL-553 (the commit barrier stops paying to grow
+  the file — the data area is extended 8 MiB ahead, zero-filled;
+  containerised durable write ~1.18x, 11/12 reps; the first containerised
+  commit split says barrier 89.8%, engine 5.8%), AHL-554 (a row-id-shaped
+  key comparator: self-time fell, the clock did not move — reverted, the
+  finding kept) and AHL-555 (C2: at 8 connections 70% of a server thread's
+  time is waiting behind other writers, 8% is the barrier, 1.4% the socket
+  — the single-writer gate is the wall).
 - 2026-09-04: AHL-551 (a point lookup resumes from the ancestor it
   descended through — half of all probes on the LIMIT-join shape start
   below the root; `indexed-range` +3–7%, PK `LIMIT 10` 3.46 → 3.33 µs,

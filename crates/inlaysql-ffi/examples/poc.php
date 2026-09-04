@@ -11,7 +11,7 @@
  *   cargo build -p inlaysql-ffi --release
  *
  * Run this:
- *   php examples/ffi/poc.php [path/to/libinlaysql.dylib|.so|.dll] [db path]
+ *   php examples/poc.php [path/to/libinlaysql.dylib|.so] [db path]
  *
  * Requires PHP 7.4+ with the FFI extension (bundled, not enabled by default).
  * Preload/FPM needs ffi.enabled=preload with the definitions in a preloaded

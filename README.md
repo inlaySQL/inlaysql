@@ -43,21 +43,30 @@ protocol](docs/server.md) so existing ORMs connect as-is, and as a CLI.
 
 ## Installation
 
-**Prebuilt binaries** — from the
-[releases page](https://github.com/inlaySQL/inlaysql/releases) (currently
-[`v0.0.1.beta`](https://github.com/inlaySQL/inlaysql/releases/tag/v0.0.1.beta),
-each archive with a `.sha256` beside it):
+**Use it like SQLite** — download, one small loader, SQL:
 
-- `inlaysql-<version>-x86_64-unknown-linux-gnu.tar.gz` — the CLI + MCP server
-- `inlaysql-ffi-<version>-aarch64-apple-darwin.tar.gz` /
-  `…-x86_64-unknown-linux-gnu.tar.gz` — the C-ABI shared library
-  (`libinlaysql_ffi.dylib`/`.so`) with `inlaysql.h`: open the file
-  in-process from PHP, Python, Ruby, or any FFI language — see
-  [`docs/clients.md`](docs/clients.md)
-- `inlaysql-wasm-<version>.tar.gz` — the WASM module and its JS glue
+1. Grab the library for your platform from the
+   [releases page](https://github.com/inlaySQL/inlaysql/releases)
+   ([`v0.0.1.beta`](https://github.com/inlaySQL/inlaysql/releases/tag/v0.0.1.beta);
+   macOS Apple silicon and Linux x86_64 today — the file layer is Unix-only).
+2. Copy the ~40-line loader for your language from
+   [`docs/clients.md`](docs/clients.md#the-5-minute-version) — PHP, Python,
+   Ruby, C# and Java each have a tested one; PHP and Python need nothing but
+   their standard library.
+3. Open the file, run SQL:
+
+```php
+// PHP (FFI is built in) — Ruby and Python are the same shape
+$db = new InlaySQL('app.inlay');
+$db->run('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)');
+$db->run('INSERT INTO users (name) VALUES (?)', ['Ada']);
+$rows = $db->run('SELECT id, name FROM users');    // JSON: columns + rows
+```
 
 No Windows build yet: the file layer is Unix-only. The WASM module runs
-anywhere a browser or Node does, Windows included.
+anywhere a browser or Node does, Windows included. Want your ORM instead?
+The MySQL-wire server (`inlaysql serve --mysql`) is the Laravel/Rails/
+Django/Spring path — same file, second direction, below.
 
 **Rust crate** (not on crates.io yet — the format is pre-1.0):
 

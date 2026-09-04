@@ -1,353 +1,423 @@
-# Using InlaySQL from PHP, Python, Ruby, Node.js, C#, Java — and Rust
+# Using InlaySQL like SQLite — from PHP, Python, Ruby, Node.js, C#, Java, and Rust
 
-InlaySQL reaches every common web language through **three directions**, and
-which one applies is decided by what the language can load:
-
-| Direction | How it works | Languages |
-| --- | --- | --- |
-| **Embed (library)** — the engine is a library in your process, the file opened directly | The engine compiles into your binary/runtime — or into a C shared library any FFI loads | Rust (native crate); any FFI language through [`inlaysql-ffi`](../crates/inlaysql-ffi/README.md): PHP, Python, Ruby, C#/.NET, Java |
-| **Embed (WASM)** — the engine is the WASM module in your runtime | The `inlaysql-js` SDK wraps the module; no server, the bytes are yours | JavaScript / TypeScript (Node, Deno, Bun, browser, edge) |
-| **MySQL wire** — the database is a server speaking MySQL's protocol | `inlaysql serve --mysql` opens the file; any MySQL driver connects | PHP, Python, Ruby, C#/.NET, Java, Node.js, Go — anything with a MySQL driver |
-
-**The C ABI is the SQLite-like adapter.** `inlaysql-ffi` builds to
-`libinlaysql.dylib`/`.so`/`.dll` with a seven-function C API
-(`inlaysql_open` / `inlaysql_exec` / `inlaysql_close` …, header in
-[`include/inlaysql.h`](../crates/inlaysql-ffi/include/inlaysql.h)). A
-language that can call C functions can open the file in-process — no server
-process, the deployment shape SQLite has. A working PHP FFI example ships in
-[`crates/inlaysql-ffi/examples/poc.php`](../crates/inlaysql-ffi/examples/poc.php):
+InlaySQL keeps SQLite's deal: **one file, no server, you open it directly in
+your process.** From any language that can call C functions — which PHP,
+Python, Ruby, C# and Java all can, through their built-in FFI — using it is
+a download, one small loader, and SQL you already know.
 
 ```php
-$ffi = FFI::cdef('
-    InlaysqlHandle *inlaysql_open(const char *path);
-    int inlaysql_exec(InlaysqlHandle *h, const char *sql,
-                      const char *params, char **out_json);
-    // …
-', 'libinlaysql.dylib');
-
-$handle = $ffi->inlaysql_open('app.inlay');
-$result = inlaysql_exec($ffi, $handle, 'SELECT id, title FROM docs');
+$handle = $ffi->inlaysql_open('app.inlay');          // the file; created if absent
+$rows    = exec_sql($ffi, $handle, 'SELECT ...');    // plain SQL, JSON back
 ```
 
-One honest correction to a natural assumption, stated up front because it
-saves an afternoon: **a SQLite driver cannot open an InlaySQL file.** The
-project borrows SQLite's *model* — one file, no server, copy it around — not
-its on-disk format. The format is InlaySQL's own, and it is what makes the
-native vector/BM25 indexes and the MVCC writer possible. "SQLite
-compatibility" here means the SQL dialect, not the bytes. For languages that
-cannot load the engine as a library, the MySQL shim is the bridge — that is
-what it exists for, and a stock Laravel 11 skeleton runs against it today
-(see [`server.md`](server.md) for exactly how far that goes).
+This document leads with that path. The MySQL-wire server (direction two,
+below) is there for when you want a server process — ORMs, several machines,
+one file — but you do not need it to get started.
 
-```sh
-# The server side of direction two. One command, one file, one port.
-inlaysql serve --mysql app.inlay --password-env INLAYSQL_PASSWORD
-#   --tls-cert server.pem --tls-key key.pem          # enable TLS (recommended)
-#   --tls-required                                    # refuse plaintext logins
-#   --port 3306                                       # the default
-```
+## The 5-minute version
 
-Security posture, in one paragraph: the protocol is **plaintext until you
-give it a certificate**, and the server advertises that honestly rather than
-allowing a silent downgrade. With `--tls-cert`/`--tls-key` a client that asks
-upgrades before sending credentials; with `--strong-passwords` (needs TLS)
-accounts store salted PBKDF2 instead of the wire protocol's fast-hash
-verifiers and can only log in over TLS. For anything beyond localhost, turn
-TLS on. Full detail: [`server.md`'s Security section](server.md#security).
+1. **Download** the library for your platform from the
+   [releases page](https://github.com/inlaySQL/inlaysql/releases)
+   (macOS Apple silicon or Linux x86_64 today — see the note on Windows at
+   the end), and unpack it. Inside: the shared library, `inlaysql.h`, and a
+   working example for your language.
+2. **Copy the loader for your language** from the quickstarts below — 15 to
+   60 lines, once, then never think about FFI again.
+3. **Use SQL.** Same dialect as SQLite (vectors and retrieval functions are
+   the additions); parameters bound as you would expect; results as plain
+   data.
+
+That is the whole integration. What follows is the per-language detail.
 
 ---
 
-## Direction 1 — Embed
+## PHP — quickstart
 
-### Rust (native)
+PHP 7.4+ has FFI built in (enable `ffi=on` in php.ini, or it is always on in
+the CLI). Save this next to the unpacked library and run it:
 
-```toml
-[dependencies]
-inlaysql = "0"          # the file-backed database
-```
+```php
+<?php
+// inlaysql.php — the whole binding. Copy this file into your project.
+// Library path: pass it in, or hardcode the unpacked .dylib/.so path.
+define('INLAYSQL_LIB', $argv[1] ?? './libinlaysql_ffi.dylib');
 
-```rust
-use inlaysql::{Database, Value};
+final class InlaySQL
+{
+    private \FFI $ffi;
+    /** @var \FFI\CData */
+    private $handle;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut db = Database::open("app.inlay")?;
+    public function __construct(string $path)
+    {
+        $this->ffi = \FFI::cdef(<<<'C'
+            typedef struct InlaysqlHandle InlaysqlHandle;
+            InlaysqlHandle *inlaysql_open(const char *path);
+            InlaysqlHandle *inlaysql_open_read_only(const char *path);
+            void inlaysql_close(InlaysqlHandle *handle);
+            int inlaysql_exec(InlaysqlHandle *handle, const char *sql,
+                              const char *params, char **out_json);
+            const char *inlaysql_last_error(void);
+            void inlaysql_free_string(char *s);
+            const char *inlaysql_version(void);
+        C, INLAYSQL_LIB);
 
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS docs (
-            id INTEGER PRIMARY KEY,
-            title TEXT,
-            body TEXT
-        )",
-        &[],
-    )?;
-    db.execute(
-        "INSERT INTO docs (title, body) VALUES (?, ?)",
-        &[Value::Text("Hello".into()), Value::Text("World".into())],
-    )?;
-
-    let rows = db.query("SELECT id, title FROM docs WHERE id = ?", &[Value::Integer(1)])?;
-    for row in &rows.rows {
-        println!("{:?}", row);
+        $this->handle = $this->ffi->inlaysql_open($path);
+        if (\FFI::isNull($this->handle)) {
+            throw new RuntimeException('open failed: ' . $this->ffi->inlaysql_last_error());
+        }
     }
-    Ok(())
-}
-```
 
-The crate is `#![forbid(unsafe_code)]`, thread-per-handle, and every handle
-on the same file commits with MVCC — no writer lock around the whole
-database. Vectors are a column type: `VECTOR(384)`, with
-`vector_score`/`bm25_score`/`fuse` for retrieval (see
-[`indexes.md`](indexes.md)).
+    public function __destruct() { $this->ffi->inlaysql_close($this->handle); }
 
-### PHP / Python / Ruby / C# / Java — the C ABI (in-process, no server)
-
-The same file, opened in-process, through the C ABI
-([`inlaysql-ffi`](../crates/inlaysql-ffi/README.md)). Each language's
-binding is a thin loader over the same seven functions — PHP's built-in FFI
-ext needs ~40 lines, shown in
-[`examples/poc.php`](../crates/inlaysql-ffi/examples/poc.php); Python's
-`ctypes`, Ruby's `ffi` gem, .NET's `DllImport` and Java's FFM are each of
-the same size. Build once:
-
-```sh
-cargo build -p inlaysql-ffi --release   # → libinlaysql_ffi.{dylib,so,dll}
-```
-
-```python
-# Python (ctypes) — the whole binding:
-import ctypes
-lib = ctypes.CDLL("libinlaysql_ffi.so")
-lib.inlaysql_exec.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
-                              ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-h = lib.inlaysql_open(b"app.inlay")
-out = ctypes.c_char_p()
-lib.inlaysql_exec(h, b"SELECT id, title FROM docs", None, ctypes.byref(out))
-print(out.value)  # {"columns":["id","title"],"rows":[[1,"Hello"]]}
-```
-
-The result JSON is the same shape the WASM and MySQL surfaces produce, so
-what you learn binding one language applies to all of them.
-
-### JavaScript / TypeScript (Node, Deno, Bun — and the browser)
-
-The `inlaysql-js` SDK wraps the WASM build: typed results, storage adapters,
-and an ORM whose `search()` generates the hybrid query. Plain ESM, zero
-runtime dependencies, no build step.
-
-```js
-import { openDatabase } from "@inlaysql/core";
-import { opfs } from "@inlaysql/storage";          // Node: memory() / bytes()
-import { defineModel, field, install, repo } from "@inlaysql/orm";
-
-const Page = defineModel("pages", {
-  id: field.integer().primaryKey(),
-  title: field.text(),
-  body: field.text().index("bm25"),
-  embedding: field.vector(384).index("hnsw").embedFrom("body"),
-});
-
-const db = await openDatabase({ source: opfs("app.inlay"), create: true });
-await install(db, Page);
-
-await repo(db, Page).insert({ title: "Hello", body: "World" }); // embedding computed
-
-const hits = await repo(db, Page).search("hello world", { mode: "hybrid", limit: 8 });
-console.log(hits.rows, hits.sql);  // the SQL is part of the result
-```
-
-Live, runnable versions of exactly this: the
-[vanilla SDK demo](https://inlaysql.github.io/demo/js-sdk/) and the
-[one-script-tag demo](https://inlaysql.github.io/demo/js-sdk/simple.html).
-Repository: [inlaySQL/inlaysql-js](https://github.com/inlaySQL/inlaysql-js).
-
----
-
-## Direction 2 — MySQL wire
-
-Everything below assumes the server from the top of this file is running.
-The database is the file the server opened — there is no `CREATE DATABASE`
-and no schema selection client-side; the drivers below connect with whatever
-default database name your tooling insists on and it is accepted.
-
-### PHP (PDO — the Laravel/Eloquent path)
-
-A stock Laravel 11 skeleton runs against the shim: `php artisan migrate`
-completes, ordinary Eloquent traffic works. Outside Laravel, PDO speaks for
-itself:
-
-```php
-$pdo = new PDO(
-    'mysql:host=127.0.0.1;port=3306;dbname=app;charset=utf8mb4',
-    'inlaysql',
-    getenv('INLAYSQL_PASSWORD'),
-    [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION],
-);
-
-$stmt = $pdo->prepare('INSERT INTO docs (title, body) VALUES (?, ?)');
-$stmt->execute([$title, $body]);
-
-foreach ($pdo->query('SELECT id, title FROM docs ORDER BY id LIMIT 20') as $row) {
-    echo $row['id'], ' ', $row['title'], PHP_EOL;
+    /** Run one statement. Rows come back as objects keyed by column name. */
+    public function run(string $sql, array $params = []): array
+    {
+        $out = $this->ffi->new('char *');
+        $code = $this->ffi->inlaysql_exec(
+            $this->handle, $sql,
+            $params === [] ? null : json_encode($params, JSON_UNESCAPED_SLASHES),
+            \FFI::addr($out),
+        );
+        if ($code !== 0) {
+            throw new RuntimeException($this->ffi->inlaysql_last_error() . " — $sql");
+        }
+        $result = json_decode(\FFI::string($out), true, flags: JSON_THROW_ON_ERROR);
+        $this->ffi->inlaysql_free_string($out);
+        return $result;
+    }
 }
 
-// Upserts, RETURNING, CTEs and set operations all work (see server.md):
-$pdo->prepare('INSERT INTO docs (id, title) VALUES (?, ?)
-               ON CONFLICT (id) DO UPDATE SET title = excluded.title')
-    ->execute([$id, $title]);
+// ---- usage -------------------------------------------------------------
+$db = new InlaySQL('app.inlay');
+$db->run('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)');
+$db->run('INSERT INTO users (name, email) VALUES (?, ?)', ['Ada', 'ada@example.org']);
+
+$result = $db->run('SELECT id, name, email FROM users WHERE id = ?', [1]);
+print_r($result['rows']);   // [[1, "Ada", "ada@example.org"]]
 ```
 
-`mysqli` works the same way. PHP binds integers as strings by default; the
-engine applies SQLite's comparison affinity, so `WHERE id = ?` with a string
-`'1'` finds the integer row (this was a real bug once — AHL-486 — and is
-covered by tests).
+A complete runnable script is in the release archive (`poc.php`) and at
+[`crates/inlaysql-ffi/examples/poc.php`](../crates/inlaysql-ffi/examples/poc.php) —
+it also shows the error path. **Laravel:** the same database also works
+through Eloquent over the MySQL wire (direction two below) — a stock
+Laravel 11 skeleton migrates and serves against it.
 
-### Python (PyMySQL, mysqlclient, or SQLAlchemy's mysql dialect)
+## Python — quickstart
+
+Standard library only. Save this as `inlaysql.py` next to the unpacked
+library:
 
 ```python
-import pymysql
+# inlaysql.py — the whole binding. Copy this file into your project.
+import ctypes, json
 
-conn = pymysql.connect(
-    host="127.0.0.1", port=3306,
-    user="inlaysql", password=os.environ["INLAYSQL_PASSWORD"],
-    autocommit=True,
-)
+class InlaySQL:
+    def __init__(self, lib_path, db_path):
+        self.lib = ctypes.CDLL(lib_path)
+        lib = self.lib
+        lib.inlaysql_open.argtypes = [ctypes.c_char_p];  lib.inlaysql_open.restype = ctypes.c_void_p
+        lib.inlaysql_exec.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                      ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
+        lib.inlaysql_exec.restype = ctypes.c_int
+        lib.inlaysql_last_error.argtypes = []; lib.inlaysql_last_error.restype = ctypes.c_char_p
+        lib.inlaysql_free_string.argtypes = [ctypes.c_char_p]; lib.inlaysql_free_string.restype = None
+        lib.inlaysql_close.argtypes = [ctypes.c_void_p]; lib.inlaysql_close.restype = None
 
-with conn.cursor() as cur:
-    cur.execute("INSERT INTO docs (title, body) VALUES (%s, %s)", (title, body))
-    cur.execute("SELECT id, title FROM docs WHERE body LIKE %s LIMIT 10", (f"%{q}%",))
-    for row in cur.fetchall():
-        print(row)
+        self.handle = lib.inlaysql_open(db_path.encode())
+        if not self.handle:
+            raise RuntimeError(f"open failed: {lib.inlaysql_last_error().decode()}")
+
+    def run(self, sql, params=None):
+        out = ctypes.c_char_p()
+        code = self.lib.inlaysql_exec(
+            self.handle, sql.encode(),
+            json.dumps(params).encode() if params is not None else None,
+            ctypes.byref(out))
+        if code != 0:
+            raise RuntimeError(f"{self.lib.inlaysql_last_error().decode()} — {sql}")
+        result = json.loads(out.value)
+        self.lib.inlaysql_free_string(out)
+        return result
+
+    def close(self):
+        self.lib.inlaysql_close(self.handle)
+
+# ---- usage -------------------------------------------------------------
+db = InlaySQL('./libinlaysql_ffi.so', 'app.inlay')
+db.run('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)')
+db.run('INSERT INTO users (name, email) VALUES (?, ?)', ['Ada', 'ada@example.org'])
+
+result = db.run('SELECT id, name, email FROM users WHERE id = ?', [1])
+print(result['rows'])   # [[1, 'Ada', 'ada@example.org']]
 ```
 
-SQLAlchemy works through its `mysql` dialect for the same reason PDO does:
-the wire is MySQL's, so the driver is MySQL's. Point SQLAlchemy's URL at the
-server (`mysql+pymysql://...`) and ORM traffic runs — within the SQL surface
-[`server.md`](server.md#what-does-not-work-yet) documents.
+A complete runnable script ships as
+[`poc.py`](../crates/inlaysql-ffi/examples/poc.py). SQLAlchemy's `sqlite`
+dialect will **not** open this file — the format is InlaySQL's own — but a
+thin `InlaySQL.run()` wrapper covers most of what an ORM is doing, and the
+MySQL-wire direction below is the full-ORM path.
 
-### Ruby (mysql2 gem)
+## Ruby — quickstart
+
+One gem: `gem install ffi`. Save this as `inlaysql.rb` next to the unpacked
+library:
 
 ```ruby
-require "mysql2"
+# inlaysql.rb — the whole binding. Copy this file into your project.
+require 'ffi'
+require 'json'
 
-client = Mysql2::Client.new(
-  host: "127.0.0.1", port: 3306,
-  username: "inlaysql", password: ENV["INLAYSQL_PASSWORD"],
-)
+class InlaySQL
+  INLAYSQL_OK = 0
+  INLAYSQL_ERR_BAD_HANDLE = 2
 
-client.query("INSERT INTO docs (title, body) VALUES ('#{q}', '#{b}')") # bind in real code
-results = client.query("SELECT id, title FROM docs ORDER BY id LIMIT 20")
-results.each { |row| puts row["title"] }
+  module Native
+    extend FFI::Library
+    ffi_lib File.expand_path('./libinlaysql_ffi.dylib', __dir__)  # .so on Linux
+    attach_function :inlaysql_open, [:string], :pointer
+    attach_function :inlaysql_close, [:pointer], :void
+    attach_function :inlaysql_exec, [:pointer, :string, :string, :pointer], :int
+    attach_function :inlaysql_last_error, [], :string
+    attach_function :inlaysql_free_string, [:pointer], :void
+  end
+
+  def initialize(db_path)
+    @handle = Native.inlaysql_open(db_path)
+    raise "open failed: #{Native.inlaysql_last_error}" if @handle.null?
+  end
+
+  def run(sql, params = nil)
+    out = FFI::MemoryPointer.new(:pointer)
+    code = Native.inlaysql_exec(@handle, sql, params && JSON.generate(params), out)
+    case code
+    when INLAYSQL_OK
+      result = JSON.parse(out.read_pointer.read_string)
+      Native.inlaysql_free_string(out.read_pointer)
+      result
+    when INLAYSQL_ERR_BAD_HANDLE then raise 'bad handle'
+    else raise "#{Native.inlaysql_last_error} — #{sql}"
+    end
+  end
+
+  def close = Native.inlaysql_close(@handle)
+end
+
+# ---- usage -------------------------------------------------------------
+db = InlaySQL.new('app.inlay')
+db.run('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)')
+db.run('INSERT INTO users (name, email) VALUES (?, ?)', ['Ada', 'ada@example.org'])
+
+result = db.run('SELECT id, name, email FROM users WHERE id = ?', [1])
+p result['rows']   # [[1, "Ada", "ada@example.org"]]
 ```
 
-### C# / .NET (MySqlConnector)
+A complete runnable script ships as
+[`poc.rb`](../crates/inlaysql-ffi/examples/poc.rb).
+
+## C# / .NET — quickstart
+
+`DllImport` over the same seven functions; the JSON result comes back as a
+string you decode with `System.Text.Json`. The full program:
 
 ```csharp
-using MySqlConnector;
+using System.Runtime.InteropServices;
+using System.Text.Json;
 
-await using var conn = new MySqlConnection(
-    "Server=127.0.0.1;Port=3306;User ID=inlaysql;Password=...");
-await conn.OpenAsync();
-
-await using (var cmd = new MySqlCommand(
-    "INSERT INTO docs (title, body) VALUES (@t, @b)", conn))
+class InlaySQL : IDisposable
 {
-    cmd.Parameters.AddWithValue("@t", title);
-    cmd.Parameters.AddWithValue("@b", body);
-    await cmd.ExecuteNonQueryAsync();
+    const string LIB = "libinlaysql_ffi.so";   // "libinlaysql_ffi.dylib" on macOS
+
+    [DllImport(LIB)] static extern IntPtr inlaysql_open(string path);
+    [DllImport(LIB)] static extern void inlaysql_close(IntPtr handle);
+    [DllImport(LIB)] static extern int inlaysql_exec(IntPtr handle, string sql,
+        string? parameters, out IntPtr outJson);
+    [DllImport(LIB)] static extern IntPtr inlaysql_last_error();
+    [DllImport(LIB)] static extern void inlaysql_free_string(IntPtr ptr);
+
+    readonly IntPtr _handle;
+    public InlaySQL(string path) =>
+        (_handle = inlaysql_open(path)) != IntPtr.Zero
+            ? true : throw new Exception(Marshal.PtrToStringAnsi(inlaysql_last_error()));
+
+    public JsonElement Run(string sql, object?[]? parameters = null)
+    {
+        if (inlaysql_exec(_handle, sql,
+                parameters is null ? null : JsonSerializer.Serialize(parameters),
+                out var outJson) != 0)
+            throw new Exception($"{Marshal.PtrToStringAnsi(inlaysql_last_error())} — {sql}");
+        using var doc = JsonDocument.Parse(Marshal.PtrToStringUTF8(outJson)!);
+        var result = doc.RootElement.Clone();
+        inlaysql_free_string(outJson);
+        return result;
+    }
+
+    public void Dispose() => inlaysql_close(_handle);
 }
 
-await using var select = new MySqlCommand(
-    "SELECT id, title FROM docs ORDER BY id LIMIT 20", conn);
-await using var reader = await select.ExecuteReaderAsync();
-while (await reader.ReadAsync())
-    Console.WriteLine(reader.GetInt32("id"));
+// ---- usage -------------------------------------------------------------
+using var db = new InlaySQL("app.inlay");
+db.Run("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)");
+db.Run("INSERT INTO users (name, email) VALUES (?, ?)", new object?[] { "Ada", "ada@example.org" });
+
+var rows = db.Run("SELECT id, name, email FROM users WHERE id = ?", new object?[] { 1 });
+Console.WriteLine(rows.GetProperty("rows"));   // [[1,"Ada","ada@example.org"]]
 ```
 
-### Java (JDBC)
+**Entity Framework** over this file is future work; the MySQL-wire direction
+below (Pomelo provider against `inlaysql serve --mysql`) is the EF path
+today.
+
+## Java — quickstart
+
+Java 22+ has the Foreign Function & Memory API (`java.lang.foreign`) in the
+JDK — no JNI C compilation:
 
 ```java
-try (Connection c = DriverManager.getConnection(
-        "jdbc:mysql://127.0.0.1:3306/app", "inlaysql", password);
-     PreparedStatement insert = c.prepareStatement(
-        "INSERT INTO docs (title, body) VALUES (?, ?)");
-     PreparedStatement select = c.prepareStatement(
-        "SELECT id, title FROM docs ORDER BY id LIMIT 20")) {
+// The whole binding. Java 22+, standard JDK.
+import java.lang.foreign.*;
+import java.lang.invoke.MethodHandle;
 
-    insert.setString(1, title);
-    insert.setString(2, body);
-    insert.executeUpdate();
+public final class InlaySQL implements AutoCloseable {
+    static final Linker LINKER = Linker.nativeLinker();
+    static final SymbolLookup LIB = SymbolLookup.libraryLookup("libinlaysql_ffi.so",
+        Arena.global());                                   // .dylib on macOS
+    static final Arena ARENA = Arena.ofShared();
 
-    try (ResultSet rs = select.executeQuery()) {
-        while (rs.next()) System.out.println(rs.getString("title"));
+    static final MethodHandle OPEN = linkerDowncall("inlaysql_open",
+        FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+    static final MethodHandle EXEC = linkerDowncall("inlaysql_exec",
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS,
+            ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+    static final MethodHandle LAST_ERROR = linkerDowncall("inlaysql_last_error",
+        FunctionDescriptor.of(ValueLayout.ADDRESS));
+    static final MethodHandle FREE = linkerDowncall("inlaysql_free_string",
+        FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+
+    final MemorySegment handle;
+
+    static MethodHandle linkerDowncall(String name, FunctionDescriptor d) {
+        return LINKER.downcallHandle(LIB.find(name).orElseThrow(), d);
+    }
+
+    public InlaySQL(String path) throws Throwable {
+        var cpath = ARENA.allocateUtf8(path);
+        handle = (MemorySegment) OPEN.invoke(cpath);
+        if (handle.address() == 0)
+            throw new IllegalStateException((String) LAST_ERROR.invoke());
+    }
+
+    /** Run one statement; params is a Java array marshalled to JSON. */
+    public String run(String sql, Object... params) throws Throwable {
+        var csql = ARENA.allocateUtf8(sql);
+        var cparams = params.length == 0 ? MemorySegment.NULL
+            : ARENA.allocateUtf8(new com.google.gson.Gson().toJson(params));
+        var out = ARENA.allocate(ValueLayout.ADDRESS);
+        int code = (int) EXEC.invoke(handle, csql, cparams, out);
+        if (code != 0)
+            throw new IllegalStateException((String) LAST_ERROR.invoke() + " — " + sql);
+        var json = out.get(ValueLayout.ADDRESS, 0);
+        var text = json.getUtf8String(0);
+        FREE.invoke(json);
+        return text;
+    }
+
+    @Override public void close() throws Throwable {
+        LINKER.downcallHandle(LIB.find("inlaysql_close").orElseThrow(),
+            FunctionDescriptor.ofVoid(ValueLayout.ADDRESS)).invoke(handle);
+    }
+
+    public static void main(String[] args) throws Throwable {
+        try (var db = new InlaySQL("app.inlay")) {
+            db.run("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)");
+            db.run("INSERT INTO users (name, email) VALUES (?, ?)", "Ada", "ada@example.org");
+            System.out.println(db.run("SELECT id, name, email FROM users WHERE id = ?", 1));
+            // {"columns":["id","name","email"],"rows":[[1,"Ada","ada@example.org"]]}
+        }
     }
 }
 ```
 
-Hibernate, jOOQ and friends ride the same wire; the same SQL-surface caveats
-apply. JDBC's prepared statements use the binary protocol, which is also the
-**only** way a `BLOB` column accepts a value today — the text protocol has no
-binary literal, so send blobs through a binary-protocol driver (JDBC and
-MySqlConnector do; see [`server.md`](server.md#what-does-not-work-yet)).
+The JSON-marshalling line is the only piece a real binding replaces (with
+Jackson, for instance). Older JDKs use JNI over the same header.
 
-### Node.js (mysql2)
+## What crosses the boundary
 
-Node has both directions: the WASM SDK above for embedding, or `mysql2` over
-the wire when you want the file owned by one server process:
+The result of every statement is JSON in one of three shapes, identical
+across all of InlaySQL's foreign surfaces (WASM, MySQL wire, FFI):
 
-```js
-import mysql from "mysql2/promise";
-
-const conn = await mysql.createConnection({
-  host: "127.0.0.1", port: 3306, user: "inlaysql",
-  password: process.env.INLAYSQL_PASSWORD,
-});
-
-await conn.execute("INSERT INTO docs (title, body) VALUES (?, ?)", [title, body]);
-const [rows] = await conn.query("SELECT id, title FROM docs ORDER BY id LIMIT 20");
+```json
+{"kind":"ddl"}                                    // schema changed
+{"kind":"written","rows":1}                       // one row written
+{"columns":["id","name"],"rows":[[1,"Ada"]]}      // a SELECT
 ```
 
----
-
-## What works over the wire — and what does not
-
-The protocol is not the limit; the SQL surface underneath it is. What runs
-today, from [`server.md`](server.md#what-does-not-work-yet):
-
-- Full DML: `SELECT` (joins, subqueries, CTEs including `WITH RECURSIVE`,
-  set operations), `INSERT` (upserts, `INSERT ... SELECT`), `UPDATE`,
-  `DELETE`, `RETURNING` on all three.
-- Full constraint DDL inside `CREATE TABLE`, plus the standalone
-  `ALTER TABLE ADD {INDEX|UNIQUE|CONSTRAINT}`, `TRUNCATE`, `RENAME TABLE`,
-  and SQLite's four `ALTER TABLE` operations.
-- Any declared column type — MySQL names like `TIMESTAMP`, `JSON`,
-  `LONGTEXT` resolve under SQLite's affinity rules.
-- MySQL functions where they exist; the shim translates what it can and
-  refuses loudly what it cannot — nothing is accepted and silently ignored.
-  A clause the shim drops but cannot represent reports a `1618` warning
-  naming it.
-
-Known limits worth planning around:
-
-- Foreign keys are recorded but **not enforced** — SQLite's own default.
-- A foreign key declared *after* table creation via
-  `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY` cannot be recorded
-  (declare it inside the initial `CREATE TABLE`).
-- `BLOB` writes need the binary protocol (see Java/C# above).
-
----
-
-## Which direction, when
-
-| Situation | Direction |
+| Passing in (`params`) | Meaning |
 | --- | --- |
-| Rust service, CLI, embedded app | Embed (Rust) |
-| PHP/Python/Ruby/C#/Java wanting SQLite's deployment shape — no server | C ABI (`inlaysql-ffi`) |
-| Browser or edge search, offline-capable app | Embed (WASM) |
-| Laravel / Rails / Django / Spring / Entity Framework app, minimal glue | MySQL wire — the ORMs already speak it |
-| One file serving several processes or machines | MySQL wire |
-| Maximum performance, no server in the trust boundary | Embed (Rust or C ABI) |
+| `["Ada", 1, null, 2.5]` | bound to `?` in order |
+| `[[0.1, 0.2, 0.3]]` | a **vector** — bind to a `VECTOR(n)` comparison or retrieval function |
+| omitted / `null` | no parameters |
 
-The same file serves both: a Rust batch job can `Database::open` the file the
-MySQL server is serving (use one writer at a time per the MVCC rules in
-[`recovery.md`](recovery.md)), and the WASM build opens files the native
-build wrote, byte for byte.
+Errors: `inlaysql_exec` returns non-zero and `inlaysql_last_error()` holds
+the engine's message verbatim. There are no numeric error codes to learn.
+
+Two things the boundary does not do, stated so nobody discovers them in a
+debugger: a **vector** value comes back in `rows` as the placeholder
+`"<vector(n)>"` (ask for what you need in SQL; the raw floats do not cross
+in JSON), and **one handle is one thread at a time** — open one handle per
+thread for concurrent access, which is also SQLite's model.
+
+---
+
+## Direction two: the MySQL wire — when you want a server
+
+The same file can be served instead of opened. `inlaysql serve --mysql`
+speaks MySQL's wire protocol, so every ORM that already talks MySQL works
+with no new driver — this is the path for Laravel, Rails, Django, Spring and
+Entity Framework today, and for one file shared by several processes.
+
+```sh
+inlaysql serve --mysql app.inlay --password-env INLAYSQL_PASSWORD
+#   --tls-cert server.pem --tls-key key.pem --tls-required   # beyond localhost
+```
+
+Then it is your framework's normal database configuration:
+
+| Language | Connect with |
+| --- | --- |
+| **PHP (Laravel/Eloquent)** | `.env`: `DB_CONNECTION=mysql`, host `127.0.0.1` — a stock Laravel 11 skeleton migrates and serves against it |
+| **Python (Django/SQLAlchemy)** | the `mysql` backend, `pymysql` driver |
+| **Ruby (Rails)** | `database.yml`, the `mysql2` adapter |
+| **C# (.NET)** | `MySqlConnector` / Pomelo EF provider |
+| **Java (Spring/Hibernate)** | `jdbc:mysql://127.0.0.1:3306/app` |
+| **Node.js** | `mysql2` |
+
+Full detail — security posture, what works, the honest gaps — is in
+[`server.md`](server.md). The connection is plaintext until you give it a
+certificate; for anything beyond localhost, pass `--tls-cert` and
+`--tls-required`.
+
+## Which shape, when
+
+| You want | Take |
+| --- | --- |
+| Zero servers, zero gems, the file is yours | **C ABI** (this page's quickstarts) |
+| Your ORM's migrations and models, today | **MySQL wire** |
+| A browser tab, offline app, edge worker | **WASM** — the [inlaysql-js SDK](https://github.com/inlaySQL/inlaysql-js) |
+| A Rust service or CLI | the `inlaysql` crate directly |
+
+The C-ABI and MySQL shapes share the same file safely (the engine holds an
+OS advisory lock, so one writer process at a time; readers can open
+`inlaysql_open_read_only` alongside). See [`recovery.md`](recovery.md).
+
+## Notes and limits
+
+- **Not a SQLite file.** The dialect is SQLite's; the bytes are InlaySQL's —
+  that is what makes the native vector/BM25 indexes possible. A `sqlite3`
+  driver cannot open it.
+- **No Windows library yet.** The file layer is Unix-only today; the WASM
+  module runs anywhere a browser or Node does, Windows included.
+- **Pre-1.0 format.** A database written by this version may not open in a
+  later one — recreate, not migrate.
+- `:memory:` is refused by name (`inlaysql_open` returns NULL and says so);
+  use a real path, or the Rust crate's `Database::open_in_memory()`.
