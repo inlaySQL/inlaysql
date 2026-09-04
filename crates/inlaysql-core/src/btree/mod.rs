@@ -28,4 +28,4 @@ pub use device::{
     AbsorbQueue, AbsorbResult, AbsorbTxn, CommitPoint, Device, Durability, PendingOps,
 };
 pub use page::{PageId, DEFAULT_PAGE_SIZE, MIN_PAGE_SIZE};
-pub use tree::{CommitOutcome, CowBTree, FORMAT_VERSION};
+pub use tree::{CommitOutcome, CowBTree, Diagnostics, FORMAT_VERSION};

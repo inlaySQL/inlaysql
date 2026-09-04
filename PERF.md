@@ -5499,6 +5499,224 @@ leaf's `Rc<Node>` alongside its id is the obvious next slice and was
 deliberately not bundled here. And `memcmp` at ~20% self is unchanged by this
 item — the path removes *comparisons*, not the cost of each one, and a
 key-prefix or fixed-width row-id comparison is a different item.
+### The point read's tail was a cache full of dead pages, and the instrument that found it (AHL-552, 2026-09-04)
+
+**The question.** The published point read beats SQLite WAL at the median —
+625 ns against 750 — and loses on ops/s at 0.56x, and the whole of the loss is
+the tail: p95 6.50 µs against 1.04, p99 10.50 against 1.25 (`BENCHMARK.md`,
+2026-09-03 21:00). Nothing in the self-time profile is that size, and a
+profile could not have shown it if it were: a tail made of *rare* events —
+a clock sweep, a hash-table doubling, a state-block read, a preemption — does
+not accumulate enough samples to appear as a frame, and the bench records
+p50/p95/p99 and nothing about what any one slow query did. The candidates
+were the `PageCache` clock sweep, `RawLeafCache`'s `Vec::remove(0)`,
+`SlotIndex` growth, the allocator, the shared read cache's `RwLock`, the
+clock, the harness's own timer, and the operating system.
+
+**The instrument.** `bin/profile --suite points --tail true` times every
+query on its own `Instant` pair and files it into a fixed log2 histogram
+(`<250 ns`, then doublings to `>=1 ms`), printed with the count *and the share
+of time* in each bucket. Every query at or over `--tail-threshold` (3 µs by
+default) is recorded with its ordinal and the delta of a new
+`Database::diagnostics()` across it — lifetime counters on the tree handle:
+decoded-cache evictions, inserts and index doublings, raw-leaf admissions,
+decodes, single-page device reads, state-block reads, plus the cache's
+residency — so a slow query can say which rare event, if any, it paid for.
+The ordinals are printed, their gaps summarised and the run sliced into
+twenty, so a period shows as a period and a warm-up as a front-loaded first
+slice. Then the same loop, histogram and seeded keys run against SQLite WAL
+in the same process, so the operating system's share is visible on both
+sides, and a third histogram of back-to-back `Instant::now()` pairs shows the
+timer's own contribution. `--tail-durable true --queries 5000` loads the rows
+one auto-committed `INSERT` each and stops after 5,000 lookups, which is
+`points.rs`'s read phase exactly. The counters cost one increment on a path
+that already did the work counted and nothing on a hit; every profile suite
+measured flat against the previous binary (table below).
+
+**Finding one: on a steady loop, the tail is the operating system, equally on
+both sides.** Batched load, 4 s, pre-fix binary, load 2.4–3.8/18:
+
+| Engine | queries | p50 | p95 | p99 | max | ≥3 µs | share of time ≥3 µs |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| InlaySQL | 12,202,440 | 292 ns | 334 ns | 416 ns | 306 µs | 1,245 (0.010%) | 0.25% |
+| SQLite WAL | 4,890,275 | 792 ns | 875 ns | 917 ns | 58 µs | 1,122 (0.023%) | 0.23% |
+| harness floor | 34.9M | 0 ns | 42 ns | 42 ns | 19 µs | 14 | 0.03% |
+
+About three hundred events a second over 3 µs, on both engines, spread evenly
+across the run's twenty slices, and 95.5% of InlaySQL's with no counter
+moving at all. That is a scheduler, not an engine, and the timer pair is not
+it either. On this shape the engine has no tail to fix.
+
+**Finding two: on the published shape, the tail is the page cache, and the
+counters name it.** The bench does not run a steady loop. It runs 20,000
+single-row durable commits and then 5,000 lookups, and the handle enters the
+read phase in this state (`Diagnostics` at the marker, pre-fix, identical in
+every rep):
+
+```
+page_cache_evictions: 151635, page_cache_inserts: 153066, page_cache_len: 1431,
+page_cache_bytes: 8383583 (budget 8388608), decodes: 153066, device_reads: 153063
+```
+
+The cache is full to the byte, and what fills it is dead. Every commit
+copy-on-writes the root-to-leaf paths it touches (~7.6 pages: the row's path,
+the change-log's, the counters') and the *next* commit's descent re-reads the
+pages the previous one wrote — a miss, a decode, an insert — which the commit
+after that supersedes. Twenty thousand commits of that leave 1,431 resident
+versions of the same few paths, none of them reachable from the committed
+root, while the leaves that hold the rows — each written once at its split
+and never read since — are not resident at all. The 5,000 lookups then pay
+for it: 573 misses (11.5%), 915 clock evictions to make room for them, each
+miss a `pread` (the device's shared cache does not hold them either:
+`device_reads == decodes`), a decode and a sweep. Rep 2 of three, load
+2.5–5.0/18:
+
+```
+InlaySQL point read: 5000 queries in 9.23ms (541593 ops/s), p50 791ns p95 8.46µs p99 13.63µs max 106.33µs
+  bucket                queries    share         time    share
+  [250ns, 500ns)              2    0.04%     917.00ns    0.01%
+  [500ns, 1µs)             3430   68.60%       2.53ms   27.43%
+  [1µs, 2µs)                787   15.74%       1.09ms   11.82%
+  [2µs, 4µs)                265    5.30%     641.58µs    6.95%
+  [4µs, 8µs)                175    3.50%       1.26ms   13.61%
+  [8µs, 16µs)               321    6.42%       3.16ms   34.23%
+  [16µs, 32µs)               16    0.32%     296.87µs    3.22%
+  [32µs, 64µs)                3    0.06%     146.50µs    1.59%
+  [64µs, 128µs)               1    0.02%     106.33µs    1.15%
+  >= 3µs: 536 queries, 10.72% of queries, 54.53% of time
+  counters over the run: evictions 915, inserts 573, decodes 573, device_reads 573
+  counter moved on slow queries: evictions 503 (93.8%), inserts/decodes/device_reads 504 (94.0%),
+                                 index_grows 0, raw_leaf_inserts 0, state_reads 0; no counter 32 (6.0%)
+  slow queries per twentieth of the run: [189, 132, 74, 61, 19, 18, 11, 5, 3, 5, 5, 8, 6, 0, 0, 0, 0, 0, 0, 0]
+
+SQLite (WAL, sync=NORMAL) point read: 5000 queries in 3.97ms (1259599 ops/s), p50 750ns p95 1.00µs p99 1.17µs max 5.13µs
+  [500ns, 1µs)             4711   94.22%       3.65ms   91.85%
+  [1µs, 2µs)                286    5.72%     312.17µs    7.86%
+  [2µs, 4µs)                  1    0.02%       2.21µs    0.06%
+  [4µs, 8µs)                  2    0.04%       9.25µs    0.23%
+  >= 3µs: 2 queries, 0.04% of queries, 0.23% of time
+```
+
+Half the read phase's time is in the 11% of queries that missed, 94% of the
+slow queries carry an eviction and a decode, and they are front-loaded — 189
+of the first 250 — because it is a warm-up the sample is too short to
+amortise. SQLite's cache is keyed by page number and written through, so its
+pages after a write phase are the pages a read wants; it has two slow queries
+in five thousand. `RawLeafCache`, `SlotIndex` growth, the state block and the
+shared cache's lock do not appear at all: `raw_leaf_inserts`,
+`page_cache_index_grows` and `state_reads` are zero across every rep.
+
+**The fix, in `btree/tree.rs` and `btree/cache.rs`.** Two halves, each
+useless without the other. `CowBTree::supersede` now drops the superseded
+page from the decoded cache the moment the transaction replaces it — this
+handle will never read that id again through any root it can reach, and a
+rollback or conflict that makes it live again costs one miss, not a wrong
+answer (`PageCache::remove`, new). And the commit path admits the pages it
+has just written to the data area (`CowBTree::admit_written_pages`, after
+`write_dirty_pages` on both the solo and the cohort-member path), decoding
+each from its encoded bytes so what is cached is byte-for-byte what a read
+would have produced. That is sound for the reason the cache needs no
+invalidation at all: a page id names one immutable sequence of bytes for the
+life of the file, the bytes are on the device under those ids whether or not
+the commit record that references them is durable yet, and an id that never
+becomes reachable is never re-issued (AHL-406) and simply ages out. Both
+halves keep the read path's gates — data-area pages only, never under page
+reuse. Removal alone would leave the cache empty and the leaves still missing;
+admission alone would still bury the live leaves under 7.6 dead pages per
+commit. Together the resident set is the live tree, bounded by the budget:
+after the same 20,000 commits the handle now enters the read phase with 856
+live pages, 7.9 MB, and **zero evictions over the whole write phase** (was
+151,635). The same rep 2, post-fix:
+
+```
+InlaySQL point read: 5000 queries in 2.21ms (2265326 ops/s), p50 334ns p95 875ns p99 1.42µs max 21.00µs
+  bucket                queries    share         time    share
+  <250ns                      4    0.08%     833.00ns    0.04%
+  [250ns, 500ns)           3883   77.66%       1.32ms   59.73%
+  [500ns, 1µs)              949   18.98%     638.82µs   28.94%
+  [1µs, 2µs)                152    3.04%     186.38µs    8.44%
+  [2µs, 4µs)                  6    0.12%      15.08µs    0.68%
+  [4µs, 8µs)                  4    0.08%      16.79µs    0.76%
+  [8µs, 16µs)                 1    0.02%       9.92µs    0.45%
+  [16µs, 32µs)                1    0.02%      21.00µs    0.95%
+  >= 3µs: 7 queries, 0.14% of queries, 2.31% of time
+  counters over the run: evictions 0, inserts 0, decodes 0, device_reads 0 — no counter moved on any slow query
+
+SQLite (WAL, sync=NORMAL) point read: 5000 queries in 4.07ms (1228330 ops/s), p50 792ns p95 958ns p99 1.17µs max 3.96µs
+  >= 3µs: 1 query, 0.02% of queries, 0.10% of time
+```
+
+All three reps, same binaries, same keys, interleaved:
+
+| rep | pre-fix p50 / p95 / p99 | ≥3 µs share of time | post-fix p50 / p95 / p99 | ≥3 µs share of time | SQLite WAL p50 / p95 / p99 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1.04 / 9.88 / 14.92 µs | 52.6% | 0.96 / 2.96 / 4.29 µs | 16.3% | 0.75 / 0.96 / 1.17 µs |
+| 2 | 0.79 / 8.46 / 13.63 µs | 54.5% | 0.33 / 0.88 / 1.42 µs | 2.3% | 0.75 / 1.00 / 1.17 µs |
+| 3 | 0.33 / 2.75 / 4.54 µs | 28.2% | 0.38 / 0.88 / 1.79 µs | 15.6% (5 queries, one of 409 µs) | 0.79 / 1.00 / 1.25 µs |
+
+Pre-fix, 573 misses and 915 evictions in every rep, 94–99% of the slow
+queries carrying one; post-fix, zero misses in every rep and no counter on
+any slow query. p95 and p99 are 3/3 ahead, and p95 is now at or under
+SQLite's in two reps of three.
+
+**What it costs, and what else it moved.** One decode per written page per
+commit, under a commit that is barrier-dominated — 7.6 pages against a ~4 ms
+`F_FULLFSYNC` on the durable path; on the batched path, one decode per leaf of
+~40 rows. Interleaved against the instrument-only binary at `8fa80ed`, control
+re-run each rep, order alternated, `--seconds 4`, load 2.3–6.3/18:
+
+| Suite | pre-fix (A / A′) | post-fix | Verdict |
+| --- | --- | --- | --- |
+| `points` | 3264 / 3224 / 3267k (A′ 3280 / 3341 / 3274k) | 3284 / 3336 / 3295k ops/s | flat, inside the control |
+| `indexed` | 494.6 / 499.0 / 506.7k (A′ 490.8 / 507.8 / 485.5k) | 496.2 / 504.3 / 482.3k | flat, mixed sign |
+| `indexed-range` | 129.2 / 132.0 / 129.6k (A′ 130.7 / 130.4 / 130.8k) | 126.5 / 131.9 / 129.5k | flat, mixed sign |
+| `joins-limit` | 180.4 / 179.8 / 181.6k (A′ 180.3 / 179.9 / 181.9k) | 175.3 / 179.9 / 182.5k | flat, mixed sign |
+| `aggregate`, 20k | 2170 / 2191 / 2164 (A′ 2190 / 2178 / 2181) | 2293 / 2284 / 2303 | **ahead 3/3, +5%** |
+
+`aggregate` is the one suite that moves, and for the same reason the bench
+does: its rows are loaded in one batched transaction, and the leaves that
+transaction wrote are now resident when the first scan starts instead of
+being read back through the device one by one (505 decodes over a 4 s
+`points` loop before, 0 after — visible in the batched-load `--tail` run's
+counters). The published bench's own `points` suite, interleaved, 3 reps:
+
+`cargo run --release -p inlaysql-bench -- --suite points --rows 20000
+--lookups 5000`, order alternated, load 1.9–3.2/18 at each start (rep 2's
+post-fix run started at 13.65):
+
+| rep | InlaySQL pre-fix ops/s, p50 / p95 / p99 | InlaySQL post-fix | SQLite WAL, same run as pre-fix | SQLite WAL, same run as post-fix |
+| --- | --- | --- | --- | --- |
+| 1 | 1,150,704 — 500 ns / 3.17 / 5.08 µs | 1,882,796 — 416 ns / 0.92 / 1.33 µs | 1,120,291 — 833 ns / 1.08 / 1.29 µs | 982,294 — 917 ns / 1.21 / 1.42 µs |
+| 2 | 1,240,849 — 375 ns / 2.63 / 4.54 µs | 1,535,725 — 500 ns / 1.42 / 1.83 µs | 930,875 — 834 ns / 1.33 / 2.13 µs | 1,058,733 — 875 ns / 1.17 / 1.42 µs |
+| 3 | 1,523,017 — 375 ns / 2.67 / 4.21 µs | 1,350,044 — 417 ns / 1.38 / 1.79 µs | 1,190,760 — 792 ns / 1.04 / 1.25 µs | 1,295,630 — 750 ns / 0.88 / 1.00 µs |
+
+p95 3.17 / 2.63 / 2.67 → 0.92 / 1.42 / 1.38 µs and p99 5.08 / 4.54 / 4.21 →
+1.33 / 1.83 / 1.79 µs, **3/3 non-overlapping each**; p95 is now at SQLite
+WAL's level in the same process rather than 2.5–3x it. The median is mixed
+(500 / 375 / 375 → 416 / 500 / 417 ns) and so is ops/s (1.15 / 1.24 / 1.52M →
+1.88 / 1.54 / 1.35M): at 5,000 samples the ops/s figure is one outlier's —
+rep 3's post-fix run carried a single 787 µs lookup, a fifth of its whole
+read phase — and is reported as what it is. Note that both binaries' pre-fix
+figures here are already well clear of the published edition's 692,893 ops/s
+and 6.50 µs p95, with the same code; the edition was a louder day, and the
+next gated regeneration is what replaces it.
+
+**What the instrument did not explain, stated rather than smoothed over.**
+The *median* moved 3x between reps on both binaries — 334 ns to 1.04 µs
+pre-fix, 334 ns to 958 ns post-fix — while SQLite WAL's, in the same process
+seconds later, was 750–792 ns in every rep, and the profile's steady 4 s loop
+was 292 ns in every rep. The difference between the two InlaySQL loops is what
+precedes them: the bench's 5,000 lookups (2–10 ms of work) begin the instant
+80 s of barrier-bound commits end, during which the core was mostly waiting
+on the disk; SQLite WAL's begin after 0.1 s of CPU-bound inserts. A read phase
+shorter than a frequency or core-placement ramp measures the ramp, and that is
+the shape of `BENCHMARK.md`'s p50 disagreement across editions (500 / 625 /
+916 ns in the three runs behind the current one, on code five A/Bs measured
+flat) — the run with the busiest machine was the fastest because a busy
+machine is already clocked up. That is a harness property, not an engine one,
+and it is named here rather than changed: a warm-up or a longer read phase in
+`points.rs` would alter the published method and belongs with the next gated
+regeneration.
 
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 

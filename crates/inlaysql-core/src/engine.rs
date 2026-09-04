@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
 use crate::bm25_paged::PagedBm25Index;
-use crate::btree::{BackupSummary, Durability};
+use crate::btree::{BackupSummary, Diagnostics, Durability};
 use crate::catalog::{
     auto_index_name, auto_unique_index_name, Catalog, Index, IndexKind, Table, CATALOG_KEY,
 };
@@ -1202,6 +1202,12 @@ impl Engine {
     /// add `N`.
     pub fn statements_parsed(&self) -> u64 {
         self.parses.get()
+    }
+
+    /// A snapshot of the storage backend's lifetime cache and read counters
+    /// — see [`Diagnostics`]. Zeros on a backend that counts nothing.
+    pub fn diagnostics(&self) -> Diagnostics {
+        self.storage.diagnostics()
     }
 
     /// Run a prepared statement with `params` bound to its placeholders.

@@ -70,9 +70,25 @@
 //!
 //! Uncommitted pages are not cached either: a transaction's copied pages live
 //! in the tree's `dirty` map until the commit that makes them real, and a
-//! transaction that conflicts throws them away. Only
-//! `CowBTree::committed_node` fills this cache, and it only ever reads the
-//! data area.
+//! transaction that conflicts throws them away. Two paths fill this cache:
+//! `CowBTree::committed_node`, on a read that missed, and — since AHL-552 —
+//! the commit path, for the pages it has just written to the data area
+//! (`CowBTree::admit_written_pages`). Both only ever touch the data area.
+//!
+//! # Dead pages are removed, not left to the clock (AHL-552)
+//!
+//! A copy-on-write commit supersedes every page on the paths it rewrote, and
+//! this handle will never read those ids again: nothing it can reach names
+//! them. Left resident they are pure waste, and the waste compounds — twenty
+//! thousand single-row commits, each superseding ~7 pages, turned this cache
+//! into eight mebibytes of dead versions of the same few paths, with the
+//! current leaves *not* resident because nothing had read them since they
+//! were written. The published point-read bench's tail was exactly that: 573
+//! misses in the 5,000 lookups that followed, each a `pread`, a decode and an
+//! eviction sweep, 151 of the 153 queries over 3 µs (`PERF.md`, 2026-09-04).
+//! So `CowBTree::supersede` drops the superseded id from this cache the moment
+//! it is superseded, and the commit admits what it wrote: the resident set is
+//! then the live tree, bounded by the budget, and a read after a write hits.
 //!
 //! # Memory
 //!
@@ -169,6 +185,9 @@ struct SlotIndex {
     slots: Vec<u32>,
     /// Occupied buckets.
     len: usize,
+    /// How many times the table has doubled. Diagnostic — see
+    /// [`PageCache::index_grows`].
+    grows: u64,
 }
 
 /// A vacant bucket.
@@ -180,6 +199,7 @@ impl SlotIndex {
             keys: Vec::new(),
             slots: Vec::new(),
             len: 0,
+            grows: 0,
         }
     }
 
@@ -292,6 +312,7 @@ impl SlotIndex {
     }
 
     fn grow(&mut self) {
+        self.grows += 1;
         let capacity = (self.keys.len() * 2).max(64);
         let keys = core::mem::replace(&mut self.keys, alloc::vec![0; capacity]);
         let slots = core::mem::replace(&mut self.slots, alloc::vec![EMPTY; capacity]);
@@ -350,6 +371,12 @@ pub struct PageCache {
     index: SlotIndex,
     /// The clock hand: the next slot index eviction will examine.
     hand: usize,
+    /// How many entries the clock has evicted since the cache was created.
+    /// Diagnostic — see [`PageCache::evictions`].
+    evictions: u64,
+    /// How many entries have been made resident. Diagnostic — see
+    /// [`PageCache::inserts`].
+    inserts: u64,
 }
 
 impl PageCache {
@@ -362,6 +389,8 @@ impl PageCache {
             free: Vec::new(),
             index: SlotIndex::new(),
             hand: 0,
+            evictions: 0,
+            inserts: 0,
         }
     }
 
@@ -383,6 +412,30 @@ impl PageCache {
     /// Whether the cache holds nothing.
     pub fn is_empty(&self) -> bool {
         self.index.is_empty()
+    }
+
+    /// How many entries the clock hand has evicted over this cache's lifetime.
+    ///
+    /// A counter, not a gauge: it only ever grows, so a caller snapshots it
+    /// before and after a query to learn whether that query evicted. This is
+    /// the question AHL-552's tail histogram asks — whether the point read's
+    /// slow outliers coincide with the clock sweep — and the counter costs one
+    /// increment on the eviction path, nothing on a hit.
+    pub fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
+    /// How many entries have been made resident over this cache's lifetime;
+    /// the insert path's counterpart of [`PageCache::evictions`].
+    pub fn inserts(&self) -> u64 {
+        self.inserts
+    }
+
+    /// How many times the page-id index has doubled its table. Each doubling
+    /// rehashes every resident id, which is the one `O(n)` step on the insert
+    /// path — worth knowing about when a slow query is being explained.
+    pub fn index_grows(&self) -> u64 {
+        self.index.grows
     }
 
     /// Drop every entry.
@@ -412,6 +465,24 @@ impl PageCache {
         let entry = self.slots.get_mut(slot)?.as_mut()?;
         entry.referenced = true;
         Some(Rc::clone(&entry.node))
+    }
+
+    /// Drop `id` if it is resident. `true` if it was.
+    ///
+    /// For a page this handle can no longer reach — one a commit superseded.
+    /// The slot is recycled through `free` exactly as an eviction's is; the
+    /// clock hand is left where it was.
+    pub fn remove(&mut self, id: PageId) -> bool {
+        let Some(at) = self.index.get(id) else {
+            return false;
+        };
+        let Some(slot) = self.slots.get_mut(at).and_then(Option::take) else {
+            return false;
+        };
+        self.index.remove(id);
+        self.bytes = self.bytes.saturating_sub(slot.footprint);
+        self.free.push(at);
+        true
     }
 
     /// Make `node` resident under `id`, evicting under the clock policy until
@@ -466,6 +537,7 @@ impl PageCache {
         };
         self.index.insert(id, at);
         self.bytes += footprint;
+        self.inserts += 1;
     }
 
     /// Evict one entry under the clock policy: sweep the hand forward,
@@ -499,6 +571,7 @@ impl PageCache {
             self.index.remove(slot.id);
             self.bytes = self.bytes.saturating_sub(slot.footprint);
             self.free.push(at);
+            self.evictions += 1;
             return true;
         }
         false
@@ -619,6 +692,30 @@ mod tests {
         assert!(cache.bytes() <= cache.budget());
         // Two live slots, so the slab never needed more than two.
         assert_eq!(cache.slots.len(), 2);
+    }
+
+    #[test]
+    fn removing_a_page_frees_its_bytes_and_slot() {
+        // Budgeted from the leaf actually inserted, not from `cache_of`'s
+        // one-byte key: the cache is bounded in *bytes*, so a budget sized on
+        // a shorter key evicts on size and this test would be measuring
+        // eviction rather than removal (the same trap
+        // `the_least_recently_used_page_is_the_one_evicted` records).
+        let mut cache = PageCache::new(node_footprint(&leaf(b"one")) * 2);
+        cache.insert(1, leaf(b"one"));
+        cache.insert(2, leaf(b"two"));
+        let bytes = cache.bytes();
+        assert!(cache.remove(1));
+        assert!(!cache.remove(1));
+        assert!(cache.get(1).is_none());
+        assert!(cache.get(2).is_some());
+        assert_eq!(cache.len(), 1);
+        assert!(cache.bytes() < bytes);
+        // The freed slot is reused rather than the slab growing.
+        cache.insert(3, leaf(b"thr"));
+        assert_eq!(cache.slots.len(), 2);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.evictions(), 0);
     }
 
     #[test]
