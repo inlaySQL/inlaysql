@@ -168,6 +168,7 @@ Full map: [`README.md#layout`](README.md#layout). Short version:
 | Retrieval indexes (BM25, HNSW, staleness) | [`docs/indexes.md`](docs/indexes.md) |
 | MCP server mode | [`docs/mcp.md`](docs/mcp.md) |
 | WASM build | [`docs/wasm.md`](docs/wasm.md) |
+| Client languages: the C ABI, the WASM SDK and the MySQL wire | [`docs/clients.md`](docs/clients.md) |
 | SQLancer / fuzzing | [`docs/sqlancer.md`](docs/sqlancer.md) |
 | Benchmark methodology | [`bench/README.md`](bench/README.md) |
 | The current published numbers, wins and losses | [`BENCHMARK.md`](BENCHMARK.md) |

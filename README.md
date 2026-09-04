@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/inlaySQL/inlaysql/actions/workflows/ci.yml"><img src="https://github.com/inlaySQL/inlaysql/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://github.com/inlaySQL/inlaysql/actions/workflows/wasm.yml"><img src="https://github.com/inlaySQL/inlaysql/actions/workflows/wasm.yml/badge.svg?branch=main" alt="WASM"></a>
-  <a href="https://github.com/inlaySQL/inlaysql/releases"><img src="https://img.shields.io/badge/version-0.0.1--experimental-orange" alt="experimental"></a>
+  <a href="https://github.com/inlaySQL/inlaysql/releases"><img src="https://img.shields.io/badge/version-0.0.1.beta-orange" alt="v0.0.1.beta"></a>
   <a href="https://github.com/inlaySQL/inlaysql/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPLv3--or--commercial-blue" alt="license"></a>
 </p>
 
@@ -42,6 +42,22 @@ protocol](docs/server.md) so existing ORMs connect as-is, and as a CLI.
 > [`SECURITY.md`](SECURITY.md), privately.
 
 ## Installation
+
+**Prebuilt binaries** — from the
+[releases page](https://github.com/inlaySQL/inlaysql/releases) (currently
+[`v0.0.1.beta`](https://github.com/inlaySQL/inlaysql/releases/tag/v0.0.1.beta),
+each archive with a `.sha256` beside it):
+
+- `inlaysql-<version>-x86_64-unknown-linux-gnu.tar.gz` — the CLI + MCP server
+- `inlaysql-ffi-<version>-aarch64-apple-darwin.tar.gz` /
+  `…-x86_64-unknown-linux-gnu.tar.gz` — the C-ABI shared library
+  (`libinlaysql_ffi.dylib`/`.so`) with `inlaysql.h`: open the file
+  in-process from PHP, Python, Ruby, or any FFI language — see
+  [`docs/clients.md`](docs/clients.md)
+- `inlaysql-wasm-<version>.tar.gz` — the WASM module and its JS glue
+
+No Windows build yet: the file layer is Unix-only. The WASM module runs
+anywhere a browser or Node does, Windows included.
 
 **Rust crate** (not on crates.io yet — the format is pre-1.0):
 
@@ -818,6 +834,7 @@ crates/
   inlaysql-core/    SQL + planner + executor + storage + retrieval  (no_std)
   inlaysql/         file-backed Device, Database and AsyncDatabase  (std)
   inlaysql-uring/   io_uring Device backend  (Linux)
+  inlaysql-ffi/     the C ABI: libinlaysql.{dylib,so} for FFI languages
   inlaysql-mcp/     MCP server mode and the `inlaysql` CLI
   inlaysql-server/  MySQL wire-protocol server mode, depends on inlaysql alone
   inlaysql-wasm/    the engine compiled to WebAssembly

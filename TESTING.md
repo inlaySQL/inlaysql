@@ -60,7 +60,11 @@ runtime and publishes the demo from `main`.
 campaign and the benchmarks on every push to `main` and nightly, and uploads
 the results as downloadable artifacts (`fuzz-status`, `benchmark-results`).
 [`release.yml`](.github/workflows/release.yml) runs on a version tag and
-packages the CLI and the WASM module into a GitHub Release.
+packages the CLI, the WASM module and the C-ABI shared libraries (macOS and
+Linux — the file layer is Unix-only, so no Windows build) into a GitHub
+Release, each archive with a `.sha256`. `workflow_dispatch` builds the same
+artifacts without publishing, which is how the packaging is tested before
+cutting a real tag.
 
 The split that matters is fast versus slow. A reviewer waits for `ci.yml` and
 nothing else, so the 10,000-schedule sweeps only run there on `main`, on a tag, or on
