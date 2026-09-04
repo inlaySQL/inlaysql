@@ -31,6 +31,44 @@ blocks [2 + 4 * WAL_BLOCKS, ...) data     (copy-on-write B-tree pages)
 * **Data area** — the copy-on-write B-tree pages, including overflow pages. A
   page is written once and never modified in place.
 
+### The data area is longer than the tree, on purpose (AHL-553)
+
+Copy-on-write means every commit allocates page ids past the highest one the
+previous commit used, so — before this — every commit also *grew the file*,
+and the commit's own barrier had to flush the extent allocation and the new
+inode size along with the bytes. InnoDB and PostgreSQL fsync a preallocated
+log rewritten in place and pay neither. `FileDevice::extend_for`
+(`crates/inlaysql/src/device.rs`) therefore extends the data area ahead of the
+writer, in geometric chunks between one and eight mebibytes, and **fills the
+extension with real zero bytes** — `set_len` alone leaves a hole, and the
+writer's first write into a hole allocates exactly as growing the file did,
+which is measured and stated in `PERF.md`'s AHL-553 section along with what
+this bought (a single-row durable commit, containerised, 0.679 ms → 0.556 ms
+median, 18 of 20 interleaved repetitions).
+
+**What this changes for recovery, which is the reason it is written here
+rather than only in `PERF.md`:** a database file no longer ends within a page
+of its newest committed write. Past the last page any committed root points
+at there is now a tail of zeros, up to eight mebibytes of it, and after a
+crash that tail can also hold pages from commits that never completed —
+exactly as the space immediately past the old end-of-file could, since the
+tree wrote there before its barrier either way.
+
+Nothing in the protocol below reads it. Recovery is driven entirely by the
+state block and the log: the header names the page size, the state block and
+the accepted record chain name the root and the next free page id, and every
+page recovery touches is named by a record. **No step derives anything from
+the file's length**, so a longer file is indistinguishable from a shorter one
+to every one of them. The allocator is likewise unaffected — it is monotonic
+per file (`adopt_next_page_id`), never derived from where the bytes stop — so
+a preallocated tail can only ever be space the next commits write into, never
+space an id is chosen from because it happened to be there.
+
+The two properties are pinned in `crates/inlaysql/tests/preallocation.rs`:
+a file extended sixty-four mebibytes past its last commit opens, reads back
+every committed row, and keeps committing into that tail; and two handles on
+one file share a single extension rather than racing to make it twice.
+
 ## Commit protocol (write-ahead)
 
 A normal commit is one short reservation, one ready-ticket publication and a

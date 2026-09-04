@@ -221,6 +221,21 @@ struct CommitCoordinator {
     /// [`Device::note_page_reuse_enabled`] in the core for the contract this
     /// satisfies.
     reuse_enabled: AtomicBool,
+    /// How far the data area has been extended **and filled with real
+    /// bytes**, so a write below this offset lands inside an allocated extent
+    /// and inside `i_size`. `0` means "not yet read from the file"; see
+    /// [`FileDevice::extend_for`] for what this buys and what it costs.
+    ///
+    /// Shared by every handle on this file because file length is a property
+    /// of the file, not of a descriptor: one handle's extension is every
+    /// handle's, and the fast path is a single relaxed-acquire load that a
+    /// second handle skips the work behind.
+    allocated: AtomicU64,
+    /// Serialises the *slow* path of [`FileDevice::extend_for`] — the
+    /// `set_len` and the zero fill — so two writers never extend the same
+    /// range twice. Never held across a barrier, and never taken at all once
+    /// the file is long enough.
+    allocate_lock: Mutex<()>,
     /// The [`Durability`] level [`Device::sync_commit`] uses for this file,
     /// shared by every handle this process has open on it.
     ///
@@ -1009,6 +1024,37 @@ const COMMIT_COALESCE_MAX_YIELDS: usize = 16384;
 /// present to amortize an `fsync` over.
 const COMMIT_COALESCE_STALL_YIELDS: usize = 1500;
 
+/// The smallest amount of data area [`FileDevice::extend_for`] ever adds, and
+/// the largest.
+///
+/// A copy-on-write tree never overwrites a live page, so **every commit
+/// allocates page ids past the end of the file and the file grows** — and the
+/// commit's own barrier therefore has to flush the metadata that extends it
+/// (the extent allocation and the inode size) as well as the bytes. InnoDB
+/// and PostgreSQL fsync a preallocated log rewritten in place and pay
+/// neither. Extending the file *ahead* of the writer moves that work out of
+/// the critical path without weakening anything: the pages are still written
+/// and still synced, only the growth moves. See `PERF.md`'s AHL-553 section
+/// for the measurement, which is where these two numbers come from —
+/// containerised, on the Docker volume `BENCHMARK.md`'s OLTP row runs on,
+/// a single-row durable commit went from a 0.679 ms median to 0.556 ms,
+/// 18 of 20 interleaved repetitions.
+///
+/// Growth is geometric between the two, so a database that stays small stays
+/// small: the first extension past the log adds one mebibyte, not eight, and
+/// the chunk only reaches the ceiling once the data area is already that big.
+/// The cost is stated plainly — the zero fill writes every data byte once
+/// before the tree writes it again, so a write-only workload issues about
+/// twice the bytes it used to. That is the trade the numbers above bought,
+/// and it is why the fill is chunked rather than done in one reservation.
+const PREALLOC_MIN_CHUNK: u64 = 1 << 20;
+const PREALLOC_MAX_CHUNK: u64 = 8 << 20;
+
+/// How much of the zero fill is issued per `pwrite`. Large enough that an
+/// eight-mebibyte extension is 32 calls rather than 2,048, small enough that
+/// the buffer behind it is not worth reusing across calls.
+const PREALLOC_FILL_CHUNK: usize = 256 << 10;
+
 type CoordinatorRegistry = Mutex<HashMap<FileId, Weak<CommitCoordinator>>>;
 
 static COORDINATORS: OnceLock<CoordinatorRegistry> = OnceLock::new();
@@ -1173,6 +1219,81 @@ impl FileDevice {
     /// and may. `true` only when `buf` was filled from the cache; every other
     /// outcome — disabled cache, unknown layout, an offset below the data
     /// area, a miss — falls through to a real device read.
+    /// Make sure the file already reaches past `offset + len`, extending and
+    /// zero-filling it in chunks if it does not, so the write that follows
+    /// lands inside an allocated extent and inside `i_size` and the commit's
+    /// barrier has only bytes to flush.
+    ///
+    /// Three things this deliberately does not do:
+    ///
+    /// * **It never touches anything below the data area.** The header, the
+    ///   state block and the write-ahead log are written in place at fixed
+    ///   offsets and are fully materialised the moment a database is created;
+    ///   there is no growth there to move. Until the layout is known — the
+    ///   first header this process reads or writes teaches it, which happens
+    ///   while the database is being opened — this does nothing at all rather
+    ///   than guess a boundary.
+    /// * **It does not use `set_len` alone.** That is the cheap thing to
+    ///   reach for and it is worth nothing: a hole is not an extent, and the
+    ///   writer's first write into one allocates exactly as growing the file
+    ///   did. Measured, in the container, over twenty interleaved
+    ///   repetitions: `set_len` on its own is flat against doing nothing
+    ///   (paired ratio median 0.99), and the same preallocation with real
+    ///   bytes in it is not (`PERF.md`, AHL-553).
+    /// * **It does not sync.** The zeros are ordinary writes; whatever
+    ///   barrier the commit was going to issue covers them, and a zero that
+    ///   never reaches the platter is a zero in a region no committed root
+    ///   points at.
+    fn extend_for(&self, offset: usize, len: usize) -> Result<()> {
+        let Some(coordinator) = &self.coordinator else {
+            return Ok(());
+        };
+        let end = (offset + len) as u64;
+        if end <= coordinator.allocated.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let boundary = coordinator
+            .read_cache
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .boundary();
+        let Some(boundary) = boundary else {
+            return Ok(());
+        };
+        if offset < boundary {
+            return Ok(());
+        }
+        let _guard = coordinator
+            .allocate_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Another handle may have extended the file while this one waited.
+        let mut have = coordinator.allocated.load(Ordering::Acquire);
+        if have == 0 {
+            have = self.file.metadata().map_err(io_error)?.len();
+        }
+        if end <= have {
+            coordinator.allocated.store(have, Ordering::Release);
+            return Ok(());
+        }
+        let chunk = have
+            .saturating_sub(boundary as u64)
+            .clamp(PREALLOC_MIN_CHUNK, PREALLOC_MAX_CHUNK);
+        let target = end.max(have.saturating_add(chunk));
+        self.file.set_len(target).map_err(io_error)?;
+        let zeros = vec![0u8; PREALLOC_FILL_CHUNK];
+        let mut at = have;
+        while at < target {
+            let take = (target - at).min(zeros.len() as u64) as usize;
+            self.file
+                .write_all_at(&zeros[..take], at)
+                .map_err(io_error)?;
+            at += take as u64;
+        }
+        coordinator.allocated.store(target, Ordering::Release);
+        Ok(())
+    }
+
     fn read_from_shared_cache(&self, offset: usize, buf: &mut [u8]) -> bool {
         let Some(coordinator) = self.coordinator.as_ref() else {
             return false;
@@ -1376,6 +1497,10 @@ impl Device for FileDevice {
         if self.coordinator.is_none() {
             return Err(self.read_only_error("write"));
         }
+        // Before the write, never after: the point is that the write below
+        // lands in space the file already has, so this commit's barrier has
+        // no file to grow. See [`FileDevice::extend_for`].
+        self.extend_for(offset, data.len())?;
         self.file
             .write_all_at(data, offset as u64)
             .map_err(io_error)?;
@@ -2012,6 +2137,8 @@ fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator
         next_reader_token: AtomicU64::new(1),
         read_cache: RwLock::new(ReadCache::new(shared_read_cache_budget())),
         reuse_enabled: AtomicBool::new(false),
+        allocated: AtomicU64::new(0),
+        allocate_lock: Mutex::new(()),
         durability: AtomicU8::new(DURABILITY_UNSET),
         absorption: Mutex::new(AbsorbQueue::default()),
         absorption_enabled: AtomicBool::new(false),
@@ -2164,6 +2291,8 @@ mod group_commit_tests {
             next_reader_token: AtomicU64::new(1),
             read_cache: RwLock::new(ReadCache::new(1 << 20)),
             reuse_enabled: AtomicBool::new(false),
+            allocated: AtomicU64::new(0),
+            allocate_lock: Mutex::new(()),
             durability: AtomicU8::new(DURABILITY_UNSET),
             absorption: Mutex::new(AbsorbQueue::default()),
             absorption_enabled: AtomicBool::new(false),
