@@ -5718,6 +5718,173 @@ and it is named here rather than changed: a warm-up or a longer read phase in
 `points.rs` would alter the published method and belongs with the next gated
 regeneration.
 
+### C2 — the server-to-server barrier-rate gap, made measurable, and answered (AHL-555, 2026-09-04)
+
+"Task 2" above (2026-08-31) diagnosed the gap between InlaySQL-server's
+1,522.2 ops/s and MySQL 8.4's 4,992.0 at 8 connections down to barrier
+*rate* — commits-per-fsync at parity (4.06 vs 3.90), the achieved `fsync`
+cadence itself ~3.4x apart (~375/s vs ~1,280/s) — and left the mechanism as
+a named, unconfirmed suspect: "round-trip cost specific to the server
+topology... paces how fast new commit tickets *arrive* at the coordinator,"
+explicitly **not measured directly**, because nothing timed a connection
+thread's own socket-wait, execution or commit-wait separately. C2's task was
+exactly that instrument, not a fix.
+
+**The instrument.** `crates/inlaysql-server/src/metrics.rs` gained four
+`SHOW GLOBAL STATUS` counters — `Inlaysql_thread_socket_wait_ns` (time
+blocked in the socket read, before dispatch), `Inlaysql_thread_execute_ns`
+(time inside dispatch — the whole command), `Inlaysql_thread_commit_ns` and
+`Inlaysql_thread_commits` (the *separable* case: an explicit `COMMIT`) — see
+`crates/inlaysql-server/src/connection.rs`'s `serve`, `dispatch` and
+`commit`. The third bucket the task asked for, "executing up to where
+commit begins" split from "inside commit," turned out not to exist as a
+seam the server can see for this benchmark's own workload: a durable,
+autocommit single-row write commits inside one opaque
+`Database::execute_prepared` call (`Engine::run_refreshed` → `end_write` →
+`commit_storage`, `crates/inlaysql-core/src/engine.rs`), with no point
+between "execution" and "commit" that anything outside `inlaysql-core` can
+time without adding a timestamp to the engine's own commit path — which
+this task was explicitly told not to do (another change is in flight
+there). So it is said plainly rather than faked: on this benchmark,
+`Inlaysql_thread_commit_ns`/`_commits` read zero, and
+`Inlaysql_thread_execute_ns` is execution *and* its commit, fused, for
+every write.
+
+**What did not need building.** `inlaysql::CommitStats`
+(`crates/inlaysql/src/device.rs`) already carried `gate_wait_ns` (blocked
+acquiring the reservation gate), `gate_hold_ns` (a writer's own work once it
+has the gate — rebase, WAL encode, the record and page writes) with its
+racing/racing-start splits (whether that hold started or ran while a flush
+was already in flight), `follower_wait_ns` (parked waiting for someone
+else's flush rather than leading one), `gather_spin_ns`, `fsync_ns` and
+`post_ns` — added alongside AHL-547's commit-side absorption work and never
+read by anything outside the crate. Twelve more `Inlaysql_commit_*` status
+variables expose them, unchanged, no new timer anywhere in `inlaysql` or
+`inlaysql-core`. This is the accessor the task asked to be found before
+building anything: it answers the "does a writer proceed while a barrier is
+in flight" half of C2's question more precisely than a server-side timer
+ever could, because it is inside the coordinator itself.
+
+**The measurement.** `bench/external/server_driver.py`'s
+`measure_concurrency` was extended (additively — `commit_stats` untouched)
+to bracket these sixteen counters the same way it already brackets
+`Inlaysql_normal_commit_tickets`/`_flushes`, as a new `thread_stats` field
+`common.write_server_oltp_result` passes through unchanged for any target
+that has it (`inlaysql-server` only; MySQL has no equivalent, and this
+driver does not invent one). Run manually rather than through the full
+`bench/compare.sh` (which times DuckDB, pgvector, Meilisearch, PostgreSQL
+and a containerised InlaySQL rebuild that this diagnostic did not need):
+`cargo run --release -p inlaysql-bench -- --export --export-oltp` once for
+the same corpus/workload shape compare.sh uses (5,000 docs, 20,000/5,000
+OLTP rows/lookups), `docker compose up -d --build --wait mysql
+inlaysql-server drivers`, then `docker compose exec -T -e
+SERVER_CONCURRENCY_LEVELS=1,8 drivers python server_driver.py` three times.
+**Host load was 5.7–12.9/18 throughout — not quiet, not load-gated, and
+disclosed rather than hidden**: the absolute write ops/s below are not a
+`BENCHMARK.md`-grade figure and are not meant to replace the published,
+gated 668.9/1,522.2 row — they reproduce its *sign* and rough order (this
+run's own InlaySQL medians: 606.3 → 1,177.5 ops/s; MySQL: 716.8 → 3,146.4,
+both noisy, MySQL's own 8-connection column spanning 2,705.5–5,027.0 across
+the three reps, the same "MySQL's write column is the loudest on the page"
+disclosed there). What this section rests on is the *within-run* time
+decomposition, which held consistent to within a few percentage points
+across all three repetitions regardless of that noise.
+
+**At 1 connection, a thread's time is almost entirely the barrier itself.**
+Median of three: `Inlaysql_thread_execute_ns` is 96.5–96.8% of a thread's
+total time (socket wait 3.2–3.5%) — expected, since the client sends its
+next row the instant it gets an answer and this is a synchronous
+round-trip. Of `execute_ns`, `fsync_ns` alone is 82.5–87.0% (median 84.4%),
+`gate_hold_ns` 9.6–11.6% (the row's own encode-and-write), `gate_wait_ns`
+and `follower_wait_ns` both ~0% (nothing to queue behind, solo writer,
+`gate_hold_racing_count` is 0 of 2,002 gate holds in every rep — no commit
+ever started while another was mid-flush, because there was never another
+one running). Commits-per-fsync is exactly 1.000 in all three reps, as
+`PERF.md`'s existing "no doubled barrier" evidence already found. The
+remaining ~5.7% (`execute_ns` minus every commit-machinery bucket) is
+parse, plan, row-build and dispatch overhead — small, and the same order as
+`gather_spin_ns`'s near-zero at one writer.
+
+**At 8 connections, the picture inverts: a thread spends most of its life
+waiting on someone else's barrier, not running one of its own or waiting on
+the socket.** Socket wait falls further, to 1.2–1.5% of total thread time —
+the client is never the bottleneck; it always has the next row ready.
+`execute_ns` is 98.5–98.8%. Inside `execute_ns`, median shares across the
+three reps: `gate_wait_ns` **36.4%**, `follower_wait_ns` **33.4%**,
+`gate_hold_ns` 8.8%, `fsync_ns` only **8.0%**, `gather_spin_ns` 2.5%,
+`post_ns` 0.2%, leaving ~10.9% unaccounted (statement work). **Two-thirds
+of a connection thread's own execution time (`gate_wait` + `follower_wait`,
+69.8% median) is spent blocked on commit machinery it does not own** —
+queued for the reservation gate another writer is holding, or parked as a
+follower waiting for whichever writer became this cycle's flush leader —
+while the barrier a thread's own commit actually needs, `fsync_ns`, is a
+tenth of that. This is the direct, per-thread confirmation of what "Task 2"
+could only infer from a harness-mismatched proxy: it is not execution that
+throttles arrival at 8 connections (statement work is a stable ~5-11% of
+`execute_ns` at both 1 and 8 connections — it did not get slower, there is
+just far more waiting stacked around it) and it is not the socket (its
+share *shrinks* as connections rise, the opposite of what a client-bound
+theory predicts). **It is time spent waiting behind other writers' commits.**
+
+**Does the next gate holder proceed while a barrier is in flight, or is the
+pipeline serial? Partially overlapped, and the overlap is not the
+bottleneck.** `gate_hold_racing_count` / `gate_waits` is 81.2–83.5% (median
+82.9%) at 8 connections: four in five gate holds *do* start or run while a
+flush from an earlier cohort is still in progress — a writer is not
+blocked behind a previous barrier's `fsync` call itself, confirming AHL-547's
+own finding that holding the gate across the barrier (rather than
+releasing it before syncing) is what would serialise that overlap away, and
+that this build does not do that. What is serial, and what the counters
+separate for the first time, is the **gate** as a mutual-exclusion section
+in its own right: only one writer's rebase-encode-append can be inside it
+at a time, and eight threads contending for that one critical section is
+where `gate_wait_ns`'s 36.4% comes from — not from waiting on a barrier,
+from waiting on each other to finish a comparatively cheap append. The
+second-largest bucket, `follower_wait_ns` at 33.4%, is the group-commit
+design working as intended in aggregate (`SCOREBOARD.md` §3.5: InlaySQL's
+own commits-per-fsync ties or beats InnoDB's at low concurrency) and
+costing exactly what group commit costs any *individual* member: only the
+elected leader calls `fsync`, everyone else in that cohort blocks until it
+returns. Commits-per-fsync this run: 1.000 at 1 connection, 3.453–3.760
+(median 3.555) at 8 — consistent with the published 4.06, and confirming
+again that batching is not the weak link; these sixteen counters just show
+*where the batched-away time actually went* for the writers who are not
+leading: into `gate_wait_ns` and `follower_wait_ns`, not onto the socket
+and not onto slower statement execution.
+
+**Answering C2's two questions directly.** A connection thread's time goes
+overwhelmingly into commit machinery, not the socket and not raw
+execution, at both concurrency levels measured — the composition of that
+machinery is what changes: nearly all barrier (`fsync_ns`) at 1 connection,
+nearly all contention for the gate and for another writer's flush
+(`gate_wait_ns` + `follower_wait_ns`) at 8. The pipeline is not fully
+serial — most gate holds do race a barrier that is already running — but
+the gate itself is a single-writer critical section, and at 8 connections
+seven of eight threads at any instant are either queued for it or parked
+waiting on the eighth's flush to land, which is functionally serial from
+any one thread's point of view even though the coordinator's *aggregate*
+throughput benefits from the overlap that does happen. This is "Task 2"'s
+"arrival rate into the coordinator throttles as threads increase"
+hypothesis, now with a number: at 8 connections a thread spends a median
+69.8% of its own execution time waiting on other writers' commits rather
+than running its own.
+
+**The smallest experiment that would test overlapping prepare with
+barrier, not built here.** If a connection thread parsed, planned and
+built its row (today's ~9-11% "other" share of `execute_ns`) *before*
+attempting the gate, rather than only starting that work once it holds the
+gate, a thread parked in `follower_wait_ns` could be doing next-statement
+prepare work concurrently with waiting instead of blocking on both in
+series — the smallest version of this is a two-line reorder in
+`Connection::run_on_engine` (or the engine call it wraps) that separates
+"plan and validate" from "take the gate and commit," measured with exactly
+the `Inlaysql_thread_*` counters this section adds: if `execute_ns`'s
+"other" share moved into `gate_wait_ns`/`follower_wait_ns` instead of
+shrinking, prepare and barrier were already overlapping for free and
+nothing changed; if `execute_ns` itself fell, the reorder bought real wall
+time. Untested — this section's mandate was to measure, not to change the
+commit path.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness

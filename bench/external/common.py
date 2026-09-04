@@ -334,6 +334,13 @@ def write_server_oltp_result(
         }
         if level.get("commit_stats") is not None:
             encoded["commit_stats"] = level["commit_stats"]
+        # AHL-555 (C2): the per-thread socket-wait/execute/commit split and
+        # the commit-machinery detail (`Inlaysql_commit_*`) — see
+        # `server_driver.py::measure_concurrency`'s docstring for what each
+        # key means. `inlaysql-server`-only, like `commit_stats_all` above;
+        # `None` for a target with no such counters.
+        if level.get("thread_stats") is not None:
+            encoded["thread_stats"] = level["thread_stats"]
         encoded_levels.append(encoded)
     result = {
         "engine": engine,

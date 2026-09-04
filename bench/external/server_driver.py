@@ -344,6 +344,44 @@ def measure_concurrency(target: dict, workload: common.OltpWorkload, concurrency
         else None
     )
 
+    # AHL-555 (C2): the connection-thread and commit-machinery counters
+    # `crates/inlaysql-server/src/metrics.rs` added this session, bracketed
+    # the same way as `counter_names`/`counter_names_all` above — a delta
+    # over this level's write phase, read outside the worker pool. Only
+    # `inlaysql-server` has these; MySQL has no equivalent, so `mysql`'s
+    # `thread_stats` stays `None` and this driver reports what it can for
+    # the row this task is actually about rather than inventing a MySQL
+    # side that does not exist. `_ns` fields are nanoseconds summed across
+    # every connection thread this level's pool opened (each is its own
+    # process and its own `Database` handle — D2 — so this is a true sum,
+    # not a per-thread average), and the `Inlaysql_commit_*` fields are
+    # already whole-file, not per-thread: one `CommitCoordinator` shared by
+    # every connection.
+    thread_names = (
+        [
+            "Inlaysql_thread_socket_wait_ns",
+            "Inlaysql_thread_execute_ns",
+            "Inlaysql_thread_commit_ns",
+            "Inlaysql_thread_commits",
+            "Inlaysql_commit_gate_wait_ns",
+            "Inlaysql_commit_gate_waits",
+            "Inlaysql_commit_gate_hold_ns",
+            "Inlaysql_commit_gate_hold_racing_ns",
+            "Inlaysql_commit_gate_hold_racing_count",
+            "Inlaysql_commit_follower_wait_ns",
+            "Inlaysql_commit_follower_waits",
+            "Inlaysql_commit_gather_spin_ns",
+            "Inlaysql_commit_fsync_ns",
+            "Inlaysql_commit_post_ns",
+            "Inlaysql_commit_gap_ns",
+        ]
+        if target["slug"] == "inlaysql-server"
+        else None
+    )
+    thread_before = None
+    if thread_names is not None:
+        thread_before = {name: global_status(target, name) for name in thread_names}
+
     commit_stats = None
     if counter_names is not None:
         commits_name, fsyncs_name = counter_names
@@ -383,6 +421,11 @@ def measure_concurrency(target: dict, workload: common.OltpWorkload, concurrency
                 commits_all_delta / fsyncs_all_delta if fsyncs_all_delta else 0.0
             )
 
+    thread_stats = None
+    if thread_names is not None:
+        thread_after = {name: global_status(target, name) for name in thread_names}
+        thread_stats = {name: thread_after[name] - thread_before[name] for name in thread_names}
+
     write_ops_s = len(workload.rows) / write_elapsed
     write_timer = common.Timer()
     write_retries = 0
@@ -410,6 +453,7 @@ def measure_concurrency(target: dict, workload: common.OltpWorkload, concurrency
         read_ops_s=read_ops_s,
         read_timer=read_timer,
         commit_stats=commit_stats,
+        thread_stats=thread_stats,
     )
 
 
