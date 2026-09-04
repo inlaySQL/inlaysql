@@ -5718,6 +5718,167 @@ and it is named here rather than changed: a warm-up or a longer read phase in
 `points.rs` would alter the published method and belongs with the next gated
 regeneration.
 
+### The barrier was paying to grow the file (AHL-553, 2026-09-04)
+
+Two facts about a commit were taken on faith by the brief that opened this
+item, and both needed a counter rather than a reading. Both are now measured,
+one confirmed and one corrected, by `crates/inlaysql-bench/src/bin/commit_growth.rs`
+— a harness this commit adds, which drives durable single-row (and hundred-row)
+statements, reads `FileDevice::commit_stats` around the timed phase, and can
+put a counting [`Device`] between the tree and the file that attributes every
+call by offset.
+
+* **One barrier per commit: confirmed.** 1,500 single-row commits produce
+  exactly 1,500 `sync_commit` calls, every run, in container and on the host.
+  `commits per barrier` is 1.00 at one writer, as the shape requires.
+* **The wrap costs an extra barrier every ~52 commits, not every ~33.** The
+  brief's arithmetic used a ~31 KB record; the record is **~18-20 KB** on this
+  shape (measured: 20,229 B per commit, against 20,117 B of data-page writes —
+  the earlier 31 KB figure came from folding the region-zeroing write into the
+  record). 1,529 total barriers for 1,500 commits: 1,500 from `sync_commit`
+  and **29 from `write_state_values`**, one per WAL-region wrap, one wrap per
+  51.7 commits — **1.9% of commits, not 3%**. That number is deterministic:
+  it was identical (29/1,500) across every repetition of every arm in every
+  run below, because it is a function of record size and region size and
+  nothing else. On the hundred-row batch shape the record is 32,769 B and the
+  wrap comes every 33.3 commits.
+
+**The containerised commit split, which no one had taken.** Every commit
+profile in this file before this one is host-side, where `F_FULLFSYNC` is
+85-97% of the sample and hides everything behind it. Taken inside
+`bench/external/compose.yml`'s `inlaysql-oltp` image on the
+`inlaysql-bench_inlaysql-oltp-data` named volume (btrfs on a virtio device
+inside OrbStack's Linux VM — `df -T /data`), `WRAP=1`, per statement, the
+cleanest of three repetitions each:
+
+| | single row | 100-row statement |
+| --- | --- | --- |
+| total per statement | 0.825 ms | 1.485 ms |
+| **the barrier (`sync_commit`)** | **0.741 ms — 89.8%** | **1.254 ms — 84.4%** |
+| WAL record `pwrite` (1 call) | 20,229 B, 0.005 ms — 0.6% | 32,769 B, 0.007 ms — 0.5% |
+| data-area `pwrite` (1 call) | 20,117 B, 0.008 ms — 1.0% | 32,631 B, 0.009 ms — 0.6% |
+| region-zeroing `pwrite` (0.02/commit) | 0.004 ms — 0.5% | 0.005 ms — 0.3% |
+| state block write + its `sync` (0.02/commit) | 0.012 ms — 1.5% | 0.034 ms — 2.3% |
+| device reads (4.9/commit) | 0.007 ms — 0.8% | 0.008 ms — 0.5% |
+| **engine above the storage layer** | **0.048 ms — 5.8%** | **0.169 ms — 11.3%** |
+
+Across all six repetitions the shares held: barrier 89-94% and engine
+2.6-5.8% on the single row, barrier 85-89% and engine 11-15% on the batch.
+Scaled onto `BENCHMARK.md`'s published 619.8 ops/s row — 1.61 ms per commit —
+**roughly 1.45 ms of it is the barrier and roughly 0.10 ms is ours**, of which
+under 0.04 ms is every `pwrite` this engine issues put together. The
+`pwrite`s are not the item and never were; on the single-row shape they are
+2.1% of the statement.
+
+**So the item was: what is the barrier itself doing?** The hypothesis this
+session tested is that it is not flushing bytes but *growing the file*.
+InlaySQL is copy-on-write, so every commit allocates page ids past the
+highest one before it and the file grows — 20,117 B per commit, measured, the
+file going 4.0 → 32.8 MiB over 1,500 commits — and the barrier therefore has
+to flush the extent allocation and the new inode size as well as the data.
+InnoDB and PostgreSQL fsync a preallocated log rewritten in place and pay
+neither. This is untouched by the deferred-durability rejection above (twice
+measured, twice rejected, not re-proposed here): the pages are still written
+and still synced inside the same commit, only the *growth* moves out of the
+critical path.
+
+**Measured before it was built**, four arms, order re-shuffled every
+repetition (the lesson §6 records from the fsync sweep), one throwaway
+repetition discarded before anything was recorded, on the container volume
+above:
+
+| Arm | What it does | Result |
+| --- | --- | --- |
+| `base` | nothing — the file grows as it always has | control |
+| `sparse` | `File::set_len` well past the run, nothing written | **flat** |
+| `filled` | `set_len` plus real zero bytes over the whole range, synced, before the timed phase | **~1.20x** |
+| `chunked` | extends and fills 8 MiB at a time *inside* the timed phase — the implementable design | **~1.16x** |
+
+`sparse` is the result worth stating loudly, because it is the cheap thing
+anyone would reach for first and it is worth **nothing**: over 14 interleaved
+repetitions its paired ratio against `base` was a median of **0.99** (base
+median 839.4 ops/s, sparse 1,201.8 — the *unpaired* medians look like a win
+and the paired comparison says otherwise, which is what a machine this noisy
+does to an unpaired reading). On btrfs a hole is not an extent: `set_len`
+moves `i_size` and allocates nothing, so the writer's first write into the
+range allocates exactly as growing the file did.
+
+`filled` is the upper bound on what preallocation can be worth and it is
+real: 6/6 non-overlapping in a first 6-repetition run (base median 1,391
+ops/s, filled 1,681 — base max 1,568 below filled min 1,625), then 12/14 in
+the 14-repetition run above at a paired median of 1.195x. 25 of 28
+repetitions across three runs.
+
+`chunked` — the prototype of the actual change, growing 8 MiB at a time
+inside the timed loop so the zero fill is charged to the workload that
+benefits from it — was measured head to head against `base` over **20
+interleaved repetitions**: **18/20 wins**, paired ratio median **1.157x**,
+p50 latency **0.679 ms → 0.556 ms** (also 18/20). Machine load 3.85 at the
+start, 5.13 at the end, on an 18-CPU box whose quiet ceiling is 4.5 — two
+other agents were building throughout, which is why this needed twenty
+repetitions and a paired statistic rather than §4's three-and-non-overlapping
+rule. Two earlier runs on the same arms agree in direction (7/8 and 9/14).
+The first run of any process is a 2-3x outlier — cold page cache, cold btrfs
+allocator — which is why the harness now discards a warm-up repetition.
+
+**And measured again after it was built, which is the number that counts.**
+Two `commit_growth` binaries from the same source tree differing only in
+`crates/inlaysql/src/device.rs` (the control built with that file stashed),
+alternating process by process, order flipped every repetition, 12
+repetitions, 1,500 durable single-row commits each on the same container
+volume: **11/12 wins on throughput and 11/12 on p50**, paired ratio median
+**1.181x**, p50 **1.359 ms → 1.069 ms**. Load 2.68 at the start, 3.30 at the
+end. The control's file goes 4.0 → 32.8 MiB over the run; the preallocating
+build's goes 5.0 → 36.0 MiB, which is the change visible in the artefact
+rather than only in the clock.
+
+**Landed**: `FileDevice::extend_for`, in `crates/inlaysql/src/device.rs`.
+A write at or past the data-area boundary that would run past the file's
+current length extends it first, in geometric chunks between 1 and 8 MiB
+(`PREALLOC_MIN_CHUNK`/`PREALLOC_MAX_CHUNK`), and fills the extension with
+real zero bytes. The watermark lives on the `CommitCoordinator`, so every
+handle on the file shares one extension, and the fast path is a single atomic
+load. Nothing below the data area is ever touched: the header, state block
+and log are written in place at fixed offsets and are fully materialised when
+the database is created. No sync of its own — the commit's own barrier covers
+the zeros, and a zero that never reaches the platter is a zero in a region no
+committed root points at.
+
+**The read shapes are flat, as they have to be**, interleaved on the host
+between the same two binaries, 3 repetitions, order flipped every
+repetition: `points` 3.378 / 3.396 / 3.356 M ops/s against 3.406 / 3.360 /
+3.359 M, `joins-limit` 185.4 / 182.5 / 184.6 k against 185.8 / 184.4 / 185.1
+k, `indexed-range` 136.0 / 136.4 / 134.1 k against 137.4 / 137.1 / 136.8 k.
+The last one is consistently ~1% under the control, three of three, which is
+well inside §4's own A/A floor (CoV 3.6-7.3% on a quiet machine) and has no
+mechanism in the diff — nothing on a read path calls `extend_for`, whose
+first line returns on an atomic load. Recorded as flat, with the sign
+disclosed.
+
+**The cost, stated rather than buried.** The zero fill writes every data byte
+once before the tree writes it again, so a write-heavy workload issues about
+twice the bytes it used to, and a database that inserts one row and stops is
+1 MiB larger than it was. Geometric growth is what bounds that: the first
+extension past the log is a mebibyte, not eight, and the chunk only reaches
+the ceiling once the data area is already that big. On the macOS host the
+change is a small loss and not a win — the host A/B is flat across all four
+arms (base 263.2 / sparse 250.5 / filled 260.2 ops/s at 300 commits;
+`chunked` 209.5 against `base` 242.1 at 200), because `F_FULLFSYNC` is 99% of
+a host commit and growing the file is lost inside it. This is a change that
+pays on the platform the servers are compared on and costs a little on the
+one they are not.
+
+**Recovery.** A preallocated file ends in zeros rather than at the last
+committed page, which is a shape nothing tested before: every earlier
+database ended within a page of its newest write, so "past the end of the
+file" and "past the last commit" were the same offset. `docs/recovery.md`'s
+layout section now states what the tail is and why no recovery step reads it
+(nothing derives anything from the file's length; the allocator is monotonic
+per file and never derived from where the bytes stop), and
+`crates/inlaysql/tests/preallocation.rs` pins it: a file extended 64 MiB past
+its last commit opens, reads back every committed row, keeps committing into
+that tail, and reopens correct.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness
