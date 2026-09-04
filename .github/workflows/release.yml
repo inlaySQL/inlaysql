@@ -108,9 +108,10 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ matrix.lib }}" "dist/$name/"
           cp crates/inlaysql-ffi/include/inlaysql.h "dist/$name/"
           cp LICENSE "dist/$name/"
-          # The PHP proof of concept is the worked example the header's
-          # consumers start from; it needs nothing but the library.
-          cp crates/inlaysql-ffi/examples/poc.php "dist/$name/"
+          # The wrappers are what a PHP/Python/Ruby/C#/Java developer actually
+          # requires — one file each, and every language can use every one,
+          # so all of them ship in every archive regardless of target.
+          cp -R crates/inlaysql-ffi/wrappers "dist/$name/wrappers"
           tar -czf "dist/${name}.tar.gz" -C dist "$name"
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
           ls -l dist
@@ -227,9 +228,12 @@ jobs:
             echo "### Using the C-ABI libraries"
             echo
             echo "Each FFI archive carries the \`${version}\` library, the"
-            echo "\`inlaysql.h\` header, and \`poc.php\` — a working PHP FFI example"
-            echo "that is the fastest way to see the shape of the surface. A"
-            echo "Python \`ctypes\` binding is a dozen lines; see"
+            echo "\`inlaysql.h\` header, and the **wrappers/** directory — a"
+            echo "one-file class per language (\`inlaysql.php\`, \`inlaysql.py\`,"
+            echo "\`inlaysql.rb\`, \`InlaySQL.cs\`, \`InlaySQL.java\`), each the whole"
+            echo "binding for its language. Copy the one you need and open the"
+            echo "file like SQLite; the quickest introduction, with copy-paste"
+            echo "quickstarts for all five, is"
             echo "[docs/clients.md](https://github.com/inlaySQL/inlaysql/blob/main/docs/clients.md)."
             echo
             echo "### WASM payload"
