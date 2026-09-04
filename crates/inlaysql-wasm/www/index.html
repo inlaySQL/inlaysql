@@ -644,18 +644,27 @@
 <section class="band">
   <div class="wrap narrow">
     <h2>Get started</h2>
-<pre class="code"><span class="com"># Not on crates.io yet — it is version 0.0.1 and the format is pre-1.0.</span>
-git clone https://github.com/inlaySQL/inlaysql
-<span class="kw">cd</span> inlaysql
+<pre class="code"><span class="com"># Use it like SQLite: download the library, one small loader, SQL.
+# Prebuilt for macOS (Apple silicon) and Linux — from the releases page:</span>
+<span class="com">#   https://github.com/inlaySQL/inlaysql/releases</span>
 
-<span class="com"># Hybrid retrieval, end to end, in one example</span>
+<span class="com"># PHP (FFI is built in; Python and Ruby are the same shape)</span>
+$db = <span class="kw">new</span> InlaySQL(<span class="com">'app.inlay'</span>);
+$db-&gt;run(<span class="com">'INSERT INTO users (name) VALUES (?)'</span>, [<span class="com">'Ada'</span>]);
+$rows = $db-&gt;run(<span class="com">'SELECT id, name FROM users'</span>);
+<span class="com">// → {"columns":["id","name"],"rows":[[1,"Ada"]]}</span>
+
+<span class="com"># From source — the CLI, and hybrid retrieval end to end</span>
+git clone https://github.com/inlaySQL/inlaysql && <span class="kw">cd</span> inlaysql
 cargo run --example hybrid_search
 
 <span class="com"># Or serve a database over the MySQL wire protocol,</span>
 <span class="com"># then point your ORM at 127.0.0.1:3306</span>
 cargo run -p inlaysql-mcp --bin inlaysql -- serve --mysql app.inlay</pre>
     <p class="note" style="margin-top:1.2rem">
-      Reading order for the repository:
+      Per-language loaders (PHP, Python, Ruby, C#, Java) are in
+      <a href="demo/clients/">the client-languages guide</a>. Reading order
+      for the repository:
       <a href="https://github.com/inlaySQL/inlaysql#readme">README</a> for the
       pitch and the architecture,
       <a href="https://github.com/inlaySQL/inlaysql/blob/main/TESTING.md">TESTING.md</a>

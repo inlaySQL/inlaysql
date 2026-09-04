@@ -122,17 +122,17 @@
 <main class="wrap">
 
   <div class="directions">
-    <div class="direction">
-      <span class="tag">direction 1 · embed</span>
-      <h2>The database is a library</h2>
-      <p>
-        The engine compiles into your binary or runtime. No server, no socket:
-        the file is yours, reads and writes happen in-process, and MVCC lets
-        every thread open its own handle on the same file.
-      </p>
-      <p class="langs">Rust · JavaScript / TypeScript (WASM)</p>
-      <pre><span class="kw">let</span> db = Database::open(<span class="com">"app.inlay"</span>)?;</pre>
-    </div>
+      <div class="direction">
+        <span class="tag">direction 1 · embed</span>
+        <h2>The database is a library</h2>
+        <p>
+          The engine compiles into your binary or runtime — or into a C shared
+          library any FFI language loads. No server, no socket: the file is
+          yours, reads and writes happen in-process.
+        </p>
+        <p class="langs">PHP · Python · Ruby · C# · Java (C ABI) · Rust · JavaScript (WASM)</p>
+        <pre>$handle = $ffi-&gt;inlaysql_open(<span class="com">'app.inlay'</span>);</pre>
+      </div>
     <div class="direction">
       <span class="tag">direction 2 · mysql wire</span>
       <h2>The database is a server</h2>
@@ -147,28 +147,149 @@
   </div>
 
   <div class="honest">
-    <strong>One honest correction first:</strong> a SQLite driver cannot open
-    an InlaySQL file. The project borrows SQLite's <em>model</em> — one file,
-    no server — not its on-disk bytes. The format is InlaySQL's own, and it is
-    what makes the native vector and BM25 indexes possible. "SQLite
-    compatibility" means the SQL dialect, not the file. That is exactly why
-    the MySQL direction exists.
+    <strong>Use it like SQLite:</strong> download the library from the
+    <a href="https://github.com/inlaySQL/inlaysql/releases">releases page</a>,
+    copy the ~40-line loader for your language below, open the file, run SQL.
+    One correction first: a SQLite <em>driver</em> cannot open the file — the
+    dialect is SQLite's, the bytes are InlaySQL's own (that is what makes the
+    vector and BM25 indexes possible), so the loader below is your driver.
   </div>
 
   <section id="embed">
-    <h2>Direction 1 — embed it</h2>
+    <h2>Direction 1 — embed it, like SQLite</h2>
     <p>
-      The full engine in your process. In Rust it is a
-      <code>#![forbid(unsafe_code)]</code> crate; in JavaScript it is the
-      ~660 KiB WASM module behind a zero-dependency SDK with an ORM and a
-      <code>search()</code> builder.
+      Download the prebuilt library from the
+      <a href="https://github.com/inlaySQL/inlaysql/releases">release</a>
+      (macOS Apple silicon and Linux x86_64 today — the file layer is
+      Unix-only), copy the loader for your language, and run plain SQL with
+      bound parameters. Every loader below is complete — that really is the
+      whole integration.
     </p>
     <div class="tabs" data-group="embed">
       <div class="tabbar" role="tablist">
-        <button data-tab="rust" class="active">Rust</button>
-        <button data-tab="js">JavaScript / TypeScript</button>
+        <button data-tab="php" class="active">PHP</button>
+        <button data-tab="python">Python</button>
+        <button data-tab="ruby">Ruby</button>
+        <button data-tab="rust">Rust</button>
+        <button data-tab="js">JavaScript (WASM)</button>
       </div>
-      <div class="tabpane active" id="tab-rust">
+      <div class="tabpane active" id="tab-php">
+<pre><span class="com">// PHP 7.4+: FFI is built in. The whole binding — copy into your project.</span>
+$db = <span class="kw">new</span> InlaySQL(<span class="com">'app.inlay'</span>);
+$db-&gt;run(<span class="com">'CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)'</span>);
+$db-&gt;run(<span class="com">'INSERT INTO users (name) VALUES (?)'</span>, [<span class="com">'Ada'</span>]);
+$rows = $db-&gt;run(<span class="com">'SELECT id, name FROM users'</span>);
+
+<span class="com">// The ~40-line class this uses:</span>
+final class InlaySQL {
+    private \FFI $ffi;
+    private $handle;
+
+    public function __construct(string $path) {
+        $this-&gt;ffi = \FFI::cdef(<span class="com">'
+            typedef struct InlaysqlHandle InlaysqlHandle;
+            InlaysqlHandle *inlaysql_open(const char *path);
+            void inlaysql_close(InlaysqlHandle *handle);
+            int inlaysql_exec(InlaysqlHandle *, const char *sql,
+                              const char *params, char **out_json);
+            const char *inlaysql_last_error(void);
+            void inlaysql_free_string(char *s);
+        '</span>, <span class="com">'libinlaysql_ffi.dylib'</span>);   <span class="com">// .so on Linux</span>
+
+        $this-&gt;handle = $this-&gt;ffi-&gt;inlaysql_open($path);
+        if (\FFI::isNull($this-&gt;handle))
+            <span class="kw">throw new</span> RuntimeException($this-&gt;ffi-&gt;inlaysql_last_error());
+    }
+    public function __destruct() { $this-&gt;ffi-&gt;inlaysql_close($this-&gt;handle); }
+
+    public function run(string $sql, array $params = []): array {
+        $out = $this-&gt;ffi-&gt;new(<span class="com">'char *'</span>);
+        $code = $this-&gt;ffi-&gt;inlaysql_exec($this-&gt;handle, $sql,
+            $params === [] ? null : json_encode($params), \FFI::addr($out));
+        <span class="kw">if</span> ($code !== 0)
+            <span class="kw">throw new</span> RuntimeException($this-&gt;ffi-&gt;inlaysql_last_error() . <span class="com">" — $sql"</span>);
+        $result = json_decode(\FFI::string($out), true);
+        $this-&gt;ffi-&gt;inlaysql_free_string($out);
+        <span class="kw">return</span> $result;   <span class="com">// {"columns":[…],"rows":[[…]]}</span>
+    }
+}</pre>
+        <p class="note">From the release archive, <code>poc.php</code> is a runnable version with the error path shown. Laravel/Eloquent over this same file: the <a href="#wire">MySQL wire</a>.</p>
+      </div>
+      <div class="tabpane" id="tab-python">
+<pre><span class="com"># Python: standard library only (ctypes). The whole binding.</span>
+db = InlaySQL(<span class="com">'./libinlaysql_ffi.so'</span>, <span class="com">'app.inlay'</span>)   <span class="com"># .dylib on macOS</span>
+db.run(<span class="com">'CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)'</span>)
+db.run(<span class="com">'INSERT INTO users (name) VALUES (?)'</span>, [<span class="com">'Ada'</span>])
+print(db.run(<span class="com">'SELECT id, name FROM users'</span>)[<span class="com">'rows'</span>])
+
+<span class="kw">import</span> ctypes, json
+
+<span class="kw">class</span> InlaySQL:
+    <span class="kw">def</span> __init__(self, lib_path, db_path):
+        self.lib = ctypes.CDLL(lib_path)
+        lib = self.lib
+        lib.inlaysql_open.argtypes = [ctypes.c_char_p];  lib.inlaysql_open.restype = ctypes.c_void_p
+        lib.inlaysql_exec.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                      ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
+        lib.inlaysql_exec.restype = ctypes.c_int
+        lib.inlaysql_last_error.restype = ctypes.c_char_p
+        lib.inlaysql_free_string.argtypes = [ctypes.c_char_p]
+        lib.inlaysql_close.argtypes = [ctypes.c_void_p]
+        self.handle = lib.inlaysql_open(db_path.encode())
+        <span class="kw">if not</span> self.handle:
+            <span class="kw">raise</span> RuntimeError(lib.inlaysql_last_error().decode())
+
+    <span class="kw">def</span> run(self, sql, params=None):
+        out = ctypes.c_char_p()
+        code = self.lib.inlaysql_exec(self.handle, sql.encode(),
+            json.dumps(params).encode() <span class="kw">if</span> params <span class="kw">is not</span> None <span class="kw">else</span> None,
+            ctypes.byref(out))
+        <span class="kw">if</span> code != 0:
+            <span class="kw">raise</span> RuntimeError(self.lib.inlaysql_last_error().decode())
+        result = json.loads(out.value)
+        self.lib.inlaysql_free_string(out)
+        <span class="kw">return</span> result</pre>
+        <p class="note">Runnable: <code>poc.py</code> in the release archive.</p>
+      </div>
+      <div class="tabpane" id="tab-ruby">
+<pre><span class="com"># Ruby: one gem (gem install ffi). The whole binding.</span>
+db = InlaySQL.new(<span class="com">'app.inlay'</span>)
+db.run(<span class="com">'CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)'</span>)
+db.run(<span class="com">'INSERT INTO users (name) VALUES (?)'</span>, [<span class="com">'Ada'</span>])
+p db.run(<span class="com">'SELECT id, name FROM users'</span>)[<span class="com">'rows'</span>]
+
+<span class="kw">require</span> <span class="com">'ffi'</span>; <span class="kw">require</span> <span class="com">'json'</span>
+
+<span class="kw">class</span> InlaySQL
+  module Native
+    extend FFI::Library
+    ffi_lib File.expand_path(<span class="com">'./libinlaysql_ffi.dylib'</span>, __dir__)
+    attach_function :inlaysql_open, [:string], :pointer
+    attach_function :inlaysql_close, [:pointer], :void
+    attach_function :inlaysql_exec, [:pointer, :string, :string, :pointer], :int
+    attach_function :inlaysql_last_error, [], :string
+    attach_function :inlaysql_free_string, [:pointer], :void
+  end
+
+  <span class="kw">def</span> initialize(db_path)
+    @handle = Native.inlaysql_open(db_path)
+    <span class="kw">raise</span> <span class="com">"open failed: #{Native.inlaysql_last_error}"</span> <span class="kw">if</span> @handle.null?
+  end
+
+  <span class="kw">def</span> run(sql, params = nil)
+    out = FFI::MemoryPointer.new(:pointer)
+    code = Native.inlaysql_exec(@handle, sql, params && JSON.generate(params), out)
+    <span class="kw">raise</span> Native.inlaysql_last_error <span class="kw">unless</span> code.zero?
+    result = JSON.parse(out.read_pointer.read_string)
+    Native.inlaysql_free_string(out.read_pointer)
+    result
+  end
+
+  <span class="kw">def</span> close = Native.inlaysql_close(@handle)
+end</pre>
+        <p class="note">Runnable: <code>poc.rb</code> in the release archive.</p>
+      </div>
+      <div class="tabpane" id="tab-rust">
 <pre><span class="kw">use</span> inlaysql::{Database, Value};
 
 <span class="kw">let mut</span> db = Database::open(<span class="com">"app.inlay"</span>)?;
@@ -205,7 +326,7 @@ db.execute(<span class="com">"INSERT INTO docs (title, body) VALUES (?, ?)"</spa
   </section>
 
   <section id="wire">
-    <h2>Direction 2 — the MySQL wire</h2>
+    <h2>Direction 2 — the MySQL wire, for your ORM</h2>
     <p>
       Start the server once; every sample below assumes it is running. The
       connection is plaintext until you hand it a certificate — for anything
@@ -325,22 +446,29 @@ cmd.Parameters.AddWithValue(<span class="com">"@b"</span>, body);
   </section>
 
   <section id="caveats">
-    <h2>What works over the wire — and what does not</h2>
+    <h2>The fine print, stated</h2>
     <p>
-      The protocol is not the limit; the SQL surface underneath it is, and the
-      rule of this project is that a statement it cannot honour is
-      <strong>refused, never accepted and ignored</strong>.
+      What crosses the C-ABI boundary: every statement returns JSON in one of
+      three shapes (<code>{"kind":"ddl"}</code>,
+      <code>{"kind":"written","rows":n}</code>,
+      <code>{"columns":…,"rows":…}</code>) — the same shapes on every surface
+      (WASM, wire, FFI). Params are a JSON array; a nested array of numbers is
+      a vector. Errors return non-zero and
+      <code>inlaysql_last_error()</code> carries the engine's message — there
+      are no numeric codes to learn. Over the wire, the SQL surface is the
+      limit, and the rule of this project is that a statement it cannot honour
+      is <strong>refused, never accepted and ignored</strong>.
     </p>
     <table>
       <tr><th>Works today</th><th>Plan around</th></tr>
       <tr><td>Joins, subqueries, CTEs (<code>WITH RECURSIVE</code>), set operations</td><td>Foreign keys are recorded but not enforced — SQLite's own default</td></tr>
       <tr><td>Upserts, <code>INSERT … SELECT</code>, <code>RETURNING</code> on INSERT/UPDATE/DELETE</td><td><code>ADD CONSTRAINT … FOREIGN KEY</code> after creation can't be recorded — declare keys inside <code>CREATE TABLE</code></td></tr>
-      <tr><td>Full constraint DDL in <code>CREATE TABLE</code>; standalone <code>ADD {INDEX|UNIQUE|CONSTRAINT}</code>, <code>TRUNCATE</code>, <code>RENAME</code></td><td><code>BLOB</code> writes need a binary-protocol driver (Java, .NET)</td></tr>
-      <tr><td>Any declared type name — <code>TIMESTAMP</code>, <code>JSON</code>, <code>LONGTEXT</code> resolve under SQLite's affinities</td><td></td></tr>
+      <tr><td>Full constraint DDL in <code>CREATE TABLE</code>; standalone <code>ADD {INDEX|UNIQUE|CONSTRAINT}</code>, <code>TRUNCATE</code>, <code>RENAME</code></td><td>One handle, one thread (C ABI); <code>BLOB</code> writes need a binary-protocol driver (Java, .NET)</td></tr>
+      <tr><td>Any declared type name — <code>TIMESTAMP</code>, <code>JSON</code>, <code>LONGTEXT</code> resolve under SQLite's affinities</td><td>No Windows library yet; the WASM module runs anywhere a browser or Node does</td></tr>
     </table>
     <p>
-      Full detail, with the statements cited by test file:
-      <a href="https://github.com/inlaySQL/inlaysql/blob/main/docs/server.md">docs/server.md</a>.
+      Full detail: <a href="https://github.com/inlaySQL/inlaysql/blob/main/docs/server.md">docs/server.md</a>
+      and <a href="https://github.com/inlaySQL/inlaysql/blob/main/docs/clients.md">docs/clients.md</a>.
     </p>
   </section>
 
