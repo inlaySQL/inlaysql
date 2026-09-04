@@ -5884,6 +5884,144 @@ shrinking, prepare and barrier were already overlapping for free and
 nothing changed; if `execute_ns` itself fell, the reorder bought real wall
 time. Untested — this section's mandate was to measure, not to change the
 commit path.
+### A cheaper key comparator for the row-key shape — measured, and not landed (AHL-554, 2026-09-04)
+
+**The premise.** `memcmp` is 20–27% of self time on every read shape
+(`points`, `indexed-range`, `joins-limit`). A stored row's key
+([`crate::storage::row_key`]) is `<lowercase table name>\0<8-byte
+big-endian row id>`, so within one table's subtree every key shares a
+constant prefix and differs only in its last eight bytes — a big-endian
+integer, chosen precisely because big-endian byte order is integer order.
+The question was whether comparing that shape cheaper than a generic
+`Ord for [u8]` moves the needle, and by how much.
+
+**Where `memcmp` actually goes, split by domain.** `bin/profile --suite
+<name> --rows 20000`, `sample` synchronised to the query phase via the
+harness's own `PROFILE_QUERY_PHASE_START` marker (a blind `sleep 3` before
+sampling caught the load phase instead on `joins-limit` the first time —
+84.6% `__fcntl`, not a query at all), then `bench/attribute.py` to attribute
+every `memcmp`/`memmove` sample to its nearest engine caller rather than
+trust the leaf name. Three suites, `85a8c1c` (this item's baseline), load
+7–13 throughout (a second agent building and testing concurrently on the
+same machine, per this item's own instructions):
+
+| Suite | samples | total `memcmp`/`memmove` | row-key domain (in scope) | index-key domain (out of scope) |
+| --- | --- | --- | --- | --- |
+| `points` (PK lookups on `kv`) | 7,631 | 36.8% | **35.0%** (`descend_get` 21.4, `child_index` 12.4, `CursorPath::admits` 1.2) | ~0% (no index touched) |
+| `indexed-range` | 11,108 | 30.8% | **20.5%** (`get_from` 11.5, `descend_get` 3.3, `CursorPath::admits` 2.4, `child_index` 1.8, `walk_raw_row_ids` 1.5) | 22.6% (`scan_leaf_cells` 7.0, `WalkBounds::admits` 4.9, `index::encode_bytes` 4.0, `starts_below` 2.5, `index::encode_value` 2.4, `Collation::compare` 1.8) |
+| `joins-limit` | 11,202 | 23.1% | **21.5%** (`child_index` 5.5, `descend_get` 4.8, `CursorPath::admits` 4.2, `WalkBounds::admits` 2.9, `starts_below` 1.7, `walk_raw_row_values` 1.2, `admits_whole_leaf` 1.2) | 1.4% (`scan_leaf_cells` 0.7, `index::encode_value` 0.7) |
+
+("By nearest engine caller" rows don't have to sum to the subsystem total —
+a sample can be attributed once per matching frame at a different stack
+depth — but the split between the two domains is unambiguous: every
+row-key-domain caller lives in `CowBTree::get_from`/`descend_get` or
+`WalkBounds`/`CursorPath`'s bound checks over row keys, every index-key one
+in the index scan's own key construction and comparison.)
+
+So the **ceiling for this item is `points` at ~35%, `joins-limit` at ~21.5%,
+`indexed-range` at ~20.5%** — `indexed-range`'s remaining `memcmp` is spent
+on variable-length, collated *index* keys, which this item's own scope
+excludes (`crate::index`'s doc comment: memcomparable encoding, not a fixed
+row-id tail — a byte-skipping comparator over that content would need a
+different, much larger argument for correctness than "big-endian equals
+numeric order").
+
+**The comparator, and the guarantee it has to meet.** `key_cmp(a, b)` in
+`btree/page.rs`: if `a.len() == b.len()` and both are at least 8 bytes long,
+compare the leading `len - 8` bytes, and only if those are equal compare the
+trailing 8 as `u64::from_be_bytes` rather than byte by byte; otherwise fall
+straight through to `a.cmp(b)`. This is *unconditionally* identical in
+verdict to `Ord for [u8]` — not just for row keys, for any two byte
+strings — because splitting a lexicographic compare into "prefix, then
+suffix" is exactly what `Ord for [u8]` already does one byte at a time, and
+comparing 8 big-endian bytes as a `u64` is exactly comparing them
+lexicographically, since that is what big-endian byte order *means*. A
+length mismatch (a key that is a strict prefix of another, an index key, a
+metadata key, the empty key) falls straight to the `else` branch unaffected.
+Wired into `child_index`'s `partition_point`, both leaf `binary_search_by`
+call sites (`descend_get`, `reseek`, and the insert/delete leaf searches),
+`WalkBounds::admits`/`starts_below`, and `CursorPath::admits` (the retained
+descent path's bound check, AHL-551) — every comparison the profile above
+named.
+
+Checked against `[u8]::cmp` directly, not just argued: 20,000 random pairs
+up to 40 bytes; the row-key shape itself (shared prefixes of 0/1/5/32 bytes
+against ten boundary row ids — `0`, `1`, `u64::MAX`, the sign-bit neighbours,
+`0x00FF…FF`, `0xFF00…00` — crossed pairwise, plus 5,000 random ones);
+adversarial shapes named in this item's own brief (different lengths, one
+key a strict prefix of another, a shared prefix differing by exactly one
+byte at every position, a `\0` inside what would be a table name, the empty
+key, same-length keys under 8 bytes — metadata keys' shape — at every length
+0–7). A mutation check confirms these actually pin the property rather than
+its absence: swapping the tail to `from_le_bytes`, or moving the split point
+by one byte (`len - 7`), fails three of the five tests immediately (the
+second panics outright — the mis-sized slice conversion — before it even
+gets to disagree with `Ord`), and separately, forcing `child_index`'s
+`partition_point` predicate from `!= Ordering::Greater` to `== Ordering::Less`
+fails dozens of the tree's own existing tests.
+
+**Measured, and it did not clear the bar.** `bench/profile_ab.sh`, `REPS=3
+SECONDS=4`, `85a8c1c` as `HEAD`, load 7–13/18 the entire session (the
+concurrent commit-path/device/bench work this item's brief named):
+
+| Suite | before | after | ratio | verdict |
+| --- | --- | --- | --- | --- |
+| `points`, 20k (6 reps) | 3228.5 / 2953.3 / 3282.1k ops/s | 3084.9 / 2939.5 / 3265.2k | 0.956x | ranges overlap |
+| `indexed-range` | 132.3 / 126.9 / 134.1k | 135.1 / 123.4 / 135.5k | 1.021x | ranges overlap |
+| `indexed` | 461.3 / 390.4 / 492.8k | 463.2 / 399.8 / 467.0k | 1.004x | ranges overlap |
+| `joins-limit`, 20k | 179.5 / 177.0 / 181.3k | 175.6 / 169.3 / 178.9k | 0.978x | ranges overlap |
+| `joins`, 20k | 47 / 36 / 48 | 46 / 37 / 47 | 0.979x | ranges overlap |
+| `aggregate`, 20k | 2192 / 2078 / 2240 | 2033 / 1900 / 2182 | 0.927x | ranges overlap |
+| `batch-insert` | 17504 / 10764 / 24051 | 18321 / 8562 / 24060 | 1.047x | ranges overlap |
+
+Every suite overlaps; none reaches this item's own 3/3 non-overlapping bar,
+and `points` — the shape with the highest ceiling — is the one with the most
+reps (6) and still shows no separation, trending slightly *behind*.
+
+**Where the self-time did move, and why it didn't reach the clock.**
+`points`, same `sample` + `bench/attribute.py` method as the ceiling
+measurement, post-change: `memcmp`/`memmove` subsystem share 36.8% → 32.9%,
+top-leaf `_platform_memcmp` 34.9% → 29.8% — a real, if modest, ~14%
+relative drop, consistent across both views. The wall clock stayed flat
+anyway, and the reason is in `kv`'s own shape: its table name is two bytes,
+so a row key is 11 bytes total and the "prefix" `key_cmp` still has to
+compare via `a[..split].cmp(&b[..split])` is 3 bytes. `split` is a *runtime*
+value (`a.len() - 8`), not a compile-time constant, so LLVM cannot inline
+that comparison into straight-line code the way it would a fixed-size one —
+it still lowers to a call into the platform's `memcmp`/`bcmp`, and that
+call's fixed dispatch overhead is paid whether the buffer is 3 bytes or 11.
+Apple's libSystem implementation already handles anything up to 16 bytes as
+close to a single vectorised load-and-compare as this is going to get
+without inlining, so shrinking 11 bytes to 3 barely moves the *cost of the
+call that was already cheap*, while `key_cmp` now pays that call **plus** a
+branch **plus** a `u64` load-and-compare on the equal-prefix path — which
+for `kv`'s two-byte table name is the common case. Net: fewer bytes
+compared, comparable or slightly more instructions issued. A longer table
+name would shift this arithmetic (the memcmp saved grows with prefix
+length while the added branch/u64 cost stays fixed), but every suite this
+repository benchmarks uses short names (`kv`, `users`, `posts`), so that
+is a real ceiling, not a tuning knob available here.
+
+**What would actually clear it, deliberately not built here.** The
+comparator above shrinks each comparison's byte count; it does not remove
+the comparison, and removing it is where the real cost lives — `child_index`
+re-compares the same table-name prefix against a fresh separator at *every*
+level of a descent, even though every separator inside a subtree once
+proven bounded to one table's key range shares that whole prefix already
+(`docs/PLAN.md`'s option (a): "the caller proves the prefix is equal once
+per descent rather than per level"). That requires `child_index` and the
+leaf search to accept a common-prefix length established by whoever bounds
+the descent to one table (`WalkBounds`'s own `start`/`end`, or the retained
+`CursorPath`), and skip the prefix entirely rather than compare a shorter
+one — a change to the descent's bookkeeping with its own DST obligation,
+not a drop-in comparator. This item is the honest floor under that one: it
+shows the ceiling is real (`points` at 35%) and that a *narrower* comparison
+alone does not reach it, because the dominant cost on this repo's key
+shapes is the call, not the bytes.
+
+**Disposition.** Reverted. `key_cmp` and its call sites are not in the tree;
+this section is the record of the measurement. `crates/inlaysql-core/src/btree/page.rs`
+and `crates/inlaysql-core/src/btree/tree.rs` are unchanged by this item.
 
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
