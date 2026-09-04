@@ -241,6 +241,28 @@ fn rounds() -> u64 {
         .unwrap_or(DEFAULT_ROUNDS)
 }
 
+/// [`rounds`], but never more than `cap` — for a shape whose seed costs
+/// orders of magnitude more than a predicate's.
+///
+/// The campaign's budget is seeds, and seeds are not the same price. Measured
+/// on 2026-09-04, per thousand seeds: the predicate shapes cost about 0.2
+/// seconds, the `LIMIT` joins about 5, and
+/// `count_star_agrees_with_sqlite_through_a_transaction` **69**, because each
+/// of its seeds runs eleven durable transactions against a real file and then
+/// the same eleven in memory. At the 50,000 rounds `trust.yml` asks for, that
+/// one test alone is most of an hour and Trust's `differential vs SQLite` job
+/// hit its thirty-minute ceiling on every run from 2026-09-03 onward — the
+/// campaign stopped finishing, which is worse than a smaller campaign that
+/// does.
+///
+/// So an expensive shape takes a ceiling and the cheap ones keep the whole
+/// budget. The rule for anything added later: time it at a thousand seeds,
+/// and if a seed costs more than about a millisecond, cap it here and say
+/// what it costs.
+fn bounded_rounds(cap: u64) -> u64 {
+    rounds().min(cap)
+}
+
 #[test]
 fn random_predicates_agree_with_sqlite() {
     let total = rounds();
@@ -932,7 +954,9 @@ fn nocase_key_joins_agree_with_sqlite() {
 ///   (or an `OFFSET` that skipped a row the `ON` had rejected) would show.
 fn limited_joins_agree(left: bool) {
     let kind = if left { "LEFT JOIN" } else { "INNER JOIN" };
-    for seed in 0..rounds() {
+    // ~5 ms a seed: three inner paths x five limit/offset pairs x two
+    // orderings, each a full join answered twice. See `bounded_rounds`.
+    for seed in 0..bounded_rounds(10_000) {
         let mut rng = SeededRng::new(seed);
         let (xs, ys) = generate_pairs(&mut rng);
         for path in [InnerPath::Scan, InnerPath::Index, InnerPath::RowId] {
@@ -1275,7 +1299,12 @@ fn sqlite_count_star_steps(
 
 #[test]
 fn count_star_agrees_with_sqlite_through_a_transaction() {
-    for (seed, empty) in (0..rounds()).map(|seed| (seed, false)).chain([(0, true)]) {
+    // ~69 ms a seed: eleven durable transactions on a real file, then eleven
+    // more in memory. See `bounded_rounds`.
+    for (seed, empty) in (0..bounded_rounds(2_000))
+        .map(|seed| (seed, false))
+        .chain([(0, true)])
+    {
         let mut rng = SeededRng::new(seed);
         let groups = if empty {
             Vec::new()

@@ -107,7 +107,13 @@ jobs:
   logic-bugs:
     name: differential vs SQLite
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Forty-five, not thirty: the campaign grew five shapes over 2026-09-03/04
+    # and stopped finishing inside the old ceiling — every run from 09-03
+    # 12:37 onward was cancelled, which buys no coverage at all. The expensive
+    # shapes now carry their own per-seed ceilings (see `bounded_rounds` in
+    # `crates/inlaysql/tests/differential.rs`, which records what a seed of
+    # each costs); this is the headroom around them.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
 
