@@ -56,7 +56,7 @@ class InlaySQL
     name = LIBRARY_NAMES.values.find do |candidate|
       File.file?(File.join(__dir__, candidate)) || File.file?(File.join(Dir.pwd, candidate))
     end || LIBRARY_NAMES[linux? ? :linux : :darwin]
-    candidates = [__dir__, Dir.pwd].map { |dir| File.join(dir, name) }
+    candidates = [__dir__, File.join(__dir__, '..'), Dir.pwd].map { |dir| File.join(dir, name) }
     found = candidates.find { |path| File.file?(path) }
     raise Error, <<~MSG if found.nil?
       could not find #{name} beside #{__dir__} or the working directory —

@@ -152,7 +152,7 @@ final class InlaySQL
                 ? ['inlaysql_ffi.dll']
                 : ['libinlaysql_ffi.so']);
         foreach ($names as $name) {
-            foreach ([__DIR__, getcwd() ?: '.'] as $dir) {
+            foreach ([__DIR__, dirname(__DIR__), getcwd() ?: '.'] as $dir) {
                 $candidate = $dir . DIRECTORY_SEPARATOR . $name;
                 if (is_file($candidate)) {
                     return $candidate;

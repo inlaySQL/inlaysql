@@ -55,7 +55,7 @@ def _locate_library(explicit: str | None) -> str:
         "Darwin": "libinlaysql_ffi.dylib",
         "Windows": "inlaysql_ffi.dll",
     }.get(system := __import__("platform").system(), "libinlaysql_ffi.so")
-    for directory in (Path(__file__).parent, Path.cwd()):
+    for directory in (Path(__file__).parent, Path(__file__).parent.parent, Path.cwd()):
         candidate = directory / names
         if candidate.is_file():
             return str(candidate)
