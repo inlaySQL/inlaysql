@@ -1,8 +1,10 @@
 # InlaySQL continuation plan
 
 This is the durable, repository-tracked handoff for the next Codex task. The
-larger working roadmap is the gitignored root `PLAN.md`; this file contains the
-current execution order without relying on local conversation history.
+larger working roadmap is the gitignored root `PLAN.md`; this file carries the
+current state and execution order without relying on local conversation
+history. Both files are open queues, not archives: landed work is deleted from
+them and lives in `PERF.md`'s dated sections and `git log`.
 
 ## Repository and invariants
 
@@ -17,166 +19,88 @@ current execution order without relying on local conversation history.
   planner-only changes still need the ordinary workspace and differential
   gates.
 
-## Current state (2026-09-02, evening)
+## Current state (2026-09-04)
 
-- 2026-09-04 afternoon: AHL-553 (the commit barrier stops paying to grow
-  the file — the data area is extended 8 MiB ahead, zero-filled;
-  containerised durable write ~1.18x, 11/12 reps; the first containerised
-  commit split says barrier 89.8%, engine 5.8%), AHL-554 (a row-id-shaped
-  key comparator: self-time fell, the clock did not move — reverted, the
-  finding kept) and AHL-555 (C2: at 8 connections 70% of a server thread's
-  time is waiting behind other writers, 8% is the barrier, 1.4% the socket
-  — the single-writer gate is the wall).
-- 2026-09-04: AHL-551 (a point lookup resumes from the ancestor it
-  descended through — half of all probes on the LIMIT-join shape start
-  below the root; `indexed-range` +3–7%, PK `LIMIT 10` 3.46 → 3.33 µs,
-  points flat) and AHL-552 (the point read's tail was the decoded page
-  cache full of superseded pages: a commit now admits its own pages and
-  drops the ones it replaced; evictions 151,635 → 0, p95/p99 3/3
-  non-overlapping better, at SQLite WAL's level). Both unpublished until
-  the regeneration that follows.
-- 2026-09-03 evening: AHL-549 (the probed inner row is decoded once where
-  it is used, the borrowing API serves joins, an index probe's four
-  per-outer-row buffers are reused: PK `LIMIT 10` join 4.4 → 3.7 µs vs
-  SQLite 3.4–3.5, secondary 6.4 → 6.1) and AHL-550 (the residual filter is
-  compiled once per execution: `indexed-range` 1.22–1.36x; the UTF-8
-  re-validation item measured flat and was not landed). Both unpublished
-  until the next gated `repeat.sh`.
-- 2026-09-03, 12:00–16:45: AHL-547 (C1 slice 2 — one WAL append and one
-  sync per cohort, acknowledged after the barrier; DST-clean; **measured
-  0.78–0.90x at 8–32 writers** because commit-side cohorts displace the
-  flush-side ticket gather; flag stays off) and AHL-548 (`COUNT(*)` from
-  leaf cell counts; the published scalar aggregate went 225 → 1,914/s,
-  ~6x MySQL 8.4, ~5x PG 17).
-- **Every `run.sh` suite was regenerated at `7b20175`** (three gated runs,
-  none contaminated; `bench/results/20260902T022325Z-repeat.txt`).
-  `BENCHMARK.md`, `README.md` and the web copy carry the new figures; the
-  sync checker is green. The joins table is withheld: see item 1.
-- **The regeneration caught a real regression.** AHL-512's join cost model
-  priced an outer row at one unit and drove from the larger table; the
-  secondary-index full join went 3.7 ms → 14 ms. Fixed as AHL-524
-  (`OUTER_ROW_COST` in `planner.rs`); both written orders now run
-  users-driving at ~3.3 ms against SQLite's 10 ms and 30 ms (gate-off single
-  run; the gated run is owed). Bisect in `PERF.md`.
-- Landed the same day, each measured interleaved on `bin/profile` and
-  recorded in `PERF.md`: AHL-521 (page-cache index is a hash, 1.11x on the
-  `LIMIT` join), AHL-522 (raw scan reads sixteen pages per syscall, 1.26x on
-  `aggregate` 100k, 1.17x full joins), AHL-523 (`GROUP BY` by hash table,
-  1.12x), AHL-525 (`ORDER BY` + `LIMIT` joins may reorder; bare `LIMIT`
-  still refuses). The point read did not move through any of them.
-- **Evening, three parallel agents on the fresh per-shape profiles:**
-  AHL-527 (point read stops allocating for its bookkeeping — cursor bounds
-  borrowed, lazy statement clock, inline column mask; **points 1.23x, 8/8**),
-  AHL-528a/b/c (streamed aggregate folds from the row bytes through one
-  reused buffer, whole-leaf admission, bare-column fast path; **aggregate
-  1.5x** on top of the morning's 1.44x). A third agent found the range
-  shape's row ids were already fetched in rowid order and that a multi-slot
-  point cursor measures *negative* on the published shapes — B3 is closed.
-- 2026-09-03, 10:00–11:00: AHL-545 (split point linear, cells written
-  straight into the page, `UPDATE` encoder hoisted — landed as algorithmic
-  fixes, no number claimed: the batch-insert statement is 89% fsync),
-  AHL-546 (`MIN`/`MAX` on rowid/indexed column in one descent; the
-  published scalar shape still scans for `COUNT(*)`), and the batch-insert
-  row measured like for like in a container (67,484 rows/s: ~1.2x MySQL
-  8.4, 0.68x PG 17).
-- 2026-09-03, 01:00–02:30: AHL-541 (leaf format change rejected by
-  reading — the slot directory already exists; a shared inlined cell parser
-  landed: +4–9% on every read shape), AHL-542 (**C7 landed**: pages stay
-  decoded for the life of a transaction, encoded once at commit; batch
-  insert 1.29–1.44x; five DST sweeps green), AHL-543 (C1 design brief,
-  `docs/research/commit-group-logical.md`; first slice is rebase-only
-  absorption), AHL-544 (**C1 slice 1 landed behind an off-by-default
-  flag**: the gate holder judges the writers parked behind it. Cohorts
-  form — 5.4–8.9 members, 81–95% of commits absorbed at 8–32 writers, so
-  the brief's premise holds — and it measures flat, which the slice's own
-  plan predicted before the run, because every follower still enters the
-  gate to encode and append. `EngineOptions::commit_absorption` stays off;
-  the decision ordering, the chain seal and the crash sweeps are what
-  Slice 3 needed proving first. `PERF.md` AHL-544).
-- 2026-09-03, small hours: AHL-538 (streamed aggregate by callback off the
-  borrowed leaf, walk stops at the last wanted column; aggregate 1.08–1.12x
-  at every row width), AHL-539 (in-memory rows shared, 0 allocations per
-  in-memory point read; A8 done), AHL-540 (A9 closed by measurement: the
-  miss path's remaining copy is the kernel's; PERF.md only).
-- Night: AHL-535 (borrowing row API `query_prepared_each_ref`, zero
-  allocations per row on the point/range shapes; benches step rows on both
-  sides; **points 1.56x, range 1.40x**), AHL-536 (leaf scan borrows the
-  device's resident page, `Arc` throughout; aggregate 20k 1.14x), AHL-537
-  (B4 brief: the fold is ~1% of the cost, decode/fetch is the floor — B4
-  re-scoped to the decode). A merged tree was pushed before it was built
-  once (`b55e7de`, fixed `619f5ba`): build before push, always.
-- Late evening: AHL-532 (a limited scan's first batch is the limit, not
-  32; `joins-limit` 1.2–1.4x). Three ideas were built, measured and dropped
-  with the numbers recorded in `PERF.md`/root plan §9a: a per-statement
-  join-plan cache (planning is 1.3–1.8% of the query), a dense-rowid leaf
-  walk for range scans (the retained cursor already makes sorted ids one
-  descent), a covering-index scan (owned index keys cost more than the
-  fetch it removes; kept on `ahl-533-covering-index-wip`), and a 64 MiB
-  shared read cache (the cost is the page copy, not the syscall). The
-  range-scan and point-read remainders now point at one item: **A7, a
-  borrowing result API / borrowed-entry index walk.**
-- Earlier in the day: the allocation diet (AHL-517–520 plus four read-path
-  commits) and aggregate streaming (AHL-513/514/515).
-- **Still stale:** every `compare.sh`-sourced table (MySQL/PostgreSQL OLTP
-  and aggregate rows, DuckDB/pgvector/Meilisearch, server-to-server) is
-  from 2026-08-30. The published 3.4–6x aggregate loss predates everything
-  above; the profile's aggregate shape is 1.44x faster since the morning's
-  baseline, so it is very likely smaller, and unproven.
+- **Published figures.** `BENCHMARK.md`'s current edition is the `run.sh`
+  suites at `1f7921a` (2026-09-03, gated median of three) and every
+  `compare.sh`- and driver-sourced table at `bdc64eb` (regenerated under the
+  load gate and repeat wrapper for the first time on the night of
+  2026-09-02/03). No table is carried forward from 2026-08-30 except the
+  eleven-level concurrency sweep with its 32-writer tail row, and the
+  quantisation spot-check at scale; both say so in place.
+- **Where we win:** warm in-process reads ~67x MySQL 8.4 / ~12x PostgreSQL 17;
+  point reads ~3.9x durable SQLite; both full-join shapes ~3x and ~7-8x SQLite
+  and ~4x / ~2.6-2.9x the servers; range scan ~8x / ~5.5x the servers;
+  `GROUP BY` 1.9x / 1.26x and the scalar aggregate ~6x / ~5x the servers (both
+  were the worst multiples in the matrix a week ago); durable single-row writes
+  ~2.5x SQLite and ~13x at eight concurrent writers; batch insert ~1.2x MySQL
+  8.4 like for like; bulk load 227k rows/s; ~9x `sqlite-vec`, ~60-70x
+  DuckDB/pgvector on hybrid retrieval.
+- **Where we lose, and these five are the queue below:** `LIMIT 10` joins vs
+  SQLite (1.1x / 1.3-1.5x slower), range scan vs SQLite (0.83x), point-read
+  ops/s vs SQLite WAL (0.56x, while ahead on p50), batch insert vs PostgreSQL
+  like for like (0.68x), and server-to-server writes at eight connections
+  (0.30x). Also open and published: p99 commit latency at 32 writers, and
+  sequential durable writes against both containerised servers.
+- **Landed and not yet published** — do not quote these as published numbers;
+  the next gated regeneration decides them: AHL-551 (a point lookup resumes
+  from the ancestor it descended through), AHL-552 (the point read's tail was a
+  decoded cache full of superseded pages; evictions over the write phase
+  151,635 -> 0, p95/p99 at SQLite WAL's level in-process) and AHL-553 (the
+  commit barrier stops paying to grow the file; containerised durable write
+  ~1.18x).
+- **Closed by measurement, not open work:** C1's commit-side absorption is
+  built through slice 2, DST-clean, and measures 0.78-0.90x at 8-32 writers
+  because commit-side cohorts displace the flush side's larger ones —
+  `EngineOptions::commit_absorption` stays off. AHL-554's row-id-shaped
+  comparator was reverted (self-time fell, the clock did not move). The full
+  list of measured dead ends is root `PLAN.md` section 9.
+- **The write-side picture, measured:** one barrier per commit, confirmed; the
+  WAL wrap costs one extra barrier per 51.7 single-row commits (33.3 on the
+  hundred-row shape); the first containerised commit split puts the barrier at
+  89.8% and the engine above storage at 5.8%. On the server, at eight
+  connections 69.8% of a connection thread's time is waiting behind other
+  writers and 8.0% is the barrier — the single-writer gate is the wall
+  (AHL-555).
 
 ## Next work, in order
 
-Done items are removed, not struck through; `PERF.md`'s dated sections and
-`git log` hold them. Every item below lands only with an interleaved A/B
-(3 reps, control re-run each rep, 3/3 non-overlapping) and touches no
-published row without a gated regeneration.
+Every item lands only with an interleaved A/B (3 reps, control re-run each rep,
+3/3 non-overlapping) and touches no published row without a gated
+regeneration.
 
-1. **`LIMIT 10` joins vs SQLite (1.27x / 1.59x slower).** Ten PK probes
-   are ten descents; the inner row is decoded through the owned path and
-   its column copied; each outer row's matches are collected into a fresh
-   `Vec`. Angles: the inner side borrows (AHL-535's buffer applied to the
-   join's probed row), the match buffer is reused across outer rows, and a
-   probe that reseeks from the retained cursor's parent on a leaf miss.
-2. **Range scan vs SQLite (0.81x since AHL-550; was 0.67x).** After AHL-550: the residual filter
-   is compiled per execution and is ~7% of the shape (1.22–1.36x on
-   `indexed-range`, `PERF.md` 2026-09-03); reading the filter-only `TEXT`
-   column raw to skip its `from_utf8` was built and measured flat — the
-   removable share is ~2 points, the returned column's validation is the
-   `&str` API's, and a second row walk costs more than it saves (same
-   section; do not re-propose without fusing it into the decoder, and
-   even then it is under §4's floor). What is left is the descent:
-   `memcmp` ~24–27% is B-tree key comparison, `get_from` ~5%. Angle: a
-   borrowed-entry index walk. Do not re-propose a dense walk or a
-   covering scan (both measured negative) without that first.
-3. **Point-read tail: fixed (AHL-552).** The instrument
-   (`--suite points --tail true`) named it — the decoded cache filled with
-   superseded pages while the live leaves were evicted — and the fix took
-   p95/p99 to SQLite WAL's level. What remains on this shape is the
-   published ops/s figure, which the next gated regeneration decides.
-4. **Batch insert vs PostgreSQL like for like (0.68x).** ~1.0 ms of
-   engine work per hundred-row statement in the container vs PG's ~0.6 ms;
-   the page path is tiny now. Profile *in the container*: if the state
-   block's write + `sync` is a second barrier per commit, rewrite it lazily
-   at checkpoint (the record already carries root/next/seq — recovery's
-   chain must prove it); otherwise coalesce record + dirty pages into one
-   `pwritev`.
-5. **Server-to-server writes at 8 connections — diagnosed (AHL-555).**
-   The C2 split is in `SHOW GLOBAL STATUS` now: at 1 connection 84% of a
-   thread's time is the barrier; at 8, 70% is waiting behind other writers
-   and the barrier is 8%. Socket 1–3%, statement work 6–11%, 83% of gate
-   holds already overlap a flush. The gate is a single-writer critical
-   section and that is the wall. Next experiment, named not built: split
-   plan-and-validate from take-the-gate-and-commit in
-   `Connection::run_on_engine` and see which bucket the unaccounted share
-   moves to. (Item 4's "second barrier per commit" hypothesis is refuted by
-   reading: `write_state_values` syncs only on WAL-region wrap, ~1 in 33
-   commits.)
+1. **`LIMIT 10` joins vs SQLite (1.1x / 1.3-1.5x slower).** AHL-549 and
+   AHL-551 are done; what is left is the descent itself — `get_from` is 35.5%
+   of the shape and dominates. Gate: `joins-limit` 3/3, `joins` and `points`
+   flat.
+2. **Range scan vs SQLite (0.83x; the published cell already contains
+   AHL-550's compiled filter, which moved it 97,624 -> 119,219 ops/s).** What
+   is left is the descent: `memcmp` 24-27% is B-tree key comparison,
+   `get_from` ~5%. Angle: a borrowed-entry index walk. Do not re-propose a
+   dense rowid walk, a covering-index scan, or reading the filter-only `TEXT`
+   column raw — all three were built and measured negative or flat.
+3. **Point-read ops/s vs SQLite WAL (0.56x).** The tail that explained it is
+   fixed (AHL-552). This row needs the next gated regeneration, not a fix,
+   before anything else is proposed for it.
+4. **Batch insert vs PostgreSQL like for like (0.68x).** ~1.0 ms of engine work
+   per hundred-row statement in the container against PG's ~0.6 ms, and the
+   host profile is 89% fsync and hides it. **Profile it in the container.** The
+   state block is not a second barrier per commit — AHL-553 measured one wrap
+   per 33.3 hundred-row commits — so the likely item is coalescing the WAL
+   record and the dirty pages into one `pwritev`.
+5. **Server-to-server writes at 8 connections (0.30x) — diagnosed (AHL-555),
+   not fixed.** Next experiment, named not built: split plan-and-validate from
+   take-the-gate-and-commit in `Connection::run_on_engine`, and see whether the
+   unaccounted share moves into `gate_wait`/`follower_wait` (already
+   overlapping, no gain) or `execute_ns` falls (real gain).
 
-Still open, not a published loss: B2's index-probe reorder, A3's WITHOUT
-ROWID cursor, B4's kernel copy (architecture: recycled `Arc` pool or an
-`mmap` device), C1 (closed as a measured loss until commit-side cohorts
-and the flush-side gather compose; slices 1–2 stay in behind the
-default-off flag), the live row count (needs a delta-merge metadata rule),
-F3/F4 server posture, the serverless brief.
+Still open, not a published loss: B2's index-probe reorder, A3's WITHOUT ROWID
+cursor, B4's remaining kernel copy (an architecture decision — a recycled `Arc`
+pool or an `mmap` device — or nothing), C1 (closed as a measured loss until
+commit-side cohorts and the flush-side gather compose; slices 1-2 stay in
+behind the default-off flag), an exact live row count (needs a delta-merge
+metadata rule; `merge_max_counter` is a max-merge), F3/F4 server posture, and
+the R13 serverless brief before any object-store code.
 
 ## Acceptance and handoff
 

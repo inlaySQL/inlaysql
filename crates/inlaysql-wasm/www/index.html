@@ -597,10 +597,13 @@
         API and a <code>LIMIT</code>-sized first batch); both full joins are
         faster, and against MySQL and PostgreSQL the range scan wins outright.
         Measured, published above, and the current top priority. What is left
-        in the <code>LIMIT</code>-shape gap is profiled: ten full tree
-        descents for ten consecutive keys in one leaf, plus the per-row
-        page-decode cost whose obvious fix was tried twice and rejected for
-        regressing point reads.
+        in the <code>LIMIT</code>-shape gap is profiled and has been narrowed
+        again since these figures were taken: a point lookup now retains the
+        path it descended and resumes from an ancestor rather than the root,
+        and the point read&rsquo;s throughput tail — a page cache that filled
+        with superseded pages during the benchmark&rsquo;s write phase — has
+        been found and fixed. Both are landed and await the next gated
+        regeneration, so the numbers above do not yet show them.
       </li>
       <li>
         <strong>Batch inserts lose to PostgreSQL.</strong> <code>GROUP BY</code> was the worst shape we
@@ -612,7 +615,19 @@
         hundred-row statement is one <code>F_FULLFSYNC</code> (4.1 ms) against
         the servers' cheaper virtualised barrier — the barrier, not the
         engine; like for like, in a container on the servers' volume class,
-        it is ~1.2× MySQL 8.4 and ~0.68× PostgreSQL 17.
+        it is ~1.2× MySQL 8.4 and ~0.68× PostgreSQL 17. The first
+        containerised commit profile puts 89.8% of a single-row commit in the
+        barrier and 5.8% in this engine; the barrier no longer pays to grow
+        the file, which is worth ~1.18× on that shape and is also not yet in
+        the figures above.
+      </li>
+      <li>
+        <strong>Write throughput over the wire does not scale the way MySQL&rsquo;s
+        does.</strong> At eight connections we write ~0.30× MySQL 8.4 with
+        commit batching at parity, and a connection thread&rsquo;s own time
+        now says why: 70% of it is spent waiting behind other writers, 8% is
+        the barrier, 1-3% is the socket. The gate is a single-writer critical
+        section, and that is the wall.
       </li>
       <li>
         <strong>Join reordering is new and narrow.</strong> <code>ANALYZE</code>

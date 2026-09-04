@@ -1243,26 +1243,47 @@ below is a surprise to the project, it is the honest state of it:
    limited scan's first batch to the `LIMIT`; AHL-535's borrowing row API took
    the allocations out of the row loop entirely; AHL-549 took the decode copy
    and the bookkeeping allocations off the join probe; AHL-550 compiled the
-   residual filter once per execution. After all four, the profile is ten
-   full tree descents for ten consecutive keys in one leaf at 37% of the
-   `LIMIT` join on their own, and on the range shape `memcmp` at 27% (the
-   descent) with the compiled filter at 7%. The next
-   angle is extending the point read's already-proven retained cursor to the
-   entry-range walk itself (`walk`/`scan_range_from`; the cheapest first step
-   is `colliding_rows` over the already cursor-backed `scan_index_row_ids`).
+   residual filter once per execution. AHL-551 then went after the descents
+   themselves, and corrected the belief above it on the way: the ten probes do
+   *not* share a leaf — instrumented, four of ten start from the retained
+   leaf, two from the root and four from a deeper ancestor — so a point
+   lookup now retains the path it descended and resumes from the lowest
+   ancestor whose separator span admits the key, which took the range scan a
+   further 3-7% and the PK `LIMIT` shape to 3.33 µs. What is left there is the
+   descent's own comparisons: `memcmp` is 35% of the point shape's self time
+   and 20% of the range shape's. The obvious way at it — the row key is a
+   table prefix and an eight-byte big-endian id, so compare the id as an
+   integer — was built and measured: self time fell, the clock did not move,
+   because the shortened prefix compare still calls the platform `memcmp` and
+   Apple's is already near-optimal at these lengths. The item that would work
+   is proving the shared prefix once per descent rather than once per
+   comparison. The point read's *throughput* has its own answer already:
+   AHL-552 found its tail was a page cache full of superseded pages after the
+   benchmark's write phase, and fixed it — landed, and unpublished until the
+   next gated regeneration.
    [`PERF.md`](PERF.md) carries what was built, measured and dropped on the
    way here, each with the number that killed it: page/cell representation
    twice (AHL-493), prefix-skipping key comparison during descent, a
    per-statement join-plan cache, a dense-rowid leaf walk, a covering-index
-   scan and a 64 MiB shared read cache.
+   scan, a 64 MiB shared read cache, a multi-slot point cursor and the
+   row-id-shaped comparator above.
 2. **Write throughput at eight connections, server to server.** Over the wire
    against MySQL 8.4 on the same driver and the same transport, writes are
    ~0.64x at one connection and ~0.30x at eight: MySQL's write throughput
    scales 4.8x from one connection to eight where this engine's reaches 2.3x.
    Commit batching is not the gap — at eight connections our coordinator rides
    4.06 commits per barrier to InnoDB's 3.90 — it is barrier *rate*, roughly
-   375 fsyncs/s against 1,280: thread-per-connection against a worker pool,
-   the same diagnosis the 1/4/16-connection sweeps reached on 2026-08-31. The
+   375 fsyncs/s against 1,280. **Where that rate goes is now measured rather
+   than surmised** (AHL-555 put a connection thread's own time into `SHOW
+   GLOBAL STATUS`): at one connection 84% of a thread's time is the barrier
+   itself; at eight it inverts — 70% is spent waiting behind other writers
+   (36% queued for the gate, 33% parked as a follower) and the barrier falls
+   to 8%, while the socket is 1-3% and the statement 6-11% at both levels.
+   83% of gate holds already overlap an in-flight flush, so the pipeline is
+   not serial; the gate is simply a single-writer critical section and that
+   is the wall. The next experiment is named in `PERF.md` and not built:
+   split plan-and-validate from take-the-gate-and-commit and watch which
+   bucket the unaccounted share moves to. The
    per-connection page cache this item used to be about is gone from it,
    because the diagnosis behind it did not survive two investigations: the
    read drop it cited was a GIL-bound threaded Python client, a process-based
@@ -1270,7 +1291,14 @@ below is a surprise to the project, it is the honest state of it:
    reads the 1-to-8 read step at −4% to −12%, inside the measurement floor —
    not reproduced, not claimed fixed. As a library, containerised, single-row
    durable writes are ~1.5x behind MySQL 8.4 and ~1.2x behind PostgreSQL 17,
-   and batch insert like for like is ~1.2x MySQL and 0.68x PostgreSQL.
+   and batch insert like for like is ~1.2x MySQL and 0.68x PostgreSQL — with
+   one lever already taken and not yet published: the first containerised
+   commit profile anyone has taken puts **89.8% of a single-row commit in the
+   barrier and 5.8% in this engine**, and AHL-553 stopped the barrier paying
+   to grow the file (the data area is now extended eight mebibytes ahead,
+   zero-filled), worth ~1.18x on that shape in eleven of twelve interleaved
+   repetitions. `set_len` alone is flat, incidentally: a hole is not an
+   extent, so the fill is what pays.
    `BENCHMARK.md`'s correction on the library figures is worth reading before
    trusting the size of any of them: the transport asymmetry that flatters the
    library rows (no socket round trip) is worth roughly as much as the entire
