@@ -68,11 +68,14 @@ jobs:
     # Python ctypes, Ruby FFI, .NET P/Invoke) can do nothing without the
     # binary matching its OS and architecture.
     #
-    # Three targets, not five: arm64 Windows exists but no Windows runner
-    # carries an arm64 toolchain worth pinning here yet, and an x86_64 macOS
-    # build is skipped until someone asks for it — Rosetta runs the arm64
-    # library. Adding a target is a matrix row and a `rustup target` line,
-    # nothing else; the packaging step is target-shape-agnostic.
+    # Two targets, because the engine's file layer is Unix-only today:
+    # `FileDevice` is built on `pread`/`pwrite`, advisory `flock` and
+    # `stat`'s `dev`/`ino` (see `crates/inlaysql/src/device.rs`), none of
+    # which Windows maps to without a port that has never been written or
+    # tested — CI has never carried a Windows job for exactly this reason.
+    # Shipping a Windows DLL would be shipping a build nobody has ever run.
+    # When the port lands, adding the target is a matrix row and a
+    # `rustup target` line.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -84,9 +87,6 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             lib: libinlaysql_ffi.so
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            lib: inlaysql_ffi.dll
     steps:
       - uses: actions/checkout@v5
 
@@ -214,11 +214,15 @@ jobs:
             echo "| \`inlaysql-${version}-x86_64-unknown-linux-gnu.tar.gz\` | the CLI + MCP server (Linux) |"
             echo "| \`inlaysql-ffi-${version}-aarch64-apple-darwin.tar.gz\` | C-ABI library (macOS, Apple silicon) |"
             echo "| \`inlaysql-ffi-${version}-x86_64-unknown-linux-gnu.tar.gz\` | C-ABI library (Linux) |"
-            echo "| \`inlaysql-ffi-${version}-x86_64-pc-windows-msvc.tar.gz\` | C-ABI library (Windows) |"
             echo "| \`inlaysql-wasm-${version}.tar.gz\` | WASM module + the JS glue |"
             echo
             echo "Each \`.tar.gz\` ships beside a \`.sha256\`; verify with"
             echo "\`sha256sum -c <file>.sha256\`."
+            echo
+            echo "**No Windows build:** the file layer is Unix-only today"
+            echo "(\`pread\`/\`pwrite\`, advisory locks) — a Windows port has not"
+            echo "been written. The WASM module runs anywhere a browser or"
+            echo "Node does, Windows included."
             echo
             echo "### Using the C-ABI libraries"
             echo
