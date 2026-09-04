@@ -2664,15 +2664,43 @@ mod group_commit_tests {
                 }));
             }
 
-            // Wait for every one of them to actually be counted as waiting
-            // on the gate the checkpoint holds — proving the pile-up really
-            // happened, not just that the threads were spawned.
+            // Wait for writers to be counted as waiting on the gate the
+            // checkpoint holds — proving the pile-up really happened, not
+            // just that the threads were spawned.
+            //
+            // All `WAITERS` at one instant is what this waits for and what a
+            // quiet machine reaches in microseconds. It is *not* what the
+            // race needs, and requiring it made this test fail on a shared
+            // CI runner (2026-09-04, a docs-only commit, on code that had
+            // passed thirty minutes earlier): `cargo test` runs this binary's
+            // tests in parallel, so six writer threads, a parked leader, a
+            // gate-holding checkpoint and this spinning poll compete for four
+            // vCPUs, and six threads need not all reach `begin_normal_commit`
+            // — which is where the count is taken — inside any fixed window.
+            // What the race needs is *a* writer queued behind the held gate
+            // while the checkpoint is a follower; everything asserted below
+            // is about what happens then. So: take all of them when the
+            // machine can give them, accept two when it cannot, and fail only
+            // if no pile-up formed at all. The high-water mark goes into the
+            // message either way, because a run that proceeded on two is a
+            // weaker run and should say so.
+            const MIN_PILE_UP: usize = 2;
             let waiters_deadline = Instant::now() + POLL_TIMEOUT;
+            let mut seen_max = 0;
             loop {
-                if coordinator.normal_waiters.load(Ordering::Acquire) >= WAITERS {
+                seen_max = seen_max.max(coordinator.normal_waiters.load(Ordering::Acquire));
+                if seen_max >= WAITERS {
                     break;
                 }
                 if Instant::now() >= waiters_deadline {
+                    if seen_max >= MIN_PILE_UP {
+                        eprintln!(
+                            "note: only {seen_max} of {WAITERS} writers were queued behind \
+                             the checkpoint's gate at once — the race is still exercised, \
+                             but this run is weaker than one that reached all of them"
+                        );
+                        break;
+                    }
                     fail(
                         "writers never piled into normal_waiters behind the checkpoint's \
                          held reservation gate — the race this test exists to exercise \
