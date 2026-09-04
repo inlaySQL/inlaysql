@@ -151,12 +151,17 @@ published row without a gated regeneration.
    at checkpoint (the record already carries root/next/seq — recovery's
    chain must prove it); otherwise coalesce record + dirty pages into one
    `pwritev`.
-5. **Server-to-server writes at 8 connections (0.30x MySQL 8.4; commits
-   per fsync at parity, barrier rate 375/s vs 1,280/s).** The C2
-   diagnostic first — socket-wait vs gate-wait vs commit-wait per
-   connection thread — then pipelining the next gate holder's prepare with
-   the current cohort's barrier; item 4's second barrier, if real, halves
-   the rate on its own.
+5. **Server-to-server writes at 8 connections — diagnosed (AHL-555).**
+   The C2 split is in `SHOW GLOBAL STATUS` now: at 1 connection 84% of a
+   thread's time is the barrier; at 8, 70% is waiting behind other writers
+   and the barrier is 8%. Socket 1–3%, statement work 6–11%, 83% of gate
+   holds already overlap a flush. The gate is a single-writer critical
+   section and that is the wall. Next experiment, named not built: split
+   plan-and-validate from take-the-gate-and-commit in
+   `Connection::run_on_engine` and see which bucket the unaccounted share
+   moves to. (Item 4's "second barrier per commit" hypothesis is refuted by
+   reading: `write_state_values` syncs only on WAL-region wrap, ~1 in 33
+   commits.)
 
 Still open, not a published loss: B2's index-probe reorder, A3's WITHOUT
 ROWID cursor, B4's kernel copy (architecture: recycled `Arc` pool or an
