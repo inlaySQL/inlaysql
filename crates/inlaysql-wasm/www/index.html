@@ -294,8 +294,10 @@
 <div class="wrap">
   <p class="warn">
     <strong>Still in development, and under heavy testing right now.</strong>
-    The on-disk format is pre-1.0 (recreate, not migrate) and the MySQL server
-    is plaintext and localhost-first — see
+    The on-disk format is pre-1.0 (recreate, not migrate) and the MySQL
+    server's wire parser is young — it now refuses a bind that would expose the
+    database by accident, but its fuzzing campaigns have only just been written
+    and have not yet run. See
     <a href="https://github.com/inlaySQL/inlaysql#what-this-is-not">What this is not</a>
     below before you rely on it for anything real. If the idea here is one you'd
     use, tell us in
@@ -651,8 +653,13 @@
         <code>--tls-required</code> refuses logins that do not use it, and
         <code>--strong-passwords</code> stores salted PBKDF2 so a stolen
         database file is not a stolen password list. All three are off by
-        default, and it binds to 127.0.0.1. Without a certificate, do not put
-        it on a network you do not own.
+        default, and it binds to 127.0.0.1. Without a certificate it will not
+        bind to anything else: a <code>--bind</code> that reaches another
+        machine is refused — not warned about — unless the database has
+        accounts of its own, the bootstrap password is not empty, and TLS is
+        required. <code>--plaintext-network</code> relaxes the two TLS
+        conditions on a segment the server checks is private, and relaxes
+        nothing else.
       </li>
       <li>
         <strong>Recall on uniformly random vectors is poor</strong> — and

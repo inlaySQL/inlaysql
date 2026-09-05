@@ -378,7 +378,12 @@ Entity Framework today, and for one file shared by several processes.
 
 ```sh
 inlaysql serve --mysql app.inlay --password-env INLAYSQL_PASSWORD
-#   --tls-cert server.pem --tls-key key.pem --tls-required   # beyond localhost
+
+# Beyond localhost, these are not advice — a --bind that reaches another
+# machine is refused without them:
+inlaysql user add app.inlay --user app --password-env INLAYSQL_PASSWORD --superuser
+inlaysql serve --mysql app.inlay --bind 10.0.1.14 \
+  --tls-cert server.pem --tls-key key.pem --tls-required
 ```
 
 Then it is your framework's normal database configuration:
@@ -394,8 +399,12 @@ Then it is your framework's normal database configuration:
 
 Full detail — security posture, what works, the honest gaps — is in
 [`server.md`](server.md). The connection is plaintext until you give it a
-certificate; for anything beyond localhost, pass `--tls-cert` and
-`--tls-required`.
+certificate, and the server will not let you skip that quietly: binding
+anywhere that reaches another machine is refused unless the database has
+accounts of its own, the bootstrap password is not empty, and `--tls-cert` plus
+`--tls-required` are given. On a private segment where you accept plaintext,
+`--plaintext-network` says so — and the server checks the address really is
+private before believing you.
 
 ## Which shape, when
 

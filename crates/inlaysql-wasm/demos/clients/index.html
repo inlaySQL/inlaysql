@@ -329,10 +329,17 @@ db.execute(<span class="com">"INSERT INTO docs (title, body) VALUES (?, ?)"</spa
     <h2>Direction 2 — the MySQL wire, for your ORM</h2>
     <p>
       Start the server once; every sample below assumes it is running. The
-      connection is plaintext until you hand it a certificate — for anything
-      beyond localhost, use <code>--tls-cert</code> and <code>--tls-required</code>.
+      connection is plaintext until you hand it a certificate — and beyond
+      localhost that is not a suggestion: a <code>--bind</code> that reaches
+      another machine is <strong>refused</strong> unless the database has
+      accounts of its own, the bootstrap password is not empty, and
+      <code>--tls-cert</code> plus <code>--tls-required</code> are given.
     </p>
-    <pre>inlaysql serve --mysql app.inlay --password-env INLAYSQL_PASSWORD \
+    <pre>inlaysql serve --mysql app.inlay --password-env INLAYSQL_PASSWORD
+
+# Beyond localhost — the server refuses to start without all of this:
+inlaysql user add app.inlay --user app --password-env INLAYSQL_PASSWORD --superuser
+inlaysql serve --mysql app.inlay --bind 10.0.1.14 \
   --tls-cert server.pem --tls-key key.pem --tls-required</pre>
 
     <div class="tabs" data-group="wire">

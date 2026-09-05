@@ -35,9 +35,12 @@ one it is about:
   process*, and it is advisory — an OS-level guarantee is out of scope.
 - **The MySQL wire server** (`inlaysql serve --mysql`): accounts, per-table
   grants and a superuser, enforced on every statement from its *plan*.
-  Binds `127.0.0.1` unless told otherwise. **Plaintext by default** — no
-  `CLIENT_SSL` is advertised, so a client cannot be quietly downgraded — and
-  TLS only when a certificate is configured. See
+  Binds `127.0.0.1` unless told otherwise, and **refuses** a bind that reaches
+  another machine unless the database has accounts of its own, the bootstrap
+  password is not empty, and TLS is required — or `--plaintext-network` asserts
+  a private segment, which the server then checks rather than takes on trust.
+  **Plaintext by default** — no `CLIENT_SSL` is advertised, so a client cannot
+  be quietly downgraded — and TLS only when a certificate is configured. See
   [`docs/server.md`](docs/server.md) for the model and its stated limits.
 - **The WASM module** (browser, edge): runs in the page's origin, no
   capabilities beyond what the page already has. OPFS persistence is

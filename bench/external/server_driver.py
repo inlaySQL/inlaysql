@@ -56,15 +56,19 @@ two engines:
   difference at high concurrency — not a tuning gap either engine can close
   by reconfiguring, and this driver does not try to hide it by picking
   concurrency levels that avoid showing it.
-* Both sides here run with one shared user and one shared password, but
-  that is this benchmark's own setup, not a capability InlaySQL is missing
-  a knob for: InlaySQL has no user table, no grants and no per-table
-  permission model at all, where MySQL's is a real feature this comparison
-  simply never exercises.
-* Neither side negotiates TLS in this comparison, but only one side could:
-  MySQL's container has none configured; InlaySQL's wire protocol does not
-  implement TLS at all yet and never advertises `CLIENT_SSL`
-  (`docs/server.md`).
+* Both sides here run with one shared user and one shared password, and on
+  both sides that is this benchmark's own setup rather than a missing
+  capability: InlaySQL has accounts, `GRANT`/`REVOKE` and per-table
+  privileges in the database file (`docs/server.md`), and this comparison
+  simply never exercises either engine's grant system. The InlaySQL account
+  is created by `inlaysql user add` before `serve`, not by a flag, because a
+  database whose only credential is `--user`/`--password` is refused a
+  network bind.
+* Neither side negotiates TLS in this comparison, though both now could:
+  MySQL's container has none configured, and InlaySQL's server is started
+  with `--plaintext-network` on the compose bridge rather than with
+  `--tls-cert`, because a TLS handshake measured against MySQL's plaintext
+  socket would be measuring the wrong thing (`docs/server.md`).
 * PostgreSQL is absent from this table on purpose, not by oversight.
   InlaySQL speaks the MySQL wire protocol, not PostgreSQL's — there is no
   InlaySQL server to put on the other end of a `psycopg` connection, so the
@@ -159,7 +163,7 @@ TARGETS = [
         engine="InlaySQL (server, its own MySQL wire — inlaysql serve --mysql)",
         host=os.environ.get("INLAYSQL_SERVER_HOST", "inlaysql-server"),
         port=int(os.environ.get("INLAYSQL_SERVER_PORT", "3306")),
-        user=os.environ.get("INLAYSQL_SERVER_USER", "root"),
+        user=os.environ.get("INLAYSQL_SERVER_USER", "bench"),
         password=os.environ.get("INLAYSQL_SERVER_PASSWORD", "bench"),
         database=None,
         create_table="CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)",
@@ -472,8 +476,9 @@ def publish(target: dict, levels: list[dict], workload: common.OltpWorkload) -> 
         "each connection is a spawned process in this driver, with its own prepared "
         "statement and autocommit session, one durable commit per row; concurrency levels "
         "are disjoint contiguous id/key ranges per connection, not a shared queue. See "
-        "bench/README.md's Server-to-server section for the concurrency-model, credential "
-        "and TLS asymmetries that remain even so, and for why PostgreSQL has no row in "
+        "bench/README.md's Server-to-server section for the concurrency-model difference "
+        "that remains even so, for the credential and TLS choices this harness makes on "
+        "both sides, and for why PostgreSQL has no row in "
         "this table. Where present, commit_stats is the delta of each engine's own commit/"
         "fsync counters bracketing that level's write phase — the commits-per-fsync "
         "instrument, SCOREBOARD.md §6: a ratio rising with concurrency says group commit is "

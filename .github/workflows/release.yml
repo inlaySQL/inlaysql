@@ -244,8 +244,12 @@ jobs:
             echo
             echo "The on-disk format is **pre-1.0 — recreate, not migrate**: a"
             echo "database written by this version may not open in a later one."
-            echo "The MySQL server mode is plaintext and localhost-first unless"
-            echo "you configure TLS. Read"
+            echo "The MySQL server mode binds 127.0.0.1 and is plaintext unless"
+            echo "you configure TLS; a bind that reaches another machine is"
+            echo "refused without accounts of the database's own and TLS"
+            echo "required, or \`--plaintext-network\` on a segment it checks is"
+            echo "private. The wire parser is young and its fuzzing campaigns"
+            echo "are new. Read"
             echo "[What this is not](https://github.com/inlaySQL/inlaysql#what-this-is-not)"
             echo "before relying on this for anything real."
             echo

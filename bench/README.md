@@ -1118,21 +1118,28 @@ reader to discover in a suspicious ratio:
   structural property of the two designs, not a tuning gap**, and a widening
   gap between concurrency levels in this table should be read that way,
   not as evidence InlaySQL was misconfigured.
-- **One shared credential, on both sides, but for different reasons.** Both
-  containers here are configured with a single username and password. For
-  MySQL that is this benchmark's own setup — a real multi-user grant system
-  sitting unused. For InlaySQL it is the whole of what exists: there is no
-  user table, no per-table permission, no grants at all
-  (`docs/server.md`). This table cannot measure that gap because neither
-  side is asked to exercise per-user permissions; it is named here so the
-  matched-credentials setup is not mistaken for the two servers having
-  equivalent auth models.
-- **No TLS, on either side, for different reasons again.** MySQL's
-  container has no TLS configured for this comparison. InlaySQL's wire
-  protocol does not implement TLS at all yet and never advertises
-  `CLIENT_SSL`, so a client cannot negotiate it even if asked
-  (`docs/server.md`). Both sides are plaintext here; only one side has the
-  option not to be.
+- **One shared credential, on both sides, and on both sides it is this
+  benchmark's own setup.** Each container is configured with a single username
+  and password — `bench` on both — and a real grant system sits unused behind
+  each. InlaySQL has had accounts, `GRANT`/`REVOKE` and per-table privileges in
+  the database file since AHL-497 (`docs/server.md`), so this is no longer an
+  asymmetry; it is named here only so the matched-credentials setup is not
+  mistaken for either server lacking an auth model. The InlaySQL account is not
+  `root` and is not created by a flag: the compose service runs
+  `inlaysql user add ... --password-env --superuser` against the file before
+  `serve`, because a database whose only credential is `--user`/`--password` is
+  refused a network bind under every flag (AHL-556).
+- **No TLS, on either side, for different reasons again.** MySQL's container
+  has no TLS configured for this comparison. InlaySQL's wire protocol *does*
+  implement TLS now (`--tls-cert`/`--tls-key`/`--tls-required`) and this stack
+  deliberately does not turn it on, because a TLS handshake measured against
+  MySQL's plaintext socket would be measuring the wrong thing. That is why the
+  service passes `--plaintext-network`, and why it binds the compose service
+  name rather than `0.0.0.0`: the flag is an assertion the server checks, so
+  the listener has to genuinely be on the RFC1918 bridge address, and the
+  wildcard would be refused. This is the only place in the repository that
+  starts a server off loopback. Both sides are plaintext here; both now have
+  the option not to be.
 - **A single shared database file, opened by every connection.** Every
   `inlaysql-server` connection in this table opens the same file
   (`/data/bench-oltp-server.inlay`), matching how a real deployment would

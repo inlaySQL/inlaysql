@@ -33,7 +33,7 @@ each is closed with evidence. It is a scoreboard, not a claim.
 | 6 | Fully resident retrieval indexes, per connection | measured; **both halves now have a lever**, and both are trades — see the entry |
 | 7 | Integer comparison through `f64` above 2^53 | **closed** |
 | 8 | No statement timeout; unbounded materialisation | **closed** — with two loops deliberately not interruptible, named in the entry |
-| 9 | No TLS, one user, no grants | **accounts and privileges closed**, TLS open |
+| 9 | No TLS, one user, no grants | **all three closed** — accounts and privileges (AHL-497), TLS (F1), salted password storage (F2), and an exposing bind refused rather than warned about (AHL-556). What is left under the heading — metadata hiding above all — is named in the entry |
 | 10 | Effectively no observability | **closed** — `EXPLAIN`, `SHOW PROCESSLIST`, `SHOW STATUS` and an opt-in slow-query log; no histograms and no audit log, named in the entry |
 | 11 | Exponential parser backtracking through `IF` (upstream `sqlparser`) | **closed** — refused at the pre-parse scan, both fuzz inputs pinned as tests; see the entry |
 
@@ -675,7 +675,7 @@ timeouts really are set (`--wait-timeout`), and a zero timeout is refused at
 bind rather than quietly clamped. That also closes the idle-connection hole,
 where 64 idle clients could hold all 64 slots forever.
 
-### 9. No TLS, one user, no grants — *accounts closed, TLS open*
+### 9. No TLS, one user, no grants — *closed, with a named residue*
 
 **The accounts half is closed (AHL-497).** The MySQL-wire server has a durable
 account store in the database file, seven privileges grantable globally or per
@@ -690,9 +690,11 @@ a test in `crates/inlaysql-server/tests/wire.rs`:
   challenge-response is defined in terms of, and a login is checked by running
   the exchange backwards. `accounts_and_grants_survive_reopening_the_database`
   greps the raw database file for the plaintext and asserts it is not there.
-  The verifiers are unsalted — the plugins' own definitions fix that — so a
-  stolen file is a stolen password list offline; `docs/server.md` argues why
-  the salted alternative would be worse here rather than better.
+  The plugins' own verifiers are unsalted — their definitions fix that — so a
+  stolen file is a stolen password list offline. `--strong-passwords` (F2) is
+  the way out: salted PBKDF2 instead, for accounts created or rotated from
+  there on, at the cost of needing TLS to authenticate at all. `docs/server.md`
+  states both sides of that trade.
 * **Authorisation reads the plan, not the statement text.** A table named only
   inside a subquery, a join, a `UNION` arm or a derived table is checked like
   any other (`inlaysql::Statement::table_access`;
@@ -708,10 +710,24 @@ a test in `crates/inlaysql-server/tests/wire.rs`:
 
 **What is still open under this heading.**
 
-* **TLS.** Unchanged: the wire is plaintext, `CLIENT_SSL` is never advertised,
-  and a client that asks is told rather than downgraded. Accounts make the
-  server usable by more than one party; they do not make the link safe to run
-  across a network. This is still the first thing a security review stops at.
+* **TLS is no longer open, and the bind posture is why it can be said that
+  way.** `--tls-cert`/`--tls-key` serve a certificate and `--tls-required`
+  refuses any login that did not upgrade (F1). Plaintext remains the *default*,
+  because the default is loopback — and since AHL-556 a `--bind` that reaches
+  another machine is **refused**, not warned about, unless the database has
+  accounts of its own, the bootstrap password is not empty and TLS is required.
+  `--plaintext-network` relaxes the two TLS conditions only, only on an address
+  the server checks is private, and warns on every start it relaxes. So the
+  sentence a review used to stop at — accounts make the server usable by more
+  than one party but do not make the link safe across a network — is now
+  enforced rather than written down.
+* **The wire parser's own adversarial pass is new, and unproven.** Four fuzz
+  targets cover the bytes an unauthenticated peer can send, with committed
+  seeds replayed in `cargo test --workspace` and nightly campaigns in
+  `trust.yml`; reading the path first found three defects (a reachable panic in
+  `decode_time`, 16 MiB allocated pre-authentication from a four-byte header,
+  and a TLS handshake shortcut that also broke real MySQL clients over TLS).
+  None of that is the same as time on a fuzzer: the campaigns have not yet run.
 * **Metadata is not hidden.** Any authenticated account can `SHOW TABLES` and
   `DESCRIBE` anything. Real MySQL shows only what you hold a privilege on.
 * **No column-level or row-level privileges, no host-based access control, no

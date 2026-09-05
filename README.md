@@ -383,9 +383,17 @@ under a `*_ci` collation the way MySQL does, but not an accent
 `--tls-cert`/`--tls-key` are given — `--tls-required` then refuses any login
 that did not encrypt, and `--strong-passwords` stores salted PBKDF2 instead of
 the MySQL plugins' unsalted two-hash verifiers, so a stolen database file is
-not a stolen password list. Accounts, `GRANT`/`REVOKE` and per-table
+not a stolen password list. **A `--bind` that reaches another machine is
+refused, not warned about**: an empty bootstrap password, a database with no
+accounts of its own, no certificate, or a certificate that is not required each
+stop the start with a sentence naming the address, the fact and the flag that
+fixes it. `--plaintext-network` relaxes the two TLS conditions on a segment it
+checks is private — RFC1918 and friends, never a wildcard, never a routable
+address — and never the other two. Accounts, `GRANT`/`REVOKE` and per-table
 privileges live in the file itself; the `--user`/`--password` flags are the
-whole credential only until the first `CREATE USER`.
+whole credential only until the first `CREATE USER`, and
+`inlaysql user add app.inlay --user app --password-env VAR --superuser`
+creates that first account without starting a server.
 [`docs/server.md`](docs/server.md) has the full security posture, the
 function-by-function mapping and the complete divergence list, each checked
 against a real MySQL 8.4.11.
@@ -1378,16 +1386,24 @@ below is a surprise to the project, it is the honest state of it:
 5. **Deeper SQL Logic Test coverage, real SQLancer runs and continuous
    fuzzing** beyond what `trust.yml` runs today (see
    [`docs/sqlancer.md`](docs/sqlancer.md)).
-6. **Server posture: refuse to expose, and fuzz the packet path.** `127.0.0.1`
-   is the default bind and should stay the default; what is missing is the
-   loud path — binding to anything else while TLS is off, or while the only
-   credential is the bootstrap `--user`/`--password` pair, should *refuse*
-   rather than warn, because a database that is easy to expose by accident is
-   the failure mode the whole item exists to prevent. The wire parser is
-   attacker-facing by construction and young; the fuzzer has already found one
-   parser DoS in this project (AHL-500), and the server's own packet path
-   deserves the same treatment before the documentation stops saying
-   "localhost only".
+6. **Server posture: refuse to expose, and fuzz the packet path — landed, and
+   the fuzzing half is not yet proven.** `127.0.0.1` is still the default bind,
+   and a bind that reaches another machine is now *refused* rather than warned
+   about (AHL-556): an empty bootstrap password, a database with no accounts of
+   its own, no certificate, or a certificate that is not required each stop the
+   start with a sentence naming the address, the fact and the flag that fixes
+   it. `inlaysql user add` creates the account store without a server, so the
+   "no accounts" refusal has a remedy. `--plaintext-network` relaxes the two TLS
+   conditions on a segment it *checks* is private, and nothing else. On the
+   packet path, four fuzz targets with committed seeds now cover the bytes an
+   unauthenticated peer can send, and reading it first found three defects — a
+   panic from a `TIME` parameter's day count, 16 MiB allocated from four bytes
+   before authentication, and a TLS handshake shortcut that also stopped real
+   MySQL clients logging in over TLS at all. What remains is the part a
+   fuzzer only earns with time: the targets have not yet run a full nightly
+   campaign, so nothing here has been *searched*, only written and replayed.
+   Until those campaigns come back clean, this item stays open and the docs go
+   on saying the wire server is young.
 7. **Read replicas over the existing CDC log**, and the serverless work that
    shares its shape. `cdc.rs` is already pull-based and bounded, so the work
    is shipping records and tracking replica position — the Turso model, no

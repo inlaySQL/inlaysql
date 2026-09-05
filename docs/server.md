@@ -35,7 +35,7 @@ accepts a statement and means something slightly different by it.
 
 ## Security
 
-Four things, none of them optional reading.
+Six things, none of them optional reading.
 
 **It is plaintext until you give it a certificate.** With no `--tls-cert`,
 every statement, result and credential crosses the connection in the clear,
@@ -93,9 +93,28 @@ certificate it is still accepted — the operator has accepted a plaintext
 posture, everything already crosses in the clear, and refusing would protect
 nobody while breaking a client with no better option.
 
-**It binds `127.0.0.1` by default.** Reaching the network takes an explicit
-`--bind`, and doing so prints a warning that names the risk. A database server
-that defaults to every interface is a liability.
+**It binds `127.0.0.1` by default, and a bind that reaches another machine is
+refused rather than warned about (AHL-556).** A database server that defaults
+to every interface is a liability, and a warning is something an operator reads
+once and scrolls past. Four conditions are checked, in this order, and the
+first one that holds refuses the start:
+
+1. the bootstrap password is empty;
+2. the database has no accounts of its own, so `--user`/`--password` are the
+   whole credential;
+3. no certificate is configured;
+4. a certificate is configured but TLS is not required.
+
+The order is the point: an operator told "no certificate" first would go and
+buy one for a database anybody could already log into. Each refusal names the
+address, the fact, and the flag that fixes it — the exact sentences are pinned
+in `crates/inlaysql-server/tests/exposure.rs`. `127.0.0.1` is refused nothing:
+the default posture keeps starting exactly as it did.
+
+Conditions 3 and 4 — and only those two — can be relaxed by
+`--plaintext-network`, which is a claim about the segment and is checked; see
+[Deploying on a private network](#deploying-on-a-private-network). Conditions 1
+and 2 cannot be relaxed by anything.
 
 **There are accounts and privileges now (AHL-497), in the database file.**
 `CREATE USER` / `ALTER USER` / `DROP USER`, `GRANT` / `REVOKE` /
@@ -122,13 +141,19 @@ a connection rather than fall back to a guessable one. That protects the
 and, on `caching_sha2_password`'s full-authentication fallback, the password
 too: a client with nothing to attempt the fast scramble with sends the
 password in the clear instead, over an already-plaintext connection.
-Accepting that is a deliberate, narrow call — v1 is documented
-plaintext-localhost from the top of this file down, so a cleartext password
-crossing this connection reveals nothing to a network observer that every
-other statement on it does not already reveal. The RSA public-key exchange a
-real client would otherwise fall back to on an unencrypted connection is not
-implemented; a client that asks for it is refused with `1235` naming what it
-cannot do, rather than silently mishandled or hung.
+Accepting that is a deliberate, narrow call, and it is scoped by the
+certificate state of *this* server rather than by a claim about where it is
+deployed: a plaintext full authentication is accepted only on a server with no
+certificate at all, which is a server whose every statement and result already
+crosses in the clear, so the password reveals nothing to an observer the rest
+of the connection does not already reveal. On a server that has a certificate
+it is refused, naming TLS. And a server with no certificate cannot be bound off
+loopback in the first place unless `--plaintext-network` says the segment is
+private — so the combination is either loopback or a segment somebody has
+asserted and the server has checked. The RSA public-key exchange a real client
+would otherwise fall back to on an unencrypted connection is not implemented; a
+client that asks for it is refused with `1235` naming what *this* server does
+instead, rather than silently mishandled or hung.
 
 A rejected login gets a proper `1045 / 28000` error rather than a closed
 socket, and the message does not say which half of the credential was wrong.
@@ -139,7 +164,12 @@ socket, and the message does not say which half of the credential was wrong.
 
 | Flag | Default | What it does |
 | --- | --- | --- |
-| `--bind <addr>` | `127.0.0.1` | Address to listen on. Anything else warns. |
+| `--bind <addr>` | `127.0.0.1` | Address to listen on. Anything that reaches another machine is **refused** unless the database has accounts of its own, the bootstrap password is not empty, and TLS is required — see [Deploying on a private network](#deploying-on-a-private-network). |
+| `--tls-cert <path>` | — | PEM certificate chain, leaf first. With `--tls-key`, this makes TLS *available*: the server advertises `CLIENT_SSL` and upgrades when a client asks. Both or neither. |
+| `--tls-key <path>` | — | Its PEM private key. |
+| `--tls-required` | off | Refuse any login that did not upgrade to TLS. Without it a certificate only makes TLS available, and a client that does not ask still sends its credential in the clear. |
+| `--strong-passwords` | off | Store passwords as salted PBKDF2 instead of the plugins' unsalted verifiers. Needs `--tls-cert`. See [Security](#security). |
+| `--plaintext-network` | off | Assert that `--bind`'s address is a private segment where plaintext is acceptable. Relaxes the two TLS conditions and nothing else, refuses itself on a wildcard or a publicly routable address, and warns on every start it relaxes. **Read the section below.** |
 | `--port <n>` | `3306` | `0` asks the OS for a free port and prints it. |
 | `--user <name>` | `root` | The bootstrap account. Ignored once the database has accounts of its own. |
 | `--password <pw>` | empty | Its password. Visible to `ps`. Prefer the next one. |
@@ -155,7 +185,84 @@ socket, and the message does not say which half of the credential was wrong.
 | `--paged-text` | off | Keep full-text (BM25) indexes in the file instead of in each connection's memory. Scores are identical; file growth on writes is not. **Read the section below before using it.** |
 
 An empty password means an empty password: any client that can reach the port
-can read and write the database. The server says so at startup.
+can read and write the database. The server says so at startup on `127.0.0.1`,
+and refuses to start at all on an address that reaches another machine.
+
+---
+
+## Deploying on a private network
+
+The shape a bind off loopback has to have, and the command line that produces
+it. Everything here is checked by the server, not advised by this page.
+
+**Give the database accounts before the first `--bind`.** There is a
+subcommand for it, because the remedy for a refusal must not require the server
+that was just refused:
+
+```sh
+INLAYSQL_PASSWORD='…' inlaysql user add app.inlay \
+  --user app --password-env INLAYSQL_PASSWORD --superuser
+```
+
+It opens the file, creates the account store and closes it — no listener, no
+port. There is deliberately no `--password`: this is the one credential entry
+point built from scratch, so it does not inherit the flag that puts a password
+in the machine's process list. An empty password is refused. The **first**
+account in a database must be `--superuser`: creating the store is the write
+that makes `--user`/`--password` stop being consulted, so a store whose only
+account cannot grant anything is a database nobody can ever administer, and
+there is no flag back out of that. After it exists, `CREATE USER` and `GRANT`
+over the wire are how accounts are managed.
+
+**With a certificate — the shape to prefer:**
+
+```sh
+inlaysql serve --mysql app.inlay \
+  --bind 10.0.1.14 --port 3306 \
+  --tls-cert server.pem --tls-key key.pem --tls-required \
+  --max-connections 64 --wait-timeout 900
+```
+
+Accounts in the file, a certificate, TLS required: none of the four conditions
+apply, and the start is not refused. `--wait-timeout` is worth setting below
+MySQL's 28,800-second default here, because a silent socket holds one of
+`--max-connections` slots until it expires.
+
+**Without a certificate, on a segment you are asserting a fact about:**
+
+```sh
+inlaysql serve --mysql app.inlay \
+  --bind 10.0.1.14 --port 3306 --plaintext-network \
+  --max-connections 64 --wait-timeout 900
+```
+
+`--plaintext-network` relaxes **only** conditions 3 and 4 — the two about TLS.
+It is a claim about the deployment, not about your state of mind, and the
+server checks it:
+
+* every address `--bind` resolves to must be private — RFC1918, link-local,
+  `100.64.0.0/10`, or IPv6 `fc00::/7`. A publicly routable address is refused:
+  there is no deployment where a database on a public address should be
+  plaintext.
+* `0.0.0.0` and `::` are refused. They are every interface, including whichever
+  public one this host has; name the private address or hostname instead. This
+  is the single most common way a database ends up on the internet by accident,
+  and a container hint is not an exception to it.
+* it cannot relax conditions 1 or 2. A database with no accounts of its own, or
+  with an empty bootstrap password, is refused an off-loopback bind under every
+  combination of flags — and those refusals do not even mention the flag,
+  because it is not the answer to them.
+* every start it actually relaxes something on prints a warning to stderr
+  naming what was given up. There is no flag to turn that off.
+
+That check is what separates it from an `--i-know-this-is-insecure` flag, which
+anybody can satisfy and which constrains nothing.
+
+`bench/external/compose.yml` is the repository's own worked example: it creates
+the `bench` account with `inlaysql user add`, binds the compose service name so
+the listener lands on the RFC1918 bridge address, and passes
+`--plaintext-network`. It is the only place in this repository that starts a
+server off loopback.
 
 ---
 
@@ -307,7 +414,11 @@ exactly as it did before this existed: `--user`/`--password` are the one
 credential, that credential is a superuser, and not a byte is written. The
 store is created by the first `CREATE USER` or `GRANT`, and the bootstrap
 account is written into it first — so the credential you are holding when you
-run your first `CREATE USER` keeps working through it.
+run your first `CREATE USER` keeps working through it. `inlaysql user add`
+creates the same store the same way, without a server; that is the entry point
+[Deploying on a private network](#deploying-on-a-private-network) uses, and it
+is why the "no accounts of its own" refusal has a remedy that does not require
+the server it just refused to start.
 
 That laziness is not only politeness. Every row in this engine draws its row id
 from **one counter shared by every table** (see [Divergences](#divergences)),
@@ -2534,6 +2645,42 @@ against an independent implementation, the error map, the session, the text
 utilities, the shim, the DDL translation clause by clause, and the function
 mapping call by call — including that a statement with nothing to translate is
 returned byte for byte.
+
+**The refusals are tested as text, not as `is_err()`**
+(`crates/inlaysql-server/tests/exposure.rs`). A refusal is a piece of user
+interface — read once, under time pressure, by somebody who wants the server up
+— so what it names is the feature, and a test that only checked that *some*
+error happened would let the address, the fact and the flag rot out of it one at
+a time. Nothing there binds a socket: the refusal happens before the listener,
+which is why `192.168.1.10` never has to be an address the test machine has.
+Alongside the four conditions it pins that loopback is refused nothing, that the
+wildcards count as reaching the network, that a required certificate plus real
+accounts gets past every condition, and the property the escape hatch rests on —
+that `--plaintext-network` cannot expose an account-less or empty-password
+database, under any combination of flags.
+
+**The packet path is fuzzed** (`fuzz/fuzz_targets/server_*.rs`). Four targets
+cover the bytes an unauthenticated peer can send: packet framing
+(`server_packet_frame`), the handshake response (`server_handshake`), binary
+parameter decoding (`server_stmt_params`) and command dispatch
+(`server_command`). Each asserts more than "did not panic" — bounded
+allocation, bounded reads and bounded output, per input rather than per process,
+so a target cannot pass by being cheap on average. `trust.yml` runs them
+nightly; `ci.yml` compiles them on every pull request, because a target that
+stopped building is a fuzzing gap nobody notices until the next crash. Their
+hand-written corpora are committed in `fuzz/seeds/`, and four ordinary tests in
+`crates/inlaysql-server/src/fuzz.rs` replay every seed inside
+`cargo test --workspace`, so the seeds are checked on a machine with no nightly
+toolchain and no `cargo-fuzz`.
+
+Three defects were found by reading the path before the fuzzer ran, and each is
+pinned: a `TIME` parameter's `days * 24` could overflow and panic the connection
+thread in a debug build, reachable from the wire; `read_message` resized its
+buffer to a client-declared length before a byte of it arrived, so four bytes
+bought 16 MiB pre-authentication; and the `CLIENT_SSL` shortcut keyed on the
+capability flag rather than on which half of the handshake this was — which
+meant a real MySQL client, which keeps the flag set in the full response it
+sends *inside* TLS, could not log in over TLS at all.
 
 ### Interop, checked by hand
 
