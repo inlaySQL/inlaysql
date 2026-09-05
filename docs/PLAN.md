@@ -99,7 +99,11 @@ regeneration.
    state block is not a second barrier per commit — AHL-553 measured one wrap
    per 33.3 hundred-row commits — so the likely item is coalescing the WAL
    record and the dirty pages into one `pwritev`.
-5. **Server-to-server writes at 8 connections (0.30x) — diagnosed (AHL-555),
+5. **Three clean nightly fuzz campaigns** — the written trigger for
+   deleting the site's localhost bullet. Track F is otherwise complete:
+   F3, F4 and `user list` (AHL-558) all landed 2026-09-05.
+
+6. **Server-to-server writes at 8 connections (0.30x) — diagnosed (AHL-555),
    not fixed.** Next experiment, named not built: split plan-and-validate from
    take-the-gate-and-commit in `Connection::run_on_engine`, and see whether the
    unaccounted share moves into `gate_wait`/`follower_wait` (already
