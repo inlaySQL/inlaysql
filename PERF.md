@@ -6183,6 +6183,120 @@ per file and never derived from where the bytes stop), and
 its last commit opens, reads back every committed row, keeps committing into
 that tail, and reopens correct.
 
+### The seam AHL-555 named already exists, and it is on the far side of the gate (AHL-560, 2026-09-05)
+
+AHL-555 closed by naming the smallest experiment it had not run: split "plan
+and validate" from "take the gate and commit" in `Connection::run_on_engine`,
+on the theory that a connection thread "only start[s] that work once it holds
+the gate," and watch whether `execute_ns`'s ~10.9% unaccounted share moves
+into `gate_wait_ns`/`follower_wait_ns` (already overlapping, no gain) or out
+of `execute_ns` (a real gain). **The premise is false, and it is false by
+construction: every part of a write statement except the commit itself
+already runs before the gate is taken.** This section is the code argument,
+the measurement that prices it, and the arithmetic that says the experiment's
+ceiling would not have mattered even if it had been buildable.
+
+**Where the gate actually opens.** `Device::begin_normal_commit` has exactly
+one production call site: `crates/inlaysql-core/src/btree/tree.rs`, inside
+`CowBTree::commit`, after the early return for an empty transaction and after
+the absorption offer. `CowBTree::commit` is reached only through
+`Storage::commit` (`crates/inlaysql-core/src/storage.rs`) ← `Engine::
+commit_storage` ← `Engine::end_write`, and `end_write` is the *last* statement
+of every write path in `engine.rs` — `insert` is
+`insert_uncommitted(...)?; self.end_write()?;` and the other fourteen call
+sites have the same shape. So for an autocommit single-row write over the
+wire, the order is already: refresh the snapshot, validate the statement
+against the catalog and the bound parameters, arm the clock and the interrupt,
+build every proposed row, apply constraints, resolve the row id, encode the
+row, maintain the indexes, apply it to the tree as dirty pages — *then* take
+the gate. Nothing about plan-or-validate is inside the critical section. The
+reason `Inlaysql_thread_commit_ns` read zero in AHL-555 is not that the two
+phases are fused in the wrong order; it is that `Database::execute_prepared`
+offers no API boundary between them for the server to time. Adding one would
+let the server *measure* the split. It cannot make the split *happen*,
+because it already has.
+
+**And there would be nothing to overlap it with.** The proposed gain was a
+thread parked in `follower_wait_ns` doing its *next* statement's prepare work
+concurrently. The MySQL wire protocol as this server speaks it is strictly
+request/response — `Connection::serve` blocks in `read_message`, dispatches,
+replies, and only then reads again — so while a thread is parked in a commit
+there is no next statement in existence to prepare. AHL-555's own socket-wait
+share is the evidence: it *falls* to 1.2–1.5% at 8 connections, which means
+the client is never ahead of the server, it is always waiting on it.
+
+**Priced directly, in process.** `crates/inlaysql-bench/src/concurrency.rs`
+now prints, beside the barriers line it already printed, the same buckets
+AHL-555's `Inlaysql_thread_*` counters split a connection into — read from
+the `CommitStats` the coordinator already keeps, no new timer anywhere — with
+the residual computed against the sum of every successful commit's own
+latency. That residual is, by the code argument above, exactly the pre-gate
+statement work. It is an *upper* bound on the engine's share of AHL-555's
+unaccounted 10.9%, because this suite calls `Database::execute` and re-parses
+the statement on every iteration where the server runs a prepared one. Three
+repetitions, `--suite concurrency --writers 8 --txns 150`, `Durability::Full`,
+host load 8.3–9.4 of 18 and ten unrelated containers running — disclosed, and
+the reason the throughput column below is indicative while the decomposition
+is the result:
+
+| Writers | gate_wait | gate_hold | follower_wait | gather_spin | fsync | post | **pre-gate residual** |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0.0% | 3.2% | 0.0% | 0.0% | **97.9%** | 0.0% | **-1.1%** `[-0.3 -1.2 -1.1]` |
+| 2 | 1.4% | 3.3% | 46.4% | 0.5% | 49.5% | 0.0% | -0.3% `[-0.2 -1.5 -0.3]` |
+| 4 | 6.2% | 3.4% | 65.3% | 0.4% | 24.7% | 0.0% | -0.2% `[-0.2 -0.2 -0.1]` |
+| 8 | 16.1% | 3.6% | **66.8%** | 0.5% | 11.8% | 0.0% | **1.0%** `[0.9 1.0 2.1]` |
+
+Medians of three, raw values beside the column the finding rests on. **The
+pre-gate residual is -1.2% to +2.1% — zero to within the slop of the
+measurement** (the small negatives are real and expected: the bucket totals
+are device-wide and include the schema-creating handle's two extra gate
+acquisitions, while `busy` counts only the 150-per-writer commits that
+succeeded). A whole `INSERT` — parse, plan, validate, row build, index
+maintenance, tree insert — costs tens of microseconds against a 3.3–3.6 ms
+commit. The shape reproduces AHL-555's server-side inversion at a different
+weighting, which is what a comparison without a socket, a protocol or a
+session should look like: barrier-dominated at one writer (97.9% `fsync`),
+waiting-dominated at eight (`gate_wait` + `follower_wait` = 82.9%, `fsync`
+11.8%), with `gate_hold` a near-constant 2.8–3.9% at every level.
+
+**So the experiment's ceiling.** Even granting AHL-555's full server-side
+residual of 10.9% — which is mostly protocol encode, session bookkeeping,
+prepared-statement lookup and reply framing, none of it near the gate —
+driving it to zero is `1/(1-0.109)` = **1.12x**. The engine's own share of it,
+measured above, is ~1–2%, so the honest bound is **≤1.02x**. The gap the
+experiment was aimed at is 4,992.0 / 1,522.2 = **3.28x**. The experiment could
+not have closed it, could not have closed a tenth of it, and — because the
+work is already outside the gate — would have measured 1.00x had it been
+built.
+
+**What the same run says about the barrier rate, which is the number that
+matters.** Barriers per second, computed from this run rather than from the
+server: 1 writer, 286 commits/s at 1.000 commits/barrier = **286
+barriers/s**; 8 writers, 1,143 commits/s at 4.53 commits/barrier = **252
+barriers/s**. It does not rise with concurrency — it *falls slightly* — and
+all of the 4.0x throughput gain from 1 to 8 writers is batching. That is
+exactly what the design says should happen: only one flush is in flight at a
+time, so the barrier rate is pinned at `1 / barrier latency`, and this run
+measures that latency directly and finds it flat at 3.31 ms (1 writer,
+495.8 ms of `fsync_ns` over 150 flushes) and 3.63 ms (8 writers, 973 ms over
+268) — `F_FULLFSYNC` on this machine, one write cohort at a time.
+`1 / 3.4 ms` = 294/s, and the measured 252–286/s sits just under it.
+
+Put against the server figures, the arithmetic reads: InlaySQL 1,522.2 ops/s
+÷ 4.06 = 375 barriers/s, i.e. 2.67 ms per barrier; MySQL 4,992.0 ÷ 3.90 =
+1,280 barriers/s, i.e. 0.78 ms per barrier. **The 3.4x barrier-rate gap is a
+3.4x barrier-cost gap, and nothing in a connection thread's scheduling can
+touch it.** The two levers this leaves are the two AHL-547 already named — a
+cheaper barrier, or more commits absorbed per barrier — and neither is a
+reorder in `Connection::run_on_engine`. This is the third negative recorded
+in this area (AHL-544's flat, AHL-547's 0.90x, and this one's "already done"),
+and the three agree: the commit path's cost is the barrier and the queueing
+around it, never the statement in front of it.
+
+**Landed:** the bucket line in the concurrency suite, and nothing else. No
+engine, coordinator, commit-path or server change — the experiment this
+section was chartered to build turned out to be already built.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness
