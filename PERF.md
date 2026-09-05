@@ -6296,6 +6296,203 @@ around it, never the statement in front of it.
 **Landed:** the bucket line in the concurrency suite, and nothing else. No
 engine, coordinator, commit-path or server change — the experiment this
 section was chartered to build turned out to be already built.
+### The key comparison stops calling `memcmp` — and proving the prefix per node does not help (AHL-559, 2026-09-05)
+
+AHL-554 measured the ceiling for a cheaper row-key comparator, built one, and
+did not land it: shortening the compared range while still going *through*
+`memcmp` moved `memcmp`'s self time ~14% and the wall clock not at all,
+because on this repository's key shapes the cost is the call, not the bytes.
+It closed by naming what it thought would clear the bar — prove the shared
+prefix once per descent rather than once per comparison. That was this item's
+brief. **The prefix proof was built, is correct, and measures flat to
+negative; what cleared the bar was deleting the call.** Both halves are below,
+because the refuted half is the more useful record.
+
+#### Where the descent's `memcmp` actually goes, per suite
+
+`bin/profile --suite <name> --rows 20000`, `sample` for 25 s synchronised to
+the harness's own `PROFILE_QUERY_PHASE_START` marker, `bench/attribute.py
+--symbol memcmp`, on `b873f4e` (this item's baseline). Percentages are of the
+sampled thread's total:
+
+| Suite | samples | `_platform_memcmp` self | leaf binary search (`descend_get`) | routing (`child_index`) | retained-leaf search (`get_from`/`reseek`) | `CursorPath::admits` | `WalkBounds::admits` | `starts_below` | `admits_whole_leaf` | outside the descent |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `points` | 16,747 | **41.1%** | **31.6** | 9.0 | 0.0 | 0.8 | – | – | – | `check_schema` 1.0, `Catalog::table` 0.3 |
+| `indexed-range` | 17,469 | **26.4%** | 4.5 | 1.7 | **10.2** | 2.5 | 5.6 | 2.5 | – | `walk_raw_row_ids` 1.5, `Collation::compare` 1.6 |
+| `joins-limit` | 17,299 | **18.9%** | 4.8 | **6.0** | 0.3 | 4.1 | 2.6 | 1.8 | 1.1 | `walk_raw_row_values` 1.1 |
+
+This is the split AHL-554 did not have, and it moves the target. That item
+scoped its successor against `child_index` — "`child_index` re-compares the
+same table-name prefix against a fresh separator at *every* level of a
+descent" — but on `points`, routing is 9.0% and the **leaf** search is 31.6%,
+more than three times as much. The arithmetic is obvious once stated: 20,000
+rows is two internal levels over a few hundred leaves, so a descent runs two
+`child_index` searches and one leaf search, and the leaf has more cells to
+bisect than either internal node. On `indexed-range` the single largest share
+is the *retained* leaf's search inside `reseek` (AHL-551's cursor hit path,
+10.2%), which does no descent at all and so has no descent to hang a
+per-descent proof on. A design that only touched the levels above the leaf
+would have been scoped against a third of its ceiling.
+
+#### The prefix proof: built, correct, and not kept
+
+A node's cells are stored in key order, so every cell key `x` satisfies
+`first <= x <= last` for that node's own edge cells. If `first` and `last` both
+begin with a prefix `p`, so does every `x` between them: let `i` be the first
+position where `x` disagrees with `p` (or the end of `x`, if it is shorter);
+everything before `i` matches `p` and therefore matches `first` and `last`
+there too, so `x` ending at `i` or `x[i] < p[i]` makes `x < first`, and
+`x[i] > p[i]` makes `x > last` — both contradicting the ordering. So the
+shorter of the search key's common prefix with the node's first cell and with
+its last is a prefix **every cell of that node shares with it**, established by
+two prefix scans per node instead of one comparison per cell, and the binary
+search can then compare only what follows it.
+
+Two things about that proof are worth keeping even though the code is not:
+
+* **It reads off the node in hand, not off the descent's bounds.** The brief
+  proposed deriving it from the separators bounding the descent (`WalkBounds`,
+  or AHL-551's `CursorPath`). That is equally sound — a subtree fenced by two
+  separators sharing a prefix holds only keys with that prefix, by the same
+  interval argument — but strictly weaker *here*: the root has no fences, and
+  neither has the leftmost or rightmost child at any level, so the levels that
+  would gain nothing are ones every descent walks; and `reseek`'s retained-leaf
+  hit, the largest single share on `indexed-range`, has no descent at all.
+  The answer to "is `CursorPath` the proof you need?" is: it would be a proof,
+  and the node's own edges are a better one.
+* **One node really can hold two tables' keys**, since the catalog, every
+  table's rows and every index entry share one key space — so a comparator
+  that *assumed* a table prefix would be wrong there. Nothing in the proof
+  assumes one; it is over whatever the two edges happen to share, which for
+  such a node is short or empty. Nor is the prefix, on this data, the table
+  name: `kv`'s row keys are `kv\0` plus a big-endian row id, and 20,000 ids
+  leave the top six bytes of that id zero, so a leaf's edge keys typically
+  share nine or ten bytes and the surviving comparison is one or two.
+
+**Measured against itself**, which is the only way to know what it was worth:
+the landed comparator, built twice, once with `proven_prefix` returning its
+real answer and once forced to `0`, interleaved, three repetitions, control
+re-run each repetition, `--seconds 4`:
+
+| Suite | `b873f4e` | comparator, no prefix proof | comparator + prefix proof |
+| --- | --- | --- | --- |
+| `points` | 3.170 / 3.155 / 3.181M ops/s | **3.903 / 3.839 / 3.874M** | 3.852 / 3.871 / 3.855M |
+| `indexed-range` | 125.5 / 126.2 / 127.4k | **144.6 / 148.3 / 147.3k** | 148.4 / 145.0 / 146.3k |
+| `joins-limit` | 181.8 / 178.8 / 182.5k | **200.6 / 202.1 / 202.4k** | 194.0 / 194.3 / 192.2k |
+
+The proof contributes **nothing** on the two suites it was designed for and is
+**3/3 non-overlapping behind on `joins-limit`, by ~4%**. The reason is the same
+one AHL-554 ran into, one level up: the two prefix scans are per *node*, but
+what they save is already only a word compare or two per cell, and
+`joins-limit`'s tables (`posts`, `users`) have longer names to scan. Paying a
+fixed cost per node to shorten an already-cheap comparison is the same trade
+that failed per comparison. It is removed; `page::proven_prefix` and
+`key_cmp_from` are not in the tree, and this section is their record.
+
+#### What landed: the comparison stops being a call
+
+`page::key_cmp` compares eight bytes at a time as big-endian `u64`s and is
+**unconditionally identical in verdict to `<[u8] as Ord>::cmp`** — big-endian
+byte order *is* lexicographic byte order, so a differing pair of words is
+decided by its first differing byte either way, and a length tie-break
+finishes it. Every read is a fixed eight bytes: the last partial word is read
+as the eight bytes *ending* at the common length, overlapping the previous
+word, because a variable-length read lowers to `memcpy` and would put back the
+call this exists to delete. Past `INLINE_CMP_LIMIT` (128 bytes in common) it
+hands the work to `memcmp`, whose vector loop wins once its call overhead is
+amortised. It replaces `.cmp()`/`<`/`>=` in the leaf search, the routing
+search, `WalkBounds::admits`, `WalkBounds::starts_below` and
+`CursorPath::admits`.
+
+**The first two attempts died on the same thing, which is the useful part of
+this section.** Both wired the comparator into
+`entries.binary_search_by(|e| ...)` and `cells.partition_point(|c| ...)`.
+`memcmp` duly fell from 41.1% of `points` to 1.8% — and
+`descend_get::{{closure}}` and `partition_point::{{closure}}` appeared as
+*outlined symbols* worth 23.1% and 13.3%. The comparison had grown past what
+the compiler would inline into the search, so every probe still paid a call;
+only its name had changed, and the clock did not move. `#[inline(always)]` on
+the comparator did not fix it — that inlines the comparator into the closure,
+not the closure into the search. Writing the two searches out by hand
+(`page::search_entries` and `page::route_separators`, which is why they exist
+as functions rather than as closures at their call sites) is what made the
+comparison straight-line code inside the loop, and it is what moved the clock.
+
+#### On the clock
+
+Interleaved A/B against a `b873f4e` binary built in a separate worktree,
+control re-run every repetition, order alternated between repetitions,
+`--seconds 4`, `--rows 20000` where the suite takes it:
+
+| Suite | `b873f4e` | AHL-559 | Verdict |
+| --- | --- | --- | --- |
+| `points` | 2.696 / 2.737 / 2.796M ops/s | **3.474 / 3.419 / 3.458M** | **ahead 3/3, non-overlapping, +25%** |
+| `joins-limit` | 180.8 / 182.3 / 183.3k | **206.1 / 205.1 / 206.3k** | **ahead 3/3, non-overlapping, +13%** |
+| `indexed-range` | 135.1 / 131.9 / 134.7 / 132.2k | **153.1 / 152.8 / 152.8 / 153.1k** | **ahead 4/4, non-overlapping, +14%** |
+| `indexed` | 494.3 / 440.9 / 461.3k | **541.2 / 534.1 / 529.4k** | **ahead 3/3, non-overlapping, +15%** |
+| `joins` | 48 / 48 / 48 / 48 | 48 / 49 / 48 / 49 | flat |
+| `aggregate` | 2271 / 2271 / 2288 / 2263 | 2287 / 2276 / 2302 / 2276 | flat |
+| `batch-insert` | 12014 / 11787 / 12010 / 14612 | 12020 / 13590 / 12213 / 12660 | flat |
+
+(`points`, `joins-limit` and `indexed` were taken at load 3-9; `indexed-range`,
+`joins`, `aggregate` and `batch-insert` were re-run at load 2-5 with four
+repetitions after a first set lost a run each to a load spike. Every row above
+is one uninterrupted interleaved set, not a mix.)
+
+`batch-insert` flat is the right answer rather than a disappointment: the
+write path's leaf search is the same `search_entries`, but a batch insert's
+time is the WAL record and the barrier (AHL-553: 85-90% of a commit), not key
+comparison. `joins` is the full cross-join shape whose time is the join.
+
+**Where the time went.** `points`, same method as the ceiling measurement,
+post-change: the `memcmp`/`memmove` subsystem is **42.7% -> 2.3%** of the
+sample, and what is left of it is `Statement::check_schema` (1.7%) and
+`Catalog::table` (0.6%) — neither a B-tree comparison. `_platform_memcmp`
+falls from the top leaf at 41.1% to 1.9%, and the descent's two searches take
+its place at 27.4% (`search_entries`) and 16.3% (`route_separators`).
+
+#### Correctness
+
+Eight tests in `crates/inlaysql-core/src/btree/page.rs`'s `key_comparison`
+module, every one asserting against `<[u8] as Ord>::cmp` in both argument
+orders rather than against a hand-written expectation, because agreeing with
+`Ord` is the entire claim: 20,000 random pairs over a four-symbol alphabet (so
+equal prefixes and exact ties are common rather than never); 4,000 pairs
+straddling `INLINE_CMP_LIMIT`, including the two lengths either side of it
+exactly; the row-key shape across ten boundary row ids (`0`, `1`, the sign-bit
+neighbours — which a signed comparison would get wrong — `0x00FF..FF`,
+`0xFF00..00`, `u64::MAX`) crossed against seven table names including the empty
+one, one that is a prefix of another and one that is its neighbour, plus a
+`\0`-prefixed metadata key; every one-byte difference at every position at
+every length up to 40; every strict prefix of every such key; the empty key; a
+key against itself; and variable-length collated index-shaped keys. Two more
+drive the searches themselves: `search_entries` and `route_separators` return
+exactly what `binary_search_by` and `partition_point` over `Ord` return, on
+4,000 random nodes (half probed with a key they hold) and on a 64-cell row-key
+node, and an empty node answers rather than reading past its end.
+
+Mutation-checked, because a test that passes on the bug is not a test. Reading
+the word little-endian, moving the overlapping tail word by one byte, dropping
+the length tie-break, skipping the trailing partial word entirely, and
+flipping `route_separators`' `is_le` to `is_lt` each fail four or more of
+those tests immediately. Two mutations that were *not* caught were checked and
+are equivalent rather than missed: stopping the word loop one iteration early
+(`i + 8 < n`) and forcing the short-key byte loop to run in place of the
+overlapping tail word (`if n >= 8` to `if false`) both still compute the
+correct verdict by a different route.
+
+All five DST sweeps pass — `dst_sweep`, `free_list_reuse_dst`, `backup_dst`,
+`durability_dst` on `-p inlaysql-core` and `index_recovery_dst` on
+`-p inlaysql`, each `-- --ignored` — which is this repository's real gate on a
+B-tree change.
+
+#### What this leaves
+
+`points`' remaining descent cost is the search itself, and inside it, per
+probe, a `Key::resolve` match and a bounds-checked slice before any comparison
+happens — the comparison is now one or two word compares and there is nothing
+left to shave off it. The next slice for this shape is a cell layout the
+search can read a key out of without resolving it, not a cheaper comparator.
 
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
