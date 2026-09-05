@@ -451,7 +451,11 @@ mod tests {
         for ty in 0..=u8::MAX {
             if let Ok(params) = decode_params(&body, &[(ty, false)], &[]) {
                 assert!(params.consumed <= body.len());
-                assert!(params.owned_bytes() <= body.len());
+                // Plus the widest text a temporal decoder renders: five bytes
+                // of `DATE` are the ten characters `2026-09-05`, which is the
+                // engine having no temporal type rather than a finding. See
+                // `fuzz/fuzz_targets/server_stmt_params.rs`.
+                assert!(params.owned_bytes() <= params.consumed + 32);
             }
         }
     }
