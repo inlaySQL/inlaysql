@@ -42,16 +42,35 @@ reference given for each row. The concurrent-commits figures trace to
 `BENCHMARK.md`'s own new "Server-to-server, extended" subsection, this same
 edition.
 
-**Regenerated cells, 2026-09-02/03 (`bdc64eb`), the first gated and repeated
-edition of every cross-engine number on this page.** `REPEATS=3
-./bench/repeat-compare.sh` (load-gated, none `CONTAMINATED`, median of
-three — `bench/results/20260902T185304Z-repeat-compare.txt`) refilled §3.1,
-§3.3, §3.5's 1/8-connection row and §3.8's pgvector cell; `REPS=5` runs of
+**Regenerated cells, 2026-09-05 (`b873f4e`) — the second gated and repeated
+edition of the `compare.sh` numbers on this page, and the first clean gated
+`repeat-compare.sh` since 2026-09-03.** `REPEATS=3
+./bench/repeat-compare.sh` (load-gated, `dirty: no`, none `CONTAMINATED`,
+per-run load max 3.23/4.25/3.66 of 18, median of three —
+`bench/results/20260905T062213Z-repeat-compare.txt`, from
+`bench/results/20260905T{062620,063102,063530}Z-compare.txt`) refilled
+§3.1, §3.3, §3.5's 1/8-connection row and §3.8's pgvector cell, replacing
+the `bdc64eb` figures of 2026-09-02/03 (published by `832f89e`) that those
+cells carried. **Three verdicts move on this pass** and each says why in
+place: §3.3's single-row durable write from LOSS to **TIE** against both
+servers (the engine's attributable share of the move is AHL-553's measured
+1.181x; the rest, and the ratio flip against MySQL, is the two servers'
+own cells moving on unchanged code, and §3.3 splits it), §3.8's exact
+vector cell from TIE to **WIN** on a second sitting that agrees in
+direction, and §3.5's 1-connection server-to-server write staying a LOSS
+but narrowing from ~0.64x to ~0.89x on the one cell in this document whose
+two editions' ranges do not overlap. **The InlaySQL side of §3.5's stack
+also changed and it is not an engine change**: `inlaysql serve --mysql`
+now binds the compose service name rather than `0.0.0.0` and the driver
+authenticates as the account `bench` created by `inlaysql user add` rather
+than as `root` (Track F's compose change) — §3.5 names it where its read
+column moved. The **earlier** gated pass, `REPS=5` runs of
 `read_driver.py`/`batch_driver.py`/`sql_shapes` over the unix socket on a
 quiet machine (`uptime` 1.47–2.36/18 before and after;
 `bench/results/20260902T191343Z-scoreboard/`) refilled §3.2, §3.4, §3.6 and
 §3.7, whose 2026-08-31 figures were taken under desktop load with the gate
-overridden. **The MySQL container is 8.4 (LTS) as of these runs; every
+overridden — those four sections are **still at `bdc64eb`** and were not
+re-run on 2026-09-05. **The MySQL container is 8.4 (LTS) as of these runs; every
 MySQL figure dated 2026-08-31 or earlier on this page was 8.0.x**, and no
 edition-to-edition MySQL move is attributed to either engine. The quiet-
 machine floors (§1) apply to the regenerated cells; §4.0's 20.2% desktop
@@ -125,14 +144,14 @@ configuration changed.
 
 | Workload | SQLite | MySQL 8.4 | PostgreSQL 17 |
 | --- | --- | --- | --- |
-| Point read by PK | WIN ~2-4x vs durable config; LOSS ~2x vs WAL/NORMAL | WIN ~67x (structural, §3.1) | WIN ~12x (structural, §3.1) |
+| Point read by PK | WIN ~2-4x vs durable config; LOSS ~2x vs WAL/NORMAL | WIN ~200x (structural, §3.1) | WIN ~35x (structural, §3.1) |
 | Indexed range scan | LOSS ~1.5x (durable) / ~2.5x (WAL) | WIN ~7x (§3.2) | WIN ~4.5x (§3.2) |
-| Single-row insert (durable) | WIN ~2.7x | LOSS ~1.5x (containerised, 3/3 runs; not floor-bound, §3.3) | LOSS ~1.2x (containerised, 3/3 runs; not floor-bound, §3.3) |
+| Single-row insert (durable) | WIN ~2.7x | TIE (containerised; medians read 1.10x our way, but pairing the runs we are ahead in 1 of 3, 0.55–2.08x — was LOSS ~1.5x, §3.3) | TIE (containerised; medians read 0.90x, ahead in 1 of 3, 0.61–2.05x — was LOSS ~1.2x, §3.3) |
 | Batch insert | UNKNOWN — no SQLite-batched comparison published | WIN ~1.2x like for like (containerised InlaySQL 67,484 rows/s vs 56,700; on the host, LOSS ~2.4x on the barrier, §3.4) | LOSS ~1.5x like for like (67,484 vs 99,212; on the host ~4.1x, §3.4) |
-| Concurrent commits, 4/8/16 writers | WIN ~10-17x across 4/8/16 | LOSS @1,4,16 (~1.4-2.4x/~1.1-3.0x/~3.1-5.4x, widening with concurrency, 5 interleaved reps); LOSS @8 ~0.30x (gated median of 3 vs MySQL 8.4, 2026-09-02/03; batching at parity, barrier rate ~3.4x behind) | UNKNOWN — no server exists (§3.4) |
+| Concurrent commits, 4/8/16 writers | WIN ~10-17x across 4/8/16 | LOSS @1,4,16 (~1.4-2.4x/~1.1-3.0x/~3.1-5.4x, widening with concurrency, 5 interleaved reps); LOSS @8 ~0.30x and LOSS @1 ~0.89x (gated median of 3 vs MySQL 8.4, 2026-09-05; batching at parity, barrier rate ~3.3x behind; the @1 loss narrowed from ~0.64x on AHL-553, §3.5) | UNKNOWN — no server exists (§3.4) |
 | Two-table join | MIXED: WIN one shape (~5-9x), LOSS three shapes (~1.1-3.5x) | WIN all four shapes: ~4x on both full joins; several-x on `LIMIT`, on a smaller LIMIT than theirs (§3.6) | WIN all four shapes: ~2.7-2.9x on both full joins; several-x on `LIMIT`, same caveat (§3.6) |
 | Aggregate / `GROUP BY` | UNKNOWN — no harness | WIN ~1.9x group / WIN ~6x scalar (§3.7) | WIN ~1.26x group / WIN ~5x scalar (§3.7) |
-| Vector search, exact | N/A (stock) / WIN ~8-10x vs `sqlite-vec` ext., iso-recall | N/A — no vector capability | TIE — 129 vs 148 µs, gap inside InlaySQL's own 36% three-run spread (§3.8) |
+| Vector search, exact | N/A (stock) / WIN ~8-10x vs `sqlite-vec` ext., iso-recall | N/A — no vector capability | WIN ~1.7x — 93 vs 158 µs, ahead in 6 of 6 runs across two gated sittings; was TIE when one sitting's own spread swallowed the gap (§3.8) |
 | Vector search, int8 | UNKNOWN — no cross-engine harness | N/A — no vector capability | UNKNOWN — no cross-engine harness |
 | p99 commit latency | LOSS ~7-9x at high writer counts | TIE @1 (mixed sign, 4/5 reps); LOSS @4,16 (~1.5-4.5x/~2.4-8.9x, widening, 5 interleaved reps) | UNKNOWN — no server exists (§3.4) |
 
@@ -160,6 +179,18 @@ column is mostly filled in (and mixed, not a sweep), and the
 MySQL/PostgreSQL columns are filled and mixed too — reads, range, joins
 and `GROUP BY` win; every write-side cell and the scalar aggregate lose.
 
+**Updated 2026-09-05** (`b873f4e`, the second gated `repeat-compare.sh`):
+three of those cells moved. The single-row durable write against both
+servers is no longer a LOSS and is not a WIN either — it is a TIE, on a
+sitting whose three runs put us ahead of each server exactly once (§3.3),
+and the part of that move with a commit behind it is AHL-553's measured
+1.181x, not the 1.41x the cell itself shows and not the ratio flip against
+MySQL, both servers having moved substantially on unchanged code. The
+exact-vector cell against pgvector moved TIE → WIN on a second sitting
+agreeing in direction (§3.8). The server-to-server 1-connection write
+narrowed from ~0.64x to ~0.89x and stays a LOSS (§3.5). Nothing moved from
+UNKNOWN, and the five UNKNOWN cells above are unchanged.
+
 ---
 
 ## 3. Per-row detail
@@ -176,15 +207,22 @@ config in each column; InlaySQL's own durability level is irrelevant to a
 read.
 
 **MySQL / PostgreSQL** (`BENCHMARK.md` "Against MySQL and PostgreSQL",
-containerised row, gated median of three, 2026-09-02/03, MySQL 8.4):
-InlaySQL 704,742 ops/s (576,889–861,858 across the runs) vs MySQL 10,498
-(held within 0.2%; **WIN, ~67x**, 55–82x at the runs' extremes) and
-PostgreSQL 58,415 (47,502–68,177; **WIN, ~12x**, 8–18x). The previous
-single-run edition read ~74x/~35x; the MySQL side is unchanged in kind and
-the PostgreSQL narrowing is entirely PostgreSQL's own column moving
-19.4k → 58.4k, which `BENCHMARK.md` records as unattributed (nothing in
-the driver's read path or the container's configuration changed). Far
-outside any floor even at the worst run. **Read this WIN in
+containerised row, gated median of three, 2026-09-05, `b873f4e`, MySQL
+8.4): InlaySQL 2,018,526 ops/s (2,001,217–2,058,765 across the runs — a
+2.9% spread, the tightest ops/s cell in the repeat) vs MySQL 10,103
+(10,080–10,285; **WIN, ~200x**, 195–204x pairing the runs) and PostgreSQL
+57,524 (54,168–69,376; **WIN, ~35x**, 30–37x). The previous gated edition
+read ~67x/~12x, and all of the move is our own cell going 704,742 →
+2,018,526 while both servers held (10,498 → 10,103, 58,415 → 57,524).
+**Split, because only part of it is a commit**: AHL-552 stopped a commit
+leaving the decoded page cache full of superseded pages, and this row's
+tail moved exactly as `PERF.md` measured it interleaved (p95 4 → 1 µs,
+p99 13 → 1 µs, and this driver's ops/s is 5,000 lookups' total wall clock,
+so it pays the tail directly) — but `PERF.md` calls that suite's *ops/s*
+mixed in sign rather than 2.9x, so the size is the sitting and the multiple
+is published as a band, not a figure. The cell's spread collapsing from 40%
+to 2.9% is the corroborating shape, and is what removing a tail looks like.
+Far outside any floor even at the worst run. **Read this WIN in
 context, not as an engine-side result**: it is InlaySQL as an in-process
 library against a socket round trip on both servers — a structural
 advantage, not a mechanism win, and already disclosed as such (§4.2).
@@ -249,15 +287,40 @@ a real architectural difference, measured, not an artifact of the floor.
 Durability: both `F_FULLFSYNC` on the host, full durability, one writer.
 
 **MySQL / PostgreSQL** (`BENCHMARK.md` "Against MySQL and PostgreSQL",
-gated median of three, 2026-09-02/03, MySQL 8.4): InlaySQL containerised
-619.8 ops/s (600.8–622.1) vs MySQL 8.4 910.3 (814.0–974.0; **LOSS,
-~1.5x**, 1.31–1.62x per run, MySQL ahead 3/3) and PostgreSQL 762.8
-(707.3–819.6; **LOSS, ~1.2x**, 1.14–1.32x per run, PostgreSQL ahead 3/3).
-Which server leads the other flipped against the 2026-08-30 interleaved
-rerun (InlaySQL 698.9 vs MySQL 8.0 1,002.3 and PostgreSQL 1,265.7 —
-1.43x/1.81x, PostgreSQL ahead 5/5), on a MySQL version change, and is
-noise; the floor-bound analysis that follows was done on that 2026-08-30
-rerun and stands. **This looks like the textbook FLOOR-BOUND
+gated median of three, 2026-09-05, `b873f4e`, MySQL 8.4): InlaySQL
+containerised 876.0 ops/s (612.6–1,605.5) vs MySQL 8.4 797.2
+(770.2–1,579.7) and PostgreSQL 17 977.4 (781.6–1,430.5). **TIE against
+both**, and the reasoning matters more than the medians. Pairing the runs —
+the only comparison in which the three engines were measured in the same
+sitting — gives 612.6 vs 797.2/977.4, then 1,605.5 vs 770.2/781.6, then
+876.0 vs 1,579.7/1,430.5: **InlaySQL ahead in 1 of 3 against each**,
+0.55–2.08x against MySQL and 0.61–2.05x against PostgreSQL. The medians are
+per column and independent, so the run supplying our median is also the run
+in which both servers posted their best figures; by §1's rule a gap inside
+the spread is a TIE no matter how the raw numbers round, and this one is
+inside a spread of 113% (ours), 101% (MySQL's) and 66% (PostgreSQL's).
+**This was LOSS ~1.5x / ~1.2x last edition** (InlaySQL 619.8 vs 910.3 and
+762.8, ahead 0 of 3 against each).
+
+**How the move splits, since a 1.41x cell and a flipped MySQL ratio invite
+being banked as an engine win.** Only one thing in `bdc64eb..b873f4e` is on
+this path: **AHL-553**, which stops a commit's barrier paying to grow the
+file, measured after it landed at a **paired ratio median of 1.181x, 11 of
+12 interleaved repetitions** on exactly this shape and this container volume
+class (`PERF.md`, 2026-09-04). Apply that 1.181x to the previous edition's
+619.8 and it lands at ~732 ops/s — **below MySQL's new 797.2 and well below
+PostgreSQL's new 977.4**, so the engine's measured share does not on its own
+turn either loss around. What did the rest: both servers moved
+substantially on unchanged code, images, tuning and drivers — **MySQL
+910.3 → 797.2 (−12%) and PostgreSQL 762.8 → 977.4 (+28%)**, in opposite
+directions — and our own cell moved 619.8 → 876.0 (1.41x), of which 1.18x
+is attributable and ~1.20x is the sitting. **1.18x is the claim this
+document makes; the rest is the machine, and the flip of the MySQL ratio is
+mostly the machine's, not ours.** Which server leads the other has now
+changed in three consecutive editions and is noise; the floor-bound analysis
+that follows was done on the 2026-08-30 interleaved rerun and stands.
+
+**This looks like the textbook FLOOR-BOUND
 case from the task brief — one writer, one commit in flight, no group commit
 possible for any of the three engines, all writing to the same class of
 Docker-virtualised volume — and it was checked against exactly that
@@ -271,17 +334,17 @@ closely and this one does not. `BENCHMARK.md`'s own conclusion, quoted rather
 than re-derived: *"the floor does not explain most of this run's variance...
 it is more likely the Python driver/connector overhead, `docker
 exec`/process-spawn jitter, or the compose bridge network."* So this cell is
-marked **LOSS**, not FLOOR-BOUND, on the evidence — with two loud caveats:
-(1) the multiple should be read as "roughly 1.4-1.8x," never to two
-significant figures, given each engine's own 50-81% single-rep spread, and
+marked **TIE**, not FLOOR-BOUND, on the evidence — with two loud caveats:
+(1) no multiple should be read off it at all this edition, given each
+engine's own 66-113% spread across three gated runs, and
 (2) this comparison structurally favours InlaySQL (§4.2: it skips a
 transport tax MySQL and PostgreSQL both pay, of the same order of magnitude
 as the entire gap), so a transport-matched rerun could plausibly narrow,
-hold, or reverse this LOSS — the one single-run transport-matched data point
-that exists (§3.4) found MySQL still ~1.35x ahead even with that advantage
-removed, which does not overturn the LOSS but does not confirm its exact
-size either. The host row (253.2 ops/s, real `F_FULLFSYNC`) is **not
-comparable** to the containerised MySQL/PostgreSQL rows at all — different
+hold, or reverse this cell — the transport-matched row that exists (§3.5)
+reads MySQL ~1.13x ahead at one connection on this same sitting, with that
+advantage removed, which is the closest thing to a settled answer on this
+workload and is a LOSS where the library row is a TIE. The host row
+(257.9 ops/s, real `F_FULLFSYNC`) is **not comparable** to the containerised MySQL/PostgreSQL rows at all — different
 hardware barrier classes entirely — and is excluded from this cell rather
 than mixed in. Durability: InlaySQL containerised — same commit path as the
 host, on a named Docker volume; MySQL `innodb_flush_log_at_trx_commit=1`;
@@ -319,6 +382,7 @@ for InlaySQL's row and is withdrawn.
 | Engine | rows/s (median, range) | commits/s | c/fsync |
 | --- | --- | --- | --- |
 | InlaySQL (host, `F_FULLFSYNC`) | 24,102 (23,219–24,736) | 241 | 1.00 |
+| **InlaySQL (containerised, same volume class as the servers)** | **67,484 (60,453–70,943)** | 675 | 1.00 |
 | MySQL 8.4 (containerised) | 56,700 (45,244–68,901) | 567 | 0.71 |
 | PostgreSQL 17 (containerised) | 99,212 (93,776–100,749) | 992 | 1.00 |
 
@@ -327,10 +391,11 @@ for InlaySQL's row and is withdrawn.
 81,229 under desktop load). The loss widened because the servers' side
 rose on a quiet machine while InlaySQL's cannot: at 241 commits/s the
 statement *is* the host barrier — 4.1 ms, the same `F_FULLFSYNC` the host
-single-row write in §3.3's table pays at 246.8 ops/s — and 24,102 rows/s
+single-row write in §3.3's table pays at 257.9 ops/s — and 24,102 rows/s
 is 98% of that barrier's ceiling. The servers commit against the Docker
 volume's cheaper virtualised barrier, measured InlaySQL-against-itself in
-`BENCHMARK.md`'s OLTP table at 2.5x cheaper tonight. `PERF.md`'s AHL-542
+`BENCHMARK.md`'s OLTP table at 3.4x cheaper at the medians and 2.4–6.2x
+pairing the runs on 2026-09-05. `PERF.md`'s AHL-542
 (2026-09-03) profiled this exact shape, found the per-row page round trip
 at 32% of the statement, removed it, and measured 1.29–1.44x on the
 engine's own batch-insert profile with `sync_commit` rising to 85% of the
@@ -339,9 +404,15 @@ because on the host the barrier hides it. **The published ratio is the
 barrier, not the engine.** The c/fsync column is the noise-resistant
 metric and orders the same way: InlaySQL and PostgreSQL at exactly 1.00,
 MySQL at 0.71 (InnoDB's log layer flushing ~1.4x per commit at this batch
-size). What this cell owes: a containerised InlaySQL batch row on the same
-volume class, not run yet — `BENCHMARK.md` states the expectation and
-declines to publish it as a number.
+size). What this cell owes as of 2026-09-05: a re-run on a build carrying
+AHL-553. The neighbouring single-row containerised row has now had one
+(§3.3) and AHL-553's own interleaved A/B measured 1.181x on it; this row
+came from `sql_shapes`/`batch_driver.py` at `REPS=5`, which the 2026-09-05
+`repeat-compare.sh` sitting did not regenerate, so it is still a
+pre-AHL-553 measurement. The barrier is 84.4% of the hundred-row statement
+against 89.8% of the single-row one (`PERF.md`'s containerised commit
+split), so the single-row figure bounds what to expect here rather than
+standing in for it, and no number is invented.
 
 ### 3.5 Concurrent commits at 4/8/16 writers
 
@@ -504,22 +575,52 @@ this session — §4.3 — though PostgreSQL has no row in this table); InlaySQL
 server has no separate durability knob — every commit syncs before the
 statement returns, the same path the host/containerised rows measure.
 
-**The 1/8-connection table, regenerated gated and repeated (2026-09-02/03,
-`REPEATS=3 ./bench/repeat-compare.sh`, MySQL 8.4, `BENCHMARK.md`
-"Server-to-server"):** 1 connection, InlaySQL 668.9 ops/s (663.2–694.6)
-vs MySQL 1,041.8 (724.5–1,206.8) — **LOSS, ~0.64x** (0.58–0.92x per run,
-MySQL ahead 3/3); 8 connections, InlaySQL 1,522.2 (1,397.6–1,522.6) vs
-MySQL 4,992.0 (2,708.6–6,075.1) — **LOSS, ~0.30x** (0.25–0.52x per run,
-3/3). This replaces the 2026-08-29 single run (556.7 vs 787.7 at 1,
-~0.71x; 1,255.5 vs 3,092.7 at 8, ~0.41x, MySQL 8.0 at stock buffer pool)
-that the previous edition flagged as unreconfirmed. Commits-per-fsync was
-bracketed on both sides this time: at 8 connections InlaySQL 4.06
-(3.98–4.10) vs MySQL 3.90 (3.82–3.92) — batching at parity — so the
-throughput gap decomposes to barrier rate, ~375 vs ~1,280 fsyncs/s, the
-same ~3x §6 measured on 2026-08-31. Write p99 at 8 connections 22.30 ms
-vs 4.02 ms (ranges 21.36–24.04 vs 2.35–5.42, non-overlapping). MySQL's
-own write column is the loudest on the page (46%/67% spread at 1/8), so
-the multiples are bands, not digits.
+**The 1/8-connection table, regenerated gated and repeated (2026-09-05,
+`b873f4e`, `REPEATS=3 ./bench/repeat-compare.sh`, MySQL 8.4,
+`BENCHMARK.md` "Server-to-server"):** 1 connection, InlaySQL 789.5 ops/s
+(759.9–849.6) vs MySQL 890.7 (863.5–1,341.8) — **LOSS, ~0.89x**
+(0.59–0.95x per run, MySQL ahead 3/3); 8 connections, InlaySQL 1,456.5
+(1,423.6–1,560.7) vs MySQL 4,837.8 (3,096.7–4,862.3) — **LOSS, ~0.30x**
+(0.29–0.47x per run, 3/3). Both stay LOSS. **The 1-connection cell is the
+cleanest engine result in this document**: it moved 668.9 → 789.5 with the
+two gated editions' ranges not overlapping (663.2–694.6 then), which is
+**1.18x** — AHL-553's own measured paired ratio of 1.181x on this shape and
+volume class, to three digits, on a row whose write p50 fell with it (1.38
+→ 1.16 ms). Stated as a coincidence of precision rather than a claim to
+three digits: a non-overlapping ~1.2x on a shape where an independent
+interleaved A/B found ~1.2x. **At eight connections the same change does
+not show** (1,522.2 → 1,456.5, ranges overlapping — flat), and the
+mechanism says why: the coordinator already rides ~3.9 commits on each
+barrier there, so a cheaper barrier is amortised rather than paid per
+commit. Commits-per-fsync at 8 connections, bracketed on both sides:
+InlaySQL 3.89 (3.71–3.99) vs MySQL 3.90 (3.87–3.90) — batching at parity —
+so the throughput gap still decomposes to barrier rate, ~374 vs ~1,241
+fsyncs/s, a 3.3x deficit now reproduced in three gated sittings. Write p99
+at 8 connections 21.33 ms vs 5.64 ms (ranges 19.31–25.22 vs 4.28–7.66,
+non-overlapping). Scaling from 1 to 8 connections is 1.8x on our side
+against MySQL's 5.4x. MySQL's own write column remains among the loudest on
+the page (55%/57% spread at 1/8), so the multiples are bands, not digits.
+
+**Reads on this table, and a client change a reader must know about.** At
+one connection InlaySQL 9,386.1 (8,436.0–9,498.4) vs MySQL 8,904.1
+(5,256.2–8,974.9) — ahead 3 of 3 but at ~1.05x on two of them, so **TIE**
+by §1's rule rather than the WIN a median-of-ratios would suggest; at eight,
+8,185.2 vs 7,890.1, mixed sign, **TIE**. Both InlaySQL read cells fell about
+10% against the previous gated edition by more than either cell's own spread
+(10,292.4 → 9,386.1, 9,067.7 → 8,185.2) while MySQL's held — **published as
+a band and left unattributed**. Two things on that path changed at once and
+neither was measured: the engine range (AHL-551/552 are read-path commits
+and both measured flat-to-better, so they do not predict this direction),
+and the stack — Track F's compose change has `inlaysql serve --mysql` bind
+the compose service name rather than `0.0.0.0`, with `--plaintext-network`
+checking it, and has the driver authenticate as the account `bench` created
+by `inlaysql user add --superuser` rather than as `root` through
+`--user`/`--password`, because a database whose only credential is
+`--user`/`--password` is now refused a network bind. An account lookup on
+connect and a privilege check per statement is a **candidate** mechanism for
+a few per cent on a read row and is named as one, not as a cause: nobody has
+run the two logins against each other. MySQL's side of this table is
+untouched by that change.
 
 **PostgreSQL: UNKNOWN**, and distinctly so — this is not a missing
 measurement, it is a missing capability on **InlaySQL's** side, not
@@ -653,15 +754,25 @@ stock or extension, in this comparison. No container for one exists in
 so** — this is the cell where the discipline matters most to apply
 consistently. The previous edition held it UNKNOWN because
 `BENCHMARK.md`'s DuckDB/pgvector/Meilisearch table was a single run
-(135.00 vs 147.00 µs) with no floor of its own. It is now a gated median
-of three (2026-09-02/03): InlaySQL 129.00 µs p50 (88–134 µs across the
-runs, a 36% spread) vs pgvector-HNSW 148.00 µs (146–187 µs; recall 1.000
-vs 0.987, not recall-matched) — InlaySQL ahead in all three runs, by 1.1x
-to 1.7x, but the median gap (13%) is inside InlaySQL's own measured spread,
-so by §1's rule it is a **TIE**, not a WIN. Against pgvector-exhaustive
-(479.00 µs, 478–482, recall 0.999 — recall-matched) the 3.7x margin does
-clear the spread, but that is an exhaustive scan against an index and
-`BENCHMARK.md` does not publish it as a like-for-like row. Both pgvector
+(135.00 vs 147.00 µs) with no floor of its own. It became a gated median
+of three on 2026-09-02/03 (InlaySQL 129.00 µs p50, 88–134 µs, a 36% spread,
+vs pgvector-HNSW 148.00 µs, 146–187 µs — ahead 3 of 3 but a 13% median gap
+inside our own spread, so **TIE** by §1's rule), and a second gated median
+of three on 2026-09-05 (`b873f4e`) reads **InlaySQL 93.00 µs p50 (89–101
+µs, a 13% spread) vs pgvector-HNSW 158.00 µs (156–168 µs; recall 1.000 vs
+0.988, not recall-matched) — ahead 3 of 3 by 1.54x, 1.70x and 1.89x**, a
+median gap of 70% far outside either cell's spread. **WIN, ~1.7x**, and the
+reason the verdict moves is the second sitting, not a commit: nothing in
+`bdc64eb..b873f4e` touches a retrieval path, both cells landed inside the
+ranges the first sitting had already measured, and pooling the two sittings
+gives InlaySQL ahead in **6 of 6 gated runs** at 1.1–1.9x with the pooled
+ranges (88–134 µs against 146–187 µs) not overlapping. That consistency of
+direction across two independent sittings is what clears §1's bar; the
+size of the margin is a band (1.1–1.9x), not the 1.7x median, and the
+edition-to-edition move in either cell is unattributed. Against
+pgvector-exhaustive (506.00 µs, 490–530, recall 0.999 — recall-matched) the
+5.4x margin does clear the spread, but that is an exhaustive scan against
+an index and `BENCHMARK.md` does not publish it as a like-for-like row. Both pgvector
 rows include a socket round trip the library does not pay.
 
 ### 3.9 Vector search, int8
@@ -945,12 +1056,15 @@ this disadvantage; every cell that stays a library call (§3.1, §3.2, §3.6,
    one run) — needed to turn the current provisional LOSS into a number
    trustworthy to a specific multiple, and to actually test the §4.2
    prediction that transport-matching narrows or reverses it. **Partly
-   paid 2026-09-02/03**: the server-to-server 1-connection row (§3.5) is
-   now a gated median of three on the matched transport — InlaySQL 668.9
-   vs MySQL 8.4 1,041.8, ~0.64x, MySQL ahead 3/3 — against ~1.5x in the
-   library row (§3.3) the same night, so the loss did not reverse and
-   narrowed only inside MySQL's own 46% spread. Still not interleaved
-   within a pass, and three runs rather than five.
+   paid, twice**: the server-to-server 1-connection row (§3.5) is now a
+   gated median of three on the matched transport in two sittings —
+   InlaySQL 668.9 vs MySQL 8.4 1,041.8 (~0.64x) on 2026-09-02/03, and
+   789.5 vs 890.7 (~0.89x, MySQL ahead 3/3) on 2026-09-05 after AHL-553.
+   So the loss has not reversed on the matched transport even though the
+   library row (§3.3) is now a TIE, which is the more informative of the
+   two answers and the reason §3.3 declines to read a multiple off its own
+   medians. Still not interleaved within a pass, and three runs rather than
+   five.
 8. **(Largest, explicit non-goal today) A PostgreSQL-wire InlaySQL
    server.** The only way §3.5's PostgreSQL cell moves from UNKNOWN to a
    real verdict. `PLAN.md`'s "Still closed" list keeps this out of scope

@@ -316,7 +316,7 @@
       <em>1,145 commits/s at 8 writers, 0% aborted</em>
     </div>
     <div class="figure">
-      <b>192 µs</b>
+      <b>167 µs</b>
       <span>hybrid search latency</span>
       <em>vector + BM25 fused in the engine</em>
     </div>
@@ -499,21 +499,21 @@
         </tr>
         <tr>
           <td>Hybrid search (BM25 + vector)</td>
-          <td class="num">192.0 µs</td>
+          <td class="num">167.0 µs</td>
           <td>DuckDB, pgvector</td>
-          <td class="win">~60-70× faster</td>
+          <td class="win">~70-90× faster</td>
         </tr>
         <tr>
           <td>Durable write, one row per commit (containerised)</td>
-          <td class="num">619.8 ops/s</td>
-          <td>PostgreSQL 17</td>
-          <td class="loss">~1.2× slower</td>
+          <td class="num">876.0 ops/s</td>
+          <td>PostgreSQL 17 (977.4 ops/s)</td>
+          <td class="num">tie — 0.61–2.05× per run, ahead in one of three <span class="note">(published as a loss last edition; the engine's measured share of the move is 1.18×, the rest is the machine)</span></td>
         </tr>
         <tr>
           <td>Durable write, one row per commit (containerised)</td>
-          <td class="num">619.8 ops/s</td>
-          <td>MySQL 8.4</td>
-          <td class="loss">~1.5× slower</td>
+          <td class="num">876.0 ops/s</td>
+          <td>MySQL 8.4 (797.2 ops/s)</td>
+          <td class="num">tie — 0.55–2.08× per run, ahead in one of three <span class="note">(the medians read our way; the runs do not, so no win is claimed)</span></td>
         </tr>
         <tr>
           <td>Secondary-index inner join, 20k × 160k rows</td>
@@ -553,9 +553,9 @@
         </tr>
         <tr>
           <td>Server writes over MySQL wire, 8 connections</td>
-          <td class="num">1,522.2 ops/s</td>
-          <td>MySQL 8.4 (4,992.0 ops/s)</td>
-          <td class="loss">~2-4× slower</td>
+          <td class="num">1,456.5 ops/s</td>
+          <td>MySQL 8.4 (4,837.8 ops/s)</td>
+          <td class="loss">~2-3× slower</td>
         </tr>
       </tbody>
     </table>
