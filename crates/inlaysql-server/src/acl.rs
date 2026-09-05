@@ -654,6 +654,64 @@ pub fn add_account(
     Ok(crate::AccountAdded::Added)
 }
 
+/// One account, as `inlaysql user list` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSummary {
+    /// The account name.
+    pub name: String,
+    /// Whether it holds every global privilege plus `GRANT OPTION` — the
+    /// combination [`add_account`] gives a superuser.
+    pub superuser: bool,
+    /// Whether its stored verifier is the salted, iterated kind
+    /// (`--strong-passwords`) rather than the scramble MySQL's native
+    /// handshake uses.
+    ///
+    /// The discriminator is the *absence* of a native verifier, not the
+    /// presence of a `sha2` one: a scramble account stores both, so reading
+    /// `sha2_auth` alone reports every account as salted. See
+    /// [`verifiers`] — a strong account deliberately stores nothing a
+    /// scramble handshake could answer, because a native verifier beside a
+    /// salted one is a complete bypass of it.
+    pub strong_password: bool,
+}
+
+/// Every account in this database's own store, in name order.
+///
+/// `Ok(None)` when there is no store: that database still answers to
+/// `--user`/`--password`, and saying "no accounts" would read as "an empty
+/// store", which is a different and more alarming thing.
+///
+/// The verifiers themselves are deliberately not returned. A listing exists to
+/// answer "who can reach this database and which of them can grant", and a
+/// password hash on a terminal is a password hash in a scrollback buffer.
+pub fn accounts(db: &mut Database) -> Result<Option<Vec<AccountSummary>>, MysqlError> {
+    if db.catalog().table(USER_TABLE).is_none() {
+        return Ok(None);
+    }
+    let rows = query(
+        db,
+        &format!("SELECT name, native_auth, sha2_auth, privileges FROM {USER_TABLE} ORDER BY name"),
+        &[],
+    )?;
+    let superuser = Privileges::ALL.with(Privileges::GRANT_OPTION);
+    Ok(Some(
+        rows.rows
+            .iter()
+            .filter_map(|row| {
+                let name = row.first().and_then(as_text)?;
+                let global = Privileges::from_bits(row.get(3).and_then(as_int).unwrap_or(0));
+                let native = row.get(1).and_then(as_text);
+                let sha2 = row.get(2).and_then(as_text);
+                Some(AccountSummary {
+                    name,
+                    superuser: global.contains(superuser),
+                    strong_password: native.is_none() && sha2.is_some(),
+                })
+            })
+            .collect(),
+    ))
+}
+
 /// Read one account, or `None` if there is no such name.
 ///
 /// Read afresh on **every** statement rather than cached on the connection.

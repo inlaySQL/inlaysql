@@ -4,6 +4,7 @@
 //! inlaysql serve --mcp app.inlay [--allow-writes] [--max-rows N] [--max-bytes N]
 //! inlaysql serve --mysql app.inlay [--port N] [--bind ADDR] [--user U]
 //! inlaysql user add app.inlay --user app --password-env INLAYSQL_PASSWORD
+//! inlaysql user list app.inlay
 //! inlaysql changes app.inlay [--from N]
 //! inlaysql backup app.inlay app-2026-08-25.inlay
 //! inlaysql vacuum app.inlay
@@ -23,6 +24,7 @@ USAGE:
     inlaysql serve --mcp <database> [OPTIONS]
     inlaysql serve --mysql <database> [OPTIONS]
     inlaysql user add <database> --user <name> --password-env <VAR> [--superuser]
+    inlaysql user list <database>
     inlaysql changes <database> [--from <version>]
     inlaysql backup <database> <destination>
     inlaysql vacuum <database>
@@ -467,9 +469,71 @@ fn serve_mcp(args: &[String]) -> Result<(), String> {
 fn user(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("add") => user_add(&args[1..]),
+        Some("list") => user_list(&args[1..]),
         Some(other) => Err(format!("unknown user command `{other}`\n\n{USAGE}")),
-        None => Err(format!("user needs a command: add\n\n{USAGE}")),
+        None => Err(format!("user needs a command: add or list\n\n{USAGE}")),
     }
+}
+
+/// `inlaysql user list <database>` — who can reach this database, and which of
+/// them can grant.
+///
+/// The question `Server::bind`'s refusal makes an operator ask: it declines a
+/// network bind on a database with no accounts of its own, and this is how to
+/// find out whether that is the case without starting a server. A database
+/// with no store is reported as such rather than as an empty list, because
+/// those mean different things — the first still answers to
+/// `--user`/`--password`, the second answers to nobody.
+///
+/// No verifier is printed, only whether the stored one is the salted kind: a
+/// listing is for deciding who has access, and a password hash on a terminal
+/// is a password hash in a scrollback buffer.
+fn user_list(args: &[String]) -> Result<(), String> {
+    let mut path = None;
+    for arg in args {
+        match arg.as_str() {
+            other if path.is_none() && !other.starts_with("--") => path = Some(other.to_string()),
+            other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
+        }
+    }
+    let path = path.ok_or_else(|| format!("user list needs a database\n\n{USAGE}"))?;
+
+    match inlaysql_server::accounts(&path).map_err(|error| error.to_string())? {
+        None => {
+            eprintln!(
+                "inlaysql: {path} has no account store, so it still answers to --user and \
+                 --password. `inlaysql user add {path} --user <name> --password-env <VAR> \
+                 --superuser` creates one."
+            );
+        }
+        Some(accounts) if accounts.is_empty() => {
+            eprintln!(
+                "inlaysql: {path} has an account store with no accounts in it, so nothing \
+                 can log in. --user and --password are NOT consulted once a store exists."
+            );
+        }
+        Some(accounts) => {
+            for account in &accounts {
+                let role = if account.superuser {
+                    "superuser"
+                } else {
+                    "user"
+                };
+                let password = if account.strong_password {
+                    "salted"
+                } else {
+                    "native"
+                };
+                println!("{}\t{role}\t{password}", account.name);
+            }
+            eprintln!(
+                "inlaysql: {} account(s) in {path}; --user and --password are not consulted \
+                 on a database that has its own.",
+                accounts.len()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn user_add(args: &[String]) -> Result<(), String> {

@@ -1267,6 +1267,25 @@ pub fn add_account(
         .map_err(|error| io::Error::other(error.message))
 }
 
+pub use acl::AccountSummary;
+
+/// Every account in a database's own store, or `None` when it has none.
+///
+/// This is `inlaysql user list`, and it is here for the reason
+/// [`add_account`] is: `Server::bind` refuses a network bind on a database
+/// with no accounts of its own, so "does this file have accounts, and which of
+/// them can grant?" is a question an operator has to be able to answer without
+/// starting a server. `None` distinguishes a database that has no store —
+/// still answering to `--user`/`--password` — from one whose store is empty.
+///
+/// No verifier is returned, only whether the stored one is the salted kind.
+pub fn accounts(path: impl AsRef<Path>) -> io::Result<Option<Vec<AccountSummary>>> {
+    let path = path.as_ref();
+    let mut db = Database::open(path)
+        .map_err(|error| io::Error::other(format!("cannot open {}: {error}", path.display())))?;
+    acl::accounts(&mut db).map_err(|error| io::Error::other(error.message))
+}
+
 /// Write the warning the CLI prints, so the text lives beside the behaviour it
 /// describes rather than in an argument parser.
 pub fn print_exposure_warning(options: &ServerOptions, out: &mut impl Write) -> io::Result<()> {

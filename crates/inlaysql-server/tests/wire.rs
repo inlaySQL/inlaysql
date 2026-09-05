@@ -7521,6 +7521,48 @@ fn user_add_creates_an_account_store_the_flags_no_longer_override() {
     assert_eq!(refused.code, 1045, "{refused:?}");
 }
 
+/// `user list` answers the question `Server::bind`'s refusal makes an operator
+/// ask, and distinguishes the two ways a database can have no accounts.
+///
+/// A file with no store still answers to `--user`/`--password`; a store with
+/// nothing in it answers to nobody. Reporting both as "no accounts" would
+/// send an operator to the wrong remedy.
+///
+/// The privilege and password columns are pinned because both are inferred
+/// rather than stored: a superuser is the account holding every global
+/// privilege *and* `GRANT OPTION`, and a salted account is the one with **no**
+/// native verifier — a scramble account stores a `sha2` verifier too, so
+/// reading that column alone reports every account as salted, which is what
+/// the first cut of this did.
+#[test]
+fn user_list_reports_the_store_the_accounts_and_how_each_password_is_kept() {
+    let temp = TempDb::new("user-list");
+
+    assert!(
+        inlaysql_server::accounts(&temp.path)
+            .expect("a database with no store is not an error")
+            .is_none(),
+        "a file with no account store must not read as an empty store"
+    );
+
+    inlaysql_server::add_account(&temp.path, "admin", "s3cret", true).expect("first account");
+    inlaysql_server::add_account(&temp.path, "app", "als0s3cret", false).expect("second account");
+
+    let accounts = inlaysql_server::accounts(&temp.path)
+        .expect("listing must not fail")
+        .expect("a store exists now");
+    let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["admin", "app"], "listed in name order");
+
+    assert!(accounts[0].superuser, "the first account is a superuser");
+    assert!(!accounts[1].superuser, "the second asked for nothing");
+    assert!(
+        !accounts[0].strong_password && !accounts[1].strong_password,
+        "user add stores scramble verifiers, which keep a native one — reporting \
+         these as salted is the bug this assertion exists for"
+    );
+}
+
 /// An account added after the first one gets nothing unless it is asked for,
 /// which is what makes `user add` usable for the account an application
 /// actually connects with.
