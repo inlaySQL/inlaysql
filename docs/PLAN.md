@@ -129,10 +129,17 @@ regeneration.
    writes were never the problem: 22 µs of a 251 µs hold. The cost was a
    region wrap invalidating all four regions' append offsets when it had
    moved one, manufacturing 124 cache misses at 2.6 ms each. Hold 0.262 →
-   0.121 ms, throughput 1.54–1.70x at 8–16 writers. **Next: make wraps
-   rarer** — a single-row commit writes ~20 KiB of WAL record against
-   MySQL's 605 B because ours carries whole dirty pages — and re-run
-   AHL-562's flush pipeline, which the gate was suppressing.
+   0.121 ms, throughput 1.54–1.70x at 8–16 writers. **AHL-564 then made wraps rarer**: 73% of
+   that ~20 KiB record was the zero hole a page carries between its slot
+   directory and its cells, so format v6 elides the longest zero run and
+   names it. Same physical log, one encoding tighter — the entry rebuilds
+   the page byte-for-byte, so recovery assumes nothing new, and v5 files
+   keep being written as v5. **20,747 → 5,725 B/commit; wraps every 50 →
+   every 150 commits; hold 0.166 → 0.113 ms at 16 writers.** Throughput
+   (1.14–1.22x at 8–16 writers) is the weak column and is published as one.
+   **Next:** re-run AHL-562's flush pipeline, which the gate was
+   suppressing, and chase the superlinear free-list growth the old record
+   ceiling was masking (`free_list_reuse_dst` 187 s → 1,902 s).
    Superseded: diagnosed (AHL-555),
    not fixed.** Next experiment, named not built: split plan-and-validate from
    take-the-gate-and-commit in `Connection::run_on_engine`, and see whether the
