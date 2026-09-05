@@ -164,7 +164,8 @@ fn a_network_bind_without_a_certificate_is_refused_and_named_as_plaintext() {
         "refusing to start: --bind 192.168.1.10 is reachable from other machines and no \
          certificate is configured, so every statement, result and credential would cross the \
          network in the clear. Serve it with --tls-cert <pem> --tls-key <pem> --tls-required. \
-         Drop --bind to stay on 127.0.0.1."
+         Drop --bind to stay on 127.0.0.1, or --plaintext-network if this is a private segment \
+         you accept plaintext on."
     );
 }
 
@@ -191,7 +192,8 @@ fn a_certificate_that_is_not_required_is_refused_with_its_own_remedy() {
         "refusing to start: --bind 192.168.1.10 is reachable from other machines and TLS is \
          available but NOT required, so a client that does not ask for it still sends its \
          credential in the clear and an on-path attacker need only decline to offer it. Add \
-         --tls-required. Drop --bind to stay on 127.0.0.1."
+         --tls-required. Drop --bind to stay on 127.0.0.1, or --plaintext-network if this is a \
+         private segment you accept plaintext on."
     );
 }
 
@@ -255,4 +257,204 @@ fn the_wildcards_are_treated_as_reaching_the_network() {
             "{message}"
         );
     }
+}
+
+// =====================================================================
+// --plaintext-network: the escape hatch, and what it cannot do
+// =====================================================================
+
+/// What the flag is for: a private segment, no certificate, real accounts.
+/// The only refusal left is the one from `TcpListener` about an address this
+/// machine does not have.
+#[test]
+fn the_hatch_allows_plaintext_on_a_private_segment() {
+    let fixture = Fixture::new("hatch-allowed");
+    let path = fixture.with_accounts();
+    let message = refusal(
+        &path,
+        &ServerOptions {
+            password: "s3cret".to_string(),
+            plaintext_network: true,
+            ..options(OFF_LOOPBACK)
+        },
+    );
+
+    assert!(
+        !message.contains("refusing to start"),
+        "a private segment with real accounts is what this flag is for: {message}"
+    );
+}
+
+/// The flag asserts a fact, and the fact is checked. A publicly routable
+/// address plus plaintext has no honest deployment, so the flag does not
+/// reach one — this is what separates it from `--i-know-this-is-insecure`,
+/// which is satisfiable by anyone and constrains nothing.
+#[test]
+fn the_hatch_refuses_itself_on_a_routable_address() {
+    let fixture = Fixture::new("hatch-routable");
+    let path = fixture.with_accounts();
+    let message = refusal(
+        &path,
+        &ServerOptions {
+            password: "s3cret".to_string(),
+            plaintext_network: true,
+            ..options("203.0.113.7")
+        },
+    );
+
+    assert_eq!(
+        message,
+        "refusing to start: --plaintext-network says this is a private segment, but 203.0.113.7 \
+         is a publicly routable address. There is no deployment where a database on a public \
+         address should be plaintext."
+    );
+}
+
+/// The wildcards get their own sentence, because the mistake is a different
+/// one: the operator meant an interface, and named all of them.
+#[test]
+fn the_hatch_refuses_itself_on_a_wildcard() {
+    for wildcard in ["0.0.0.0", "::"] {
+        let fixture = Fixture::new(&format!("hatch-wildcard-{}", wildcard.len()));
+        let path = fixture.with_accounts();
+        let message = refusal(
+            &path,
+            &ServerOptions {
+                password: "s3cret".to_string(),
+                plaintext_network: true,
+                ..options(wildcard)
+            },
+        );
+
+        assert_eq!(
+            message,
+            format!(
+                "refusing to start: --plaintext-network says this is a private segment, but \
+                 --bind {wildcard} listens on every interface, including any public one this \
+                 host has. Name the private address or hostname to listen on instead."
+            )
+        );
+    }
+}
+
+/// The property the whole flag rests on: it cannot be used to expose a
+/// database with no accounts of its own, or one whose password is empty.
+///
+/// If either of these ever passes, the flag has become the thing it was
+/// designed not to be — a way to say "yes I am sure" over the top of the two
+/// conditions that describe an actual disaster rather than a risk.
+#[test]
+fn the_hatch_cannot_expose_an_account_less_or_empty_password_database() {
+    // C2: no account store at all.
+    let fixture = Fixture::new("hatch-no-accounts");
+    let message = refusal(
+        &fixture.database(),
+        &ServerOptions {
+            password: "s3cret".to_string(),
+            plaintext_network: true,
+            ..options(OFF_LOOPBACK)
+        },
+    );
+    assert!(message.contains("has no accounts of its own"), "{message}");
+    assert!(!message.contains("--plaintext-network"), "{message}");
+
+    // C1: an account store, and an empty bootstrap password reset into it.
+    let fixture = Fixture::new("hatch-empty-password");
+    let path = fixture.with_accounts();
+    let message = refusal(
+        &path,
+        &ServerOptions {
+            user: "admin".to_string(),
+            reset_superuser: true,
+            plaintext_network: true,
+            ..options(OFF_LOOPBACK)
+        },
+    );
+    assert!(message.contains("EMPTY password"), "{message}");
+    assert!(!message.contains("--plaintext-network"), "{message}");
+}
+
+/// The refusals it does relax name it, so an operator on a private segment is
+/// told about the flag rather than left to find it in `--help`.
+#[test]
+fn the_tls_refusals_name_the_flag_that_relaxes_them() {
+    let fixture = Fixture::new("hatch-named");
+    let path = fixture.with_accounts();
+    let (cert, key) = fixture.certificate();
+
+    let without = refusal(
+        &path,
+        &ServerOptions {
+            password: "s3cret".to_string(),
+            ..options(OFF_LOOPBACK)
+        },
+    );
+    assert!(
+        without.ends_with(
+            "Drop --bind to stay on 127.0.0.1, or --plaintext-network if this is a private \
+             segment you accept plaintext on."
+        ),
+        "{without}"
+    );
+
+    let available = refusal(
+        &path,
+        &ServerOptions {
+            password: "s3cret".to_string(),
+            tls_cert: Some(cert),
+            tls_key: Some(key),
+            ..options(OFF_LOOPBACK)
+        },
+    );
+    assert!(
+        available.ends_with(
+            "Drop --bind to stay on 127.0.0.1, or --plaintext-network if this is a private \
+             segment you accept plaintext on."
+        ),
+        "{available}"
+    );
+}
+
+/// It never becomes silent. Every start it relaxed something on says what it
+/// gave up, in full, on stderr, with no flag to turn it off.
+#[test]
+fn the_hatch_warns_on_every_start_it_relaxes() {
+    let mut out = Vec::new();
+    inlaysql_server::print_exposure_warning(
+        &ServerOptions {
+            plaintext_network: true,
+            ..options(OFF_LOOPBACK)
+        },
+        &mut out,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("--plaintext-network: serving 192.168.1.10:3306 WITHOUT TLS"),
+        "{text}"
+    );
+    assert!(text.contains("crosses the network in the"), "{text}");
+    assert!(
+        text.contains("--tls-cert/--tls-key/--tls-required is."),
+        "{text}"
+    );
+
+    // And it does not claim a plaintext connection on a server whose TLS is
+    // required, where the flag relaxed nothing. A warning that is false is
+    // worse than no warning: it is the one an operator learns to ignore.
+    let mut out = Vec::new();
+    inlaysql_server::print_exposure_warning(
+        &ServerOptions {
+            plaintext_network: true,
+            tls_cert: Some(PathBuf::from("cert.pem")),
+            tls_key: Some(PathBuf::from("key.pem")),
+            tls_required: true,
+            ..options(OFF_LOOPBACK)
+        },
+        &mut out,
+    )
+    .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains("WITHOUT TLS"), "{text}");
+    assert!(text.contains("reachable from other machines"), "{text}");
 }

@@ -374,6 +374,26 @@ pub struct ServerOptions {
     /// in the clear" a property of the server rather than a hope about its
     /// clients; without it a certificate only makes TLS *available*.
     pub tls_required: bool,
+    /// Assert that this bind address is a private network segment on which
+    /// plaintext is acceptable.
+    ///
+    /// The escape hatch from [`refuse_unsafe_exposure`]'s TLS conditions, and
+    /// the shape of it is the whole argument. A flag whose argument is the
+    /// operator's *state of mind* — `--i-know-this-is-insecure` — is
+    /// satisfiable by anyone, says nothing and constrains nothing, so it
+    /// degrades to "paste this to make the error stop". This one asserts a
+    /// *fact about the deployment*, and the server checks it: every address
+    /// the bind resolves to has to be private (RFC1918, link-local, CGNAT
+    /// `100.64.0.0/10` or IPv6 ULA `fc00::/7`), or the flag is refused for
+    /// claiming something untrue.
+    ///
+    /// It relaxes the two TLS conditions and **nothing else**. An
+    /// empty-password database and an account-less one stay refused on every
+    /// address other machines can reach, under every combination of flags,
+    /// which is what makes this flag unable to express the disaster case. And
+    /// it never becomes silent: every start that it actually relaxed prints a
+    /// warning that cannot be turned off.
+    pub plaintext_network: bool,
     /// Store passwords as salted, iterated PBKDF2 rather than the plugins'
     /// own unsalted two-hash verifiers.
     ///
@@ -449,6 +469,9 @@ impl Default for ServerOptions {
             tls_cert: None,
             tls_key: None,
             tls_required: false,
+            // An assertion about somebody else's network, which is not
+            // something to assume on their behalf. See the field's doc.
+            plaintext_network: false,
             strong_passwords: false,
             slow_query_log_ms: 0,
             // Holding statement text is a policy change about user data, so it
@@ -493,6 +516,41 @@ fn is_loopback(address: IpAddr) -> bool {
     }
 }
 
+/// Whether `address` is one only a private network segment can reach.
+///
+/// RFC1918, link-local, CGNAT `100.64.0.0/10`, IPv6 ULA `fc00::/7` and IPv6
+/// link-local `fe80::/10` — plus loopback, which is private in the only sense
+/// that matters here: nothing off this host reaches it at all.
+///
+/// The last two v4/v6 forms are hand-rolled masks because
+/// `Ipv4Addr::is_shared` and `Ipv6Addr::is_unique_local` are both still
+/// unstable. They have a unit test each for that reason: a mask written out by
+/// hand is a mask that can be written out wrong.
+fn is_private(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                // 100.64.0.0/10 — carrier-grade NAT.
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        }
+        IpAddr::V6(v6) => {
+            // A v4 address written in v6 is judged as the v4 address it is.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            v6.is_loopback()
+                // fc00::/7 — unique local.
+                || first & 0xfe00 == 0xfc00
+                // fe80::/10 — link-local.
+                || first & 0xffc0 == 0xfe80
+        }
+    }
+}
+
 /// Whether binding `(bind, port)` puts this server where another machine can
 /// reach it.
 ///
@@ -520,6 +578,10 @@ fn reaches_the_network(bind: &str, port: u16) -> Result<bool, String> {
 /// | C2 | the database has no account store | no |
 /// | C3 | no certificate is configured | `--plaintext-network` |
 /// | C4 | a certificate is configured but TLS is not *required* | `--plaintext-network` |
+///
+/// [`ServerOptions::plaintext_network`] relaxes C3 and C4 and nothing else,
+/// and is itself refused unless every resolved address is private — see its
+/// doc comment for why the flag asserts a fact rather than a state of mind.
 ///
 /// C1 before C2 because an empty password is the loudest fact and the operator
 /// should read it first — and because it catches a `--reset-superuser` to an
@@ -575,20 +637,47 @@ fn refuse_unsafe_exposure(
         ));
     }
 
+    // The escape hatch, and it is checked before it is honoured. It reaches
+    // here only past C1 and C2, which it has no effect on at all: an
+    // empty-password or account-less database is refused this address under
+    // every combination of flags, which is what stops this one from being
+    // able to express the disaster case.
+    if options.plaintext_network {
+        for address in resolved(bind, port)? {
+            if address.is_unspecified() {
+                return Err(format!(
+                    "refusing to start: --plaintext-network says this is a private segment, but \
+                     --bind {bind} listens on every interface, including any public one this \
+                     host has. Name the private address or hostname to listen on instead."
+                ));
+            }
+            if !is_private(address) {
+                return Err(format!(
+                    "refusing to start: --plaintext-network says this is a private segment, but \
+                     {address} is a publicly routable address. There is no deployment where a \
+                     database on a public address should be plaintext."
+                ));
+            }
+        }
+        return Ok(());
+    }
+
     match policy {
         // C3.
         tls::TlsPolicy::Disabled => Err(format!(
             "refusing to start: --bind {bind} is reachable from other machines and no certificate \
              is configured, so every statement, result and credential would cross the network in \
              the clear. Serve it with --tls-cert <pem> --tls-key <pem> --tls-required. Drop --bind \
-             to stay on 127.0.0.1."
+             to stay on 127.0.0.1, or --plaintext-network if this is a private segment you accept \
+             plaintext on."
         )),
         // C4.
         tls::TlsPolicy::Available => Err(format!(
             "refusing to start: --bind {bind} is reachable from other machines and TLS is \
              available but NOT required, so a client that does not ask for it still sends its \
              credential in the clear and an on-path attacker need only decline to offer it. Add \
-             --tls-required. Drop --bind to stay on 127.0.0.1."
+             --tls-required. Drop --bind to stay on 127.0.0.1, or --plaintext-network if this is \
+             a private segment you accept plaintext on."
         )),
         tls::TlsPolicy::Required => Ok(()),
     }
@@ -1175,18 +1264,23 @@ pub fn add_account(
 pub fn print_exposure_warning(options: &ServerOptions, out: &mut impl Write) -> io::Result<()> {
     // The line an operator most needs is the one about *this* server, so it
     // states what is configured rather than a fact about the version.
-    match (options.tls_cert.is_some(), options.tls_required) {
-        (true, true) => writeln!(
+    let policy = match (options.tls_cert.is_some(), options.tls_required) {
+        (true, true) => tls::TlsPolicy::Required,
+        (true, false) => tls::TlsPolicy::Available,
+        (false, _) => tls::TlsPolicy::Disabled,
+    };
+    match policy {
+        tls::TlsPolicy::Required => writeln!(
             out,
             "inlaysql: the MySQL protocol is served over TLS, and logins without it are refused."
         )?,
-        (true, false) => writeln!(
+        tls::TlsPolicy::Available => writeln!(
             out,
             "inlaysql: TLS is available on the MySQL protocol, but NOT required — a client that \n\
              inlaysql:          does not ask for it still sends its credential in the clear. Use \n\
              inlaysql:          --tls-required to refuse those."
         )?,
-        (false, _) => writeln!(
+        tls::TlsPolicy::Disabled => writeln!(
             out,
             "inlaysql: the MySQL protocol is served in PLAINTEXT — no certificate is configured. \n\
              inlaysql:          Start with --tls-cert and --tls-key to encrypt it."
@@ -1203,12 +1297,28 @@ pub fn print_exposure_warning(options: &ServerOptions, out: &mut impl Write) -> 
     // posture line above already says what protects the connection, and this
     // one says who can open it.
     if reaches_the_network(&options.bind, options.port).unwrap_or(true) {
-        writeln!(
-            out,
-            "inlaysql: bound to {}, which is reachable from other machines: every host on \n\
-             inlaysql:          the path between them and this port is on this connection.",
-            options.bind
-        )?;
+        // The escape hatch never becomes silent. It prints on every start it
+        // actually relaxed something on — a private bind with a required
+        // certificate did not need the flag, and telling that operator their
+        // connection is in the clear would be false, which is the one thing a
+        // warning may never be.
+        if options.plaintext_network && policy != tls::TlsPolicy::Required {
+            writeln!(
+                out,
+                "inlaysql: --plaintext-network: serving {}:{} WITHOUT TLS. Every statement, \n\
+                 inlaysql:          result and credential on this port crosses the network in the \n\
+                 inlaysql:          clear and any host on this segment can read them. This is not \n\
+                 inlaysql:          a production posture; --tls-cert/--tls-key/--tls-required is.",
+                options.bind, options.port
+            )?;
+        } else {
+            writeln!(
+                out,
+                "inlaysql: bound to {}, which is reachable from other machines: every host on \n\
+                 inlaysql:          the path between them and this port is on this connection.",
+                options.bind
+            )?;
+        }
     }
     if options.page_reuse {
         // Said at startup, not only in the docs: the constraint is about other
@@ -1307,6 +1417,58 @@ mod tests {
                 !reaches_the_network(address, 0).unwrap(),
                 "{address} is this machine only"
             );
+        }
+    }
+
+    /// `Ipv4Addr::is_shared` and `Ipv6Addr::is_unique_local` are unstable, so
+    /// CGNAT and ULA are hand-rolled masks here — and a mask written out by
+    /// hand is a mask that can be written out wrong. Both edges of each range
+    /// are pinned, because an off-by-one in either direction is the whole bug:
+    /// too wide and `--plaintext-network` accepts a routable address, too
+    /// narrow and it refuses a deployment it exists to serve.
+    #[test]
+    fn the_hand_rolled_private_ranges_have_both_of_their_edges() {
+        let address = |literal: &str| literal.parse::<IpAddr>().unwrap();
+        for private in [
+            "10.0.0.5",
+            "172.16.0.1",
+            "192.168.1.10",
+            "169.254.1.1",
+            // 100.64.0.0/10, both ends.
+            "100.64.0.0",
+            "100.127.255.255",
+            // fc00::/7, both ends.
+            "fc00::",
+            "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            // fe80::/10.
+            "fe80::1",
+            "febf:ffff::1",
+            // Loopback is private in the only sense that matters: nothing off
+            // this host reaches it at all.
+            "127.0.0.1",
+            "::1",
+            "::ffff:192.168.1.10",
+        ] {
+            assert!(is_private(address(private)), "{private} is private");
+        }
+        for public in [
+            "203.0.113.7",
+            "2001:db8::1",
+            // One below and one above 100.64.0.0/10.
+            "100.63.255.255",
+            "100.128.0.0",
+            // One below fc00::/7 and one above it.
+            "fbff:ffff::1",
+            "fe00::1",
+            // fec0::/10 is site-local, deprecated, and not fe80::/10.
+            "fec0::1",
+            // The wildcards are refused by name before this is asked, but
+            // they are not private either way.
+            "0.0.0.0",
+            "::",
+            "::ffff:203.0.113.7",
+        ] {
+            assert!(!is_private(address(public)), "{public} is not private");
         }
     }
 

@@ -34,7 +34,10 @@ SERVE --mcp OPTIONS:
     --max-bytes <n>    Most bytes a tool call returns (default 65536).
 
 SERVE --mysql OPTIONS:
-    --bind <addr>      Address to listen on (default 127.0.0.1, loopback only).
+    --bind <addr>      Address to listen on (default 127.0.0.1). Anything that
+                       reaches another machine needs TLS required and accounts
+                       of the database's own, or --plaintext-network; the
+                       refusal says which is missing.
     --port <n>         Port to listen on (default 3306). 0 asks the OS for a
                        free one and prints what it got.
     --user <name>      The bootstrap account name (default `root`).
@@ -69,6 +72,23 @@ SERVE --mysql OPTIONS:
                        --tls-cert/--tls-key. Without this a certificate only
                        makes TLS *available*, and a client that does not ask
                        still sends its credential in the clear.
+    --plaintext-network
+                       Assert that this bind address is a private network
+                       segment on which plaintext is acceptable. Relaxes the
+                       TLS requirement for --bind, and NOTHING else.
+                       It is a claim about the deployment, not about your
+                       state of mind, and the server checks it: every address
+                       --bind resolves to has to be private (RFC1918,
+                       link-local, 100.64.0.0/10, or IPv6 fc00::/7), or this
+                       flag is refused for saying something untrue. 0.0.0.0
+                       and :: are refused too — they are every interface,
+                       including whichever public one this host has; name the
+                       private address or hostname instead. It cannot expose
+                       a database with no accounts of its own or with an
+                       empty password: those are refused on any address other
+                       machines can reach, under every combination of flags.
+                       Every start it relaxes something on prints a warning
+                       that cannot be turned off.
     --max-connections <n>
                        Most connections served at once (default 64).
     --wait-timeout <n> Seconds a connection may be silent before the server
@@ -161,11 +181,14 @@ SERVE --mysql OPTIONS:
                        statement text is stored at all. @@inlaysql_statement_
                        text reports which it is.
 
-    SECURITY: the MySQL protocol is served in PLAINTEXT. This version has no
-    TLS, so every statement, every result and every credential crosses the
-    connection in the clear. It listens on 127.0.0.1 unless --bind says
-    otherwise; binding anywhere else exposes an unencrypted database to the
-    network and should only be done across a link you already trust.
+    SECURITY: the MySQL protocol is served in PLAINTEXT unless --tls-cert and
+    --tls-key are given, and a client that does not ask for TLS is still
+    served unless --tls-required is. It listens on 127.0.0.1 unless --bind
+    says otherwise, and binding anywhere else is REFUSED unless the database
+    has accounts of its own, the bootstrap password is not empty, and TLS is
+    required — or --plaintext-network asserts a private segment. Each refusal
+    names the address, the fact and the flag that fixes it. Give the database
+    accounts first with `inlaysql user add`.
 
     There ARE accounts and privileges now: CREATE USER / ALTER USER / DROP
     USER, GRANT / REVOKE / SHOW GRANTS, with SELECT, INSERT, UPDATE, DELETE,
@@ -325,6 +348,7 @@ fn serve_mysql(args: &[String]) -> Result<(), String> {
                 )
             }
             "--tls-required" => options.tls_required = true,
+            "--plaintext-network" => options.plaintext_network = true,
             "--strong-passwords" => options.strong_passwords = true,
             "--user" => {
                 options.user = rest
