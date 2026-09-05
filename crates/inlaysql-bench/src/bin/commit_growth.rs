@@ -502,6 +502,8 @@ fn delta(a: CommitStats, b: CommitStats) -> CommitStats {
         follower_wait_ns: a.follower_wait_ns - b.follower_wait_ns,
         follower_waits: a.follower_waits - b.follower_waits,
         gather_spin_ns: a.gather_spin_ns - b.gather_spin_ns,
+        overlap_gather_ns: a.overlap_gather_ns - b.overlap_gather_ns,
+        handoffs: a.handoffs - b.handoffs,
         fsync_ns: a.fsync_ns - b.fsync_ns,
         post_ns: a.post_ns - b.post_ns,
         gap_ns: a.gap_ns - b.gap_ns,
