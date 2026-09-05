@@ -198,7 +198,7 @@ impl<S: Read + Write + crate::tls::Upgradable> Connection<S> {
         let Some(response) = self.stream.read_message()? else {
             return Ok(false);
         };
-        let mut response = match parse_handshake_response(&response) {
+        let mut response = match parse_handshake_response(&response, true) {
             Ok(response) => response,
             Err(error) => {
                 self.fail(&error)?;
@@ -232,7 +232,7 @@ impl<S: Read + Write + crate::tls::Upgradable> Connection<S> {
             let Some(encrypted) = self.stream.read_message()? else {
                 return Ok(false);
             };
-            response = match parse_handshake_response(&encrypted) {
+            response = match parse_handshake_response(&encrypted, false) {
                 Ok(response) => response,
                 Err(error) => {
                     self.fail(&error)?;
@@ -2360,7 +2360,27 @@ impl std::fmt::Debug for HandshakeResponse {
     }
 }
 
-fn parse_handshake_response(payload: &[u8]) -> Result<HandshakeResponse, MysqlError> {
+/// Parse a handshake response.
+///
+/// `expect_ssl_request` says which half of a TLS handshake this is, and it is
+/// a phase rather than a flag on purpose. Before the upgrade, a client that
+/// sets `CLIENT_SSL` has sent an `SSLRequest` — the first 32 bytes and nothing
+/// more — and the rest of the response arrives encrypted. *After* the upgrade
+/// the full response arrives, and a client keeps `CLIENT_SSL` set in it,
+/// because the flags describe the connection it is on rather than a request it
+/// is making; `libmysqlclient` does exactly that.
+///
+/// Reading the flag instead of the phase — which is what this did until
+/// 2026-09-05 — therefore did two things at once. It made a real TLS client
+/// unloginnable, because its encrypted response parsed as an `SSLRequest` and
+/// yielded an empty user name; and it let any client re-set the bit to reach
+/// the account lookup with no user name and no password proof, refused today
+/// only because the empty name matches no account. The test client cleared the
+/// bit for its second packet, which is why neither showed.
+fn parse_handshake_response(
+    payload: &[u8],
+    expect_ssl_request: bool,
+) -> Result<HandshakeResponse, MysqlError> {
     let malformed = || MysqlError::unknown("malformed handshake response");
     let mut reader = Reader::new(payload);
     let capabilities = reader.u32().map_err(|_| malformed())?;
@@ -2375,7 +2395,7 @@ fn parse_handshake_response(payload: &[u8]) -> Result<HandshakeResponse, MysqlEr
         ));
     }
     // An SSL request packet is only the first 32 bytes and stops there.
-    if capabilities & protocol::CLIENT_SSL != 0 {
+    if expect_ssl_request && capabilities & protocol::CLIENT_SSL != 0 {
         return Ok(HandshakeResponse {
             capabilities,
             username: String::new(),
@@ -2622,7 +2642,7 @@ mod tests {
     #[test]
     fn a_pre_41_client_is_refused_clearly() {
         let payload = 0u32.to_le_bytes().to_vec();
-        let error = parse_handshake_response(&payload).unwrap_err();
+        let error = parse_handshake_response(&payload, true).unwrap_err();
         assert_eq!(error.code, 1043);
     }
 
@@ -2642,11 +2662,66 @@ mod tests {
         payload.extend_from_slice(b"app\0");
         payload.extend_from_slice(b"mysql_native_password\0");
 
-        let response = parse_handshake_response(&payload).unwrap();
+        let response = parse_handshake_response(&payload, true).unwrap();
         assert_eq!(response.username, "root");
         assert_eq!(response.auth_response, b"abc");
         assert_eq!(response.database.as_deref(), Some("app"));
         assert_eq!(response.auth_plugin, "mysql_native_password");
+    }
+
+    /// The `SSLRequest` shortcut belongs to the first half of a TLS
+    /// handshake, not to a capability bit.
+    ///
+    /// A client keeps `CLIENT_SSL` set in the full response it sends *after*
+    /// the upgrade — the flags describe the connection, not a request —
+    /// and `libmysqlclient` does. Reading the flag rather than the phase
+    /// therefore mis-parsed a real TLS client's login as a 32-byte
+    /// `SSLRequest` and handed the account lookup an empty user name and no
+    /// password proof. Both halves are pinned here, because the pre-upgrade
+    /// shortcut is just as load-bearing: without it the 32-byte packet is a
+    /// malformed response.
+    #[test]
+    fn the_ssl_request_shortcut_follows_the_handshake_phase_not_the_flag() {
+        let capabilities = protocol::CLIENT_PROTOCOL_41
+            | protocol::CLIENT_SECURE_CONNECTION
+            | protocol::CLIENT_PLUGIN_AUTH
+            | protocol::CLIENT_SSL;
+
+        let mut ssl_request = capabilities.to_le_bytes().to_vec();
+        ssl_request.extend_from_slice(&16_777_216u32.to_le_bytes());
+        ssl_request.push(45);
+        ssl_request.extend_from_slice(&[0u8; 23]);
+        assert_eq!(ssl_request.len(), 32, "an SSLRequest is exactly 32 bytes");
+
+        // Before the upgrade: the packet stops at 32 bytes and the rest of
+        // the login is still to come, encrypted.
+        let before = parse_handshake_response(&ssl_request, true)
+            .expect("an SSLRequest is a valid first packet");
+        assert!(before.username.is_empty());
+        assert!(before.auth_response.is_empty());
+
+        // The same 32 bytes after the upgrade are not a login: the full
+        // response was promised and did not arrive.
+        parse_handshake_response(&ssl_request, false)
+            .expect_err("a bare SSLRequest is not a handshake response");
+
+        // After the upgrade, with the bit still set, the full response must
+        // be read as what it is.
+        let mut full = ssl_request.clone();
+        full.extend_from_slice(b"root\0");
+        full.push(3);
+        full.extend_from_slice(b"abc");
+        full.extend_from_slice(b"mysql_native_password\0");
+
+        let after = parse_handshake_response(&full, false).expect("a full response after TLS");
+        assert_eq!(after.username, "root");
+        assert_eq!(after.auth_response, b"abc");
+        assert_eq!(after.auth_plugin, "mysql_native_password");
+
+        // And the same bytes seen before an upgrade are still an SSLRequest,
+        // whose trailing bytes are the encrypted response's business.
+        let before = parse_handshake_response(&full, true).expect("still an SSLRequest");
+        assert!(before.username.is_empty());
     }
 
     #[test]

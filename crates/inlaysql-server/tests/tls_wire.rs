@@ -144,6 +144,21 @@ impl<S: Read + Write> Client<S> {
         self.stream.flush()
     }
 
+    /// The full handshake response a real client sends after the upgrade:
+    /// every field of a login, with `CLIENT_SSL` still set.
+    ///
+    /// `libmysqlclient` keeps the bit set in this packet — the capability
+    /// flags describe the connection it is now on, not a request it is
+    /// making. A server that reads the bit rather than the handshake phase
+    /// parses this as a bare `SSLRequest` and looks up an empty user name.
+    fn login_payload_keeping_the_ssl_bit(user: &str) -> Vec<u8> {
+        let mut payload = Self::login_payload(user, false);
+        let mut capabilities = u32::from_le_bytes(payload[..4].try_into().unwrap());
+        capabilities |= CLIENT_SSL;
+        payload[..4].copy_from_slice(&capabilities.to_le_bytes());
+        payload
+    }
+
     /// The handshake response for an empty password, which needs no scramble.
     fn login_payload(user: &str, ssl: bool) -> Vec<u8> {
         // CLIENT_LONG_PASSWORD | CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION
@@ -306,9 +321,13 @@ fn a_client_negotiates_tls_and_runs_a_statement_inside_it() {
         sequence: plain.sequence,
     };
 
-    // The credential goes inside the tunnel.
+    // The credential goes inside the tunnel — with `CLIENT_SSL` still set,
+    // which is what a real client sends and what this server mis-parsed as a
+    // second `SSLRequest` until 2026-09-05.
     secure
-        .write_packet(&Client::<TcpStream>::login_payload("root", false))
+        .write_packet(&Client::<TcpStream>::login_payload_keeping_the_ssl_bit(
+            "root",
+        ))
         .expect("login");
     let reply = secure.read_packet().expect("login reply");
     assert_ne!(
