@@ -103,7 +103,15 @@ regeneration.
    deleting the site's localhost bullet. Track F is otherwise complete:
    F3, F4 and `user list` (AHL-558) all landed 2026-09-05.
 
-6. **Server-to-server writes at 8 connections (0.30x) — diagnosed (AHL-555),
+6. **Server-to-server writes: the deficit is barrier cost (AHL-560).** The
+   statement was never inside the gate — `begin_normal_commit` has one call
+   site and `end_write` is the last thing every write path does — so the
+   pre-gate residual measures −1.2% to +2.1% and the named experiment had a
+   ceiling of 1.02x against a 3.28x gap. What the numbers say instead: our
+   barrier costs 2.67 ms against MySQL's 0.78 ms on the same volume class,
+   and barrier rate is pinned at one over that. **Why our fsync costs 3.4x
+   theirs is the open question**, and it is not the one the 2026-08-31
+   deferred-durability rejection answered. Superseded: diagnosed (AHL-555),
    not fixed.** Next experiment, named not built: split plan-and-validate from
    take-the-gate-and-commit in `Connection::run_on_engine`, and see whether the
    unaccounted share moves into `gate_wait`/`follower_wait` (already
