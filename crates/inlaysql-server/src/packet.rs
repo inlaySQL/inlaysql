@@ -27,6 +27,15 @@ pub const MAX_PAYLOAD: usize = 0xff_ff_ff;
 /// cheapest denial-of-service this protocol offers.
 pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
+/// How much of a packet's payload is read at a time.
+///
+/// The unit in which [`Stream::read_message`] grows its buffer, so it is also
+/// the most a client can make this server hold per connection by declaring a
+/// length it never sends. Sixty-four kibibytes is large enough that a real
+/// sixteen-mebibyte message costs a couple of hundred reads from an already
+/// buffered reader, and small enough that the claim itself buys nothing.
+const READ_CHUNK: usize = 64 * 1024;
+
 /// One connection's framed byte stream.
 pub struct Stream<S: Read + Write> {
     reader: BufReader<S>,
@@ -142,9 +151,7 @@ impl<S: Read + Write> Stream<S> {
                     format!("message longer than the {MAX_MESSAGE} byte limit"),
                 ));
             }
-            let start = payload.len();
-            payload.resize(start + length, 0);
-            self.reader.read_exact(&mut payload[start..])?;
+            read_payload(&mut self.reader, &mut payload, length)?;
             // Counted after the read succeeds, so `Bytes_received` is bytes
             // this server actually took delivery of rather than bytes it hoped
             // for. Header included, because that is what crossed the wire.
@@ -194,6 +201,40 @@ impl<S: Read + Write> Stream<S> {
 /// Read until `buf` is full or the stream ends, reporting how many bytes
 /// arrived. Distinguishes "ended cleanly at a message boundary" from "ended
 /// mid-header", which the caller treats very differently.
+/// Read `length` bytes onto the end of `payload`, growing it as the bytes
+/// arrive rather than as the header claims they will.
+///
+/// The header's three length bytes buy up to 16 MiB, and committing that with
+/// one `resize` before any of it has been received is what made four bytes and
+/// then silence cost this server 16 MiB per connection until the read timeout
+/// — eight hours by default — with `MAX_CONNECTIONS` of them a gibibyte, all
+/// of it reachable before authentication. [`MAX_MESSAGE`] bounds the
+/// reassembled total and never bounded this.
+///
+/// Reading in [`READ_CHUNK`] steps directly into the tail of `payload` keeps
+/// the memory proportional to what actually crossed the wire and leaves a
+/// well-behaved client with byte-identical results. `payload` is borrowed
+/// rather than returned so that a caller — and a test — can see how far it
+/// grew even when the read fails.
+fn read_payload(reader: &mut impl Read, payload: &mut Vec<u8>, length: usize) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < length {
+        let take = (length - filled).min(READ_CHUNK);
+        let at = payload.len();
+        payload.resize(at + take, 0);
+        let read = read_full(reader, &mut payload[at..])?;
+        filled += read;
+        if read < take {
+            payload.truncate(at + read);
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection ended part-way through a packet payload",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn read_full(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -412,6 +453,90 @@ mod tests {
         stream.write_message(payload).unwrap();
         stream.flush().unwrap();
         stream.read_message().unwrap().expect("a message")
+    }
+
+    /// A reader that hands out a fixed script and then reports end of
+    /// stream, counting how many bytes were ever asked for. Enough to say
+    /// what a client's *claim* costs a server that never receives it.
+    struct Truncated {
+        bytes: Vec<u8>,
+        at: usize,
+        served: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Read for Truncated {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let take = (self.bytes.len() - self.at).min(buf.len());
+            buf[..take].copy_from_slice(&self.bytes[self.at..self.at + take]);
+            self.at += take;
+            self.served.set(self.served.get() + take);
+            Ok(take)
+        }
+    }
+
+    impl Write for Truncated {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A header claiming a payload the client never sends costs the bytes
+    /// that arrived, not the bytes it claimed.
+    ///
+    /// The three length bytes can ask for sixteen mebibytes. Committing that
+    /// with one `resize` before any of it has been received — which is what
+    /// this did until 2026-09-05 — held 16 MiB per connection until the read
+    /// timeout, eight hours by default, and `MAX_CONNECTIONS` of them a
+    /// gibibyte, all of it reachable without authenticating. `MAX_MESSAGE`
+    /// bounds the reassembled total and never bounded this.
+    ///
+    /// The buffer is passed in rather than returned precisely so this can be
+    /// asserted: after the failure it must have grown by about what arrived,
+    /// not by what was claimed. Against the old one-shot `resize` the
+    /// capacity assertion fails with sixteen mebibytes.
+    #[test]
+    fn a_claimed_payload_that_never_arrives_costs_what_arrived() {
+        let served = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut reader = Truncated {
+            bytes: b"0123456789".to_vec(),
+            at: 0,
+            served: std::rc::Rc::clone(&served),
+        };
+
+        let mut payload = Vec::new();
+        let error = read_payload(&mut reader, &mut payload, MAX_PAYLOAD)
+            .expect_err("a payload that never arrives is not a payload");
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(payload.len(), 10, "the ten bytes that existed are kept");
+        assert_eq!(served.get(), 10, "and only those were ever asked for");
+        assert!(
+            payload.capacity() <= READ_CHUNK * 2,
+            "a claim of {MAX_PAYLOAD} bytes grew the buffer to {} — the \
+             client's claim was committed before its bytes arrived",
+            payload.capacity()
+        );
+    }
+
+    /// The same read, whole: every byte claimed arrives, so the payload is
+    /// exactly what was sent and nothing was truncated at a chunk boundary.
+    #[test]
+    fn a_payload_larger_than_one_chunk_is_stitched_from_its_chunks() {
+        let sent: Vec<u8> = (0..READ_CHUNK * 2 + 7).map(|i| (i % 251) as u8).collect();
+        let served = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut reader = Truncated {
+            bytes: sent.clone(),
+            at: 0,
+            served,
+        };
+
+        let mut payload = vec![0xaa];
+        read_payload(&mut reader, &mut payload, sent.len()).expect("every byte arrived");
+        assert_eq!(payload[0], 0xaa, "what was already there is untouched");
+        assert_eq!(&payload[1..], &sent[..]);
     }
 
     #[test]
