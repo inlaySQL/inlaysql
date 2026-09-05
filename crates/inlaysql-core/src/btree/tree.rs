@@ -393,24 +393,37 @@ impl DirtyPage {
         }
     }
 
-    /// How many bytes this page will occupy in the commit record, entry
-    /// header included.
+    /// An **upper bound** on the bytes this page will occupy in the commit
+    /// record, entry header included.
     ///
-    /// Exact for an [`DirtyPage::Encoded`] page in either layout — a v6 entry
-    /// elides the page's longest zero run, and that run can only be measured
-    /// on the bytes. An undecoded node is an **upper bound**: a whole page,
-    /// because [`page::encode_leaf`] and [`page::encode_internal`] always fill
-    /// one, plus the entry header. That is the safe direction and the only one
-    /// available — the hole is not known until the node is encoded, and
-    /// [`CowBTree::materialize_dirty`] runs before anything in the commit path
-    /// asks, so the commit's own arithmetic is exact and only a caller asking
-    /// mid-transaction ([`CowBTree::projected_record_len`], which already
-    /// over-reserves on purpose) sees the bound.
-    fn record_entry_len(&self, page_size: usize, format_version: u32) -> usize {
-        match self {
-            DirtyPage::Encoded(bytes) => crate::wal::page_entry_len(format_version, bytes),
-            DirtyPage::Decoded(_) => crate::wal::page_entry_header_len(format_version) + page_size,
-        }
+    /// A bound rather than the exact answer, deliberately. A v6 entry elides
+    /// the page's longest run of zeros
+    /// ([`crate::wal::HOLE_ELIDED_FORMAT_VERSION`]), and that run can only be
+    /// found by reading the page — so an exact answer here would scan every
+    /// dirty page, and [`CowBTree::pending_record_len`] is asked once per
+    /// commit *and* before every statement of an explicit transaction
+    /// (`Storage::transaction_is_nearly_full`). A batched writer holding two
+    /// hundred dirty pages would re-scan eight hundred kilobytes per statement
+    /// to learn a number it only uses to decide "not yet". The encoder finds
+    /// the run once, where the bytes are being copied anyway.
+    ///
+    /// Bounding *upward* is also what keeps this change from moving anything
+    /// it did not set out to move: `transaction_is_nearly_full` refuses at
+    /// half a region, and it refuses at exactly the point it always did,
+    /// because the number it is given is the pre-v6 one. The only place the
+    /// real, smaller size decides anything is [`CowBTree::commit`], which
+    /// measures the record it actually encoded against
+    /// [`crate::wal::max_record_len`].
+    ///
+    /// A node that is still cells rather than bytes is bounded the same way: a
+    /// whole page, because [`page::encode_leaf`] and [`page::encode_internal`]
+    /// always fill one.
+    fn record_entry_bound(&self, page_size: usize, format_version: u32) -> usize {
+        let image = match self {
+            DirtyPage::Encoded(bytes) => bytes.len(),
+            DirtyPage::Decoded(_) => page_size,
+        };
+        crate::wal::page_entry_header_len(format_version) + image
     }
 }
 
@@ -1121,10 +1134,12 @@ impl<D: Device> CowBTree<D> {
         self.has_pending
     }
 
-    /// Bytes the open transaction's log record would occupy.
+    /// An upper bound on the bytes the open transaction's log record will
+    /// occupy.
     ///
-    /// Exact, not an estimate: it is the size [`crate::wal::encode_record`]
-    /// produces, computed without building the record. A caller writing a
+    /// It was exact through format version 5: the size
+    /// [`crate::wal::encode_record`] produces, computed without building the
+    /// record. A caller writing a
     /// large amount of data can use it, against [`CowBTree::log_capacity`], to
     /// decide when to commit — which it has to do, because a transaction
     /// larger than the log region cannot be committed at all.
@@ -1136,6 +1151,14 @@ impl<D: Device> CowBTree<D> {
     /// compares against *half* the region — but "exact" was untrue, and a
     /// caller that believed the doc comment and budgeted against the whole
     /// region would have been handed a record that did not fit.
+    ///
+    /// **Format version 6 is where it stopped being exact, on purpose.** A v6
+    /// record elides each page's zero hole, so the record `commit` actually
+    /// writes is smaller — about 3.6× on real data. See
+    /// [`DirtyPage::record_entry_bound`] for why the bound is the right answer
+    /// here rather than a lazy one, and note that bounding upward is what
+    /// keeps `Storage::transaction_is_nearly_full` refusing at exactly the
+    /// point it always did.
     pub fn pending_record_len(&self) -> usize {
         // Length prefix, seq, the v5 predecessor link, root, next, page count,
         // and the trailing checksum — then each page with its id and length.
@@ -1148,7 +1171,7 @@ impl<D: Device> CowBTree<D> {
             + self
                 .dirty
                 .values()
-                .map(|page| page.record_entry_len(self.page_size, self.format_version))
+                .map(|page| page.record_entry_bound(self.page_size, self.format_version))
                 .sum::<usize>()
     }
 
