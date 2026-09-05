@@ -1,5 +1,26 @@
 # Flush pipelining — overlapping the gather with the barrier, and handing leadership over instead of re-electing it (AHL-562)
 
+**Status: RETRACTED (AHL-566, 2026-09-06). The code is deleted; this document
+is kept as the record of why.** It was built, it worked, it engaged on 83–92%
+of barriers, and the duty cycle did not move (AHL-562). AHL-562 blamed the
+reservation gate and left the code behind a default-off flag with a condition
+for turning it on. AHL-563, AHL-564 and AHL-565 then met that condition —
+the gate hold fell 0.263 → 0.085 ms, `gate_wait` 51.0% → 28.1%, commits per
+barrier 8.29 → 12.84, the duty cycle 44.3% → 52.5% — and **AHL-566 re-ran this
+experiment against a real A/A control (`bench/aa_floor.sh`) and it is still
+flat**, while engaging on 93–98% of barriers with 95% of the gather running
+under the previous `fsync`. The one effect outside the control's noise band is
+the two-writer cohort truncation §2 predicted, which is a loss. `PERF.md`'s
+AHL-566 section has the numbers and the floor.
+
+Everything below is the design as it was written, unedited except for §7,
+whose mutation table indexed tests that no longer exist. Read it for the
+ticket-to-barrier proof in §3 — the clearest statement of the durability rule
+in this repository, and true whether or not anyone ever pipelines the flush —
+and read it before having this idea again.
+
+---
+
 **Status: the design, written before the code, for the lever AHL-561 priced
 and did not build.** AHL-561 (`PERF.md`, 2026-09-05) measured both engines'
 barriers on the same volume and found them the same price — InlaySQL's
@@ -269,7 +290,8 @@ no `Device` trait change, no server change.
   entered by handoff rather than election). Both reach the benchmark through
   `CommitStats`.
 
-**Default off, behind `INLAYSQL_FLUSH_PIPELINE=1`,** read once per
+**Default off, behind `INLAYSQL_FLUSH_PIPELINE=1`** (removed with the code
+in AHL-566), read once per
 coordinator at construction. The durability contract is identical either way
 — that is §3 — but the *order in which concurrent writers are acknowledged*
 can change, and a caller with two connections can observe that ordering.
@@ -301,18 +323,3 @@ The tests that have to pass before any of that is worth reading are in §3 and
 §4: a property test that no ticket is ever reported durable by a barrier that
 started before its write, an injected failure at every step of the handoff,
 and the existing group-commit concurrency tests unchanged.
-
-## 7. Mutation checks — which test fails when the design is broken
-
-Each row was applied to the landed code, the group-commit suite was run, and
-the failure recorded. The last row is the honest one: it is a performance-only
-mutation and no test catches it.
-
-| Mutation | Test that fails |
-| --- | --- |
-| `LeaderGuard::drop` never hands the round over (`let handoff = false`) | `a_successor_takes_the_next_round_by_handoff_and_never_re_elects` — the successor re-elects, and `handoffs` stays 0. Before the successor's wait was given a poll interval this was a *hang* rather than a failure, which is itself the argument for the poll. |
-| `SuccessorGuard::drop` leaves a reserved round set (skips clearing `in_progress`/`epoch`) | `a_successor_that_dies_before_taking_the_round_never_strands_it` |
-| The successor skips the already-covered check after taking the round | `a_successor_already_covered_releases_the_round_instead_of_flushing` — it flushes a second time for a commit the previous barrier had covered. |
-| **The successor credits its cohort to the barrier it gathered underneath** (`durable_upto.fetch_max(writes_completed)` on the handoff path) — the silent-data-loss mutation this whole design is written against | `no_ticket_is_ever_durable_by_a_barrier_that_started_before_its_write`, deterministically on 3 of 3 runs, plus `a_successor_takes_the_next_round_by_handoff_and_never_re_elects` and `a_leader_that_panics_hands_a_live_round_to_its_successor` |
-| The handoff does not bump `epoch` | **Nothing.** Followers then stay parked until a round ends without a successor instead of re-checking every round. It is a latency and fairness regression, not a durability one, and it shows up in `follower_wait_ns` rather than in an assertion. Recorded rather than papered over. |
-| The overlapped gather is unbounded (call site passes a stop that never fires) | **Nothing in the suite** — `the_overlapped_gather_stops_the_moment_the_round_is_handed_over` pins the primitive, not the wiring. This one is caught by the measurement: an unbounded overlapped gather *extends* the barrier interval, which is the `barrier cycle` line's whole subject. |

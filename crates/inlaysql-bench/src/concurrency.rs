@@ -382,13 +382,6 @@ fn inlaysql_writers(
     // divided by the number of barriers, and `idle` is the difference — the
     // share of the run during which no flush was in flight at all.
     //
-    // AHL-562 adds the pipeline's own two: how many of those barriers were
-    // entered by a handoff from the outgoing leader rather than by an
-    // election, and how much gather time ran *underneath* an in-flight
-    // barrier. The second is deliberately not folded into `gather` above,
-    // because `gather + fsync + post + gap` is a decomposition of one cycle
-    // and an overlapped segment is by definition outside it.
-    //
     // `fsync_ns` is charged over `flushes`, not `normal_flushes`, because it
     // accumulates on every barrier this file paid for — the schema-creating
     // handle's checkpoint syncs included — so dividing it by the smaller
@@ -405,17 +398,13 @@ fn inlaysql_writers(
             "  barrier cycle: {writers} writers, {:.1} barriers/s — \
              fsync {fsync_ms:.3} ms, interval {interval_ms:.3} ms, \
              idle {:.3} ms ({:.1}% of the wall clock has no flush in flight); \
-             coordinator gather {:.3} post {:.3} gap {:.3} ms/barrier; \
-             pipeline {} handoffs ({:.0}% of barriers), overlapped gather {:.3} ms/barrier",
+             coordinator gather {:.3} post {:.3} gap {:.3} ms/barrier",
             flushes as f64 / elapsed.as_secs_f64(),
             interval_ms - fsync_ms,
             100.0 * (interval_ms - fsync_ms) / interval_ms,
             stats.gather_spin_ns as f64 / 1e6 / flushes as f64,
             stats.post_ns as f64 / 1e6 / flushes as f64,
             stats.gap_ns as f64 / 1e6 / flushes as f64,
-            stats.handoffs,
-            100.0 * stats.handoffs as f64 / flushes as f64,
-            stats.overlap_gather_ns as f64 / 1e6 / flushes as f64,
         );
     }
     // AHL-560: where a writer thread's own time goes, split into the same
