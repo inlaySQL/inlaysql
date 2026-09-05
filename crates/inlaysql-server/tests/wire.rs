@@ -2027,10 +2027,11 @@ fn a_caching_sha2_client_authenticates() {
 
 /// The path a client with nothing cached takes: an empty first response,
 /// then the cleartext password once the server asks for full
-/// authentication. Acceptable here — and only here — because v1 is
-/// documented plaintext-localhost already (`docs/server.md`), so a
-/// cleartext password crossing this connection reveals nothing a network
-/// observer could not already read directly off the wire.
+/// authentication. Acceptable here — and only here — because this server
+/// has no certificate, so a cleartext password crossing this connection
+/// reveals nothing a network observer could not already read directly off
+/// the wire. With a certificate the same exchange is refused unless the
+/// link is encrypted.
 #[test]
 fn a_caching_sha2_client_completes_full_authentication() {
     let server = TestServer::start("caching-sha2-full");
@@ -2061,6 +2062,15 @@ fn the_rsa_exchange_is_refused_with_a_clear_reason() {
     assert!(
         lower.contains("caching_sha2_password"),
         "the refusal must name the plugin: {}",
+        error.message
+    );
+    // It must not describe a posture this server stopped having when TLS
+    // landed: an error that states a security property is read as one, and a
+    // client told "plaintext-localhost only" by a server serving TLS has been
+    // told something false about the connection it is on.
+    assert!(
+        !lower.contains("plaintext-localhost"),
+        "the refusal must describe this server, not a posture it no longer has: {}",
         error.message
     );
 }

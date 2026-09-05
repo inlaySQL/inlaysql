@@ -389,8 +389,10 @@ impl<S: Read + Write + crate::tls::Upgradable> Connection<S> {
     /// `Ok(None)` when it already ended on its own: the connection dropped
     /// mid-exchange, or the client asked for the RSA public-key exchange and
     /// was refused with its own explicit error — this server has no RSA
-    /// implementation and v1's plaintext-localhost posture is what makes the
-    /// full-authentication fallback below acceptable instead (see
+    /// implementation, and what makes the full-authentication fallback below
+    /// acceptable instead is the check above it: a cleartext password is taken
+    /// only over an encrypted link, or on a server with no certificate at all,
+    /// where nothing on the connection was protected in the first place (see
     /// `docs/server.md` and the module docs on [`auth`]).
     fn caching_sha2_authenticate(
         &mut self,
@@ -478,9 +480,10 @@ impl<S: Read + Write + crate::tls::Upgradable> Connection<S> {
         if payload == [auth::CACHING_SHA2_REQUEST_PUBLIC_KEY] {
             self.fail(&MysqlError::unsupported(
                 "the RSA public-key exchange for caching_sha2_password is not implemented; \
-                 this server is plaintext-localhost only (see docs/server.md) and accepts the \
-                 cleartext password directly during full authentication instead of RSA — \
-                 reconnect, or tell the client to use mysql_native_password",
+                 this server has no key to hand out and takes the cleartext password directly \
+                 during full authentication instead, which it allows only over TLS or on a \
+                 server with no certificate at all — reconnect with --ssl-mode=REQUIRED if this \
+                 server has a certificate, or tell the client to use mysql_native_password",
             ))?;
             return Ok(None);
         }
