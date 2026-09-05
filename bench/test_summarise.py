@@ -19,6 +19,15 @@ sys.modules[SPEC.name] = summarise
 SPEC.loader.exec_module(summarise)
 
 
+BARRIER_SPEC = importlib.util.spec_from_file_location(
+    "summarise_barrier", Path(__file__).with_name("summarise_barrier.py")
+)
+assert BARRIER_SPEC is not None and BARRIER_SPEC.loader is not None
+summarise_barrier = importlib.util.module_from_spec(BARRIER_SPEC)
+sys.modules[BARRIER_SPEC.name] = summarise_barrier
+BARRIER_SPEC.loader.exec_module(summarise_barrier)
+
+
 class ParseTests(unittest.TestCase):
     def test_comparison_crossing_parity_is_not_a_measured_row(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -145,6 +154,118 @@ class ContaminationTests(unittest.TestCase):
             self.assertEqual(len(summarise.measured(summarise.parse(str(a)))), 1)
             self.assertEqual(len(summarise.measured(summarise.parse(str(b)))), 1)
             self.assertEqual(summarise.main([str(a), str(b)]), 0)
+
+
+def _run(
+    writers: int, ops: int, idle_pct: float, hold: float, pipeline: bool = True
+) -> str:
+    """One writer level's worth of concurrency-suite output, as the suite prints it.
+
+    `pipeline=False` is the line as it reads once AHL-566 took the pipeline's
+    two counters back off it.
+    """
+    tail = (
+        "; pipeline 12 handoffs (83% of barriers), "
+        "overlapped gather 0.679 ms/barrier"
+        if pipeline
+        else ""
+    )
+    return (
+        f"  barriers: {writers} writers, 181 normal flushes over 2400 commits "
+        f"(0.075 syncs/commit, 13.33 commits/sync)\n"
+        f"  barrier cycle: {writers} writers, 470.0 barriers/s — fsync 1.169 ms, "
+        f"interval 2.128 ms, idle 0.959 ms ({idle_pct}% of the wall clock has no "
+        f"flush in flight); coordinator gather 0.827 post 0.049 gap 0.221 "
+        f"ms/barrier{tail}\n"
+        f"  buckets: {writers} writers, busy 6097.5 ms over 2400 commits — "
+        f"gate_wait 25.0%, gate_hold 3.3%, follower_wait 63.3%, gather_spin 2.5%, "
+        f"fsync 3.6%, post 0.1%, pre-gate residual 2.2% (2404 gate waits, 2247 "
+        f"racing holds)\n"
+        f"  gate hold: {writers} writers, 2404 holds, {hold} ms mean — "
+        f"read 0.008 (12173 calls), state 0.000 (16), wal 0.005 (2416, 14.6 KiB), "
+        f"data 0.018 (2400, 23.3 KiB), of which extend 0.010 (9 extensions); "
+        f"device 0.030 ms (35.8%), residual 0.054 ms (64.2%), 3 commit-point "
+        f"misses\n"
+        f"InlaySQL (parallel WAL regions)  {writers}  {ops}  2400  0.0%\n"
+        f"SQLite (journal, sync=FULL, fullfsync)  {writers}  179  2400  0.0%\n"
+    )
+
+
+class BarrierSummaryTests(unittest.TestCase):
+    """The paired-log summariser behind AHL-566's re-run and its A/A control."""
+
+    def test_a_repetition_missing_one_arm_drops_out_of_the_pairing(self) -> None:
+        # The whole point of the interleaved design is that a ratio compares
+        # two arms from the *same* moment. A summariser that paired by
+        # position instead of by repetition would silently divide rep 2's
+        # `on` by rep 1's `off` here and report 2.00 for a harness that
+        # measured 1.00.
+        log = (
+            "=== rep 1 arm off ===\n" + _run(16, 1000, 45.1, 0.084) +
+            "=== rep 2 arm on ===\n" + _run(16, 2000, 45.1, 0.084) +
+            "=== rep 3 arm off ===\n" + _run(16, 1000, 45.1, 0.084) +
+            "=== rep 3 arm on ===\n" + _run(16, 1100, 45.1, 0.084)
+        )
+        runs = summarise_barrier.parse(log)
+        self.assertEqual(
+            summarise_barrier.ratios(runs, "on", "off", "ops", 16), [1.1]
+        )
+
+    def test_duty_is_the_share_with_a_flush_in_flight_not_the_idle_share(self) -> None:
+        # The suite prints the *idle* percentage; every PERF.md table quotes
+        # the duty cycle. Reporting one as the other flips the direction of
+        # the headline metric of AHL-561 through AHL-566.
+        runs = summarise_barrier.parse("=== rep 1 arm a ===\n" + _run(16, 1000, 45.1, 0.084))
+        self.assertAlmostEqual(runs[(1, "a", 16)]["duty"], 54.9)
+
+    def test_metrics_are_attributed_to_the_arm_in_scope_when_the_order_flips(self) -> None:
+        # Arm order flips every repetition, so an off-by-one in the header
+        # handling shows up only on the even repetitions — and would credit
+        # the pipeline arm with the control's numbers half the time.
+        log = (
+            "=== rep 1 arm off ===\n" + _run(8, 100, 45.1, 0.084) +
+            "=== rep 1 arm on ===\n" + _run(8, 200, 45.1, 0.084) +
+            "=== rep 2 arm on ===\n" + _run(8, 400, 45.1, 0.084) +
+            "=== rep 2 arm off ===\n" + _run(8, 100, 45.1, 0.084)
+        )
+        runs = summarise_barrier.parse(log)
+        self.assertEqual(runs[(2, "on", 8)]["ops"], 400.0)
+        self.assertEqual(
+            summarise_barrier.ratios(runs, "on", "off", "ops", 8), [2.0, 4.0]
+        )
+
+    def test_throughput_comes_from_the_inlaysql_row_and_not_sqlites(self) -> None:
+        runs = summarise_barrier.parse("=== rep 1 arm a ===\n" + _run(4, 3456, 45.1, 0.084))
+        self.assertEqual(runs[(1, "a", 4)]["ops"], 3456.0)
+
+    def test_each_writer_level_keeps_its_own_row(self) -> None:
+        # Every line the suite prints is prefixed with its writer count; a
+        # parser that ignored it would collapse five levels into one and make
+        # the per-level noise floor this script exists to produce meaningless.
+        log = "=== rep 1 arm a ===\n" + _run(1, 1300, 5.7, 0.037) + _run(16, 6500, 45.1, 0.084)
+        runs = summarise_barrier.parse(log)
+        self.assertEqual(runs[(1, "a", 1)]["ops"], 1300.0)
+        self.assertEqual(runs[(1, "a", 16)]["ops"], 6500.0)
+        self.assertAlmostEqual(runs[(1, "a", 1)]["duty"], 94.3)
+
+    def test_output_before_the_first_arm_header_is_not_attributed_to_an_arm(self) -> None:
+        # `FILESYSTEM:` and a cargo build precede the first header; a warm-up
+        # run appearing there would be counted as rep 0 of some arm.
+        log = "FILESYSTEM: /dev/vdb1 btrfs\n" + _run(16, 9999, 45.1, 0.084)
+        self.assertEqual(summarise_barrier.parse(log), {})
+
+    def test_a_log_without_the_retracted_pipeline_clause_still_parses(self) -> None:
+        # AHL-562 added `pipeline N handoffs ... overlapped gather` to the
+        # `barrier cycle` line and AHL-566 removed it again. A parser anchored
+        # on the longer form would silently return nothing for every log this
+        # harness produces from now on — nothing, not an error, because the
+        # line simply would not match.
+        runs = summarise_barrier.parse(
+            "=== rep 1 arm a ===\n" + _run(16, 6500, 45.1, 0.084, pipeline=False)
+        )
+        self.assertEqual(runs[(1, "a", 16)]["ops"], 6500.0)
+        self.assertAlmostEqual(runs[(1, "a", 16)]["duty"], 54.9)
+        self.assertNotIn("handoff_pct", runs[(1, "a", 16)])
 
 
 if __name__ == "__main__":
