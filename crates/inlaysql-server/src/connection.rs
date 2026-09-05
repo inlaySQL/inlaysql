@@ -2127,7 +2127,7 @@ fn binary_row(row: &[Value], defs: &[ColumnDef]) -> Vec<u8> {
 /// Every refusal below is a value a vector index must never be allowed to
 /// contain: a graph built over a NaN cannot order its own neighbours, and a
 /// truncated payload is a different embedding, not a shorter one.
-fn decode_vector_param(
+pub(crate) fn decode_vector_param(
     reader: &mut Reader<'_>,
     ty: u8,
     dim: usize,
@@ -2189,7 +2189,7 @@ fn decode_vector_param(
 }
 
 /// Decode one bound parameter.
-fn decode_binary_param(
+pub(crate) fn decode_binary_param(
     reader: &mut Reader<'_>,
     ty: u8,
     unsigned: bool,
@@ -2314,7 +2314,7 @@ fn decode_time(reader: &mut Reader<'_>) -> Result<String, Malformed> {
 /// One database file is one schema, so the only names accepted are this
 /// server's own. Silently accepting any name would let a client believe it had
 /// switched to a different database and write into this one.
-fn check_database(name: &str) -> Result<(), MysqlError> {
+pub(crate) fn check_database(name: &str) -> Result<(), MysqlError> {
     if name.is_empty() || name.eq_ignore_ascii_case(shim::DEFAULT_SCHEMA) {
         return Ok(());
     }
@@ -2334,12 +2334,12 @@ fn check_database(name: &str) -> Result<(), MysqlError> {
 }
 
 /// The fields of a `HandshakeResponse41`.
-struct HandshakeResponse {
-    capabilities: u32,
-    username: String,
-    auth_response: Vec<u8>,
-    database: Option<String>,
-    auth_plugin: String,
+pub(crate) struct HandshakeResponse {
+    pub(crate) capabilities: u32,
+    pub(crate) username: String,
+    pub(crate) auth_response: Vec<u8>,
+    pub(crate) database: Option<String>,
+    pub(crate) auth_plugin: String,
 }
 
 /// Written by hand rather than derived, so the authentication token cannot be
@@ -2377,7 +2377,7 @@ impl std::fmt::Debug for HandshakeResponse {
 /// the account lookup with no user name and no password proof, refused today
 /// only because the empty name matches no account. The test client cleared the
 /// bit for its second packet, which is why neither showed.
-fn parse_handshake_response(
+pub(crate) fn parse_handshake_response(
     payload: &[u8],
     expect_ssl_request: bool,
 ) -> Result<HandshakeResponse, MysqlError> {

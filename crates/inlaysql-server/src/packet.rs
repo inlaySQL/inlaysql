@@ -318,6 +318,16 @@ impl<'a> Reader<'a> {
         self.at >= self.bytes.len()
     }
 
+    /// How far into the packet this reader has got.
+    ///
+    /// Only the fuzz targets need this, and they need it to say something the
+    /// type system already promises but a target should still assert: a
+    /// decoder reads inside the packet it was handed and nowhere else.
+    #[cfg(any(feature = "fuzzing", test))]
+    pub fn position(&self) -> usize {
+        self.at
+    }
+
     /// Take `n` bytes.
     pub fn take(&mut self, n: usize) -> Result<&'a [u8], Malformed> {
         let end = self.at.checked_add(n).ok_or(Malformed)?;
