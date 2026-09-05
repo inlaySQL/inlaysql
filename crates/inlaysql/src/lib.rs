@@ -80,7 +80,7 @@ pub use inlaysql_core::EngineOptions;
 
 pub use asyncio::{block_on, AsyncDatabase, Task};
 pub use backup::{backup, BackupOutcome, BackupSummary, SourceAccess};
-pub use device::{CommitStats, FileDevice};
+pub use device::{CommitStats, FileDevice, GATE_PHASES, GATE_PHASE_NAMES};
 pub use inlaysql_core::bm25::Bm25Index;
 pub use inlaysql_core::bm25_paged::PagedBm25Index;
 pub use inlaysql_core::btree::Diagnostics;

@@ -1590,6 +1590,7 @@ impl<D: Device> CowBTree<D> {
             }
         }
         self.device.begin_normal_commit()?;
+        self.device.gate_phase(0);
         let region = self.device.wal_region() % crate::wal::region_count(self.format_version);
         // What the gate exists to establish: the committed state to rebase
         // against, and where this region's next record goes. A device that can
@@ -1597,6 +1598,7 @@ impl<D: Device> CowBTree<D> {
         // other device re-derives them by reading the state block and scanning
         // the log. See [`Device::commit_point`] — this is the whole of AHL-468.
         let cached = self.device.commit_point(region);
+        self.device.gate_phase(1);
         // Filled the moment the gate-protected read below runs, before this
         // closure can return `Ok(None)` for a conflict — see the conflict
         // branch past `prepared?` for why a value read *inside* the gate is
@@ -1620,6 +1622,10 @@ impl<D: Device> CowBTree<D> {
                 }
             };
             *observed_floor.borrow_mut() = Some((current_root, current_next, current_seq));
+            // AHL-563 phase marks. See [`Device::gate_phase`]: a no-op for
+            // every device that cannot read a clock, and off by default even
+            // for the one that can. The numbering is this call order.
+            self.device.gate_phase(2);
             // Rebuild even when the root did not move: an Engine handle can
             // have had its previous transaction rebased by the tree, leaving
             // its in-memory counters behind the values actually reserved on
@@ -1628,18 +1634,21 @@ impl<D: Device> CowBTree<D> {
             if !self.rebase_pending(current_root, current_next, current_seq)? {
                 return Ok(None);
             }
+            self.device.gate_phase(3);
 
             let seq = current_seq + 1;
             // Turn this transaction's superseded/reused pages into durable
             // free-list rows before the record below is built, so they ride
             // the same commit — see `CowBTree::finalize_free_list`.
             self.finalize_free_list(seq)?;
+            self.device.gate_phase(4);
             // Every page this transaction touched is still held as cells (see
             // [`DirtyPage`]); this is where it becomes bytes, once each. It
             // has to happen after `finalize_free_list`, which writes free-list
             // rows through the ordinary `put`/`delete` paths and so dirties
             // pages of its own.
             self.materialize_dirty()?;
+            self.device.gate_phase(5);
             records.reserve(self.pending_record_len());
             self.encode_pending_record(&mut records, seq, current_seq, current_root);
             if records.len() > crate::wal::max_record_len(self.page_size) {
@@ -1649,6 +1658,7 @@ impl<D: Device> CowBTree<D> {
                     crate::wal::max_record_len(self.page_size)
                 )));
             }
+            self.device.gate_phase(6);
 
             let mut append_offset = match cached {
                 Some(point) => point.append_offset,
@@ -1662,6 +1672,7 @@ impl<D: Device> CowBTree<D> {
                     .append_offset
                 }
             };
+            self.device.gate_phase(7);
             let region_end = crate::wal::region_end(self.page_size, self.format_version, region);
             if append_offset + records.len() > region_end {
                 // The region is about to be reused, so the cached answer stops
@@ -1671,7 +1682,17 @@ impl<D: Device> CowBTree<D> {
                 // cohort never straddles this: only this writer's own record
                 // is in the buffer here, and a member that would overflow the
                 // region ends the cohort instead of wrapping it.
-                self.device.set_commit_point(region, None);
+                //
+                // Only this region's append offset, not the whole cache: a
+                // wrap moves where *this* region's next record goes and
+                // nothing else, and discarding the committed state and the
+                // other three regions' offsets with it forced the next commit
+                // in each of them into a full re-derivation from the file,
+                // inside its own gate hold. See `Device::forget_append_offset`
+                // and `docs/research/gate-hold.md`. The failure path below
+                // still forgets everything, so a wrap that does not complete
+                // leaves exactly what it left before.
+                self.device.forget_append_offset(region);
                 self.write_state_values(current_root, current_next, current_seq)?;
                 let zeros = vec![0u8; crate::wal::wal_region_len(self.page_size)];
                 append_offset =
@@ -1679,9 +1700,11 @@ impl<D: Device> CowBTree<D> {
                 self.device.write(append_offset, &zeros)?;
             }
             *placement.borrow_mut() = (append_offset, region_end);
+            self.device.gate_phase(8);
             self.write_dirty_pages()?;
             self.admit_written_pages();
             self.dirty.clear();
+            self.device.gate_phase(9);
             Ok(Some(seq))
         })();
 
@@ -1714,6 +1737,7 @@ impl<D: Device> CowBTree<D> {
             }
         }
 
+        self.device.gate_phase(10);
         // One write for the whole cohort's records, in this writer's own
         // region, after every page every one of them names is on the device.
         let mut written = prepared.as_ref().map(|_| ()).err().is_none() && !records.is_empty();
@@ -1724,6 +1748,7 @@ impl<D: Device> CowBTree<D> {
                 outcome = Err(err);
             }
         }
+        self.device.gate_phase(11);
         if let (Ok(Some(_)), Some((root, next, seq))) = (&outcome, final_state) {
             if written {
                 self.device.set_commit_point(

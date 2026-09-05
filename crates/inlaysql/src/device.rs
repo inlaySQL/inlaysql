@@ -62,6 +62,22 @@ pub struct FileDevice {
     /// happened while a flush was in flight — the start-state half of the
     /// racing split, consumed by [`Device::commit_ready`].
     gate_started_racing: AtomicBool,
+    /// AHL-563: whether this handle is *inside* the reservation gate for a
+    /// normal commit right now — set by [`Device::begin_normal_commit`] and
+    /// cleared by [`FileDevice::end_reservation`], so it brackets the whole
+    /// critical section rather than ending early at
+    /// [`Device::commit_ready`] the way [`FileDevice::gate_started_ns`] does.
+    /// The device call attribution in [`Device::read`] and [`Device::write`]
+    /// reads it to decide whether the call it is about to make is inside the
+    /// serialized hold, and it is deliberately a separate flag: the two spans
+    /// differ, and a conflicted commit that never publishes a ticket still
+    /// has to leave this one cleared.
+    in_normal_gate: AtomicBool,
+    /// [`now_nanos`] at the last in-gate phase boundary, for
+    /// [`CommitCoordinator::gate_phase_ns`]. Only ever read or written while
+    /// [`FileDevice::in_normal_gate`] is set, and only when the phase split
+    /// is enabled.
+    phase_started_ns: AtomicU64,
     /// Kept only to name the file in an error message — [`FileDevice`] itself
     /// never needs to re-open or re-derive a path.
     path: PathBuf,
@@ -189,6 +205,67 @@ struct CommitCoordinator {
     gate_hold_racing_start_ns: AtomicU64,
     gate_hold_racing_start_count: AtomicU64,
     gate_waits: AtomicU64,
+    /// AHL-563: the gate hold's own decomposition, accumulated only while a
+    /// handle is between [`Device::begin_normal_commit`] and
+    /// [`Device::end_normal_commit`] — i.e. inside the serialized critical
+    /// section `gate_hold_ns` measures as a whole. Every one of these is a
+    /// device call the tree makes from inside that section, timed where the
+    /// syscall is issued rather than inferred from a profile, so the residual
+    /// (`gate_hold_ns` minus all of them) is exactly the in-gate CPU work:
+    /// `rebase_pending`'s replay, `finalize_free_list`, `materialize_dirty`,
+    /// the record encode and the bookkeeping.
+    ///
+    /// The three write buckets are split by offset against the file's own
+    /// layout, which is the only thing that distinguishes them: below
+    /// `wal_start` is the header and the state block (a region wrap's
+    /// `write_state_values`), `wal_start..boundary` is the WAL record append
+    /// and a wrap's zero fill, and at or past `boundary` is the data area.
+    gate_read_ns: AtomicU64,
+    gate_reads: AtomicU64,
+    gate_state_ns: AtomicU64,
+    gate_state_writes: AtomicU64,
+    gate_wal_ns: AtomicU64,
+    gate_wal_writes: AtomicU64,
+    gate_wal_bytes: AtomicU64,
+    gate_data_ns: AtomicU64,
+    gate_data_writes: AtomicU64,
+    gate_data_bytes: AtomicU64,
+    /// Of the write buckets above, the time spent inside
+    /// [`FileDevice::extend_for`]'s slow path — a `set_len` plus a 1–8 MiB
+    /// zero fill, amortised over many commits but landing entirely on one of
+    /// them. Reported separately so a single extension does not read as a
+    /// dear data write.
+    gate_extend_ns: AtomicU64,
+    gate_extends: AtomicU64,
+    /// `wal_start` and `all_regions_end` for this file, cached from the
+    /// header the moment [`FileDevice::note_layout`] parses one, so the
+    /// classification above costs two relaxed loads instead of an
+    /// `RwLock` read on every device call. Zero until a header is seen, which
+    /// is what the "unknown" bucket below means.
+    layout_wal_start: AtomicUsize,
+    layout_boundary: AtomicUsize,
+    /// The gate hold split by *code phase* rather than by device call
+    /// (AHL-563), one accumulator per boundary `CowBTree::commit` marks
+    /// through [`Device::gate_phase`], plus a tenth for the tail between the
+    /// last mark and the gate's release. Index `i` is the time the phase
+    /// ending at mark `i` took; see [`GATE_PHASE_NAMES`].
+    ///
+    /// Off unless `INLAYSQL_GATE_PHASES` is set, because unlike the device-call
+    /// buckets this one costs a clock read at each of nine boundaries on the
+    /// commit path rather than one around a syscall that already costs
+    /// microseconds. With it off, [`Device::gate_phase`] is one relaxed load
+    /// and a return.
+    gate_phase_ns: [AtomicU64; GATE_PHASES],
+    gate_phases_enabled: AtomicBool,
+    /// How many gate holds found [`Device::commit_point`] empty and had to
+    /// re-derive the committed state and the region's append offset from the
+    /// file, inside the hold (AHL-563).
+    gate_point_misses: AtomicU64,
+    /// `INLAYSQL_WIDE_WRAP_FORGET`: restore the pre-AHL-563 total forget on
+    /// the wrap path, so the two arms of that item's measurement are one
+    /// binary and one environment variable apart. See
+    /// [`Device::forget_append_offset`]'s implementation below.
+    wide_wrap_forget: AtomicBool,
     follower_wait_ns: AtomicU64,
     follower_waits: AtomicU64,
     /// Time the elected leader spent inside the adaptive gather window before
@@ -366,6 +443,53 @@ pub struct CommitStats {
     pub gate_hold_racing_start_ns: u64,
     /// How many holds the start-state racing split covers.
     pub gate_hold_racing_start_count: u64,
+    /// The gate hold's own decomposition (AHL-563), in nanoseconds, summed
+    /// over every device call a handle made *while inside* the reservation
+    /// gate. `gate_hold_ns` minus the sum of these is the in-gate CPU work:
+    /// `rebase_pending`'s replay, `finalize_free_list`, `materialize_dirty`,
+    /// the WAL record encode and the bookkeeping.
+    ///
+    /// * `gate_read_ns` — page reads, which is `rebase_pending` walking the
+    ///   latest committed root (and, on a device with no `commit_point`
+    ///   cache, re-deriving the committed state).
+    /// * `gate_state_ns` — writes below the log: the state block a region
+    ///   wrap rewrites.
+    /// * `gate_wal_ns` — writes into the log regions: the record append, and
+    ///   a wrap's zero fill.
+    /// * `gate_data_ns` — writes at or past the data area: the dirty pages.
+    /// * `gate_extend_ns` — of the write buckets, the part spent inside
+    ///   [`FileDevice::extend_for`]'s preallocation slow path.
+    pub gate_read_ns: u64,
+    /// How many in-gate reads [`CommitStats::gate_read_ns`] sums.
+    pub gate_reads: u64,
+    /// See [`CommitStats::gate_read_ns`].
+    pub gate_state_ns: u64,
+    /// How many in-gate state-block writes [`CommitStats::gate_state_ns`] sums.
+    pub gate_state_writes: u64,
+    /// See [`CommitStats::gate_read_ns`].
+    pub gate_wal_ns: u64,
+    /// How many in-gate log writes [`CommitStats::gate_wal_ns`] sums.
+    pub gate_wal_writes: u64,
+    /// Bytes those log writes carried.
+    pub gate_wal_bytes: u64,
+    /// See [`CommitStats::gate_read_ns`].
+    pub gate_data_ns: u64,
+    /// How many in-gate data-area writes [`CommitStats::gate_data_ns`] sums.
+    pub gate_data_writes: u64,
+    /// Bytes those data-area writes carried.
+    pub gate_data_bytes: u64,
+    /// See [`CommitStats::gate_read_ns`]. Contained in the write buckets, not
+    /// additional to them.
+    pub gate_extend_ns: u64,
+    /// How many preallocation slow paths [`CommitStats::gate_extend_ns`] sums.
+    pub gate_extends: u64,
+    /// The same hold split by *code phase* instead of by device call, one
+    /// entry per [`GATE_PHASE_NAMES`]. All zero unless `INLAYSQL_GATE_PHASES`
+    /// was set for this process; see [`CommitCoordinator::gate_phase_ns`].
+    pub gate_phase_ns: [u64; GATE_PHASES],
+    /// Gate holds that found no cached commit point and re-derived it from
+    /// the file inside the hold. Always counted; see the coordinator field.
+    pub gate_point_misses: u64,
     /// Nanoseconds writers spent as flush followers waiting on
     /// [`CommitCoordinator::flush_done`], with the number of waits.
     pub follower_wait_ns: u64,
@@ -398,6 +522,30 @@ pub struct CommitStats {
 /// so a `Normal` request can tell "nobody has asked for anything yet" apart
 /// from "somebody already required `Full`", which is what makes the ratchet
 /// direction correct rather than a coin flip on registration order.
+/// How many accumulators [`CommitCoordinator::gate_phase_ns`] carries: the
+/// nine boundaries `CowBTree::commit` marks through [`Device::gate_phase`],
+/// plus the tail between the last mark and the gate's release.
+pub const GATE_PHASES: usize = 13;
+
+/// What each [`CommitStats::gate_phase_ns`] entry is, in call order. Kept
+/// beside the array so a reader of the numbers does not have to hold the
+/// commit path in their head to know which is which.
+pub const GATE_PHASE_NAMES: [&str; GATE_PHASES] = [
+    "gate_entry",
+    "commit_point",
+    "read_state",
+    "rebase",
+    "free_list",
+    "materialize",
+    "encode",
+    "scan_region",
+    "wrap",
+    "data_writes",
+    "cohort",
+    "wal_append",
+    "tail",
+];
+
 const DURABILITY_UNSET: u8 = 0;
 const DURABILITY_NORMAL: u8 = 1;
 const DURABILITY_FULL: u8 = 2;
@@ -1322,6 +1470,8 @@ impl FileDevice {
             pending_commit_ticket: AtomicU64::new(0),
             gate_started_ns: AtomicU64::new(0),
             gate_started_racing: AtomicBool::new(false),
+            in_normal_gate: AtomicBool::new(false),
+            phase_started_ns: AtomicU64::new(0),
             normal_commit_guard: Mutex::new(None),
             cohort_guard: Mutex::new(None),
             path: path.to_path_buf(),
@@ -1369,6 +1519,8 @@ impl FileDevice {
             pending_commit_ticket: AtomicU64::new(0),
             gate_started_ns: AtomicU64::new(0),
             gate_started_racing: AtomicBool::new(false),
+            in_normal_gate: AtomicBool::new(false),
+            phase_started_ns: AtomicU64::new(0),
             normal_commit_guard: Mutex::new(None),
             cohort_guard: Mutex::new(None),
             path: path.to_path_buf(),
@@ -1435,6 +1587,22 @@ impl FileDevice {
             gate_hold_racing_start_count: coordinator
                 .gate_hold_racing_start_count
                 .load(Ordering::Relaxed),
+            gate_read_ns: coordinator.gate_read_ns.load(Ordering::Relaxed),
+            gate_reads: coordinator.gate_reads.load(Ordering::Relaxed),
+            gate_state_ns: coordinator.gate_state_ns.load(Ordering::Relaxed),
+            gate_state_writes: coordinator.gate_state_writes.load(Ordering::Relaxed),
+            gate_wal_ns: coordinator.gate_wal_ns.load(Ordering::Relaxed),
+            gate_wal_writes: coordinator.gate_wal_writes.load(Ordering::Relaxed),
+            gate_wal_bytes: coordinator.gate_wal_bytes.load(Ordering::Relaxed),
+            gate_data_ns: coordinator.gate_data_ns.load(Ordering::Relaxed),
+            gate_data_writes: coordinator.gate_data_writes.load(Ordering::Relaxed),
+            gate_data_bytes: coordinator.gate_data_bytes.load(Ordering::Relaxed),
+            gate_extend_ns: coordinator.gate_extend_ns.load(Ordering::Relaxed),
+            gate_extends: coordinator.gate_extends.load(Ordering::Relaxed),
+            gate_phase_ns: core::array::from_fn(|i| {
+                coordinator.gate_phase_ns[i].load(Ordering::Relaxed)
+            }),
+            gate_point_misses: coordinator.gate_point_misses.load(Ordering::Relaxed),
             follower_wait_ns: coordinator.follower_wait_ns.load(Ordering::Relaxed),
             follower_waits: coordinator.follower_waits.load(Ordering::Relaxed),
             gather_spin_ns: coordinator.gather_spin_ns.load(Ordering::Relaxed),
@@ -1501,10 +1669,30 @@ impl FileDevice {
         if offset < boundary {
             return Ok(());
         }
+        // AHL-563: everything past here is the slow path — a `set_len` plus a
+        // 1–8 MiB zero fill, and a wait behind whichever handle is already
+        // doing one. It is charged separately from the write that provoked it
+        // because it is amortised over many commits but lands entirely on
+        // one, and reading it inside that commit's data-write bucket would
+        // make an ordinary page write look enormously dear once in a while.
+        let in_gate = self.in_normal_gate.load(Ordering::Relaxed);
+        let started = if in_gate { now_nanos() } else { 0 };
         let _guard = coordinator
             .allocate_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        struct ExtendCharge<'a>(Option<(&'a CommitCoordinator, u64)>);
+        impl Drop for ExtendCharge<'_> {
+            fn drop(&mut self) {
+                if let Some((coordinator, started)) = self.0 {
+                    coordinator
+                        .gate_extend_ns
+                        .fetch_add(now_nanos().saturating_sub(started), Ordering::Relaxed);
+                    coordinator.gate_extends.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let _charge = ExtendCharge(in_gate.then_some((coordinator.as_ref(), started)));
         // Another handle may have extended the file while this one waited.
         let mut have = coordinator.allocated.load(Ordering::Acquire);
         if have == 0 {
@@ -1628,6 +1816,92 @@ impl FileDevice {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .note_layout(layout);
+            // AHL-563's in-gate device-call attribution classifies by offset,
+            // and this is the one place the layout those offsets mean anything
+            // against is learned. Published as plain atomics so the hot path
+            // never takes the cache lock to read them.
+            let (page_size, version) = layout;
+            coordinator
+                .layout_wal_start
+                .store(inlaysql_core::wal::wal_start(page_size), Ordering::Relaxed);
+            coordinator.layout_boundary.store(
+                inlaysql_core::wal::all_regions_end(page_size, version),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Close the in-gate phase that ends at mark `phase` and open the next.
+    ///
+    /// Does nothing unless the split is enabled and this handle is actually
+    /// inside the gate — a phase mark from a commit that never took it (there
+    /// is none today, but the trait method is callable) charges nothing rather
+    /// than charging a span that starts at some previous commit.
+    fn charge_gate_phase(&self, coordinator: &CommitCoordinator, phase: u32) {
+        if !coordinator.gate_phases_enabled.load(Ordering::Relaxed)
+            || !self.in_normal_gate.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let Some(slot) = coordinator.gate_phase_ns.get(phase as usize) else {
+            return;
+        };
+        let now = now_nanos();
+        let previous = self.phase_started_ns.swap(now, Ordering::Relaxed);
+        if previous != 0 {
+            slot.fetch_add(now.saturating_sub(previous), Ordering::Relaxed);
+        }
+    }
+
+    /// Charge a device call this handle made *inside* the reservation gate to
+    /// the bucket its offset names. Called only when
+    /// [`FileDevice::in_normal_gate`] is set, so nothing outside the
+    /// serialized hold is ever counted, and never for a device without a
+    /// coordinator.
+    ///
+    /// `elapsed` is measured around the syscall by the caller. The
+    /// classification is the file's own layout and nothing else: the header
+    /// and state block sit below `wal_start`, the WAL regions between it and
+    /// `boundary`, the data area at or past it. Before any header has been
+    /// parsed both markers read zero, and every call falls into the data
+    /// bucket — which is correct in the only case that reaches here, because
+    /// a database being created is not a normal commit.
+    fn charge_in_gate(&self, offset: usize, len: usize, elapsed: u64, write: bool) {
+        let Some(coordinator) = self.coordinator.as_ref() else {
+            return;
+        };
+        if !write {
+            coordinator
+                .gate_read_ns
+                .fetch_add(elapsed, Ordering::Relaxed);
+            coordinator.gate_reads.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let wal_start = coordinator.layout_wal_start.load(Ordering::Relaxed);
+        let boundary = coordinator.layout_boundary.load(Ordering::Relaxed);
+        if offset >= boundary {
+            coordinator
+                .gate_data_ns
+                .fetch_add(elapsed, Ordering::Relaxed);
+            coordinator.gate_data_writes.fetch_add(1, Ordering::Relaxed);
+            coordinator
+                .gate_data_bytes
+                .fetch_add(len as u64, Ordering::Relaxed);
+        } else if offset >= wal_start {
+            coordinator
+                .gate_wal_ns
+                .fetch_add(elapsed, Ordering::Relaxed);
+            coordinator.gate_wal_writes.fetch_add(1, Ordering::Relaxed);
+            coordinator
+                .gate_wal_bytes
+                .fetch_add(len as u64, Ordering::Relaxed);
+        } else {
+            coordinator
+                .gate_state_ns
+                .fetch_add(elapsed, Ordering::Relaxed);
+            coordinator
+                .gate_state_writes
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1665,6 +1939,13 @@ impl FileDevice {
     /// [`release_normal_reservation`] and can never disagree.
     fn end_reservation(&self, coordinator: &CommitCoordinator, normal: bool) -> u64 {
         if normal {
+            // AHL-563: the in-gate attribution span ends with the hold, on
+            // every path out of it — including a conflict, which never
+            // publishes a ticket and so never reaches `commit_ready`. The
+            // tail — everything after the last phase mark — is charged first,
+            // because charging it needs the flag still set.
+            self.charge_gate_phase(coordinator, GATE_PHASES as u32 - 1);
+            self.in_normal_gate.store(false, Ordering::Relaxed);
             let guard = self
                 .normal_commit_guard
                 .lock()
@@ -1697,14 +1978,27 @@ impl FileDevice {
 
 impl Device for FileDevice {
     fn read(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
-        if self.read_from_shared_cache(offset, buf) {
-            return Ok(());
+        // AHL-563: inside the reservation gate every device call is on the
+        // serialized critical path, so it is timed there and only there. The
+        // flag is one relaxed load on the read path and the clock is not read
+        // at all unless it is set.
+        let in_gate = self.in_normal_gate.load(Ordering::Relaxed);
+        let started = if in_gate { now_nanos() } else { 0 };
+        let result = (|| {
+            if self.read_from_shared_cache(offset, buf) {
+                return Ok(());
+            }
+            self.file
+                .read_exact_at(buf, offset as u64)
+                .map_err(io_error)?;
+            self.fill_shared_cache(offset, buf);
+            Ok(())
+        })();
+        if in_gate {
+            let elapsed = now_nanos().saturating_sub(started);
+            self.charge_in_gate(offset, buf.len(), elapsed, false);
         }
-        self.file
-            .read_exact_at(buf, offset as u64)
-            .map_err(io_error)?;
-        self.fill_shared_cache(offset, buf);
-        Ok(())
+        result
     }
 
     /// The shared raw cache's own `Arc` for a resident page, so the tree's
@@ -1735,6 +2029,8 @@ impl Device for FileDevice {
         if self.coordinator.is_none() {
             return Err(self.read_only_error("write"));
         }
+        let in_gate = self.in_normal_gate.load(Ordering::Relaxed);
+        let started = if in_gate { now_nanos() } else { 0 };
         // Before the write, never after: the point is that the write below
         // lands in space the file already has, so this commit's barrier has
         // no file to grow. See [`FileDevice::extend_for`].
@@ -1742,6 +2038,10 @@ impl Device for FileDevice {
         self.file
             .write_all_at(data, offset as u64)
             .map_err(io_error)?;
+        if in_gate {
+            let elapsed = now_nanos().saturating_sub(started);
+            self.charge_in_gate(offset, data.len(), elapsed, true);
+        }
         // Creating a fresh database writes the header, so this is where a
         // handle first learns the layout of a file it just made — the read
         // side never sees a header for one.
@@ -1813,6 +2113,14 @@ impl Device for FileDevice {
         let file = &self.file;
         let level = coordinator.effective_durability();
         coordinator.make_commit_durable(ticket, || commit_barrier(file, level))
+    }
+
+    /// See [`Device::gate_phase`]. Off unless `INLAYSQL_GATE_PHASES` is set,
+    /// in which case this is one relaxed load and a return.
+    fn gate_phase(&self, phase: u32) {
+        if let Some(coordinator) = &self.coordinator {
+            self.charge_gate_phase(coordinator, phase);
+        }
     }
 
     /// Publish a successful normal commit's durability ticket while its WAL
@@ -1900,6 +2208,12 @@ impl Device for FileDevice {
                 coordinator.absorption_state().gate_acquired();
             }
             self.gate_started_ns.store(now_nanos(), Ordering::Relaxed);
+            // AHL-563: from here until the gate is released, every device
+            // call this handle makes is inside the serialized hold.
+            self.in_normal_gate.store(true, Ordering::Relaxed);
+            if coordinator.gate_phases_enabled.load(Ordering::Relaxed) {
+                self.phase_started_ns.store(now_nanos(), Ordering::Relaxed);
+            }
             let racing = coordinator
                 .flush
                 .lock()
@@ -1987,18 +2301,30 @@ impl Device for FileDevice {
     /// trying would not be a stale answer but a stale *tree*.
     fn commit_point(&self, region: usize) -> Option<inlaysql_core::btree::CommitPoint> {
         let coordinator = self.coordinator.as_ref()?;
-        let gate = coordinator
-            .gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (root, next, seq) = gate.state?;
-        let append_offset = *gate.append.get(region)?;
-        Some(inlaysql_core::btree::CommitPoint {
-            root,
-            next,
-            seq,
-            append_offset: append_offset?,
-        })
+        let point = (|| {
+            let gate = coordinator
+                .gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (root, next, seq) = gate.state?;
+            let append_offset = *gate.append.get(region)?;
+            Some(inlaysql_core::btree::CommitPoint {
+                root,
+                next,
+                seq,
+                append_offset: append_offset?,
+            })
+        })();
+        // AHL-563: a miss here is what sends the gate holder into
+        // `read_committed_state` and `wal::scan_region`, both inside the
+        // hold. Counted only for a holder, so the free list's own lookups do
+        // not colour the number.
+        if point.is_none() && self.in_normal_gate.load(Ordering::Relaxed) {
+            coordinator
+                .gate_point_misses
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        point
     }
 
     fn set_commit_point(&self, region: usize, point: Option<inlaysql_core::btree::CommitPoint>) {
@@ -2021,6 +2347,53 @@ impl Device for FileDevice {
             // sequence the committed state itself depends on, so the honest
             // answer everywhere is "read the file".
             None => *gate = GateCache::default(),
+        }
+    }
+
+    /// Narrower than [`Device::set_commit_point`]`(region, None)`: forget
+    /// where `region`'s next record goes and keep the rest of the cache.
+    ///
+    /// The trait's default is the total forget, and that is still what every
+    /// *failure* path uses — a commit that stopped part-way through a
+    /// sequence the committed state depends on. This override exists for the
+    /// one caller that knows precisely what it invalidated: a WAL region wrap
+    /// is about to zero `region`, which changes where that region's next
+    /// record goes and nothing else. The committed root, the next page id and
+    /// the sequence number are the same values before and after it, and the
+    /// other regions' logs are not touched.
+    ///
+    /// So a thread reading this cache during the wrap — `refill_free_candidates`
+    /// does, outside the gate — sees exactly what it would have seen one
+    /// instruction before the wrap began, rather than `None`. That is the
+    /// whole of the safety argument, and `docs/research/gate-hold.md` §4 is
+    /// the long form of it, including why a *failed* wrap still ends in a
+    /// total forget before the gate is released.
+    ///
+    /// Measured worth: at sixteen writers a wrap of one of four regions
+    /// manufactured ~2.4 full re-derivations of the committed state, each
+    /// ~2.6 ms, each inside the reservation gate with every other writer
+    /// queued behind it — 53% of all the time spent in the gate.
+    ///
+    /// `INLAYSQL_WIDE_WRAP_FORGET` puts the total forget back, which is what
+    /// makes that a *paired* measurement rather than two runs quoted at each
+    /// other: one binary, one environment variable apart, both arms in every
+    /// repetition (`bench/gate_hold.sh`). It is the same measurement-switch
+    /// shape `INLAYSQL_DISABLE_SHARED_READ_CACHE` already has, and it costs
+    /// one relaxed load per *wrap* — about one commit in fifty.
+    fn forget_append_offset(&self, region: usize) {
+        let Some(coordinator) = self.coordinator.as_ref() else {
+            return;
+        };
+        if coordinator.wide_wrap_forget.load(Ordering::Relaxed) {
+            self.set_commit_point(region, None);
+            return;
+        }
+        let mut gate = coordinator
+            .gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(slot) = gate.append.get_mut(region) {
+            *slot = None;
         }
     }
 
@@ -2368,6 +2741,24 @@ fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator
         gate_hold_racing_start_ns: AtomicU64::new(0),
         gate_hold_racing_start_count: AtomicU64::new(0),
         gate_waits: AtomicU64::new(0),
+        gate_read_ns: AtomicU64::new(0),
+        gate_reads: AtomicU64::new(0),
+        gate_state_ns: AtomicU64::new(0),
+        gate_state_writes: AtomicU64::new(0),
+        gate_wal_ns: AtomicU64::new(0),
+        gate_wal_writes: AtomicU64::new(0),
+        gate_wal_bytes: AtomicU64::new(0),
+        gate_data_ns: AtomicU64::new(0),
+        gate_data_writes: AtomicU64::new(0),
+        gate_data_bytes: AtomicU64::new(0),
+        gate_extend_ns: AtomicU64::new(0),
+        gate_extends: AtomicU64::new(0),
+        layout_wal_start: AtomicUsize::new(0),
+        layout_boundary: AtomicUsize::new(0),
+        gate_phase_ns: [const { AtomicU64::new(0) }; GATE_PHASES],
+        gate_phases_enabled: AtomicBool::new(gate_phases_enabled()),
+        gate_point_misses: AtomicU64::new(0),
+        wide_wrap_forget: AtomicBool::new(wide_wrap_forget()),
         follower_wait_ns: AtomicU64::new(0),
         follower_waits: AtomicU64::new(0),
         gather_spin_ns: AtomicU64::new(0),
@@ -2418,6 +2809,20 @@ fn flush_pipelining_enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var_os("INLAYSQL_FLUSH_PIPELINE").is_some_and(|value| value != "0")
     })
+}
+
+/// AHL-563's in-gate phase split, off unless `INLAYSQL_GATE_PHASES` is set.
+/// Read once per process, like [`flush_pipelining_enabled`].
+fn gate_phases_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("INLAYSQL_GATE_PHASES").is_some_and(|v| v != "0"))
+}
+
+/// AHL-563's A/B switch: the pre-change total forget on the wrap path.
+/// Read once per process, like [`flush_pipelining_enabled`].
+fn wide_wrap_forget() -> bool {
+    static WIDE: OnceLock<bool> = OnceLock::new();
+    *WIDE.get_or_init(|| std::env::var_os("INLAYSQL_WIDE_WRAP_FORGET").is_some_and(|v| v != "0"))
 }
 
 fn shared_read_cache_budget() -> usize {
@@ -2550,6 +2955,28 @@ mod group_commit_tests {
             gate_hold_racing_start_ns: AtomicU64::new(0),
             gate_hold_racing_start_count: AtomicU64::new(0),
             gate_waits: AtomicU64::new(0),
+            gate_read_ns: AtomicU64::new(0),
+            gate_reads: AtomicU64::new(0),
+            gate_state_ns: AtomicU64::new(0),
+            gate_state_writes: AtomicU64::new(0),
+            gate_wal_ns: AtomicU64::new(0),
+            gate_wal_writes: AtomicU64::new(0),
+            gate_wal_bytes: AtomicU64::new(0),
+            gate_data_ns: AtomicU64::new(0),
+            gate_data_writes: AtomicU64::new(0),
+            gate_data_bytes: AtomicU64::new(0),
+            gate_extend_ns: AtomicU64::new(0),
+            gate_extends: AtomicU64::new(0),
+            layout_wal_start: AtomicUsize::new(0),
+            layout_boundary: AtomicUsize::new(0),
+            gate_phase_ns: [const { AtomicU64::new(0) }; GATE_PHASES],
+            // Never from the ambient environment, for the same reason
+            // `pipeline` is not: a test means the same thing either way.
+            gate_phases_enabled: AtomicBool::new(false),
+            gate_point_misses: AtomicU64::new(0),
+            // Never from the ambient environment, for the same reason
+            // `pipeline` is not: a test means the same thing either way.
+            wide_wrap_forget: AtomicBool::new(false),
             follower_wait_ns: AtomicU64::new(0),
             follower_waits: AtomicU64::new(0),
             gather_spin_ns: AtomicU64::new(0),
@@ -3217,6 +3644,501 @@ mod group_commit_tests {
 
     /// A checkpoint is never absorbed and never leads a cohort.
     ///
+    /// A [`FileDevice`] that refuses its `n`th write from now on.
+    ///
+    /// The only way to reach `CowBTree::commit`'s failure paths on a real
+    /// file: everything else about the device is the production one, so the
+    /// bytes, the coordinator, the commit-point cache and the gate are all
+    /// real, and only one `pwrite` is replaced by an error. Every method is a
+    /// forward except [`Device::write`].
+    struct FailNthWrite {
+        inner: FileDevice,
+        countdown: std::cell::Cell<Option<usize>>,
+        writes: std::cell::Cell<usize>,
+        failed: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl FailNthWrite {
+        fn new(inner: FileDevice, failed: std::rc::Rc<std::cell::Cell<bool>>) -> Self {
+            Self {
+                inner,
+                countdown: std::cell::Cell::new(None),
+                writes: std::cell::Cell::new(0),
+                failed,
+            }
+        }
+
+        /// Fail the `n`th write from here (0 = the very next one).
+        fn arm(&self, n: usize) {
+            self.countdown.set(Some(n));
+        }
+
+        /// Writes issued so far, so a test can count the ones a particular
+        /// commit performs instead of hard-coding the number.
+        fn writes(&self) -> usize {
+            self.writes.get()
+        }
+    }
+
+    impl Device for FailNthWrite {
+        fn write(&mut self, offset: usize, data: &[u8]) -> Result<()> {
+            self.writes.set(self.writes.get() + 1);
+            if let Some(left) = self.countdown.get() {
+                if left == 0 {
+                    self.countdown.set(None);
+                    self.failed.set(true);
+                    return Err(Error::Storage("injected write failure".to_string()));
+                }
+                self.countdown.set(Some(left - 1));
+            }
+            self.inner.write(offset, data)
+        }
+
+        fn read(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
+            self.inner.read(offset, buf)
+        }
+        fn read_shared(&self, offset: usize, len: usize) -> Option<Arc<[u8]>> {
+            self.inner.read_shared(offset, len)
+        }
+        fn sync(&mut self) -> Result<()> {
+            self.inner.sync()
+        }
+        fn sync_commit(&mut self) -> Result<()> {
+            self.inner.sync_commit()
+        }
+        fn commit_ready(&self) {
+            self.inner.commit_ready();
+        }
+        fn set_durability(&self, durability: inlaysql_core::btree::Durability) {
+            self.inner.set_durability(durability);
+        }
+        fn begin_commit(&self) -> Result<()> {
+            self.inner.begin_commit()
+        }
+        fn begin_normal_commit(&self) -> Result<()> {
+            self.inner.begin_normal_commit()
+        }
+        fn end_commit(&self) -> Option<u64> {
+            self.inner.end_commit()
+        }
+        fn end_normal_commit(&self) -> Option<u64> {
+            self.inner.end_normal_commit()
+        }
+        fn commit_generation(&self) -> Option<u64> {
+            self.inner.commit_generation()
+        }
+        fn commit_point(&self, region: usize) -> Option<inlaysql_core::btree::CommitPoint> {
+            self.inner.commit_point(region)
+        }
+        fn set_commit_point(
+            &self,
+            region: usize,
+            point: Option<inlaysql_core::btree::CommitPoint>,
+        ) {
+            self.inner.set_commit_point(region, point);
+        }
+        fn forget_append_offset(&self, region: usize) {
+            self.inner.forget_append_offset(region);
+        }
+        fn wal_region(&self) -> usize {
+            self.inner.wal_region()
+        }
+        fn is_read_only(&self) -> bool {
+            self.inner.is_read_only()
+        }
+        fn register_reader(&self) -> Option<u64> {
+            self.inner.register_reader()
+        }
+        fn update_reader(&self, token: u64, seq: u64) {
+            self.inner.update_reader(token, seq);
+        }
+        fn release_reader(&self, token: u64) {
+            self.inner.release_reader(token);
+        }
+        fn min_reader_seq(&self) -> Option<u64> {
+            self.inner.min_reader_seq()
+        }
+        fn note_page_reuse_enabled(&self) {
+            self.inner.note_page_reuse_enabled();
+        }
+        fn page_reuse_enabled(&self) -> bool {
+            self.inner.page_reuse_enabled()
+        }
+    }
+
+    /// A test path that does not collide with a concurrent run of this suite.
+    fn scratch_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "inlaysql-{name}-{}-{}.inlay",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ))
+    }
+
+    /// [`Device::forget_append_offset`] forgets one region's append offset and
+    /// nothing else — the whole of what the wrap path is allowed to invalidate.
+    ///
+    /// Both halves matter and each catches a different mutation: dropping the
+    /// `*slot = None` leaves region 1 answering, and falling back to the
+    /// trait's default total forget takes region 0 and the committed state
+    /// with it. See `docs/research/gate-hold.md` §4.
+    #[test]
+    fn forgetting_an_append_offset_leaves_the_other_regions_and_the_state() {
+        let path = scratch_path("forget-append-offset");
+        let _ = std::fs::remove_file(&path);
+        let device = FileDevice::open(&path).expect("open");
+
+        let point = |append_offset| inlaysql_core::btree::CommitPoint {
+            root: 7,
+            next: 9,
+            seq: 11,
+            append_offset,
+        };
+        device.set_commit_point(0, Some(point(4096)));
+        device.set_commit_point(1, Some(point(8192)));
+        assert!(device.commit_point(0).is_some());
+        assert!(device.commit_point(1).is_some());
+
+        device.forget_append_offset(1);
+
+        assert!(
+            device.commit_point(1).is_none(),
+            "the wrapped region's append offset is the one fact a wrap invalidates"
+        );
+        let kept = device
+            .commit_point(0)
+            .expect("another region's append offset survives a wrap that is not its own");
+        assert_eq!(
+            (kept.root, kept.next, kept.seq, kept.append_offset),
+            (7, 9, 11, 4096),
+            "a wrap moves no root, no page id, no sequence number and no other region"
+        );
+
+        drop(device);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The *total* forget is still total. Every failure path uses it — the
+    /// `!written` branch of `CowBTree::commit` and `CowBTree::checkpoint`'s own
+    /// — and AHL-563 narrowed exactly one caller, the wrap, and nothing else.
+    /// Widening `forget_append_offset` without narrowing this would pass the
+    /// test above and fail this one.
+    #[test]
+    fn the_total_forget_is_still_total() {
+        let path = scratch_path("total-forget");
+        let _ = std::fs::remove_file(&path);
+        let device = FileDevice::open(&path).expect("open");
+
+        let point = |append_offset| inlaysql_core::btree::CommitPoint {
+            root: 7,
+            next: 9,
+            seq: 11,
+            append_offset,
+        };
+        device.set_commit_point(0, Some(point(4096)));
+        device.set_commit_point(1, Some(point(8192)));
+
+        device.set_commit_point(1, None);
+
+        assert!(device.commit_point(1).is_none());
+        assert!(
+            device.commit_point(0).is_none(),
+            "a failure the caller cannot bound must still forget the whole cache"
+        );
+
+        drop(device);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// AHL-563's finding, as a test: a wrap of one WAL region must not force
+    /// the next commit in any *other* region to re-derive the committed state
+    /// from the file inside its own gate hold.
+    ///
+    /// Two handles, two regions. Both commit once, so both regions' append
+    /// offsets are cached and the file-wide state is too. Then one handle
+    /// commits until its region wraps — proven by `gate_state_writes`, which
+    /// counts the in-gate state-block writes only a wrap performs — and the
+    /// other handle commits again. With the total forget, that last commit
+    /// finds an empty cache and pays `read_committed_state` plus
+    /// `wal::scan_region`; with the narrow one it finds its own offset intact.
+    ///
+    /// The assertion is on `gate_point_misses`, which counts exactly that
+    /// event, so the test fails on the mutation rather than on a timing.
+    #[test]
+    fn a_region_wrap_costs_no_other_region_a_re_derivation() {
+        use inlaysql_core::btree::{CowBTree, DEFAULT_PAGE_SIZE};
+
+        let path = scratch_path("wrap-keeps-other-regions");
+        let _ = std::fs::remove_file(&path);
+
+        let device_a = FileDevice::open(&path).expect("open a");
+        let coordinator = Arc::clone(device_a.coordinator.as_ref().expect("coordinator"));
+        let mut tree_a = CowBTree::open_or_create(device_a, DEFAULT_PAGE_SIZE).expect("create");
+        tree_a.put(b"a", &[0u8; 64]).expect("put");
+        tree_a.commit().expect("commit a");
+
+        let device_b = FileDevice::open(&path).expect("open b");
+        assert_ne!(
+            device_b.wal_region(),
+            0,
+            "the second handle on a file takes the next region, which is what this test is about"
+        );
+        let mut tree_b = CowBTree::open_or_create(device_b, DEFAULT_PAGE_SIZE).expect("open b");
+        tree_b.put(b"b", &[0u8; 64]).expect("put");
+        tree_b.commit().expect("commit b");
+
+        // One more commit each, because opening the second handle replays the
+        // log and can checkpoint, which forgets everything — including region
+        // 0's offset, which the first commit had published. After this round
+        // both regions and the file-wide state are genuinely cached, so
+        // everything the counter records past this point is what the *wrap*
+        // did to them and nothing else.
+        tree_a.put(b"a2", &[0u8; 64]).expect("put");
+        tree_a.commit().expect("commit a again");
+        tree_b.put(b"b1", &[0u8; 64]).expect("put");
+        tree_b.commit().expect("commit b again");
+
+        let misses_before = coordinator.gate_point_misses.load(Ordering::Relaxed);
+        let wraps_before = coordinator.gate_state_writes.load(Ordering::Relaxed);
+
+        // A region is 256 pages; a value near a page fills one quickly. This
+        // loop is bounded so a change that stops wrapping fails the assertion
+        // below rather than hanging.
+        let value = vec![7u8; DEFAULT_PAGE_SIZE / 2];
+        for i in 0..2_000u32 {
+            tree_a.put(&i.to_be_bytes(), &value).expect("put");
+            tree_a.commit().expect("commit");
+            if coordinator.gate_state_writes.load(Ordering::Relaxed) > wraps_before {
+                break;
+            }
+        }
+        assert!(
+            coordinator.gate_state_writes.load(Ordering::Relaxed) > wraps_before,
+            "the loop must actually wrap a region or this test proves nothing"
+        );
+
+        let misses_after_wrap = coordinator.gate_point_misses.load(Ordering::Relaxed);
+        assert_eq!(
+            misses_after_wrap, misses_before,
+            "the wrapping writer republishes its own region before leaving the gate"
+        );
+
+        tree_b.put(b"b2", &[1u8; 64]).expect("put");
+        tree_b.commit().expect("commit b after the wrap");
+
+        assert_eq!(
+            coordinator.gate_point_misses.load(Ordering::Relaxed),
+            misses_before,
+            "a wrap in another region must not send this one back to the file"
+        );
+
+        // And the data is still there, read through a handle that shares
+        // neither tree's in-memory state.
+        drop(tree_a);
+        drop(tree_b);
+        let reader = FileDevice::open(&path).expect("reopen");
+        let check = CowBTree::open_or_create(reader, DEFAULT_PAGE_SIZE).expect("reopen tree");
+        assert_eq!(
+            check.get(b"b2").expect("get").as_deref(),
+            Some(&[1u8; 64][..])
+        );
+        assert_eq!(
+            check.get(b"a").expect("get").as_deref(),
+            Some(&[0u8; 64][..])
+        );
+        drop(check);
+
+        drop(coordinator);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A wrap that fails at *any* of its writes must leave the commit-point
+    /// cache completely empty, and the file readable as a prefix: every row a
+    /// caller was told it committed is still there, and the one it was not
+    /// told about is not required to be.
+    ///
+    /// This is the property AHL-563's narrowing has to preserve rather than
+    /// improve. `CowBTree::commit`'s wrap branch now forgets only its own
+    /// region's append offset, so the guarantee that a *failed* wrap forgets
+    /// everything rests entirely on the `!written` branch further down —
+    /// unchanged code, but code this change now depends on, which is why it
+    /// gets a test instead of a sentence. Removing that branch fails this on
+    /// the first injected failure.
+    ///
+    /// The injection walks every write of the wrapping commit: the state
+    /// block, the megabyte of zeros, each dirty page, and the record append.
+    #[test]
+    fn a_wrap_that_fails_at_any_write_forgets_the_whole_cache() {
+        use inlaysql_core::btree::{CowBTree, DEFAULT_PAGE_SIZE};
+
+        let value = vec![5u8; DEFAULT_PAGE_SIZE / 2];
+
+        // Pass one, on its own file: how many commits does it take to wrap?
+        let probe_path = scratch_path("wrap-failure-probe");
+        let _ = std::fs::remove_file(&probe_path);
+        let probe = FileDevice::open(&probe_path).expect("open probe");
+        let coordinator = Arc::clone(probe.coordinator.as_ref().expect("coordinator"));
+        let probe = FailNthWrite::new(probe, std::rc::Rc::new(std::cell::Cell::new(false)));
+        let mut tree = CowBTree::open_or_create(probe, DEFAULT_PAGE_SIZE).expect("create");
+        let mut wrap = None;
+        for i in 0..2_000u32 {
+            let before = tree.device().writes();
+            tree.put(&i.to_be_bytes(), &value).expect("put");
+            tree.commit().expect("commit");
+            if coordinator.gate_state_writes.load(Ordering::Relaxed) > 0 {
+                wrap = Some((i, tree.device().writes() - before));
+                break;
+            }
+        }
+        drop(tree);
+        drop(coordinator);
+        let _ = std::fs::remove_file(&probe_path);
+        let (wrap_at, writes_in_wrap) = wrap.expect("the probe has to reach a region wrap");
+        assert!(
+            writes_in_wrap >= 3,
+            "a wrapping commit writes at least the state block, the zeros and its record"
+        );
+        let mut injections = 0usize;
+
+        // Pass two: replay up to just before that commit, then break each of
+        // its writes in turn.
+        for fail_at in 0..writes_in_wrap {
+            let path = scratch_path(&format!("wrap-failure-{fail_at}"));
+            let _ = std::fs::remove_file(&path);
+            let inner = FileDevice::open(&path).expect("open");
+            let coordinator = Arc::clone(inner.coordinator.as_ref().expect("coordinator"));
+            let failed = std::rc::Rc::new(std::cell::Cell::new(false));
+            let device = FailNthWrite::new(inner, std::rc::Rc::clone(&failed));
+            let mut tree = CowBTree::open_or_create(device, DEFAULT_PAGE_SIZE).expect("create");
+            for i in 0..wrap_at {
+                tree.put(&i.to_be_bytes(), &value).expect("put");
+                tree.commit().expect("commit");
+            }
+            assert_eq!(
+                coordinator.gate_state_writes.load(Ordering::Relaxed),
+                0,
+                "the replay must stop one commit short of the wrap"
+            );
+
+            tree.device().arm(fail_at);
+            tree.put(&wrap_at.to_be_bytes(), &value).expect("put");
+            let outcome = tree.commit();
+
+            if failed.get() {
+                injections += 1;
+                assert!(
+                    outcome.is_err(),
+                    "an injected write failure has to be reported, not swallowed"
+                );
+                let gate = coordinator
+                    .gate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert!(
+                    gate.state.is_none() && gate.append.iter().all(Option::is_none),
+                    "a commit that stopped part-way must leave no cached answer at all \
+                     (fail_at={fail_at})"
+                );
+            }
+            drop(tree);
+
+            // Whatever happened, every row committed before the failure is
+            // still readable from a handle with no memory of any of it.
+            let reader = FileDevice::open(&path).expect("reopen");
+            let check = CowBTree::open_or_create(reader, DEFAULT_PAGE_SIZE).expect("reopen tree");
+            for i in 0..wrap_at {
+                assert_eq!(
+                    check.get(&i.to_be_bytes()).expect("get").as_deref(),
+                    Some(&value[..]),
+                    "row {i} was acknowledged before the injected failure (fail_at={fail_at})"
+                );
+            }
+            drop(check);
+            drop(coordinator);
+            let _ = std::fs::remove_file(&path);
+        }
+        assert_eq!(
+            injections, writes_in_wrap,
+            "every write the wrapping commit issues has to have been broken in turn, \
+             or this test is asserting about commits that simply succeeded"
+        );
+    }
+
+    /// The same shape as a randomised property, and the one that would catch a
+    /// stale append offset rather than merely a slow one: four handles on four
+    /// regions, each wrapping its own region several times over, and every row
+    /// any of them was told it committed has to be readable from a handle
+    /// opened afterwards with a cold cache.
+    ///
+    /// A cached append offset that survived a wrap it should not have would
+    /// put a later record on top of a live one, and the reopen below is where
+    /// that shows up — as a missing row, not as a crash.
+    #[test]
+    fn every_row_survives_repeated_region_wraps() {
+        use inlaysql_core::btree::{CowBTree, DEFAULT_PAGE_SIZE};
+
+        const HANDLES: usize = 4;
+        const ROWS: usize = 240;
+
+        let path = scratch_path("repeated-region-wraps");
+        let _ = std::fs::remove_file(&path);
+
+        let seed = FileDevice::open(&path).expect("open seed");
+        let coordinator = Arc::clone(seed.coordinator.as_ref().expect("coordinator"));
+        let mut seed_tree = CowBTree::open_or_create(seed, DEFAULT_PAGE_SIZE).expect("create");
+        seed_tree.put(b"seed", b"value").expect("seed put");
+        seed_tree.commit().expect("seed commit");
+        drop(seed_tree);
+
+        let value = vec![3u8; DEFAULT_PAGE_SIZE / 2];
+        // `CowBTree` is not `Send` (see the checkpoint test above), so the
+        // handles run in sequence here; what this test is about is the shared
+        // commit-point cache, which they share either way.
+        for handle in 0..HANDLES {
+            let device = FileDevice::open(&path).expect("open");
+            let mut tree = CowBTree::open_or_create(device, DEFAULT_PAGE_SIZE).expect("open tree");
+            for row in 0..ROWS {
+                let key = format!("h{handle}-r{row}");
+                tree.put(key.as_bytes(), &value).expect("put");
+                assert!(
+                    matches!(
+                        tree.commit().expect("commit"),
+                        inlaysql_core::btree::CommitOutcome::Committed
+                    ),
+                    "these writers touch disjoint keys and must never conflict"
+                );
+            }
+        }
+        assert!(
+            coordinator.gate_state_writes.load(Ordering::Relaxed) >= HANDLES as u64,
+            "this workload has to wrap every region at least once to mean anything"
+        );
+
+        let reader = FileDevice::open(&path).expect("reopen");
+        let check = CowBTree::open_or_create(reader, DEFAULT_PAGE_SIZE).expect("reopen tree");
+        for handle in 0..HANDLES {
+            for row in 0..ROWS {
+                let key = format!("h{handle}-r{row}");
+                assert_eq!(
+                    check.get(key.as_bytes()).expect("get").as_deref(),
+                    Some(&value[..]),
+                    "row {key} was committed and must survive every wrap after it"
+                );
+            }
+        }
+        assert_eq!(
+            check.get(b"seed").expect("get").as_deref(),
+            Some(&b"value"[..])
+        );
+        drop(check);
+
+        drop(coordinator);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// It takes the gate through [`FileDevice::begin_commit`], not
     /// `begin_normal_commit`, so it never advertises itself as a leader — and
     /// a writer arriving behind it therefore parks on the reservation exactly

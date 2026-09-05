@@ -624,6 +624,50 @@ pub trait Device {
     /// rule [`Device::end_commit`] follows, for the same reason.
     fn set_commit_point(&self, _region: usize, _point: Option<CommitPoint>) {}
 
+    /// Forget only where `region`'s next record goes, keeping whatever else a
+    /// cached commit point holds.
+    ///
+    /// This exists because [`Device::set_commit_point`]`(region, None)` is a
+    /// *total* forget — the committed state and every region's append offset —
+    /// and a caller that is about to reuse one region needs less than that. A
+    /// region wrap changes exactly one fact: where that region's next record
+    /// goes. It does not move the committed root, the next page id or the
+    /// sequence number, and it does not touch any other region's log. See
+    /// `docs/research/gate-hold.md` §3 for the measurement that made the
+    /// difference worth naming, and §4 for why the narrower forget is safe.
+    ///
+    /// **The default is the total forget**, so a device that has not thought
+    /// about the distinction keeps the conservative answer and this method
+    /// can never make one less safe than it was. `inlaysql`'s `FileDevice` is
+    /// the only implementation that overrides it.
+    ///
+    /// Called only from inside the reservation gate, before the writes that
+    /// make the old answer wrong — the same ordering rule
+    /// [`Device::set_commit_point`] follows, for the same reason.
+    fn forget_append_offset(&self, region: usize) {
+        self.set_commit_point(region, None);
+    }
+
+    /// Mark the boundary between two phases of a commit's reservation-gate
+    /// hold, for a device that can read a clock (AHL-563).
+    ///
+    /// `CowBTree::commit` calls this at each internal boundary of the
+    /// serialized critical section — after the committed state is read, after
+    /// `rebase_pending`, after `finalize_free_list`, after `materialize_dirty`,
+    /// after the record encode, after the dirty-page writes, after the cohort,
+    /// after the record append — so a native device can charge the elapsed
+    /// time to the phase that just ended. `phase` is the index of the phase
+    /// *ending*, and the numbering is that call order.
+    ///
+    /// **The default is a no-op and the core never reads the answer.** This is
+    /// a measurement seam, not a behaviour: nothing in `inlaysql-core`
+    /// branches on it, no `no_std` rule is touched (the core still cannot read
+    /// a clock — it only says *where* it is), and a device that does not
+    /// implement it pays a call the compiler removes. The native
+    /// implementation is itself off unless `INLAYSQL_GATE_PHASES` is set, so
+    /// the shipped commit path pays one relaxed atomic load per boundary.
+    fn gate_phase(&self, _phase: u32) {}
+
     /// The WAL region assigned to this device handle.
     ///
     /// Single-region and simulation devices use region zero. Native file
@@ -891,6 +935,10 @@ impl<T: Device> Device for Rc<RefCell<T>> {
 
     fn set_commit_point(&self, region: usize, point: Option<CommitPoint>) {
         self.borrow().set_commit_point(region, point);
+    }
+
+    fn forget_append_offset(&self, region: usize) {
+        self.borrow().forget_append_offset(region);
     }
 
     fn wal_region(&self) -> usize {

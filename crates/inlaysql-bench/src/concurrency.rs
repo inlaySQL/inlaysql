@@ -458,6 +458,74 @@ fn inlaysql_writers(
             stats.gate_hold_racing_count,
         );
     }
+    // AHL-563: the reservation gate's *hold*, decomposed. AHL-562 measured
+    // the hold at 0.155–0.263 ms and showed it caps the commit rate — a
+    // serialized 0.263 ms hold is ~3,800 commits/s and the run measured 2,850
+    // — but it could not say what was inside it. These are the device calls
+    // the tree makes between `begin_normal_commit` and `end_normal_commit`,
+    // timed at the syscall, so the residual is exactly the in-gate CPU work
+    // (`rebase_pending`'s replay, `finalize_free_list`, `materialize_dirty`,
+    // the record encode, the bookkeeping).
+    //
+    // Per *hold*, not per commit: `gate_waits` counts acquisitions, which is
+    // what the hold's mean is a mean over, and it includes the schema-creating
+    // handle's own. `extend` is contained in the write buckets rather than
+    // additional to them, and is subtracted out of the residual line for that
+    // reason.
+    if let Some(stats) = keeper.commit_stats() {
+        let holds = stats.gate_waits.max(1) as f64;
+        let per = |ns: u64| ns as f64 / 1e6 / holds;
+        let hold_ms = per(stats.gate_hold_ns);
+        let device_ms =
+            per(stats.gate_read_ns + stats.gate_state_ns + stats.gate_wal_ns + stats.gate_data_ns);
+        println!(
+            "  gate hold: {writers} writers, {:.0} holds, {hold_ms:.3} ms mean —              read {:.3} ({} calls), state {:.3} ({}), wal {:.3} ({}, {:.1} KiB),              data {:.3} ({}, {:.1} KiB), of which extend {:.3} ({} extensions);              device {device_ms:.3} ms ({:.1}%), residual {:.3} ms ({:.1}%), \
+             {} commit-point misses",
+            holds,
+            per(stats.gate_read_ns),
+            stats.gate_reads,
+            per(stats.gate_state_ns),
+            stats.gate_state_writes,
+            per(stats.gate_wal_ns),
+            stats.gate_wal_writes,
+            stats.gate_wal_bytes as f64 / 1024.0 / holds,
+            per(stats.gate_data_ns),
+            stats.gate_data_writes,
+            stats.gate_data_bytes as f64 / 1024.0 / holds,
+            per(stats.gate_extend_ns),
+            stats.gate_extends,
+            100.0 * device_ms / hold_ms.max(f64::MIN_POSITIVE),
+            hold_ms - device_ms,
+            100.0 * (hold_ms - device_ms) / hold_ms.max(f64::MIN_POSITIVE),
+            stats.gate_point_misses,
+        );
+    }
+    // AHL-563: the same hold split by code phase instead of by device call,
+    // printed only when `INLAYSQL_GATE_PHASES` produced one. The device-call
+    // line above says how much of the hold is I/O; this one says which part of
+    // `CowBTree::commit` the rest of it is.
+    if let Some(stats) = keeper.commit_stats() {
+        let total: u64 = stats.gate_phase_ns.iter().sum();
+        if total > 0 {
+            let holds = stats.gate_waits.max(1) as f64;
+            let parts: Vec<String> = inlaysql::GATE_PHASE_NAMES
+                .iter()
+                .zip(stats.gate_phase_ns.iter())
+                .map(|(name, ns)| {
+                    format!(
+                        "{name} {:.3} ({:.1}%)",
+                        *ns as f64 / 1e6 / holds,
+                        100.0 * *ns as f64 / total as f64
+                    )
+                })
+                .collect();
+            println!(
+                "  gate phases: {writers} writers, {:.3} ms/hold marked — {}",
+                total as f64 / 1e6 / holds,
+                parts.join(", "),
+            );
+        }
+    }
     drop(keeper);
     let _ = std::fs::remove_file(path);
     Ok(Outcome {
