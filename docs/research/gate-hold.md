@@ -237,11 +237,23 @@ ceiling, or not at all.
 
 | Test | What it pins | Mutation that fails it |
 | --- | --- | --- |
-| `wrap_keeps_other_regions_append_offset` | after a region wrap, a commit in a *different* region finds a cached commit point | `forget_append_offset` falling back to the total forget on `FileDevice` |
-| `wrap_forgets_its_own_append_offset` | the wrapping region's own offset is `None` between the forget and the republish | `forget_append_offset` clearing nothing |
-| `failed_wrap_forgets_everything` | a wrap whose write fails leaves no cached point at all | removing the `!written` total forget |
-| `region_wrap_recovers_at_every_step` (crash injection) | a crash at each write of the wrap sequence recovers to a committed prefix | reordering the state write after the zero fill |
-| `concurrent_writers` DST + the five sweeps | the whole protocol, thousands of seeds | any of the above |
+| `forgetting_an_append_offset_leaves_the_other_regions_and_the_state` | the narrow forget clears one slot and nothing else | the total-forget fallback; clearing nothing; clearing the wrong region |
+| `the_total_forget_is_still_total` | every failure path keeps the wide meaning | narrowing `set_commit_point(_, None)` itself |
+| `a_region_wrap_costs_no_other_region_a_re_derivation` | after a wrap, a commit in a *different* region still finds a cached point — asserted on `gate_point_misses`, so it fails on the bug and not on a timing | the total-forget fallback |
+| `a_wrap_that_fails_at_any_write_forgets_the_whole_cache` | a wrap broken at *every* write it issues leaves no cached point and a readable prefix | removing the `!written` total forget |
+| `every_row_survives_repeated_region_wraps` | four handles, four regions, every region wrapped, reopened cold | data-safety backstop |
+| `concurrent_writers` + all five DST sweeps, both arms | the whole protocol, thousands of seeds | any of the above |
+
+**One mutation is checked and equivalent rather than missed**, and it is
+worth writing down: deleting the wrap's forget *entirely* fails nothing. The
+success path republishes the offset before the gate is released and the
+failure path forgets everything, so the only thread that could see a stale
+offset is an out-of-gate reader — and neither `refill_free_candidates` nor
+`resolve_state_at_least` reads `append_offset`. The forget is kept as defence
+in depth. Note also that **there is no crash injection at a new step because
+there is no new step**: the wrap's write sequence is byte-identical before and
+after, and the diff moves one in-memory cache line and nothing that reaches
+the file.
 
 ## 6. Order of work
 
@@ -250,3 +262,11 @@ ceiling, or not at all.
    site.
 3. The tests above, each mutation-checked.
 4. The paired before/after measurement with its A/A row, and `PERF.md`.
+
+**Outcome, added after the fact:** the gate hold halved at four writers and
+up — 0.262 → 0.121 ms at sixteen, paired ratios 0.45–0.50, six of six —
+commit-point misses went 132 → 3, and `read_state` and `scan_region` went to
+exactly zero while every other phase held still. `bench/gate_hold.sh`
+regenerates it and `PERF.md`'s AHL-563 section is the record, including the
+one-writer A/A row (0 misses in *both* arms) that the ratios have to be read
+against.
