@@ -138,6 +138,22 @@ struct CommitCoordinator {
     /// re-check [`CommitCoordinator::durable_upto`] — see
     /// [`CommitCoordinator::make_durable`].
     flush_done: Condvar,
+    /// Where a claimed successor waits for its handoff, separate from
+    /// [`CommitCoordinator::flush_done`] so the directed wakeup does not have
+    /// to win a race against the whole follower herd. See
+    /// `docs/research/flush-pipelining.md`.
+    successor_wake: Condvar,
+    /// [`FlushState::handoff`], readable without the flush mutex — this is
+    /// the successor's *gather* stop condition, polled once per yield, and
+    /// it is what bounds the overlapped gather by the in-flight barrier so
+    /// the pipeline can never extend a cycle it was meant to shorten.
+    handoff_pending: AtomicBool,
+    /// Whether flush pipelining is on for this file (`INLAYSQL_FLUSH_PIPELINE`,
+    /// read once when the coordinator is built). Off means every path in
+    /// this file behaves exactly as it did before AHL-562: no successor is
+    /// ever claimed, so [`LeaderGuard::drop`] never finds one and takes its
+    /// old branch.
+    pipeline: AtomicBool,
     /// Diagnostic count of completed flushes. Printed only when
     /// `INLAYSQL_COMMIT_STATS` is set, so the benchmark can explain a
     /// throughput change without making statistics part of the storage API.
@@ -178,6 +194,16 @@ struct CommitCoordinator {
     /// Time the elected leader spent inside the adaptive gather window before
     /// capturing its flush target.
     gather_spin_ns: AtomicU64,
+    /// Time a *successor* spent gathering while the previous barrier was
+    /// still in flight. Deliberately not added to
+    /// [`CommitCoordinator::gather_spin_ns`]: that one, with `fsync`, `post`
+    /// and `gap`, decomposes a single cycle end to end, and adding an
+    /// overlapped segment to it would make the four sum to more than the
+    /// measured interval. This is the segment the pipeline moved *out* of
+    /// the cycle, and its size is the size of the win.
+    overlap_gather_ns: AtomicU64,
+    /// Rounds entered by taking a handoff rather than by winning an election.
+    handoffs: AtomicU64,
     /// Total wall time spent inside the barrier itself.
     fsync_ns: AtomicU64,
     /// Time spent after the barrier returning — re-locking the flush state
@@ -345,8 +371,16 @@ pub struct CommitStats {
     pub follower_wait_ns: u64,
     /// How many follower waits [`CommitStats::follower_wait_ns`] sums.
     pub follower_waits: u64,
-    /// Nanoseconds flush leaders spent in the adaptive gather window.
+    /// Nanoseconds flush leaders spent in the adaptive gather window, on the
+    /// critical path — i.e. with no barrier in flight.
     pub gather_spin_ns: u64,
+    /// Nanoseconds pipelined successors spent gathering *underneath* an
+    /// in-flight barrier, which is time the cycle no longer pays for. Zero
+    /// unless `INLAYSQL_FLUSH_PIPELINE` is set. See the coordinator field.
+    pub overlap_gather_ns: u64,
+    /// Barriers entered by taking a handoff from the outgoing leader rather
+    /// than by winning an election.
+    pub handoffs: u64,
     /// Nanoseconds spent inside the barrier itself, all flushes.
     pub fsync_ns: u64,
     /// Nanoseconds spent after the barrier waking followers.
@@ -399,12 +433,29 @@ struct GateCache {
 struct FlushState {
     /// Whether some handle is currently inside the `fsync` call — i.e. is the
     /// leader of the current flush round.
+    ///
+    /// Under flush pipelining this also covers a round that has been
+    /// *reserved* for a successor: it stays set across the handoff, from the
+    /// outgoing leader's [`LeaderGuard::drop`] until the successor takes the
+    /// round, so no third thread can elect itself into the gap. See
+    /// `docs/research/flush-pipelining.md` §2.
     in_progress: bool,
     /// Bumped every time a flush round ends (success or failure), so a
     /// follower woken by [`CommitCoordinator::flush_done`] can tell a real
     /// completion from a spurious wakeup and from a *second* round starting
-    /// before it got scheduled.
+    /// before it got scheduled. A handoff bumps it too: the round it ends is
+    /// over for every follower's purposes even though `in_progress` stays set
+    /// for the successor.
     epoch: u64,
+    /// Flush pipelining: a committer has claimed the next-leader role and is
+    /// gathering a cohort *while the current barrier runs*. At most one at a
+    /// time, and never set unless [`CommitCoordinator::pipeline`] is on.
+    successor: bool,
+    /// Flush pipelining: the outgoing leader has reserved the next round for
+    /// the successor. Consumed by the successor under this same mutex, so a
+    /// wakeup that arrives before the successor parks is not lost — the flag,
+    /// not the notification, is the state.
+    handoff: bool,
 }
 
 /// Raw page bytes shared by every read-write handle on one file.
@@ -643,40 +694,131 @@ impl CommitCoordinator {
             if self.durable_upto.load(Ordering::SeqCst) >= ticket {
                 return Ok(());
             }
+            // Whether this thread reaches the leader body having already
+            // gathered its cohort — true only on the pipelined handoff path,
+            // where the gather ran concurrently with the previous barrier.
+            let mut pre_gathered = false;
             if flush.in_progress {
-                // Follower: wait for the in-flight round to end, then loop
-                // back and re-check. `epoch` distinguishes "this round ended"
-                // from a spurious wakeup or a round that already moved on.
-                let epoch = flush.epoch;
-                let wait_started = now_nanos();
-                while flush.in_progress && flush.epoch == epoch {
-                    flush = self
-                        .flush_done
-                        .wait(flush)
+                if self.pipeline.load(Ordering::Relaxed) && !flush.successor {
+                    // Successor: instead of parking, claim the next round and
+                    // spend the current barrier gathering for it. The claim is
+                    // published under this mutex, strictly before the current
+                    // leader's `LeaderGuard::drop` can take it, so that drop is
+                    // guaranteed to see us and hand the round over.
+                    flush.successor = true;
+                    drop(flush);
+                    let mut claim = SuccessorGuard {
+                        coordinator: self,
+                        active: true,
+                    };
+                    if coalesce_normal_commits {
+                        let gather_started = now_nanos();
+                        // Bounded by the in-flight barrier: the stop condition
+                        // fires the moment the outgoing leader reserves our
+                        // round, so an overlapped gather can never delay the
+                        // barrier it was supposed to hide behind.
+                        self.coalesce_normal_commits_until(|| {
+                            self.handoff_pending.load(Ordering::Acquire)
+                        });
+                        self.overlap_gather_ns.fetch_add(
+                            now_nanos().saturating_sub(gather_started),
+                            Ordering::Relaxed,
+                        );
+                    }
+                    let mut flush = self
+                        .flush
+                        .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let wait_started = now_nanos();
+                    while flush.in_progress && !flush.handoff {
+                        // Timed, not indefinite. The handoff is a *directed*
+                        // wakeup, and the one failure mode a directed wakeup
+                        // has that a `notify_all` does not is losing it: the
+                        // state is in `handoff`, not in the notification, so
+                        // re-checking on a timer turns any wakeup this design
+                        // has not thought of from a file-wide deadlock into a
+                        // bounded hiccup. It costs nothing when the handoff
+                        // arrives, which is every time in every test and
+                        // measurement here.
+                        flush = self
+                            .successor_wake
+                            .wait_timeout(flush, SUCCESSOR_WAIT_POLL)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .0;
+                    }
+                    self.follower_wait_ns
+                        .fetch_add(now_nanos().saturating_sub(wait_started), Ordering::Relaxed);
+                    self.follower_waits.fetch_add(1, Ordering::Relaxed);
+                    if !flush.handoff {
+                        // Defensive: a round that ended without reserving one
+                        // for us. Give the claim back under the same lock and
+                        // start over, electing or following as usual.
+                        flush.successor = false;
+                        claim.active = false;
+                        drop(flush);
+                        continue;
+                    }
+                    // Take the round. `in_progress` is already set and stays
+                    // set — it was never cleared — so no other thread can have
+                    // become leader in between. The claim is disarmed because
+                    // the `LeaderGuard` below now owns ending this round.
+                    flush.handoff = false;
+                    flush.successor = false;
+                    self.handoff_pending.store(false, Ordering::Release);
+                    claim.active = false;
+                    drop(flush);
+                    self.handoffs.fetch_add(1, Ordering::Relaxed);
+                    pre_gathered = true;
+                } else {
+                    // Follower: wait for the in-flight round to end, then loop
+                    // back and re-check. `epoch` distinguishes "this round ended"
+                    // from a spurious wakeup or a round that already moved on.
+                    let epoch = flush.epoch;
+                    let wait_started = now_nanos();
+                    while flush.in_progress && flush.epoch == epoch {
+                        flush = self
+                            .flush_done
+                            .wait(flush)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    self.follower_wait_ns
+                        .fetch_add(now_nanos().saturating_sub(wait_started), Ordering::Relaxed);
+                    self.follower_waits.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
-                self.follower_wait_ns
-                    .fetch_add(now_nanos().saturating_sub(wait_started), Ordering::Relaxed);
-                self.follower_waits.fetch_add(1, Ordering::Relaxed);
-                continue;
+            } else {
+                // Leader. Mark the round in progress before releasing the lock
+                // so no second thread can also become leader for this round.
+                flush.in_progress = true;
+                drop(flush);
             }
-
-            // Leader. Mark the round in progress before releasing the lock so
-            // no second thread can also become leader for this round.
-            flush.in_progress = true;
-            drop(flush);
             // Time between the previous cycle's end and this election — the
             // coordinator-idle segment the four in-cycle segments cannot see.
+            // A handoff is charged here too, and is exactly what the pipeline
+            // is trying to shrink: the segment becomes one directed wakeup
+            // instead of a `notify_all` plus a re-election race.
             let last_end = self.last_cycle_end_ns.swap(0, Ordering::Relaxed);
             if last_end != 0 {
                 self.gap_ns
                     .fetch_add(now_nanos().saturating_sub(last_end), Ordering::Relaxed);
             }
-            // `LeaderGuard` clears `in_progress`, bumps `epoch` and wakes every
-            // follower on drop — including on an early return through `?` or
-            // an unwind out of `sync` — so a failed or panicking flush can
-            // never leave every follower waiting forever.
+            // `LeaderGuard` clears `in_progress` (or hands the round to a
+            // waiting successor), bumps `epoch` and wakes every follower on
+            // drop — including on an early return through `?` or an unwind out
+            // of `sync` — so a failed or panicking flush can never leave every
+            // follower, or the successor, waiting forever.
             let _guard = LeaderGuard { coordinator: self };
+
+            // A successor can be handed a round whose predecessor already
+            // covered it — it claimed before that barrier captured its target,
+            // and the target may have reached this ticket. That is the same
+            // conclusion every follower's re-check draws, and it is drawn here
+            // *after* the guard is armed so the reserved round is released
+            // rather than stranded. See `docs/research/flush-pipelining.md` §4,
+            // row 9.
+            if pre_gathered && self.durable_upto.load(Ordering::SeqCst) >= ticket {
+                return Ok(());
+            }
 
             // Captured strictly after this round became the sole leader and
             // strictly before `sync` is called: every ticket counted here
@@ -684,7 +826,7 @@ impl CommitCoordinator {
             // run starts after this load, so it covers every one of them.
             // Our own ticket is always among them, because `writes_completed`
             // already counted it before this function was called.
-            if coalesce_normal_commits {
+            if coalesce_normal_commits && !pre_gathered {
                 let gather_started = now_nanos();
                 self.coalesce_normal_commits();
                 self.gather_spin_ns.fetch_add(
@@ -746,9 +888,31 @@ impl CommitCoordinator {
     /// set of tickets the upcoming `fsync` covers; it can never shrink it or
     /// let a ticket be acknowledged before its bytes were actually written.
     fn coalesce_normal_commits(&self) {
+        self.coalesce_normal_commits_until(|| false);
+    }
+
+    /// [`Self::coalesce_normal_commits`] with an extra way out, polled once
+    /// per yield: `stop` returning `true` ends the window immediately.
+    ///
+    /// This exists for one caller — a pipelined successor gathering while the
+    /// previous barrier is still in flight, which must stop the instant that
+    /// barrier hands it the round. Without the bound the window's own exit
+    /// conditions (writers stop arriving, or 1,500 stalled polls) could easily
+    /// outlast the barrier and *delay* the next one, which is the opposite of
+    /// what the overlap is for. The ordinary caller passes a `stop` that never
+    /// fires, and its behaviour is unchanged.
+    ///
+    /// The durability argument in [`Self::coalesce_normal_commits`] survives
+    /// verbatim: stopping *earlier* can only shrink the set of tickets the
+    /// upcoming flush covers, and the target is still captured after this
+    /// returns and before `sync` is called.
+    fn coalesce_normal_commits_until(&self, stop: impl Fn() -> bool) {
         let mut observed = self.writes_completed.load(Ordering::Acquire);
         let mut stalled = 0usize;
         for _ in 0..COMMIT_COALESCE_MAX_YIELDS {
+            if stop() {
+                return;
+            }
             if self.normal_inflight.load(Ordering::Acquire) == 0
                 && self.normal_waiters.load(Ordering::Acquire) == 0
             {
@@ -805,17 +969,20 @@ impl Drop for CommitCoordinator {
             );
             eprintln!(
                 "commit-stats: ns gate_wait={} gate_hold={} (racing {}) follower_wait={} \
-                 gather_spin={} fsync={} post={} gap={}; waits gate={} follower={}",
+                 gather_spin={} overlap_gather={} fsync={} post={} gap={}; \
+                 waits gate={} follower={} handoffs={}",
                 self.gate_wait_ns.load(Ordering::Relaxed),
                 self.gate_hold_ns.load(Ordering::Relaxed),
                 self.gate_hold_racing_ns.load(Ordering::Relaxed),
                 self.follower_wait_ns.load(Ordering::Relaxed),
                 self.gather_spin_ns.load(Ordering::Relaxed),
+                self.overlap_gather_ns.load(Ordering::Relaxed),
                 self.fsync_ns.load(Ordering::Relaxed),
                 self.post_ns.load(Ordering::Relaxed),
                 self.gap_ns.load(Ordering::Relaxed),
                 self.gate_waits.load(Ordering::Relaxed),
                 self.follower_waits.load(Ordering::Relaxed),
+                self.handoffs.load(Ordering::Relaxed),
             );
         }
     }
@@ -838,9 +1005,26 @@ impl Drop for LeaderGuard<'_> {
             .flush
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        flush.in_progress = false;
         flush.epoch = flush.epoch.wrapping_add(1);
+        // With a successor already claimed and gathering, hand it the round
+        // rather than ending one and letting the whole woken herd race to
+        // start the next. `in_progress` deliberately stays set: it is the
+        // reservation that keeps any other thread out of the window between
+        // this drop and the successor waking up. The successor clears it, or
+        // `SuccessorGuard` does if the successor dies first.
+        let handoff = flush.successor;
+        if handoff {
+            flush.handoff = true;
+            self.coordinator
+                .handoff_pending
+                .store(true, Ordering::Release);
+        } else {
+            flush.in_progress = false;
+        }
         drop(flush);
+        if handoff {
+            self.coordinator.successor_wake.notify_all();
+        }
         self.coordinator.flush_done.notify_all();
         let ended = now_nanos();
         self.coordinator
@@ -849,6 +1033,50 @@ impl Drop for LeaderGuard<'_> {
         self.coordinator
             .last_cycle_end_ns
             .store(ended, Ordering::Relaxed);
+    }
+}
+
+/// Undoes a successor claim on every path that does not end with the
+/// successor actually taking the round — including a panic inside its gather
+/// window, and including the case where the outgoing leader had *already*
+/// reserved the round for it. Without this, a successor that died between
+/// claiming and taking would leave `in_progress` set on a round nobody is
+/// running, and every writer on the file would wait forever for a barrier
+/// that is never issued. See `docs/research/flush-pipelining.md` §4, rows 5
+/// and 6.
+struct SuccessorGuard<'a> {
+    coordinator: &'a CommitCoordinator,
+    /// Cleared once the claim has been resolved by hand — either handed to a
+    /// [`LeaderGuard`] (the successor took the round) or given back under the
+    /// same lock (the round ended without a handoff).
+    active: bool,
+}
+
+impl Drop for SuccessorGuard<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut flush = self
+            .coordinator
+            .flush
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        flush.successor = false;
+        let reserved = flush.handoff;
+        if reserved {
+            // The round was reserved for us and we are not going to run it.
+            // End it the way a leader would, so the next arrival elects.
+            flush.handoff = false;
+            flush.in_progress = false;
+            flush.epoch = flush.epoch.wrapping_add(1);
+            self.coordinator
+                .handoff_pending
+                .store(false, Ordering::Release);
+        }
+        drop(flush);
+        self.coordinator.successor_wake.notify_all();
+        self.coordinator.flush_done.notify_all();
     }
 }
 
@@ -1023,6 +1251,14 @@ const COMMIT_COALESCE_MAX_YIELDS: usize = 16384;
 /// before any yield), and only ever adds latency when a real cohort is
 /// present to amortize an `fsync` over.
 const COMMIT_COALESCE_STALL_YIELDS: usize = 1500;
+
+/// How long a claimed successor sleeps between re-reads of
+/// [`FlushState::handoff`]. Not a timeout in the sense of giving up — the
+/// loop re-checks the same two flags and goes back to sleep — only a bound on
+/// how long a lost wakeup could cost, since the handoff's state lives in the
+/// flag rather than in the notification. See the wait itself for why a
+/// directed handoff wants this and a `notify_all` does not.
+const SUCCESSOR_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The smallest amount of data area [`FileDevice::extend_for`] ever adds, and
 /// the largest.
@@ -1202,6 +1438,8 @@ impl FileDevice {
             follower_wait_ns: coordinator.follower_wait_ns.load(Ordering::Relaxed),
             follower_waits: coordinator.follower_waits.load(Ordering::Relaxed),
             gather_spin_ns: coordinator.gather_spin_ns.load(Ordering::Relaxed),
+            overlap_gather_ns: coordinator.overlap_gather_ns.load(Ordering::Relaxed),
+            handoffs: coordinator.handoffs.load(Ordering::Relaxed),
             fsync_ns: coordinator.fsync_ns.load(Ordering::Relaxed),
             post_ns: coordinator.post_ns.load(Ordering::Relaxed),
             gap_ns: coordinator.gap_ns.load(Ordering::Relaxed),
@@ -2112,8 +2350,13 @@ fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator
         flush: Mutex::new(FlushState {
             in_progress: false,
             epoch: 0,
+            successor: false,
+            handoff: false,
         }),
         flush_done: Condvar::new(),
+        successor_wake: Condvar::new(),
+        handoff_pending: AtomicBool::new(false),
+        pipeline: AtomicBool::new(flush_pipelining_enabled()),
         flushes: AtomicU64::new(0),
         tickets_flushed: AtomicU64::new(0),
         normal_flushes: AtomicU64::new(0),
@@ -2128,6 +2371,8 @@ fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator
         follower_wait_ns: AtomicU64::new(0),
         follower_waits: AtomicU64::new(0),
         gather_spin_ns: AtomicU64::new(0),
+        overlap_gather_ns: AtomicU64::new(0),
+        handoffs: AtomicU64::new(0),
         fsync_ns: AtomicU64::new(0),
         post_ns: AtomicU64::new(0),
         gap_ns: AtomicU64::new(0),
@@ -2157,6 +2402,24 @@ fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator
 /// and off across two process runs; it is a diagnostic knob, not a supported
 /// configuration surface. Read once, when the first handle on a file is
 /// opened.
+/// Whether flush pipelining is on, read once per process from
+/// `INLAYSQL_FLUSH_PIPELINE`.
+///
+/// Default **off**. The durability contract is identical either way — see
+/// `docs/research/flush-pipelining.md` §3 for the ticket-to-barrier proof —
+/// but the order in which concurrent writers are *acknowledged* can change
+/// under it, and a caller holding two connections can observe that ordering.
+/// That is what the flag is owed for. It is read from the environment rather
+/// than plumbed through `EngineOptions` so that both arms of a paired
+/// before/after measurement are the same binary, which is what AHL-561's
+/// measurement floor asks for.
+fn flush_pipelining_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("INLAYSQL_FLUSH_PIPELINE").is_some_and(|value| value != "0")
+    })
+}
+
 fn shared_read_cache_budget() -> usize {
     if std::env::var_os("INLAYSQL_DISABLE_SHARED_READ_CACHE").is_some() {
         0
@@ -2266,8 +2529,16 @@ mod group_commit_tests {
             flush: Mutex::new(FlushState {
                 in_progress: false,
                 epoch: 0,
+                successor: false,
+                handoff: false,
             }),
             flush_done: Condvar::new(),
+            successor_wake: Condvar::new(),
+            handoff_pending: AtomicBool::new(false),
+            // Never from the ambient environment: a test must mean the same
+            // thing whether or not `INLAYSQL_FLUSH_PIPELINE` is set in the
+            // shell that runs it. `pipelined_coordinator` turns it on.
+            pipeline: AtomicBool::new(false),
             flushes: AtomicU64::new(0),
             tickets_flushed: AtomicU64::new(0),
             normal_flushes: AtomicU64::new(0),
@@ -2282,6 +2553,8 @@ mod group_commit_tests {
             follower_wait_ns: AtomicU64::new(0),
             follower_waits: AtomicU64::new(0),
             gather_spin_ns: AtomicU64::new(0),
+            overlap_gather_ns: AtomicU64::new(0),
+            handoffs: AtomicU64::new(0),
             fsync_ns: AtomicU64::new(0),
             post_ns: AtomicU64::new(0),
             gap_ns: AtomicU64::new(0),
@@ -3089,6 +3362,427 @@ mod group_commit_tests {
         coordinator.set_durability(Durability::Full);
         coordinator.set_durability(Durability::Normal);
         assert_eq!(coordinator.effective_durability(), Durability::Full);
+    }
+
+    // ---------------------------------------------------------------------
+    // Flush pipelining (AHL-562). `docs/research/flush-pipelining.md` is the
+    // design; §3 is the ticket-to-barrier rule the first test below is a
+    // randomised check of, and §4 is the crash/failure table the rest cover
+    // one row at a time.
+    // ---------------------------------------------------------------------
+
+    /// A `test_coordinator` with pipelining on, which is otherwise off by
+    /// default (it is read from `INLAYSQL_FLUSH_PIPELINE` at construction, and
+    /// a test must never depend on the ambient environment).
+    fn pipelined_coordinator(name: &str) -> CommitCoordinator {
+        let coordinator = test_coordinator(name);
+        coordinator.pipeline.store(true, Ordering::Relaxed);
+        coordinator
+    }
+
+    /// The durability rule, checked over randomised interleavings rather than
+    /// argued: **no ticket is ever reported durable by a barrier that started
+    /// before that ticket's write.**
+    ///
+    /// Each simulated barrier records `writes_completed` as observed *inside*
+    /// the sync closure — i.e. at the instant the barrier starts, which is
+    /// after that round captured its target — and pushes it once the barrier
+    /// has completed. A writer that returns `Ok` for ticket `t` must be able
+    /// to point at a completed barrier whose start observation is `>= t`,
+    /// which is exactly "some barrier that started after my write was
+    /// published covered me". A pipelined successor crediting its cohort to
+    /// the barrier it gathered underneath — the one mistake in this design
+    /// that would be silent data loss rather than a hang — fails this
+    /// immediately, because that barrier's observation was taken before those
+    /// tickets existed.
+    ///
+    /// Run with pipelining off and on, so the property is pinned for both
+    /// arms and a failure can be attributed to the flag.
+    #[test]
+    fn no_ticket_is_ever_durable_by_a_barrier_that_started_before_its_write() {
+        for pipeline in [false, true] {
+            let coordinator = if pipeline {
+                pipelined_coordinator("property-on")
+            } else {
+                test_coordinator("property-off")
+            };
+            let barrier_starts: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+            const WRITERS: usize = 6;
+            const ROUNDS: usize = 40;
+
+            thread::scope(|scope| {
+                let coordinator = &coordinator;
+                let barrier_starts = &barrier_starts;
+                for writer in 0..WRITERS {
+                    scope.spawn(move || {
+                        // A per-thread xorshift, so the interleaving varies
+                        // without the test depending on a wall clock.
+                        let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ (writer as u64 + 1);
+                        let mut next = move || {
+                            rng ^= rng << 13;
+                            rng ^= rng >> 7;
+                            rng ^= rng << 17;
+                            rng
+                        };
+                        for _ in 0..ROUNDS {
+                            // Stand in for a commit holding the reservation
+                            // gate: the gather window only opens while a
+                            // normal commit is inflight or queued.
+                            coordinator.normal_inflight.fetch_add(1, Ordering::Release);
+                            for _ in 0..(next() % 8) {
+                                std::thread::yield_now();
+                            }
+                            // The ticket is published after the "writes", the
+                            // same order `commit_ready` publishes in.
+                            let ticket =
+                                coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+                            coordinator.normal_inflight.fetch_sub(1, Ordering::Release);
+                            coordinator
+                                .make_commit_durable(ticket, || {
+                                    let observed =
+                                        coordinator.writes_completed.load(Ordering::SeqCst);
+                                    for _ in 0..(next() % 16) {
+                                        std::thread::yield_now();
+                                    }
+                                    barrier_starts
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .push(observed);
+                                    Ok(())
+                                })
+                                .expect("flush");
+                            // `durable_upto` first, the record of completed
+                            // barriers second: a barrier that completes
+                            // between the two reads is then in the snapshot
+                            // but not in the watermark, which is the safe
+                            // direction. Reading them the other way round
+                            // makes the assertion below a race rather than an
+                            // invariant, because a newer barrier can advance
+                            // the watermark past the snapshot's high mark.
+                            let durable = coordinator.durable_upto.load(Ordering::SeqCst);
+                            let starts = barrier_starts
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .clone();
+                            assert!(
+                                starts.iter().any(|&start| start >= ticket),
+                                "ticket {ticket} was reported durable but no completed \
+                                 barrier had started after it was written (pipeline \
+                                 {pipeline}); barrier starts: {starts:?}"
+                            );
+                            // The same rule stated over the watermark rather
+                            // than over one ticket, which is the form that
+                            // catches a barrier crediting itself with tickets
+                            // published after it started even when some other
+                            // thread's later barrier would have covered them:
+                            // no completed barrier can make anything durable
+                            // beyond what `writes_completed` had reached when
+                            // it began.
+                            let high = starts.iter().copied().max().unwrap_or(0);
+                            assert!(
+                                durable <= high,
+                                "durable_upto {durable} is beyond every completed \
+                                 barrier's start observation {high} (pipeline {pipeline})"
+                            );
+                        }
+                    });
+                }
+            });
+
+            let stats_handoffs = coordinator.handoffs.load(Ordering::Relaxed);
+            if !pipeline {
+                assert_eq!(
+                    stats_handoffs, 0,
+                    "with pipelining off no round may ever be handed over"
+                );
+            }
+        }
+    }
+
+    /// The mechanism itself, pinned deterministically rather than hoped for:
+    /// while a leader is inside its barrier, a second committer claims the
+    /// successor slot instead of parking, and when the leader finishes it
+    /// takes the round **by handoff** — `in_progress` never clears, so no
+    /// third thread can elect itself in between, and the successor never runs
+    /// a second gather on the critical path.
+    #[test]
+    fn a_successor_takes_the_next_round_by_handoff_and_never_re_elects() {
+        let coordinator = pipelined_coordinator("handoff");
+        let (in_sync_tx, in_sync_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let successor_flushed = Arc::new(AtomicBool::new(false));
+
+        let ticket_leader = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+
+        thread::scope(|scope| {
+            let coordinator = &coordinator;
+            let leader = scope.spawn(move || {
+                coordinator.make_commit_durable(ticket_leader, move || {
+                    in_sync_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+            });
+
+            // The leader is inside its barrier and has already captured a
+            // target of 1, so the ticket published now cannot be covered by it.
+            in_sync_rx.recv().unwrap();
+            let ticket_successor = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+            let successor_flushed_inner = Arc::clone(&successor_flushed);
+            let successor = scope.spawn(move || {
+                coordinator.make_commit_durable(ticket_successor, move || {
+                    successor_flushed_inner.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+
+            // Wait for the claim to be visible under the flush mutex before
+            // letting the leader finish, so the handoff — not an election —
+            // is the only way the successor can proceed.
+            loop {
+                let claimed = coordinator
+                    .flush
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .successor;
+                if claimed {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+
+            release_tx.send(()).unwrap();
+            leader.join().unwrap().unwrap();
+            successor.join().unwrap().unwrap();
+        });
+
+        assert!(successor_flushed.load(Ordering::SeqCst));
+        assert_eq!(
+            coordinator.handoffs.load(Ordering::Relaxed),
+            1,
+            "the second committer must have entered its round by handoff, not by \
+             winning an election after a notify_all"
+        );
+        let flush = coordinator.flush.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(!flush.in_progress, "the last round must have ended");
+        assert!(!flush.successor && !flush.handoff);
+        assert!(!coordinator.handoff_pending.load(Ordering::Acquire));
+    }
+
+    /// §4 row 5 and row 13: a successor that dies — panics in its gather, or
+    /// finds the round it claimed against ended without reserving one for it
+    /// — must give the claim back. If the outgoing leader had *already*
+    /// reserved the round, giving the claim back has to end that round too,
+    /// because `in_progress` is still set and nobody is going to flush it.
+    /// Getting this wrong is not data loss, it is every writer on the file
+    /// waiting forever for a barrier that will never be issued.
+    #[test]
+    fn a_successor_that_dies_before_taking_the_round_never_strands_it() {
+        for reserved in [false, true] {
+            let coordinator = pipelined_coordinator("successor-dies");
+            {
+                let mut flush = coordinator.flush.lock().unwrap_or_else(|p| p.into_inner());
+                flush.in_progress = true;
+                flush.successor = true;
+                flush.handoff = reserved;
+            }
+            coordinator
+                .handoff_pending
+                .store(reserved, Ordering::Release);
+            let epoch_before = coordinator
+                .flush
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .epoch;
+
+            // Exactly what an unwind out of the gather window runs.
+            drop(SuccessorGuard {
+                coordinator: &coordinator,
+                active: true,
+            });
+
+            let flush = coordinator.flush.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(!flush.successor, "the claim must be given back");
+            assert!(!flush.handoff);
+            assert!(!coordinator.handoff_pending.load(Ordering::Acquire));
+            assert_eq!(
+                flush.in_progress, !reserved,
+                "a reserved round must be ended by the successor that will not run it, \
+                 and an unreserved one left alone for its live leader"
+            );
+            if reserved {
+                assert_eq!(flush.epoch, epoch_before.wrapping_add(1));
+            }
+            drop(flush);
+
+            if reserved {
+                // And the file is still usable: the next committer leads.
+                let ticket = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+                let flushed = AtomicBool::new(false);
+                coordinator
+                    .make_commit_durable(ticket, || {
+                        flushed.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(flushed.load(Ordering::SeqCst));
+            }
+        }
+    }
+
+    /// §4 row 7: a leader that panics inside its barrier still performs the
+    /// handoff, so the successor inherits a live round rather than a stranded
+    /// one — and the successor's own barrier, which starts after its writes,
+    /// is what makes it durable. A panicking leader is the one case where the
+    /// round ends on an unwind, and pipelining must not turn that into a hang.
+    #[test]
+    fn a_leader_that_panics_hands_a_live_round_to_its_successor() {
+        let coordinator = pipelined_coordinator("leader-panics");
+        let (in_sync_tx, in_sync_rx) = mpsc::channel::<()>();
+        let successor_flushed = Arc::new(AtomicBool::new(false));
+        let ticket_leader = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+
+        thread::scope(|scope| {
+            let coordinator = &coordinator;
+            let leader = scope.spawn(move || {
+                coordinator.make_commit_durable(ticket_leader, move || -> Result<()> {
+                    in_sync_tx.send(()).unwrap();
+                    // Long enough for the successor to claim; the claim is
+                    // then confirmed below before the panic can be observed.
+                    for _ in 0..10_000 {
+                        std::thread::yield_now();
+                    }
+                    panic!("simulated barrier panic");
+                })
+            });
+
+            in_sync_rx.recv().unwrap();
+            let ticket_successor = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+            let successor_flushed_inner = Arc::clone(&successor_flushed);
+            let successor = scope.spawn(move || {
+                coordinator.make_commit_durable(ticket_successor, move || {
+                    successor_flushed_inner.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+
+            assert!(leader.join().is_err(), "the leader's panic must propagate");
+            successor.join().unwrap().unwrap();
+        });
+
+        assert!(
+            successor_flushed.load(Ordering::SeqCst),
+            "a commit whose leader panicked mid-barrier must fsync for itself, \
+             never be acknowledged on the strength of the flush that panicked"
+        );
+        assert!(
+            coordinator.durable_upto.load(Ordering::SeqCst) >= 2,
+            "the successor's own barrier covers both tickets"
+        );
+    }
+
+    /// §4 row 9: a successor can be handed a round whose predecessor already
+    /// covered it — it claimed before that barrier captured a target that
+    /// reached its ticket. It must return without flushing (that is the
+    /// batching half of the contract, unchanged) **and** release the round it
+    /// was reserved, rather than sitting on a reservation nobody will use.
+    #[test]
+    fn a_successor_already_covered_releases_the_round_instead_of_flushing() {
+        let coordinator = pipelined_coordinator("successor-covered");
+        let (in_sync_tx, in_sync_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let successor_flushed = Arc::new(AtomicBool::new(false));
+
+        // Both tickets exist before the leader captures its target, so the
+        // leader's target is 2 and covers the successor.
+        let ticket_leader = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+        let ticket_successor = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+        assert_eq!((ticket_leader, ticket_successor), (1, 2));
+
+        thread::scope(|scope| {
+            let coordinator = &coordinator;
+            let leader = scope.spawn(move || {
+                coordinator.make_commit_durable(ticket_leader, move || {
+                    in_sync_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+            });
+
+            in_sync_rx.recv().unwrap();
+            let successor_flushed_inner = Arc::clone(&successor_flushed);
+            let successor = scope.spawn(move || {
+                coordinator.make_commit_durable(ticket_successor, move || {
+                    successor_flushed_inner.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+            loop {
+                let claimed = coordinator
+                    .flush
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .successor;
+                if claimed {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            release_tx.send(()).unwrap();
+            leader.join().unwrap().unwrap();
+            successor.join().unwrap().unwrap();
+        });
+
+        assert!(
+            !successor_flushed.load(Ordering::SeqCst),
+            "a successor the previous barrier already covered must not flush again"
+        );
+        let flush = coordinator.flush.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            !flush.in_progress && !flush.handoff && !flush.successor,
+            "the reserved round must be released by the successor that declined it"
+        );
+        drop(flush);
+        // And the coordinator still works.
+        let ticket = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+        let flushed = AtomicBool::new(false);
+        coordinator
+            .make_commit_durable(ticket, || {
+                flushed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        assert!(flushed.load(Ordering::SeqCst));
+    }
+
+    /// The overlapped gather is bounded by the barrier it hides behind: once
+    /// the outgoing leader reserves the round, the successor's window closes
+    /// on its next poll. Without this bound the window's own exit conditions
+    /// could outlive the barrier and delay the very cycle the pipeline exists
+    /// to shorten.
+    #[test]
+    fn the_overlapped_gather_stops_the_moment_the_round_is_handed_over() {
+        let coordinator = pipelined_coordinator("gather-bound");
+        // A writer is permanently "inflight" and tickets keep arriving, so
+        // neither of the window's own exits can fire: only the stop condition
+        // can end this.
+        coordinator.normal_inflight.fetch_add(1, Ordering::Release);
+        let stop_after = AtomicUsize::new(3);
+        coordinator.coalesce_normal_commits_until(|| {
+            coordinator.writes_completed.fetch_add(1, Ordering::SeqCst);
+            let left = stop_after.load(Ordering::Relaxed);
+            if left == 0 {
+                return true;
+            }
+            stop_after.store(left - 1, Ordering::Relaxed);
+            false
+        });
+        assert_eq!(
+            stop_after.load(Ordering::Relaxed),
+            0,
+            "the window must end on the stop condition, and only on it"
+        );
+        coordinator.normal_inflight.fetch_sub(1, Ordering::Release);
     }
 }
 
