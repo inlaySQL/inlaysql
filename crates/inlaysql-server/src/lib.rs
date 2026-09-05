@@ -508,6 +508,92 @@ fn reaches_the_network(bind: &str, port: u16) -> Result<bool, String> {
         .any(|address| !is_loopback(address)))
 }
 
+/// Refuse to serve a database to the network in a posture that gives it away.
+///
+/// Four conditions, in this order, first match wins. All four need the bind to
+/// reach another machine at all; on loopback none of them apply, which is why
+/// the default path is untouched by any of this.
+///
+/// | # | Condition | Overridable |
+/// | --- | --- | --- |
+/// | C1 | the bootstrap or reset password is **empty** | no |
+/// | C2 | the database has no account store | no |
+/// | C3 | no certificate is configured | `--plaintext-network` |
+/// | C4 | a certificate is configured but TLS is not *required* | `--plaintext-network` |
+///
+/// C1 before C2 because an empty password is the loudest fact and the operator
+/// should read it first — and because it catches a `--reset-superuser` to an
+/// empty password, which C2 does not.
+///
+/// C4 is separate from C3 because the remedy is different, and an operator who
+/// reads the wrong one goes and buys a certificate they already have. It is
+/// its own condition rather than folded into C3 because a certificate that is
+/// only *available* is the posture most likely to be mistaken for a safe one:
+/// a client that does not ask for TLS is still served, so an on-path attacker
+/// need only decline to offer the upgrade.
+fn refuse_unsafe_exposure(
+    options: &ServerOptions,
+    installed: &acl::Installed,
+    policy: tls::TlsPolicy,
+) -> Result<(), String> {
+    if !reaches_the_network(&options.bind, options.port)? {
+        return Ok(());
+    }
+    let bind = &options.bind;
+    let port = options.port;
+
+    // C1. `Reset` counts: a password given on the command line is a password
+    // whether or not it was empty, and an empty one that was just written into
+    // the store is the same open door as one that was never in it.
+    let empty_password = match installed {
+        acl::Installed::Bootstrap {
+            user,
+            empty_password,
+        }
+        | acl::Installed::Reset {
+            user,
+            empty_password,
+        } => empty_password.then_some(user),
+        acl::Installed::Existing => None,
+    };
+    if let Some(user) = empty_password {
+        return Err(format!(
+            "refusing to start: --bind {bind} is reachable from other machines and the account \
+             `{user}` has an EMPTY password, so any host that can reach port {port} can read and \
+             write this database. Set one with --password-env, or drop --bind to stay on \
+             127.0.0.1."
+        ));
+    }
+
+    // C2.
+    if let acl::Installed::Bootstrap { user, .. } = installed {
+        return Err(format!(
+            "refusing to start: --bind {bind} is reachable from other machines and this database \
+             has no accounts of its own, so `{user}` from --user/--password is the whole \
+             credential and a forgotten flag on any restart is a way back in. Run `inlaysql user \
+             add <database>` once, then restart with --bind. Or drop --bind to stay on 127.0.0.1."
+        ));
+    }
+
+    match policy {
+        // C3.
+        tls::TlsPolicy::Disabled => Err(format!(
+            "refusing to start: --bind {bind} is reachable from other machines and no certificate \
+             is configured, so every statement, result and credential would cross the network in \
+             the clear. Serve it with --tls-cert <pem> --tls-key <pem> --tls-required. Drop --bind \
+             to stay on 127.0.0.1."
+        )),
+        // C4.
+        tls::TlsPolicy::Available => Err(format!(
+            "refusing to start: --bind {bind} is reachable from other machines and TLS is \
+             available but NOT required, so a client that does not ask for it still sends its \
+             credential in the clear and an on-path attacker need only decline to offer it. Add \
+             --tls-required. Drop --bind to stay on 127.0.0.1."
+        )),
+        tls::TlsPolicy::Required => Ok(()),
+    }
+}
+
 /// A bound listener, ready to serve.
 pub struct Server {
     listener: TcpListener,
@@ -615,6 +701,16 @@ impl Server {
                 ))
             }
         };
+
+        // Before the socket, not after: a configuration that will be refused
+        // must never have been listening, not even for the moment it takes to
+        // notice. This is the fourth refusal in this function and it sits with
+        // the other three deliberately — a check only the CLI performs is a
+        // check every embedder silently skips.
+        let policy = tls_config
+            .as_ref()
+            .map_or(tls::TlsPolicy::Disabled, tls::TlsConfig::policy);
+        refuse_unsafe_exposure(options, &installed, policy).map_err(io::Error::other)?;
 
         let listener = TcpListener::bind((options.bind.as_str(), options.port))?;
         Ok(Self {
@@ -1099,11 +1195,18 @@ pub fn print_exposure_warning(options: &ServerOptions, out: &mut impl Write) -> 
     // Unresolvable is treated as reaching the network: this is the warning
     // path, `Server::bind` is where an address that cannot be resolved is
     // reported as an error, and a warning is the wrong place to swallow one.
+    //
+    // Reaching this at all now means the configuration passed
+    // `refuse_unsafe_exposure`, so the line no longer claims the credential
+    // crosses in the clear — it cannot, or the server would not have started.
+    // What is left is the fact itself, stated without a verdict on it: the
+    // posture line above already says what protects the connection, and this
+    // one says who can open it.
     if reaches_the_network(&options.bind, options.port).unwrap_or(true) {
         writeln!(
             out,
-            "inlaysql: WARNING: bound to {}, which is reachable from other machines. Every \n\
-             inlaysql:          statement, result and credential crosses the network in the clear.",
+            "inlaysql: bound to {}, which is reachable from other machines: every host on \n\
+             inlaysql:          the path between them and this port is on this connection.",
             options.bind
         )?;
     }
@@ -1298,6 +1401,10 @@ mod tests {
         assert!(text.contains("PLAINTEXT"), "{text}");
         assert!(!text.contains("reachable from other machines"), "{text}");
 
+        // A bind that reaches other machines still says so — but it no longer
+        // says the credential crosses in the clear, because a configuration
+        // where it would have has been refused a socket by now. The refusals
+        // themselves are pinned in `tests/exposure.rs`.
         let mut out = Vec::new();
         print_exposure_warning(
             &ServerOptions {
