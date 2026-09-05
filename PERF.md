@@ -7814,3 +7814,154 @@ a region wrap and a checkpoint and requires every acknowledged row back (making
 `an_ordinary_commit_survives_a_failure_at_every_one_of_its_writes`, which
 breaks each write of a steady-state commit in turn on a real `FileDevice`.
 
+
+### The free list was rereading the rows it had already rejected, and the sweep is 183 s again (AHL-565, 2026-09-06)
+
+AHL-564 ended by naming a thing it had found and not chased: shrinking the
+commit record 3.62× made `free_list_reuse_dst` **10.2× slower**, 187 s → 1,902 s,
+and the reason was not a regression in the engine. The sweep's loop breaks out
+when a commit is refused for exceeding the one-region record ceiling; across
+300 seeds the old format hit that refusal 83 times and the new one 15, so the
+sweep started running its seeds to completion. What that exposed was named as
+"superlinear growth in the free list". That inference was drawn from a
+break-count, which is evidence and not proof, so this item began by trying to
+refute it.
+
+#### 1. It is not the free list's shape. It is one argument to its scan.
+
+The instrumentation was a `Device` shim over the sweep's own `TrustedDevice`
+plus four counters inside `CowBTree`, reporting per commit: free-list row
+count, `finalize_free_list` iterations, `refill_free_candidates` calls, rows
+those calls read, how many returned **zero** candidates, and the commit's
+dirty-page count. Run over `free_list_reuse_dst`'s own heavy-churn workload
+(24 keys, `PAGE = 256`) with **the fault schedule off**, because a drawn crash
+truncates the workload at an arbitrary point and a cost measurement that can be
+cut short measures the cut — which is exactly how this hid for as long as it
+did.
+
+| commit | free rows | `finalize` iters | **refills** | **rows read** | **empty refills** | dirty pages | µs |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 10 | 14 | 8 | 7 | 89 | 6 | 11 | 801 |
+| 40 | 126 | 56 | 95 | 6,080 | 94 | 126 | 2,566 |
+| 100 | 317 | 206 | 267 | 17,088 | 236 | 374 | 89,607 |
+| 150 | 675 | 516 | 440 | 28,160 | 323 | 698 | 325,367 |
+| 190 | 423 | 288 | 163 | 10,432 | 98 | 339 | 177,438 |
+
+**The free list's length is not what grows.** It plateaus around 300–500 rows
+and stays there, and it has to: `finalize_free_list` writes one row per page
+this transaction freed and deletes one per page it drew, and the COW of the
+free-list subtree contributes to both counts equally, so the length is
+self-balancing. Four of the candidate mechanisms this item was asked to check
+are therefore *not* it — the list is not rewritten whole, and it does not
+ratchet.
+
+**What grows is the cost of asking it a question.** `refill_free_candidates`
+started every scan at the oldest free-list row (`scan_prefix_from(FREE_LIST_PREFIX,
+None, FREE_CANDIDATE_BATCH)`). Once a transaction had drawn more than
+`FREE_CANDIDATE_BATCH` (64) candidates, the oldest 64 rows were all rows it had
+already drawn — so every subsequent allocation reread those same 64 rows,
+rejected each against a **linear** walk of `consumed_ever_this_txn`, returned
+nothing, and fell back to the monotonic counter. Then the next allocation did
+it again. At commit 150 that is 440 scans in one commit, 323 of them returning
+nothing, 28,160 rows read, against **one** scan at commit 10.
+
+So the shape is "reuse scans linearly for a fit" — the third candidate on the
+list — with the aggravation that it is not one linear scan per commit but one
+per *allocation*, each of them re-examining the same prefix. Two O(n) factors
+multiplied: O(n) allocations per commit, each paying an O(n) rejection walk.
+The wall clock bears that out — 800 µs → 325 ms, 400×, while the free list grew
+36×.
+
+#### 2. The fix, and why it is contained
+
+Not a structural change to the free list, which would be a durability-path
+change needing its own design and DST story. Two lines inside
+`refill_free_candidates`, neither touching the on-disk format, the record, or
+recovery:
+
+* **`free_scan_cursor`** resumes the scan where the last one stopped, so a row
+  this transaction has drawn is never offered — or rejected — twice.
+* **`free_list_exhausted`** latches once a scan reaches the not-yet-eligible
+  boundary. The rows are oldest-freed-first, so everything past it is
+  ineligible too, and every further refill would repeat that scan for the same
+  nothing.
+
+Both are cleared at exactly the four points `free_candidates` and
+`consumed_ever_this_txn` are (commit, rollback, conflict, rebase), and both are
+conservative in the only direction that matters: the worst either can do is
+decline a page that was in fact reclaimable, which `alloc_page` already
+documents as always correct and only less space-efficient. **In practice they
+reclaim more, not less** — the old scan could never see past its first 64 rows,
+so it had an accidental 64-page-per-transaction reuse ceiling, which is why the
+free list settles ~40% shorter after the fix (423 → 197 rows at commit 190).
+
+Same workload, same probe:
+
+| commit | free rows | `finalize` iters | **refills** | **rows read** | **empty refills** | dirty pages | µs |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 10 | 14 | 8 | 1 | 12 | 0 | 11 | 701 |
+| 40 | 126 | 56 | 1 | 64 | 0 | 126 | 441 |
+| 100 | 287 | 163 | 3 | 192 | 0 | 185 | 1,345 |
+| 150 | 294 | 181 | 3 | 192 | 0 | 206 | 2,222 |
+| 190 | 197 | 134 | 2 | 128 | 0 | 162 | 2,460 |
+
+Refills per commit are now flat at 1–4 and **no refill returns empty**. (Both
+probe tables were taken while another process held `/tmp/bench-hold`, so read
+their µs columns as shape, not as a rate; the ratios below were not.)
+
+`finalize_free_list`'s iteration count is *unchanged* and still tracks the free
+list's length — a commit still rewrites as much of the free-list subtree as it
+did. **That is real work and it is not superlinear**, which is why this item
+stops here rather than restructuring the list: it was never the multiplier.
+
+#### 3. On the clock
+
+Interleaved A/B, both arms in every repetition, arm order flipped every
+repetition, the control re-run in every repetition, on an otherwise idle
+machine with `/tmp/bench-hold` taken. The two 300-seed sweeps, `--test-threads=1`:
+
+| rep | `heavy_churn` base | fix | base (A/A) | `raw_scan` base | fix | base (A/A) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 81.44 | **6.50** | 81.53 | 3.62 | 3.62 | 3.59 |
+| 2 | 82.18 | **6.14** | 81.09 | 3.59 | 3.60 | 3.63 |
+| 3 | 81.78 | **6.16** | 81.17 | 3.58 | 3.62 | 3.68 |
+
+**The A/A spread is ±1.3%** (0.999, 1.013, 1.008), which is the number to read
+the rest against. Paired fix/base ratios, one per repetition: **0.080, 0.075,
+0.075 — 13.3× on the median, three of three.** `raw_scan` is 1.00 in every
+repetition and was never the problem; AHL-564 already said so (78 s of the
+1,902).
+
+And the number the release gate actually pays, one full `-- --ignored` run per
+arm, 5,000 seeds each, machine idle:
+
+| | before | after |
+| --- | --- | --- |
+| `free_list_reuse_dst -- --ignored` | **1,801 s** (30:01) | **183 s** (3:03) |
+
+**9.8×.** That is not merely back under AHL-564's 187 s — it is under it while
+now running its seeds to completion rather than breaking out on a refused
+commit. The sweep is affordable again, and the answer to "must it stay 32
+minutes" is no.
+
+#### 4. What pins it
+
+`CowBTree::free_list_scans()` joins `pages_reused()` as a diagnostic counter,
+because the shape of this cost is invisible in every number downstream of it.
+`a_commits_free_list_scan_count_does_not_grow_with_the_free_list` runs eight
+seeds of the sweep's workload with faults off and asserts two things: an
+absolute cap of 16 scans/commit, and that the second half of the run does not
+cost more per commit than the whole run. Mutation-tested both ways — reverting
+the cursor alone, or the latch alone, takes it to **76.6 scans/commit** and the
+test goes red. Reverting the cursor also stops the workload committing
+altogether, refused for exceeding the one-region record ceiling on a tree of
+twenty-four keys: that refusal is the loop-break AHL-564 measured, reproduced
+deliberately.
+
+**Gates.** `fmt`; `clippy --release --workspace --all-targets -D warnings`;
+`cargo test --release --workspace`; `RUSTDOCFLAGS="-D warnings" cargo doc
+--workspace --no-deps --document-private-items`; `cargo check -p inlaysql-wasm
+--target wasm32-unknown-unknown`; and all five DST sweeps `-- --ignored` —
+`dst_sweep` (106 s), `free_list_reuse_dst` (183 s), `backup_dst` (80 s),
+`durability_dst` (101 s) on `-p inlaysql-core`, `index_recovery_dst` (197 s) on
+`-p inlaysql`.
