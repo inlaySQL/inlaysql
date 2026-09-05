@@ -77,6 +77,30 @@ machine floors (§1) apply to the regenerated cells; §4.0's 20.2% desktop
 floor now applies only to the 2026-08-31 figures kept as history. The
 1/4/16-connection sweeps (§3.5, §3.10, §6) are still the 2026-08-31 runs.
 
+**Regenerated cells, 2026-09-05 evening (`ea1712c`) — the sixth gated
+`run.sh` edition, and the one that moves the most SQLite verdicts on this
+page.** `REPEATS=3 ./bench/repeat.sh` (load-gated, `dirty: no`, none
+`CONTAMINATED`, per-run load max 2.65/3.07/3.67 of 18 — the quietest of the
+six sittings — median of three;
+`bench/results/20260905T133420Z-repeat.txt`, from
+`bench/results/20260905T{133420,134147,134914}Z.txt`) refilled every
+SQLite-facing cell in §3.1, §3.2, §3.3, §3.5's fresh 1/2/4/8 rows, §3.6 and
+§3.8, plus the InlaySQL range and join columns §3.2 and §3.6 reuse for the
+MySQL/PostgreSQL comparison. **Three SQLite verdicts move, and one commit
+is named on all three**: the point read against WAL-mode SQLite from LOSS
+~2x to **TIE** (§3.1), the PK-inner `LIMIT 10` join from LOSS to **TIE**
+with the p50 ahead in every run (§3.6), and the range scan and secondary
+`LIMIT` join narrowing but staying LOSS. That commit is **AHL-559** — the
+B-tree's key comparison stops calling `memcmp`, measured interleaved at
++25% / +15% / +14% / +13% on `points` / `indexed` / `indexed-range` /
+`joins-limit`, 3 of 3 or better and non-overlapping each. The gated medians
+that fill these cells see the direction on every one of those shapes and
+about half the size on the two least noisy of them, which `BENCHMARK.md`
+states in both places rather than picking the instrument that flatters the
+result. Journal-mode SQLite's own point-read cell also fell 31% in this
+sitting on unchanged code, so roughly half the widening of §3.1's durable
+multiple is the opponent's cell, not ours.
+
 ---
 
 ## 1. Verdict rules
@@ -144,14 +168,14 @@ configuration changed.
 
 | Workload | SQLite | MySQL 8.4 | PostgreSQL 17 |
 | --- | --- | --- | --- |
-| Point read by PK | WIN ~2-4x vs durable config; LOSS ~2x vs WAL/NORMAL | WIN ~200x (structural, §3.1) | WIN ~35x (structural, §3.1) |
-| Indexed range scan | LOSS ~1.5x (durable) / ~2.5x (WAL) | WIN ~7x (§3.2) | WIN ~4.5x (§3.2) |
-| Single-row insert (durable) | WIN ~2.7x | TIE (containerised; medians read 1.10x our way, but pairing the runs we are ahead in 1 of 3, 0.55–2.08x — was LOSS ~1.5x, §3.3) | TIE (containerised; medians read 0.90x, ahead in 1 of 3, 0.61–2.05x — was LOSS ~1.2x, §3.3) |
+| Point read by PK | WIN ~6x vs durable config (3-11x per run); **TIE** vs WAL/NORMAL — 0.85x on ops/s and ahead on p50 in 3 of 3 runs by ~5%, both inside this row's own floor (was LOSS ~2x, §3.1) | WIN ~200x (structural, §3.1) | WIN ~35x (structural, §3.1) |
+| Indexed range scan | LOSS ~1.15x (durable) / ~1.9x (WAL) — behind 3 of 3 on both, narrowed by AHL-559 from ~1.2x/~2x (§3.2) | WIN ~8.8x (§3.2) | WIN ~5.8x (§3.2) |
+| Single-row insert (durable) | WIN ~2.8x | TIE (containerised; medians read 1.10x our way, but pairing the runs we are ahead in 1 of 3, 0.55–2.08x — was LOSS ~1.5x, §3.3) | TIE (containerised; medians read 0.90x, ahead in 1 of 3, 0.61–2.05x — was LOSS ~1.2x, §3.3) |
 | Batch insert | UNKNOWN — no SQLite-batched comparison published | WIN ~1.2x like for like (containerised InlaySQL 67,484 rows/s vs 56,700; on the host, LOSS ~2.4x on the barrier, §3.4) | LOSS ~1.5x like for like (67,484 vs 99,212; on the host ~4.1x, §3.4) |
-| Concurrent commits, 4/8/16 writers | WIN ~10-17x across 4/8/16 | LOSS @1,4,16 (~1.4-2.4x/~1.1-3.0x/~3.1-5.4x, widening with concurrency, 5 interleaved reps); LOSS @8 ~0.30x and LOSS @1 ~0.89x (gated median of 3 vs MySQL 8.4, 2026-09-05; batching at parity, barrier rate ~3.3x behind; the @1 loss narrowed from ~0.64x on AHL-553, §3.5) | UNKNOWN — no server exists (§3.4) |
-| Two-table join | MIXED: WIN one shape (~5-9x), LOSS three shapes (~1.1-3.5x) | WIN all four shapes: ~4x on both full joins; several-x on `LIMIT`, on a smaller LIMIT than theirs (§3.6) | WIN all four shapes: ~2.7-2.9x on both full joins; several-x on `LIMIT`, same caveat (§3.6) |
+| Concurrent commits, 4/8/16 writers | WIN ~6.4x/12.6x/17.6x at 4/8/16 | LOSS @1,4,16 (~1.4-2.4x/~1.1-3.0x/~3.1-5.4x, widening with concurrency, 5 interleaved reps); LOSS @8 ~0.30x and LOSS @1 ~0.89x (gated median of 3 vs MySQL 8.4, 2026-09-05; batching at parity, barrier rate ~3.3x behind; the @1 loss narrowed from ~0.64x on AHL-553, §3.5) | UNKNOWN — no server exists (§3.4) |
+| Two-table join | MIXED: WIN both full shapes (~3x and ~8x); PK `LIMIT 10` **TIE** — ahead on p50 in 3 of 3 runs, ~1.08x behind on the throughput line that includes the cold first execution (was LOSS); LOSS on the secondary `LIMIT 10` shape (~1.13x on p50, ~1.2x on throughput) (§3.6) | WIN all four shapes: ~4x on both full joins; several-x on `LIMIT`, on a smaller LIMIT than theirs (§3.6) | WIN all four shapes: ~2.7-2.9x on both full joins; several-x on `LIMIT`, same caveat (§3.6) |
 | Aggregate / `GROUP BY` | UNKNOWN — no harness | WIN ~1.9x group / WIN ~6x scalar (§3.7) | WIN ~1.26x group / WIN ~5x scalar (§3.7) |
-| Vector search, exact | N/A (stock) / WIN ~8-10x vs `sqlite-vec` ext., iso-recall | N/A — no vector capability | WIN ~1.7x — 93 vs 158 µs, ahead in 6 of 6 runs across two gated sittings; was TIE when one sitting's own spread swallowed the gap (§3.8) |
+| Vector search, exact | N/A (stock) / WIN ~11x vs `sqlite-vec` ext., iso-recall | N/A — no vector capability | WIN ~1.7x — 93 vs 158 µs, ahead in 6 of 6 runs across two gated sittings; was TIE when one sitting's own spread swallowed the gap (§3.8) |
 | Vector search, int8 | UNKNOWN — no cross-engine harness | N/A — no vector capability | UNKNOWN — no cross-engine harness |
 | p99 commit latency | LOSS ~7-9x at high writer counts | TIE @1 (mixed sign, 4/5 reps); LOSS @4,16 (~1.5-4.5x/~2.4-8.9x, widening, 5 interleaved reps) | UNKNOWN — no server exists (§3.4) |
 
@@ -191,17 +215,41 @@ agreeing in direction (§3.8). The server-to-server 1-connection write
 narrowed from ~0.64x to ~0.89x and stays a LOSS (§3.5). Nothing moved from
 UNKNOWN, and the five UNKNOWN cells above are unchanged.
 
+**Updated again the same evening** (`ea1712c`, the sixth gated `run.sh`
+edition): **two SQLite verdicts move, both toward us, and both on one
+named commit.** The point read against WAL-mode SQLite goes from LOSS ~2x
+to **TIE** — 0.85x on ops/s and ahead on p50 in all three runs, each inside
+this row's own floor (§3.1) — and the PK-inner `LIMIT 10` join goes from
+LOSS to **TIE**, its p50 ahead in all three runs while the harness's
+throughput line, which pays our dearer cold first execution, stays ~1.08x
+behind (§3.6). The range scan and the secondary `LIMIT` join stay LOSS and
+narrow again. The commit is AHL-559, the B-tree key comparison that stopped
+calling `memcmp`, measured interleaved at +25%/+15%/+14%/+13% across the
+four affected suites. Nothing moved from UNKNOWN here either.
+
 ---
 
 ## 3. Per-row detail
 
 ### 3.1 Point read by PK
 
-**SQLite** (`BENCHMARK.md` "Point reads by primary key"): 522,562 ops/s
-median vs 160,236 (journal + `sync=FULL` + `fullfsync`, **WIN, ~2-4x**, this
-session's three individual ratios were 2.05x/2.91x/3.80x) and vs 1,118,819
-(WAL + `sync=NORMAL`, **LOSS, ~2x**). Both gaps are far outside the
-flagship point-read floor (7.3% quiet / 20.2% busy). Durability: read-only;
+**SQLite** (`BENCHMARK.md` "Point reads by primary key", gated median of
+three at `ea1712c`, 2026-09-05 evening): 991,539 ops/s median vs 164,448
+(journal + `sync=FULL` + `fullfsync`, **WIN, ~6x**, this session's three
+individual ratios were 11.04x/5.99x/6.03x) and vs 1,161,418 (WAL +
+`sync=NORMAL`, **TIE — the verdict this edition moves**). The durable WIN
+is far outside the flagship point-read floor (7.3% quiet / 20.2% busy) at
+every run. The WAL cell is not a LOSS any more and is not a WIN either, and
+both halves of that are worth stating: on ops/s we are 0.85x (from 0.74x
+and 0.56x), a 15% gap inside both the 20.2% busy floor and this row's own
+110% run-to-run spread; on p50 we are *ahead in all three runs* (0.375 vs
+0.750, 0.750 vs 0.833, 0.750 vs 0.792 µs) but by ~5%, inside the same
+floor. Consistent direction on the metric, margin inside the floor, so
+**TIE** by §1's rule rather than the WIN the raw p50 medians would round
+to. The named cause is AHL-559 (+25% on `points`, 3 of 3 interleaved,
+`memcmp` 42.7% → 2.3% of self time); journal-mode SQLite's own cell fell
+238,965 → 164,448 on unchanged code in the same sitting, so about half the
+durable multiple's widening from ~3.8x is the opponent's side. Durability: read-only;
 the underlying SQLite instance was populated and held open under the stated
 config in each column; InlaySQL's own durability level is irrelevant to a
 read.
@@ -233,11 +281,15 @@ configuration.
 
 ### 3.2 Indexed range scan
 
-**SQLite** (`BENCHMARK.md` "Secondary-index reads", range columns): 64,250
-ops/s vs 124,662 (journal, **LOSS, ~2x**) and 182,357 (WAL, **LOSS, ~2.9x**).
-Both essentially unchanged across editions and consistent in sign across all
-three runs behind the median (9-21% individual spread), so read as real
-losses, not noise. Durability: same as 3.1, read-only.
+**SQLite** (`BENCHMARK.md` "Secondary-index reads", range columns, gated
+median of three at `ea1712c`): 126,183 ops/s vs 145,719 (journal, **LOSS,
+~1.15x**) and 238,663 (WAL, **LOSS, ~1.9x**); on p50, 7.29 µs against 6.58
+and 4.00. Consistent in sign across all three runs behind each median
+(19% individual spread on our own cell), so read as real losses — but
+narrowing every edition, from ~1.2x/~2x at `be95cc3` and ~2x/~2.9x when
+this row was first filled in. AHL-559 measured +14% on this exact shape
+interleaved, 4 of 4 non-overlapping; the gated cell moved +6%, which is the
+direction at half the size and is published as such. Durability: same as 3.1, read-only.
 
 **MySQL / PostgreSQL** (2026-08-31, `bench/external/read_driver.py`, unix
 socket, 5 shuffled reps — see §4.1's disclosure about this sitting's
@@ -246,20 +298,21 @@ email, body)` at 100,000 rows, index built after the rows, 100
 `WHERE email >= ? AND email < ?` queries returning exactly 50 rows, key
 sequence generated with the same seeded xorshift64* the Rust harness uses.
 **Regenerated 2026-09-02/03, `REPS=5`, quiet machine, MySQL 8.4**:
-InlaySQL 118,489 ops/s (99k–120k; the 2026-09-05 edition's gated `run.sh`
-median of three at `be95cc3`, reused for this cell as the three editions
-before it reused their own `run.sh` figures — a different sitting from,
-and two engine editions later than, the server columns, disclosed) — with
-SQLite, in-process on the same harness, at 144,622 ops/s (6.67 µs), i.e.
-~10x MySQL and ~6.5x PostgreSQL itself, so this WIN is mostly the servers'
-client and socket rather than a storage-engine gap — vs MySQL 8.4 14,330
-ops/s (14,181–14,635, p50 67 µs) and PostgreSQL 21,824 ops/s
-(9,009–22,931, one outlier rep; p50 44 µs). **WIN ~8x vs MySQL, WIN ~5.5x
-vs PostgreSQL** — far outside the quiet floor. The `1f7921a` cell was
-119,219 and this one is 118,489, −1% and inside its own 18% run-to-run
-spread — flat, despite AHL-551 measuring a further 3–7% on this exact shape
-interleaved, 6 of 6 non-overlapping, which a cell this noisy cannot
-resolve. The `3cf0d85` cell was 97,624 (~7x/~4.5x), and the step from it is
+InlaySQL 126,183 ops/s (118k–142k; the 2026-09-05 evening edition's gated
+`run.sh` median of three at `ea1712c`, reused for this cell as the four
+editions before it reused their own `run.sh` figures — a different sitting
+from, and three engine editions later than, the server columns, disclosed)
+— with SQLite, in-process on the same harness, at 145,719 ops/s (6.58 µs),
+i.e. ~10x MySQL and ~6.5x PostgreSQL itself, so this WIN is mostly the
+servers' client and socket rather than a storage-engine gap — vs MySQL 8.4
+14,330 ops/s (14,181–14,635, p50 67 µs) and PostgreSQL 21,824 ops/s
+(9,009–22,931, one outlier rep; p50 44 µs). **WIN ~8.8x vs MySQL, WIN ~5.8x
+vs PostgreSQL** — far outside the quiet floor. The `be95cc3` cell was
+118,489 and this one is 126,183, +6% and inside its own 19% run-to-run
+spread, but this time with an A/B that agrees in direction: AHL-559
+measured +14% on this exact shape interleaved, 4 of 4 non-overlapping,
+where AHL-551's earlier 3–7% on the same shape was something this cell
+could not resolve at all. The `3cf0d85` cell was 97,624 (~7x/~4.5x), and the step from it is
 AHL-550's compiled residual filter (1.22–1.36x interleaved on this shape);
 the 2026-08-31 figures were 49,259 (desktop load) vs 13,124 (8.0.x) and
 21,455 — the servers' columns barely moved across any step, so the wider
@@ -273,9 +326,10 @@ in-process.
 
 ### 3.3 Single-row insert (durable)
 
-**SQLite** (`BENCHMARK.md` "Durable writes"): 240 ops/s vs 90 (journal +
-`fullfsync`), **WIN, ~2.7x**, one of the tightest ratios in the whole
-document (3.8%/8.9% individual spread). Both sides run one commit, one
+**SQLite** (`BENCHMARK.md` "Durable writes", gated median of three at
+`ea1712c`): 250 ops/s vs 89 (journal + `fullfsync`), **WIN, ~2.8x**, the
+tightest ratio in the whole document — all three runs read the same 250 and
+the same 89, with p50 spreads of 0.3% and 0.4%. Both sides run one commit, one
 `F_FULLFSYNC`, on the host filesystem — but this is *not* a FLOOR-BOUND cell,
 even though both pay the identical hardware barrier, because they do not pay
 it the same number of times: `PERF.md`'s AHL-496 count found InlaySQL at
@@ -416,11 +470,17 @@ standing in for it, and no number is invented.
 
 ### 3.5 Concurrent commits at 4/8/16 writers
 
-**SQLite** (`BENCHMARK.md` "Concurrent writers", `WRITER_LEVELS` sweep):
-587/1209/1616 commits/s at 4/8/16 writers vs SQLite's flat 87-92 at every
-level — **WIN, roughly 6.7x/13.7x/17.6x** respectively. Far outside the
-concurrency-suite floor (3.6% core CoV); the 8-writer point is the tightest
-in its own sweep (0.9% spread). Durability: full, both sides, real OS
+**SQLite** (`BENCHMARK.md` "Concurrent writers"): 583/1110 commits/s at
+4/8 writers from the fresh gated median of three at `ea1712c` and 1616 at
+16 from the carried-forward 2026-08-30 wide sweep (this edition, like the
+four before it, ran only the default 1/2/4/8 levels), against SQLite's flat
+88-92 at every level — **WIN, roughly 6.4x/12.6x/17.6x** respectively. Far
+outside the concurrency-suite floor (3.6% core CoV), though the 8-writer
+point's own three runs disagree by 12% this time, so read it as the
+~1,200 ±10% band `BENCHMARK.md` publishes rather than the point value.
+AHL-562's flush pipeline is in the range and **off by default**; the
+suite's own counter reports zero handoffs, so this is still the flag-off
+engine. Durability: full, both sides, real OS
 threads, one `fsync`/`F_FULLFSYNC` per commit or per coalesced batch.
 
 **MySQL, 1/4/16 connections (2026-08-31, `BENCHMARK.md` "Server-to-server,
@@ -635,13 +695,23 @@ in nearly the same words.
 
 ### 3.6 Two-table join
 
-**SQLite** (`BENCHMARK.md` "Joins"), four shapes, all vs journal-mode only
-(no WAL-mode join row is published — itself a minor completeness gap):
-PK-inner full **LOSS ~1.1-1.3x**; PK-inner `LIMIT 10` **LOSS ~2.8-3.5x**;
-secondary-index-inner full **WIN ~5-9x**; secondary-index-inner `LIMIT 10`
-**LOSS ~2.2-2.6x**. All four ratios sit on the same side of 1.0x across
-every combination of the three runs' own spread (10-38%), which is why
-`BENCHMARK.md` treats them as real despite the wide individual bands.
+**SQLite** (`BENCHMARK.md` "Joins", gated median of three at `ea1712c`),
+four shapes, all vs journal-mode only (no WAL-mode join row is published —
+itself a minor completeness gap): PK-inner full **WIN ~3x** (3.27 against
+10.54 ms); secondary-index-inner full **WIN ~8x** (3.60 against 31.30 ms);
+PK-inner `LIMIT 10` **TIE** — 3.25 against 3.50 µs on p50, ahead in all
+three runs, but 1.08x *behind* on the harness's `joins/s` line, which
+includes the cold first execution where ours is 62.71 µs against SQLite's
+8.83, so the two columns disagree in sign and neither is suppressed;
+secondary-index-inner `LIMIT 10` **LOSS ~1.13x** on p50 (5.25 against 4.63
+µs, behind 3 of 3) and ~1.2x on `joins/s`. Two of these verdicts have moved
+since this section was written — the PK full join from LOSS to WIN
+(AHL-524's corrected join cost model, `BENCHMARK.md`'s joins section) and
+the PK `LIMIT` shape from LOSS ~2.8-3.5x to TIE, by successive named
+commits ending in AHL-559's +13% on `joins-limit`. Every InlaySQL p50 in
+this table held within 7% across the three runs; SQLite's own PK `LIMIT`
+p50 is the loudest cell on the page (55%), which is why the p50 claim is
+made on the within-run pairings rather than on the two medians.
 Durability: read-only; both engines built under `journal` + `sync=FULL` +
 `fullfsync`.
 
@@ -654,30 +724,31 @@ rep. Per the pre-fixed join rule, **both FROM orders are reported,
 worst-first**, and the p50 medians are compared:
 
 **Regenerated 2026-09-02/03, `REPS=5`, quiet machine, MySQL 8.4.** The
-InlaySQL column is the 2026-09-05 edition's gated `run.sh` median of three
-at `be95cc3` (a different sitting and two engine editions later than the
-server columns — AHL-549 moved the two `LIMIT` cells from `3cf0d85`'s 4.25
-/ 6.88 µs to `1f7921a`'s 3.75 / 5.79, and AHL-551 is the named direction
-behind this edition's 3.46 / 5.54, at a size the gated row and the
-interleaved A/B disagree about; and its `LIMIT` shapes are `LIMIT 10` where
+InlaySQL column is the 2026-09-05 evening edition's gated `run.sh` median
+of three at `ea1712c` (a different sitting and three engine editions later
+than the server columns — AHL-549 moved the two `LIMIT` cells from
+`3cf0d85`'s 4.25 / 6.88 µs to `1f7921a`'s 3.75 / 5.79, AHL-551 was the
+named direction behind `be95cc3`'s 3.46 / 5.54 at a size the gated row
+could not resolve, and AHL-559's measured +13% on `joins-limit` is the name
+on this edition's 3.25 / 5.25; and its `LIMIT` shapes are `LIMIT 10` where
 the drivers run `LIMIT 20` — not the same shape, disclosed):
 
 | Shape | InlaySQL p50 | MySQL 8.4 p50 (median, range) | PostgreSQL 17 p50 (median, range) |
 | --- | --- | --- | --- |
-| PK inner, full join | **3.26 ms** | 13.68 ms (13.64–13.71) | 9.36 ms (9.28–9.47) |
-| Secondary-index inner, full join | **3.51 ms** | 13.71 ms (13.68–13.83) | 9.42 ms (9.30–9.49) |
-| PK inner, LIMIT (ours 10, theirs 20) | 3.46 µs | 44 µs (42–44) | 29 µs (28–30) |
-| Secondary-index inner, LIMIT (ours 10, theirs 20) | 5.54 µs | 51 µs (49–52) | 30 µs (28–30) |
+| PK inner, full join | **3.27 ms** | 13.68 ms (13.64–13.71) | 9.36 ms (9.28–9.47) |
+| Secondary-index inner, full join | **3.60 ms** | 13.71 ms (13.68–13.83) | 9.42 ms (9.30–9.49) |
+| PK inner, LIMIT (ours 10, theirs 20) | 3.25 µs | 44 µs (42–44) | 29 µs (28–30) |
+| Secondary-index inner, LIMIT (ours 10, theirs 20) | 5.25 µs | 51 µs (49–52) | 30 µs (28–30) |
 
-**vs MySQL 8.4 — WIN all four** (~4.2x/~3.9x on the full joins; the `LIMIT`
+**vs MySQL 8.4 — WIN all four** (~4.2x/~3.8x on the full joins; the `LIMIT`
 rows several-x on a smaller LIMIT). **vs PostgreSQL — WIN all four**
-(~2.9x/~2.7x full; `LIMIT` likewise). The 2026-08-31 edition's red cell —
+(~2.9x/~2.6x full; `LIMIT` likewise). The 2026-08-31 edition's red cell —
 PK-inner full join 13.04 ms, TIE vs MySQL (15.00 ms) and **LOSS ~1.24x vs
 PostgreSQL** (10.49 ms), "the shape where PG's planner picked the better
 order" — is gone for a named reason: AHL-524 (`PERF.md`, 2026-09-02) fixed
 AHL-512's inverted join cost model so both written orders run the same
 users-driving plan (9.34 → 3.21 ms single-run, 3.23 ms gated at `3cf0d85`,
-3.25 ms at `1f7921a`, 3.26 ms at `be95cc3`). Both
+3.25 ms at `1f7921a`, 3.26 ms at `be95cc3`, 3.27 ms at `ea1712c`). Both
 opponents still hash-join either FROM order in ~13.7/~9.4 ms; their
 columns moved from ~15.0/~10.5 on a quieter machine and, for MySQL, a
 version change — unattributed. The planner-epic decision the previous
@@ -739,10 +810,12 @@ the grouping pipeline was the cost, and it is no longer the worst cell.
 vector capability at all — **N/A** by the letter of the rule. `sqlite-vec`
 is a third-party extension, the de facto standard one, and the published
 comparison against it is real and floor-qualified (main-suite run, part of
-the same three-run median as the points table): 78.96 µs p50 vs
-`sqlite-vec`'s implied p50, **WIN ~8-10x** on the realistic corpus at
-iso-recall (1.000 both sides), **WIN ~6.5-7x** on the uniform corpus at
-non-matched recall (0.922 InlaySQL vs its own oracle). Presented as both
+the same three-run median as the points table, gated at `ea1712c`): 59.42
+µs p50 against `sqlite-vec`'s 666.79, **WIN ~11x** on the realistic corpus
+at iso-recall (1.000 both sides; per-run 11.06–11.46x), **WIN ~7x** on the
+uniform corpus at non-matched recall (6.75–8.20x; 0.922 InlaySQL vs its own
+oracle). Both cells moved this sitting — ours −7% and `sqlite-vec`'s +5% on
+the realistic corpus — and neither move is attributed to a commit. Presented as both
 labels deliberately: N/A describes what stock SQLite can do, WIN describes
 the extension comparison that is actually published and floor-qualified.
 

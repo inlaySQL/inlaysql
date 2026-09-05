@@ -306,14 +306,14 @@
   </p>
   <div class="figures">
     <div class="figure">
-      <b>910,788</b>
+      <b>991,539</b>
       <span>point reads per second</span>
-      <em>~3-10× SQLite in journal mode, durable</em>
+      <em>~3-11× SQLite in journal mode, durable</em>
     </div>
     <div class="figure">
       <b>~13×</b>
       <span>SQLite on concurrent writes</span>
-      <em>1,145 commits/s at 8 writers, 0% aborted</em>
+      <em>1,110 commits/s at 8 writers, 0% aborted</em>
     </div>
     <div class="figure">
       <b>167 µs</b>
@@ -481,21 +481,21 @@
       <tbody>
         <tr>
           <td>Point read by primary key</td>
-          <td class="num">910,788 ops/s</td>
+          <td class="num">991,539 ops/s</td>
           <td>SQLite, journal (durable)</td>
-          <td class="win">~3-10× faster</td>
+          <td class="win">~3-11× faster</td>
         </tr>
         <tr>
           <td>Concurrent writes, 8 writers</td>
-          <td class="num">1,145 commits/s</td>
+          <td class="num">1,110 commits/s</td>
           <td>SQLite, journal</td>
           <td class="win">~13× faster</td>
         </tr>
         <tr>
           <td>Vector search, recall@10 1.000</td>
-          <td class="num">63.58 µs</td>
+          <td class="num">59.42 µs</td>
           <td><code>sqlite-vec</code></td>
-          <td class="win">~10× faster</td>
+          <td class="win">~11× faster</td>
         </tr>
         <tr>
           <td>Hybrid search (BM25 + vector)</td>
@@ -517,21 +517,27 @@
         </tr>
         <tr>
           <td>Secondary-index inner join, 20k × 160k rows</td>
-          <td class="num">3.51 ms</td>
+          <td class="num">3.60 ms</td>
           <td>SQLite</td>
           <td class="win">~8× faster</td>
         </tr>
         <tr>
+          <td>PK inner join, <code>LIMIT 10</code> <span class="note">(published as a loss for six editions; the key comparison stopped calling <code>memcmp</code>, worth +13% on this shape interleaved)</span></td>
+          <td class="num">3.25 µs p50</td>
+          <td>SQLite, journal (3.50 µs p50)</td>
+          <td class="win">faster in all three runs — though on throughput, which pays our dearer first execution of a shape, ~1.08× behind</td>
+        </tr>
+        <tr>
           <td>Indexed range scan, 50 rows</td>
-          <td class="num">8.00 µs</td>
+          <td class="num">7.29 µs</td>
           <td>SQLite, journal</td>
-          <td class="loss">~1.2× slower</td>
+          <td class="loss">~1.15× slower</td>
         </tr>
         <tr>
           <td>Indexed range scan, 50 rows <span class="note">(servers answer a client over a socket; SQLite in-process is ~6-10× them on the same shape)</span></td>
-          <td class="num">118,489 ops/s</td>
+          <td class="num">126,183 ops/s</td>
           <td>MySQL 8.4, PostgreSQL 17</td>
-          <td class="win">~5-8× faster</td>
+          <td class="win">~5.8-8.8× faster</td>
         </tr>
         <tr>
           <td><code>GROUP BY</code>, 100 groups over 100k rows</td>
@@ -593,24 +599,32 @@
         loudly rather than guessing.
       </li>
       <li>
-        <strong>Row iteration loses to SQLite.</strong> Range scans and both
-        <code>LIMIT 10</code> join shapes are slower than SQLite (roughly 1.2×
-        and 1.15-1.35×, narrower again this edition); both full joins are
-        faster, and against MySQL and PostgreSQL the range scan wins outright.
-        Measured, published above, and the current top priority. Two things
-        that used to sit in this bullet as landed-but-unpublished are now in
-        the numbers: a point lookup retains the path it descended and resumes
-        from the lowest ancestor whose span still admits the key rather than
-        walking from the root, and the point read&rsquo;s throughput tail — a
-        page cache that filled with 151,635 superseded pages during the
-        benchmark&rsquo;s write phase — has been found, fixed and measured.
-        <strong>The point read&rsquo;s throughput is no longer the standing
-        loss it was</strong>: p95 and p99 are three times and nearly three
-        times better than the previous edition, 2.2× and 3.1× SQLite WAL&rsquo;s
-        rather than 6.5× and 8.7×, and throughput is 0.74× WAL&rsquo;s where it
-        was 0.56×, with one run of three above it. The median p50 moved 20%
-        the other way inside a figure whose own three runs disagree by 67%,
-        and that is published rather than explained away.
+        <strong>Row iteration still loses to SQLite, on two shapes rather
+        than three.</strong> The 50-row range scan is roughly 1.15× behind
+        journal-mode SQLite and the secondary-index <code>LIMIT 10</code>
+        join roughly 1.13× on p50 — both narrower again this edition — while
+        both full joins are faster and, against MySQL and PostgreSQL, the
+        range scan wins outright. Measured, published above, and the current
+        top priority. <strong>The PK <code>LIMIT 10</code> join has come off
+        this list on p50</strong>: 3.25 µs against SQLite&rsquo;s 3.50, ahead
+        in all three runs of the sitting, where it was published 1.15× behind
+        an edition ago. Its throughput line is still ~1.08× behind and stays
+        in the table above, because that figure counts the cold first
+        execution of a shape and ours is 62.71 µs against SQLite&rsquo;s 8.83.
+        The commit behind all of it is one: the B-tree&rsquo;s key comparison
+        stopped calling <code>memcmp</code> and now compares eight bytes at a
+        time as a big-endian integer, unconditionally identical in verdict to
+        the byte comparison — +25% on point reads, +15% on indexed lookups,
+        +14% on the range scan and +13% on the <code>LIMIT</code> join,
+        measured interleaved, 3 of 3 or better and non-overlapping each.
+        <strong>The point read is no longer a standing loss against SQLite in
+        WAL mode either</strong>: its p50 is now below WAL&rsquo;s in every
+        run of the sitting (0.75 µs against 0.792), its throughput is 0.85×
+        WAL&rsquo;s where it was 0.74× and 0.56×, and its p95 and p99 are
+        1.85× and 3.3× WAL&rsquo;s where they were 6.5× and 8.7× two editions
+        ago. What is left of that row is that it is a warm number: our miss
+        path is still dearer than SQLite&rsquo;s, so a cold handle warms up
+        more slowly.
       </li>
       <li>
         <strong>Batch inserts lose to PostgreSQL.</strong> <code>GROUP BY</code> was the worst shape we
