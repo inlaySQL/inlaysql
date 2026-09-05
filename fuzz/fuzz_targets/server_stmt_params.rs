@@ -30,6 +30,12 @@ use libfuzzer_sys::fuzz_target;
 
 use inlaysql_server::fuzz;
 
+#[path = "counted_alloc.rs"]
+mod counted_alloc;
+
+#[global_allocator]
+static ALLOCATOR: counted_alloc::Counting = counted_alloc::Counting;
+
 /// The widest text a temporal decoder renders out of a fixed number of bytes:
 /// `-4294967295:59:59.999999` is 24 characters and
 /// `2026-09-05 12:00:00.000001` is 26.
@@ -62,7 +68,27 @@ fuzz_target!(|input: Execute| {
         .map(|dim| dim.map(usize::from))
         .collect();
 
-    let Ok(params) = fuzz::decode_params(input.body, types, &dims) else {
+    counted_alloc::start();
+    let decoded = fuzz::decode_params(input.body, types, &dims);
+    let peak = counted_alloc::peak();
+
+    // Never allocates out of proportion to the body, whether the decode
+    // succeeded or not. Sixteen bytes per placeholder for the `Vec`s the loop
+    // keeps, plus the body four times over for the copies each value makes of
+    // its own bytes and the doubling those copies do while they grow.
+    //
+    // The bound is on the *failing* path too, and that is the half that
+    // matters: a decoder that allocates from a declared length and then
+    // discovers the bytes are not there has already spent the memory.
+    let bound = 4096 + 16 * types.len() + 4 * input.body.len();
+    assert!(
+        peak <= bound,
+        "decoding {} parameters from a {} byte body held {peak} at once, past the {bound} bound",
+        types.len(),
+        input.body.len()
+    );
+
+    let Ok(params) = decoded else {
         return;
     };
 

@@ -18,11 +18,37 @@ use libfuzzer_sys::fuzz_target;
 
 use inlaysql_server::fuzz;
 
+#[path = "counted_alloc.rs"]
+mod counted_alloc;
+
+#[global_allocator]
+static ALLOCATOR: counted_alloc::Counting = counted_alloc::Counting;
+
 fuzz_target!(|data: &[u8]| {
     for expect_ssl_request in [true, false] {
-        // An error is the expected outcome. Only a parse that succeeded has
-        // anything to assert about.
-        let Ok(handshake) = fuzz::parse_handshake_response(data, expect_ssl_request) else {
+        counted_alloc::start();
+        let parsed = fuzz::parse_handshake_response(data, expect_ssl_request);
+        let peak = counted_alloc::peak();
+
+        // Never allocates out of proportion to the packet, whether the parse
+        // succeeded or not.
+        //
+        // The response owns a copy of the user name, the token, the database
+        // and the plugin name, and every one of them is sized by a length in
+        // the packet — the length-encoded token form can declare `u64::MAX`,
+        // which is the shape this bound exists to catch. Four times the input
+        // rather than once, because the copies are `String` and `Vec` and both
+        // may double while they grow.
+        let bound = 4096 + 4 * data.len();
+        assert!(
+            peak <= bound,
+            "parsing a {} byte handshake held {peak} at once, past the {bound} bound",
+            data.len()
+        );
+
+        // An error is the expected outcome for almost every input. Only a
+        // parse that succeeded has anything further to assert about.
+        let Ok(handshake) = parsed else {
             continue;
         };
 
