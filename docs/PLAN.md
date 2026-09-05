@@ -80,16 +80,23 @@ Every item lands only with an interleaved A/B (3 reps, control re-run each rep,
 3/3 non-overlapping) and touches no published row without a gated
 regeneration.
 
-1. **`LIMIT 10` joins vs SQLite (1.1x / 1.3-1.5x slower).** AHL-549 and
-   AHL-551 are done; what is left is the descent itself — `get_from` is 35.5%
-   of the shape and dominates. Gate: `joins-limit` 3/3, `joins` and `points`
-   flat.
+1. **`LIMIT 10` joins vs SQLite (1.1x / 1.3-1.5x slower).** AHL-549, AHL-551
+   and AHL-559 are done — the last of those took `joins-limit` +13% and
+   `points` +25% by making the key comparison call-free, and closed `memcmp`
+   as an angle (42.7% of the `points` sample to 2.3%). What is left in the
+   descent is the *search*, not the comparison: per probe a `Key::resolve`
+   match and a bounds-checked slice, which wants a cell layout the search can
+   read a key out of without resolving it. Do not re-propose a cheaper
+   comparator (AHL-554, AHL-559) or a per-descent prefix proof (AHL-559
+   measured it flat, and 4% behind on this very suite).
 2. **Range scan vs SQLite (0.83x; the published cell already contains
-   AHL-550's compiled filter, which moved it 97,624 -> 119,219 ops/s).** What
-   is left is the descent: `memcmp` 24-27% is B-tree key comparison,
-   `get_from` ~5%. Angle: a borrowed-entry index walk. Do not re-propose a
-   dense rowid walk, a covering-index scan, or reading the filter-only `TEXT`
-   column raw — all three were built and measured negative or flat.
+   AHL-550's compiled filter, which moved it 97,624 -> 119,219 ops/s, and now
+   AHL-559's call-free comparator, +14% on `indexed-range` and +15% on
+   `indexed`).** The `memcmp` share this row was scoped against is gone.
+   Angle: a borrowed-entry index walk. Do not re-propose a dense rowid walk,
+   a covering-index scan, reading the filter-only `TEXT` column raw, or a
+   cheaper key comparator — all four were built and measured negative, flat,
+   or (the comparator) already landed.
 3. **Point-read ops/s vs SQLite WAL (0.56x).** The tail that explained it is
    fixed (AHL-552). This row needs the next gated regeneration, not a fix,
    before anything else is proposed for it.

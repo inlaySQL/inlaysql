@@ -1286,7 +1286,11 @@ impl<D: Device> CowBTree<D> {
             };
             match &*current {
                 Node::Leaf { entries, .. } => {
-                    let result = match entries.binary_search_by(|e| current.key(&e.key).cmp(key)) {
+                    // `page::search_entries` rather than `binary_search_by`:
+                    // the comparison is written into the search's own loop so
+                    // it stays straight-line code instead of an outlined
+                    // closure called once per probe (`PERF.md`, AHL-559).
+                    let result = match page::search_entries(current.bytes(), entries, key) {
                         Ok(i) => self
                             .resolve_value_at(Some(current.bytes()), &entries[i].value, pending)
                             .map(Some)?,
@@ -1409,7 +1413,7 @@ impl<D: Device> CowBTree<D> {
                 // leaf.
                 return Ok(Reseek::Miss);
             };
-            let result = match entries.binary_search_by(|e| node.key(&e.key).cmp(key)) {
+            let result = match page::search_entries(node.bytes(), entries, key) {
                 Ok(i) => {
                     Some(self.resolve_value_at(Some(node.bytes()), &entries[i].value, false)?)
                 }
@@ -3899,7 +3903,7 @@ impl<D: Device> CowBTree<D> {
                 // back in `dirty`: `free_overflow_chain` walks the chain
                 // through the pending tree.
                 let mut superseded_chain = None;
-                match entries.binary_search_by(|e| e.key.resolve(&bytes).cmp(key)) {
+                match page::search_entries(&bytes, &entries, key) {
                     Ok(i) => {
                         let old_value = core::mem::replace(&mut entries[i].value, new_value);
                         if let ValueRef::Overflow { first, .. } = old_value {
@@ -4044,7 +4048,7 @@ impl<D: Device> CowBTree<D> {
                     return Err(kind_changed(id));
                 };
                 let mut superseded_chain = None;
-                if let Ok(i) = entries.binary_search_by(|e| e.key.resolve(&bytes).cmp(key)) {
+                if let Ok(i) = page::search_entries(&bytes, &entries, key) {
                     let removed = entries.remove(i);
                     if let ValueRef::Overflow { first, .. } = removed.value {
                         superseded_chain = Some(first);
@@ -5496,14 +5500,16 @@ impl WalkBounds<'_> {
 
     /// Whether one leaf entry belongs in the answer.
     fn admits(&self, key: &[u8]) -> bool {
-        if key < self.start {
+        // `page::key_cmp` rather than `<`: same verdict, no call into the
+        // platform's `memcmp` for keys this short. See its doc comment.
+        if page::key_cmp(key, self.start).is_lt() {
             return false;
         }
-        if self.end.is_some_and(|end| key >= end) {
+        if self.end.is_some_and(|end| page::key_cmp(key, end).is_ge()) {
             return false;
         }
         match self.after {
-            Some(after) => key > after,
+            Some(after) => page::key_cmp(key, after).is_gt(),
             None => true,
         }
     }
@@ -5531,11 +5537,11 @@ impl WalkBounds<'_> {
     /// wanted key — that is, whether *both* lower bounds fall below that edge:
     /// `start` for the range, `after` for the resume.
     fn starts_below(&self, edge: &[u8]) -> bool {
-        if self.start >= edge {
+        if page::key_cmp(self.start, edge).is_ge() {
             return false;
         }
         match self.after {
-            Some(after) => after < edge,
+            Some(after) => page::key_cmp(after, edge).is_lt(),
             None => true,
         }
     }
@@ -5781,13 +5787,13 @@ impl CursorPath {
     fn admits(&self, low: Option<PathBound>, high: Option<PathBound>, key: &[u8]) -> bool {
         if let Some(low) = low {
             match self.separator(low) {
-                Some(low) if key >= low => {}
+                Some(low) if page::key_cmp(key, low).is_ge() => {}
                 _ => return false,
             }
         }
         if let Some(high) = high {
             match self.separator(high) {
-                Some(high) if key < high => {}
+                Some(high) if page::key_cmp(key, high).is_lt() => {}
                 _ => return false,
             }
         }
@@ -6193,7 +6199,10 @@ fn decode_counter(bytes: &[u8]) -> Result<u64> {
 /// one whose separator is the last separator `<= key`; the leftmost child is
 /// used when `key` is smaller than every separator.
 fn child_index(bytes: &[u8], cells: &[Separator], key: &[u8]) -> usize {
-    cells.partition_point(|c| c.key.resolve(bytes) <= key)
+    // `page::route_separators` rather than `partition_point`: the comparison
+    // is written into the search's own loop, for the reason `search_entries`
+    // gives.
+    page::route_separators(bytes, cells, key)
 }
 
 /// Point child `idx` at `new_child`. Index 0 is the leftmost pointer.

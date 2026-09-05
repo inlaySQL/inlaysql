@@ -890,9 +890,367 @@ fn get_u64(bytes: &[u8], offset: usize) -> Result<u64> {
     Ok(u64::from_le_bytes(arr))
 }
 
+/// Compare two keys, byte for byte, without a call into the platform's
+/// `memcmp`.
+///
+/// **Identical in verdict to `<[u8] as Ord>::cmp` for every pair of inputs.**
+/// Lexicographic order compares the two keys position by position and, where
+/// neither differs, orders the shorter first; this does exactly that, eight
+/// bytes at a time. Reading eight bytes as a big-endian `u64` orders them the
+/// same way comparing them one at a time does — that is what big-endian byte
+/// order *means* — so a differing pair of words is decided by its
+/// highest-order differing byte, which is its first differing byte.
+///
+/// # Why not just `a.cmp(b)`
+///
+/// On the key shapes this tree stores, `a.cmp(b)` lowers to a call into
+/// `memcmp`, and that call's fixed overhead — not the bytes it compares — is
+/// what a B-tree descent pays for. A stored row key is a short table name, a
+/// `\0` and eight bytes ([`crate::storage::row_key`]), so the platform's
+/// vectorised `memcmp` does its work in a single load-and-compare and spends
+/// the rest of its time being called. AHL-554 measured that directly:
+/// shortening the compared range while still going through `memcmp` moved
+/// `memcmp`'s self time by ~14% and the wall clock not at all. Removing the
+/// call is what was left to try, and it is what moved the clock (AHL-559).
+///
+/// Keys with more than [`INLINE_CMP_LIMIT`] bytes in common go to `memcmp`
+/// anyway: past that length the call overhead is amortised and the platform's
+/// vector loop is the better loop.
+#[inline(always)]
+pub fn key_cmp(a: &[u8], b: &[u8]) -> core::cmp::Ordering {
+    let n = a.len().min(b.len());
+    if n > INLINE_CMP_LIMIT {
+        return a.cmp(b);
+    }
+    if let Some(decided) = word_cmp(a, b, n) {
+        return decided;
+    }
+    a.len().cmp(&b.len())
+}
+
+/// Beyond this many bytes in common, the platform's `memcmp` is the better
+/// tool: its fixed call overhead stops dominating and its vector loop beats a
+/// word-at-a-time one. Two cache lines, which is past every row key
+/// (`storage::INLINE_ROW_KEY` sizes a whole one at 64 bytes) and past most
+/// index keys.
+const INLINE_CMP_LIMIT: usize = 128;
+
+/// The verdict of comparing `a[..n]` against `b[..n]`, or `None` when those
+/// ranges are equal and the caller must fall back to comparing lengths.
+/// `n` must be at most both lengths.
+///
+/// Every read is a *fixed* eight bytes, which is what keeps this free of
+/// calls: a variable-length copy lowers to `memcpy` and would put back
+/// exactly the overhead this exists to remove. The last partial word is
+/// handled by reading the eight bytes *ending* at `n` — overlapping the
+/// previous word rather than padding — which is sound because both sides read
+/// the same range, so the bytes counted twice are bytes already known equal.
+#[inline(always)]
+fn word_cmp(a: &[u8], b: &[u8], n: usize) -> Option<core::cmp::Ordering> {
+    let mut i = 0;
+    while i + 8 <= n {
+        let (x, y) = (word_at(a, i), word_at(b, i));
+        if x != y {
+            return Some(x.cmp(&y));
+        }
+        i += 8;
+    }
+    if i < n {
+        if n >= 8 {
+            // The overlapping tail word.
+            let (x, y) = (word_at(a, n - 8), word_at(b, n - 8));
+            if x != y {
+                return Some(x.cmp(&y));
+            }
+        } else {
+            // Fewer than eight bytes in common in total: too short for a word
+            // read to stay in bounds, and short enough that a byte loop is a
+            // handful of instructions.
+            while i < n {
+                if a[i] != b[i] {
+                    return Some(a[i].cmp(&b[i]));
+                }
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// The eight bytes of `s` at `at`, big-endian. Panics if they are not there,
+/// which every caller in this module has already bounded.
+#[inline(always)]
+fn word_at(s: &[u8], at: usize) -> u64 {
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&s[at..at + 8]);
+    u64::from_be_bytes(word)
+}
+
+/// Find `key` among a leaf's `entries`, as `binary_search_by` would.
+///
+/// The search is written out rather than expressed as
+/// `entries.binary_search_by(|e| ...)` for one measured reason: a closure
+/// carrying [`key_cmp`] is large enough that the compiler stops inlining it
+/// into the search, and an outlined closure is a call per probe — which is
+/// the `memcmp` call this exists to delete, wearing a different name. Written
+/// here, the comparison is straight-line code inside the loop. See `PERF.md`,
+/// AHL-559.
+pub fn search_entries(
+    source: &[u8],
+    entries: &[Entry],
+    key: &[u8],
+) -> core::result::Result<usize, usize> {
+    let (mut low, mut high) = (0usize, entries.len());
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let cell = key_bytes(source, &entries[mid].key);
+        match key_cmp(cell, key) {
+            core::cmp::Ordering::Less => low = mid + 1,
+            core::cmp::Ordering::Greater => high = mid,
+            core::cmp::Ordering::Equal => return Ok(mid),
+        }
+    }
+    Err(low)
+}
+
+/// How many of an internal node's separators are `<= key` — the
+/// `partition_point` at the heart of the tree's routing, written out for the
+/// reason [`search_entries`] gives.
+pub fn route_separators(source: &[u8], cells: &[Separator], key: &[u8]) -> usize {
+    let (mut low, mut high) = (0usize, cells.len());
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let cell = key_bytes(source, &cells[mid].key);
+        if key_cmp(cell, key).is_le() {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every property below compares against `<[u8] as Ord>::cmp` rather than
+    /// against a hand-written expectation, because the whole claim
+    /// [`key_cmp`] makes is "identical in verdict to `Ord`" — anything else
+    /// would be pinning a second opinion instead of the one that matters.
+    mod key_comparison {
+        use super::*;
+        use crate::mem::SeededRng;
+        use crate::traits::Rng;
+        use alloc::vec;
+        use alloc::vec::Vec;
+
+        /// `storage::row_key`'s shape, restated here so a change to it that
+        /// this comparator cannot handle shows up as a failure rather than as
+        /// a silent divergence.
+        fn row_key(table: &str, id: u64) -> Vec<u8> {
+            let mut key = Vec::from(table.as_bytes());
+            key.push(0);
+            key.extend_from_slice(&id.to_be_bytes());
+            key
+        }
+
+        fn agrees(a: &[u8], b: &[u8]) {
+            assert_eq!(
+                key_cmp(a, b),
+                a.cmp(b),
+                "key_cmp disagreed with Ord on {a:?} vs {b:?}"
+            );
+            assert_eq!(
+                key_cmp(b, a),
+                b.cmp(a),
+                "key_cmp disagreed with Ord on {b:?} vs {a:?}"
+            );
+        }
+
+        #[test]
+        fn agrees_with_ord_on_random_pairs() {
+            let mut rng = SeededRng::new(0x5EED_0559);
+            for _ in 0..20_000 {
+                let mut key = |max: usize| -> Vec<u8> {
+                    let len = (rng.next_u64() as usize) % (max + 1);
+                    // A tiny alphabet, so equal prefixes and exact ties happen
+                    // often instead of essentially never.
+                    (0..len).map(|_| (rng.next_u64() % 4) as u8).collect()
+                };
+                let a = key(40);
+                let b = key(40);
+                agrees(&a, &b);
+            }
+        }
+
+        #[test]
+        fn agrees_with_ord_across_the_inline_limit() {
+            let mut rng = SeededRng::new(7);
+            for _ in 0..4_000 {
+                let len = INLINE_CMP_LIMIT - 4 + (rng.next_u64() as usize) % 40;
+                let a: Vec<u8> = (0..len).map(|_| (rng.next_u64() % 3) as u8).collect();
+                let mut b = a.clone();
+                if !b.is_empty() {
+                    let at = (rng.next_u64() as usize) % b.len();
+                    b[at] = b[at].wrapping_add(1);
+                }
+                agrees(&a, &b);
+                // And the two lengths that straddle the limit exactly.
+                agrees(&a[..(INLINE_CMP_LIMIT).min(a.len())], &b);
+                agrees(&a[..(INLINE_CMP_LIMIT + 1).min(a.len())], &b);
+            }
+        }
+
+        #[test]
+        fn agrees_with_ord_on_the_row_key_shape() {
+            // The boundary row ids: zero, one, the sign-bit neighbours (which
+            // a signed comparison would get wrong), the byte-pattern extremes,
+            // and the maximum.
+            let ids: [u64; 10] = [
+                0,
+                1,
+                0x7FFF_FFFF_FFFF_FFFF,
+                0x8000_0000_0000_0000,
+                0x8000_0000_0000_0001,
+                0x00FF_FFFF_FFFF_FFFF,
+                0xFF00_0000_0000_0000,
+                0x0102_0304_0506_0708,
+                u64::MAX - 1,
+                u64::MAX,
+            ];
+            // Same table, a neighbouring table, a table that is a prefix of
+            // another, and the empty name — every prefix relationship a node
+            // holding more than one table's rows can produce, which this tree
+            // really can have: the catalog, every table and every index share
+            // one key space.
+            let tables = ["", "k", "kv", "kv2", "kw", "users", "user"];
+            let keys: Vec<Vec<u8>> = tables
+                .iter()
+                .flat_map(|t| ids.iter().map(move |&id| row_key(t, id)))
+                .collect();
+            for a in &keys {
+                for b in &keys {
+                    agrees(a, b);
+                }
+            }
+            // And a metadata key, which begins with NUL and belongs to no
+            // table at all.
+            for key in &keys {
+                agrees(key, &[0, b'r', b'o', b'o', b't']);
+            }
+        }
+
+        #[test]
+        fn agrees_with_ord_on_adversarial_shapes() {
+            // A shared prefix that differs by exactly one byte at every
+            // position, in both directions, at every length.
+            for len in 0..40usize {
+                let base: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+                for at in 0..len {
+                    for delta in [1u8, 255] {
+                        let mut other = base.clone();
+                        other[at] = other[at].wrapping_add(delta);
+                        agrees(&base, &other);
+                    }
+                }
+                // A key that is a strict prefix of another, at every cut.
+                for cut in 0..=len {
+                    agrees(&base, &base[..cut]);
+                }
+                // The empty key against everything, and a key against itself.
+                agrees(&[], &base);
+                agrees(&base, &base.clone());
+            }
+        }
+
+        #[test]
+        fn agrees_with_ord_on_variable_length_collated_keys() {
+            // The shape `crate::index` produces: memcomparable, variable
+            // length, no fixed eight-byte tail, and often sharing long runs.
+            let mut rng = SeededRng::new(0xC0FFEE);
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            for _ in 0..400 {
+                let text_len = (rng.next_u64() as usize) % 12;
+                let mut key = vec![0x02u8];
+                key.extend((0..text_len).map(|_| b'a' + (rng.next_u64() % 3) as u8));
+                key.push(0);
+                key.extend_from_slice(&(rng.next_u64() % 8).to_be_bytes());
+                keys.push(key);
+            }
+            for a in &keys {
+                for b in &keys {
+                    agrees(a, b);
+                }
+            }
+        }
+
+        /// The property the descent actually depends on, stated over the
+        /// searches rather than over one comparison: [`search_entries`] and
+        /// [`route_separators`] return what `binary_search_by` and
+        /// `partition_point` over `Ord` return, on random nodes, half of them
+        /// probed with a key they hold.
+        #[test]
+        fn the_searches_land_where_the_std_ones_do() {
+            let mut rng = SeededRng::new(0xB175);
+            for _ in 0..4_000 {
+                let count = 1 + (rng.next_u64() as usize) % 20;
+                let mut keys: Vec<Vec<u8>> = (0..count)
+                    .map(|_| {
+                        let len = (rng.next_u64() as usize) % 14;
+                        (0..len).map(|_| (rng.next_u64() % 3) as u8).collect()
+                    })
+                    .collect();
+                keys.sort();
+                keys.dedup();
+                let probe: Vec<u8> = match rng.next_u64() % 2 {
+                    0 => keys[(rng.next_u64() as usize) % keys.len()].clone(),
+                    _ => {
+                        let len = (rng.next_u64() as usize) % 14;
+                        (0..len).map(|_| (rng.next_u64() % 3) as u8).collect()
+                    }
+                };
+                let entries: Vec<Entry> = keys.iter().map(|k| entry(k, b"v")).collect();
+                assert_eq!(
+                    search_entries(&[], &entries, &probe),
+                    keys.binary_search_by(|c| c.as_slice().cmp(probe.as_slice())),
+                );
+                let cells: Vec<Separator> = keys
+                    .iter()
+                    .map(|k| Separator {
+                        key: Key::Owned(k.clone()),
+                        child: 1,
+                    })
+                    .collect();
+                assert_eq!(
+                    route_separators(&[], &cells, &probe),
+                    keys.partition_point(|c| c.as_slice() <= probe.as_slice()),
+                );
+            }
+        }
+
+        /// The row-key node the descent really walks: one table's keys, probed
+        /// with keys of that table, including ones it does not hold.
+        #[test]
+        fn the_searches_land_where_the_std_ones_do_on_row_keys() {
+            let keys: Vec<Vec<u8>> = (0..64u64).map(|i| row_key("users", i * 7)).collect();
+            let entries: Vec<Entry> = keys.iter().map(|k| entry(k, b"v")).collect();
+            for probe_id in [0u64, 1, 7, 8, 441, 442, u64::MAX] {
+                let probe = row_key("users", probe_id);
+                assert_eq!(
+                    search_entries(&[], &entries, &probe),
+                    keys.binary_search_by(|c| c.as_slice().cmp(probe.as_slice())),
+                );
+            }
+        }
+
+        /// An empty node answers rather than reads past its end.
+        #[test]
+        fn an_empty_node_is_a_miss_at_zero() {
+            assert_eq!(search_entries(&[], &[], b"anything"), Err(0));
+            assert_eq!(route_separators(&[], &[], b"anything"), 0);
+        }
+    }
 
     fn entry(key: &[u8], value: &[u8]) -> Entry {
         Entry {
