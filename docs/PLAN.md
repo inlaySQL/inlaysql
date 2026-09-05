@@ -120,8 +120,14 @@ regeneration.
    barrier and inverted that:** our `fsync` is 1.322 ms against MySQL's
    1.215 — 1.09x — and the difference is the duty cycle, 51% against 96%.
    Half our cycle is gather and idle gap, not flushing. `fdatasync` is
-   1.01x of `fsync` here, so the syscall is not the lever; **pipelining the
-   flush cycle is**, priced at 2.20x → ~1.13x on the published row.
+   1.01x of `fsync` here, so the syscall is not the lever; pipelining the flush cycle was priced at
+   2.20x → ~1.13x and **AHL-562 built it and measured nothing**: the
+   successor gathers under the in-flight fsync on 83–92% of barriers and
+   the duty cycle does not move, because the writers are queued at the
+   reservation gate — 20/37/51% of commit latency at 4/8/16 writers, a
+   serialized 0.263 ms hold capping ~3,800 commits/s. **The next lever is
+   what that gate holds**: the WAL append and the data-area writes are
+   inside it, and MySQL's equivalent critical section is a memcpy.
    Superseded: diagnosed (AHL-555),
    not fixed.** Next experiment, named not built: split plan-and-validate from
    take-the-gate-and-commit in `Connection::run_on_engine`, and see whether the
