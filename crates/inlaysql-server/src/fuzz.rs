@@ -357,6 +357,135 @@ pub fn dispatch_stateless(data: &[u8]) -> Dispatched {
 mod tests {
     use super::*;
 
+    /// Every committed seed for one target.
+    ///
+    /// `fuzz/` is a separate cargo workspace, so `cargo check --workspace`
+    /// never reaches the targets and a broken one is invisible until the
+    /// nightly campaign. The targets themselves cannot move into this
+    /// workspace — they are `#![no_main]` binaries linked against libFuzzer —
+    /// but their *inputs* can be read from here, and replaying them through
+    /// the same wrappers on stable turns "the seeds still parse the way the
+    /// targets assume" into something an ordinary `cargo test` answers.
+    ///
+    /// A missing directory is a failure rather than a skip. These files are
+    /// committed; if they are gone, something deleted them.
+    fn seeds(target: &str) -> Vec<(String, Vec<u8>)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fuzz/seeds")
+            .join(target);
+        let mut found = Vec::new();
+        let entries =
+            std::fs::read_dir(&dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("a directory entry").path();
+            if path.is_file() {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                found.push((name, std::fs::read(&path).expect("a seed")));
+            }
+        }
+        assert!(!found.is_empty(), "no seeds in {}", dir.display());
+        found
+    }
+
+    /// Every framing seed terminates, invents no payload, and reads a bounded
+    /// number of times — the three properties `server_packet_frame` asserts,
+    /// minus the allocation bound, which needs the counting allocator the fuzz
+    /// binary installs and this crate cannot have: `#![forbid(unsafe_code)]`
+    /// rules out `unsafe impl GlobalAlloc`, which is the honest reason the
+    /// allocation check lives in `fuzz/` rather than here.
+    #[test]
+    fn every_framing_seed_frames_within_its_bounds() {
+        for (name, input) in seeds("server_packet_frame") {
+            let framing = read_messages(&input);
+            assert!(
+                framing.payload_bytes() <= input.len(),
+                "{name}: {} payload bytes from {} input bytes",
+                framing.payload_bytes(),
+                input.len()
+            );
+            assert!(
+                framing.reads <= 2 * input.len() + 64,
+                "{name}: {} reads for {} bytes",
+                framing.reads,
+                input.len()
+            );
+            for message in &framing.messages {
+                assert!(message.len() <= MAX_MESSAGE, "{name}: an oversized message");
+            }
+        }
+    }
+
+    /// Every handshake seed parses in both phases, and a parse that succeeds
+    /// owns no more than its packet and claims the 4.1 protocol.
+    #[test]
+    fn every_handshake_seed_parses_within_its_bounds() {
+        for (name, input) in seeds("server_handshake") {
+            for expect_ssl_request in [true, false] {
+                let Ok(handshake) = parse_handshake_response(&input, expect_ssl_request) else {
+                    continue;
+                };
+                assert!(
+                    handshake.owned_bytes() <= input.len(),
+                    "{name}: a {} byte response owns {} bytes",
+                    input.len(),
+                    handshake.owned_bytes()
+                );
+                assert!(
+                    handshake.capabilities & CLIENT_PROTOCOL_41 != 0,
+                    "{name}: a pre-4.1 response parsed"
+                );
+            }
+        }
+    }
+
+    /// Every parameter seed decoded against every declared type byte reads
+    /// inside its own body.
+    ///
+    /// The seeds are `arbitrary`-structured for the target, and this crate has
+    /// no business depending on `arbitrary` to unpack them — so the file's
+    /// bytes are fed in as the body instead, against each type in turn. That
+    /// is a different input from the one the target sees and covers the same
+    /// decoders, which is the point.
+    #[test]
+    fn every_parameter_seed_reads_inside_its_body() {
+        for (name, body) in seeds("server_stmt_params") {
+            for ty in 0..=u8::MAX {
+                for unsigned in [true, false] {
+                    let Ok(params) = decode_params(&body, &[(ty, unsigned)], &[]) else {
+                        continue;
+                    };
+                    assert!(
+                        params.consumed <= body.len(),
+                        "{name}: type {ty:#04x} read {} of {} bytes",
+                        params.consumed,
+                        body.len()
+                    );
+                    assert!(
+                        params.owned_bytes() <= params.consumed + 32,
+                        "{name}: type {ty:#04x} owns {} bytes from {}",
+                        params.owned_bytes(),
+                        params.consumed
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every command seed is classified as its own first byte and copies no
+    /// more than a lossy UTF-8 expansion of its body.
+    #[test]
+    fn every_command_seed_dispatches_within_its_bounds() {
+        for (name, input) in seeds("server_command") {
+            let dispatched = dispatch_stateless(&input);
+            assert_eq!(dispatched.command, input.first().copied(), "{name}");
+            assert!(dispatched.owned <= 3 * input.len(), "{name}");
+        }
+    }
+
     /// The framing property, over the inputs the corpus seeds:
     /// every one terminates, and none hands back more payload than it was
     /// given.
