@@ -7965,3 +7965,223 @@ deliberately.
 `dst_sweep` (106 s), `free_list_reuse_dst` (183 s), `backup_dst` (80 s),
 `durability_dst` (101 s) on `-p inlaysql-core`, `index_recovery_dst` (197 s) on
 `-p inlaysql`.
+
+### Every suppressor AHL-562 named moved, the pipeline engages harder than it ever did, and it is still flat — retracted, with the harness's noise floor measured at last (AHL-566, 2026-09-06)
+
+AHL-562 built flush pipelining, measured it flat, and did not close the
+question: it named the reservation gate as the suppressor and left the code
+behind `INLAYSQL_FLUSH_PIPELINE`, default off, with a condition for turning it
+on written into §4 of that section. Three landings later every number that
+condition rested on has moved, in the direction it predicted, by a lot:
+
+| at sixteen writers | AHL-562 | AHL-563 | AHL-564 | today's `main` |
+| --- | --- | --- | --- | --- |
+| gate hold | 0.263 ms | 0.121 | 0.113 | **0.085** |
+| `gate_wait` share of a writer's time | 51.0% | 31.7% | 26.2% | **28.1%** |
+| duty cycle | 44.3% | 54.5% | 52.9% | **52.5%** |
+| commits per barrier | 8.29 | 11.77 | 10.48 | **12.84** |
+| a WAL region wraps every | ~50 commits | ~50 | ~150 | ~150 |
+| ops/s, control arm | 2,852 | 4,624 | 4,583 | **6,309** |
+
+So the experiment became testable, and this section is the re-run. **It is
+still flat, and the excuse is gone.** The pipeline is deleted rather than left
+on the board — a maybe that survives its own falsification is not a maybe, and
+AHL-562 said so itself: "if the gate is never widened, deleting it is a
+one-commit revert and this section is the reason." The gate *was* widened, 3.1x
+on the hold, and the answer did not change.
+
+#### 1. First, the thing worth more than the verdict: the harness's floor
+
+Four experiments in a row (AHL-561, AHL-562, AHL-563, AHL-564) have had to
+caveat their throughput column against a noise floor *estimated from whichever
+of their own rows happened to be an accidental A/A* — the one-writer row, when
+the change had nothing to do there. AHL-564 could not even do that, because a
+smaller WAL record helps a solo writer too, and it said so.
+
+`bench/aa_floor.sh` replaces the accident with a control. It is
+`bench/flush_duty_cycle.sh` and `bench/gate_hold.sh` with the independent
+variable removed: same binary, same volume, same transaction count, arms
+labelled `a` and `b` and **differing in nothing at all**, order still flipped
+every repetition. Ten repetitions, host load 5.2–5.6 of 18. What its paired
+b/a ratios print *is* the floor, at every writer count instead of only at one:
+
+| writers | ops/s | duty | gate hold | commits/barrier | `fsync` ms |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0.95 **[0.42, 1.98]** | 1.01 [0.98, 1.03] | 1.01 [0.72, 1.62] | 1.00 [1.00, 1.00] | 1.07 **[0.49, 2.40]** |
+| 2 | 0.97 **[0.45, 3.58]** | 1.00 [0.93, 1.03] | 1.05 [0.80, 1.41] | 1.00 [0.98, 1.36] | 1.05 **[0.35, 2.29]** |
+| 4 | 1.08 **[0.45, 2.50]** | 0.99 [0.91, 1.16] | 0.93 [0.85, 1.08] | 0.96 [0.77, 1.19] | 0.96 [0.33, 1.98] |
+| 8 | 1.03 [0.77, 1.48] | 0.97 [0.85, 1.11] | 0.96 [0.88, 1.11] | 1.02 [0.87, 1.22] | 0.99 [0.64, 1.31] |
+| 16 | 0.99 **[0.81, 1.27]** | 1.02 [0.83, 1.13] | 1.05 [0.84, 1.14] | 1.03 [0.89, 1.17] | 0.98 [0.77, 1.33] |
+
+(median, then the min and max of the ten paired ratios.)
+
+**The floor is not one number, and it runs the opposite way from where every
+previous item read it.** One writer is the *noisiest* point on this harness —
+a 4.7x span on throughput and a 4.9x span on the `fsync` mean, from two arms
+that are the same program run twice — and sixteen writers is the *quietest*,
+1.6x. The reason is not mysterious: a 150-transaction solo run is 150 serial
+`fsync`s and nothing else, so one slow flush moves the whole arm, while at
+sixteen writers 2,400 commits average over 181 barriers and the run is long
+enough for the host's own weather to cancel.
+
+Which means the discipline the last four items followed — quote the one-writer
+row as the floor, then discount a sixteen-writer claim against it — was
+comparing a claim taken at the quiet end against noise measured at the loud
+end. Three corrections follow, and one of them is against this project's own
+favour:
+
+* **AHL-562 was right for the wrong reason.** It discounted its 1.11 and 1.12
+  at four and eight writers because its A/A row read 1.34. The real four- and
+  eight-writer floors are [0.45, 2.50] and [0.77, 1.48], so those ratios are
+  still noise — but by a much wider margin than the argument it used, and the
+  argument it used would also have discounted a real 1.3x at sixteen.
+* **AHL-563's throughput claim was understated.** Its 1.54–1.70 at sixteen
+  writers, six of six, sits entirely outside the sixteen-writer floor's
+  [0.81, 1.27]. It called that "the weaker claim"; against a floor measured at
+  the writer count it was claimed at, it is a result.
+* **AHL-564's stays exactly where it put it.** Its 1.22 median at sixteen
+  writers (1.02–1.55) has its median *inside* [0.81, 1.27] and half its
+  repetitions inside too. "Suggestive and no more" was the right call.
+
+The gate-hold column is the other half of the answer to why AHL-563 and
+AHL-564 read as results while their throughput did not: **the hold's floor is
+±15% at every writer count above two**, because it is a ratio of two quantities
+measured inside the same run rather than against the wall clock. AHL-563's 0.48
+and AHL-564's 0.71 are nowhere near it. That is the rule this area should
+follow from here: *a within-run ratio is the deliverable; a wall-clock rate is
+evidence only at eight writers and up, and only outside [0.77, 1.48].*
+
+#### 2. The re-run
+
+`bench/flush_duty_cycle.sh`, AHL-562's own harness, unmodified: the
+`inlaysql-oltp` compose service, its own named volume (`/dev/vdb1 btrfs`
+inside OrbStack's Linux VM), the concurrency suite at `--txns 150` and
+`WRITER_LEVELS=1,2,4,8,16`, `Durability::Full`, one binary one environment
+variable apart, arm order flipped every repetition. **Ten repetitions** this
+time rather than six, on the same machine and in the same sitting as the A/A
+above — host load 4.5–5.6 of 18 throughout. Medians of ten, with AHL-562's
+medians of six beside them:
+
+| writers | arm | ops/s | commits/barrier | `fsync` ms | interval ms | **duty** | gather ms | overlapped gather | handoffs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | off | 1,623 *(1,280)* | 1.00 | 0.568 | 0.616 | **92.0%** *(90.8)* | 0.000 | — | 0% |
+| 1 | on | 1,771 *(1,750)* | 1.00 | 0.516 | 0.565 | **91.4%** *(88.2)* | 0.000 | 0.000 | **0%** |
+| 2 | off | 2,518 *(1,404)* | 1.52 | 0.546 | 0.607 | **90.5%** *(88.0)* | 0.004 | — | 0% |
+| 2 | on | 2,298 *(2,192)* | **1.36** *(1.34)* | 0.550 | 0.588 | **93.4%** *(86.0)* | 0.002 | 0.000 | 68% |
+| 4 | off | 4,191 *(2,816)* | 3.45 | 0.675 | 0.853 | **79.8%** *(61.5)* | 0.124 | — | 0% |
+| 4 | on | 4,043 *(3,024)* | 3.36 | 0.668 | 0.834 | **81.5%** *(56.2)* | 0.110 | 0.087 | **93%** |
+| 8 | off | 5,955 *(3,044)* | 6.84 | 0.744 | 1.167 | **64.4%** *(53.6)* | 0.341 | — | 0% |
+| 8 | on | 6,081 *(3,312)* | 7.42 | 0.776 | 1.224 | **63.5%** *(48.2)* | 0.355 | 0.323 | **98%** |
+| 16 | off | 6,309 *(2,852)* | 12.84 | 0.990 | 2.045 | **52.5%** *(44.3)* | 0.857 | — | 0% |
+| 16 | on | 6,560 *(2,838)* | 13.24 | 1.022 | 2.027 | **50.9%** *(44.1)* | 0.819 | 0.780 | **96%** |
+
+Paired on/off ratios, one per repetition, against the A/A floor from §1:
+
+| writers | metric | median | ten reps | **A/A floor** | verdict |
+| --- | --- | --- | --- | --- | --- |
+| 4 | duty | 1.02 | 1.01 1.00 1.06 1.06 1.07 1.11 0.95 0.85 1.02 0.94 | [0.91, 1.16] | inside |
+| 8 | duty | 0.97 | 0.95 0.97 0.97 1.06 0.82 1.31 0.79 0.87 1.06 1.02 | [0.85, 1.11] | inside |
+| 16 | duty | **1.01** | 1.06 0.86 0.99 1.15 0.87 1.03 0.85 0.81 1.07 1.12 | [0.83, 1.13] | **inside** |
+| 16 | ops/s | 1.07 | 1.13 1.11 1.03 0.80 1.18 0.76 1.19 2.44 1.00 0.99 | [0.81, 1.27] | inside |
+| 8 | ops/s | 1.03 | 0.96 1.05 1.07 0.84 1.62 0.51 1.39 1.28 0.91 1.00 | [0.77, 1.48] | inside |
+| 16 | commits/barrier | 1.03 | 1.06 1.04 0.98 1.02 1.05 1.14 1.08 1.02 1.02 0.99 | [0.89, 1.17] | inside |
+| 16 | gate hold | 0.95 | 0.83 0.93 0.99 1.12 0.92 1.14 0.93 0.59 0.96 0.98 | [0.84, 1.14] | inside |
+| **2** | **commits/barrier** | **0.90** | 0.92 0.91 0.88 0.87 0.89 0.89 0.92 0.93 0.88 0.91 | [0.98, 1.36] | **outside — a regression** |
+
+**Every metric is inside the floor except one, and that one is a loss.** The
+duty cycle at sixteen writers moved 52.45% → 50.90%, a ratio of 1.01 with a
+band that straddles 1.0 in both directions and sits inside a control that
+straddles it just as wide. This is the same "flat" AHL-562 reported, now
+measured against a control instead of against an accident.
+
+And it is flat while the mechanism works *better than it ever has*. Handoffs
+were 83–92% of barriers in AHL-562 and are **93–98%** now; the overlapped
+gather at sixteen writers was 0.679 ms/barrier and is **0.780** — which is
+**95% of that arm's whole 0.819 ms gather running underneath the previous
+`fsync`.** There is essentially no gather left on the critical path to move.
+Moving it bought nothing, at the concurrency where it moves the most.
+
+The one thing outside the floor is the cost AHL-562 predicted and accepted:
+**at two writers a successor claims late in a short barrier, gathers nothing,
+and declines to re-gather**, so cohorts shrink — commits per barrier 1.52 →
+1.36, ratio 0.90, **ten of ten below 1.0 in a band of [0.87, 0.93] against a
+control band of [0.98, 1.36]**. AHL-562 called that "the design's deliberate
+choice, and at two writers it is the wrong one" from a single pair of medians.
+It is now a measured regression with a control under it. The scoreboard for
+this change is therefore: nothing outside the noise anywhere it was supposed to
+help, and one real loss where it was known to hurt.
+
+#### 3. Why, in one paragraph, and it is not a new reason
+
+AHL-562's finding was that the coordinator is idle because there is nothing to
+flush, not because it is slow to elect. That finding survives its own
+suppressor being removed, which is the strongest form the finding could take.
+The gate hold fell 3.1x and the control arm's throughput rose 2.21x across
+AHL-563/564/565 — and the duty cycle at sixteen writers went 44.3% → 52.5% *on
+the flag-off arm*, exactly as AHL-563 and AHL-564 both predicted it would.
+Widening the gate did raise the duty cycle. What it did not do is make
+pipelining the thing that raises it further, and the arithmetic says why in
+one line. At sixteen writers the off arm's cycle is 2.045 ms of interval
+around a 0.990 ms `fsync` and a 0.857 ms gather. The on arm takes **0.780 ms
+of that gather off the critical path** — 38% of the cycle, and 95% of the
+gather — and the interval reads **2.027 ms**, a paired ratio of 0.94 in a band
+of [0.42, 1.51]. The cycle did not shrink by the time that was removed from
+it; the removed time reappeared as idle. That is what "there is nothing to
+flush" means when it is written as a subtraction: the interval is set by how
+fast commits arrive, not by how long the coordinator takes to be ready for
+them, so anything taken out of the coordinator's half is given straight back
+to the gap. AHL-561's ceiling arithmetic was not wrong about the size of the
+segment — it is wrong that removing the segment shortens the cycle.
+
+#### 4. What was removed, and what was kept
+
+Removed: the successor/handoff path in `crates/inlaysql/src/device.rs`
+(`SuccessorGuard`, `FlushState::handoff`, the reserved-round bookkeeping and
+the bounded overlapped gather), the `INLAYSQL_FLUSH_PIPELINE` flag, the
+`handoffs` and `overlap_gather_ns` counters and their column on the `barrier
+cycle` line, and the six tests that pinned the handoff's crash table. That
+is 752 lines out of `device.rs` and the `barrier cycle` line back to
+AHL-561's shape. `LeaderGuard`, the ticket-to-barrier ordering, the follower
+wait and every group-commit test that predates AHL-562 are untouched — the
+commit path is now byte-for-byte AHL-561's, minus nothing.
+
+Kept: `docs/research/flush-pipelining.md`, with a retraction header and its
+§7 mutation table dropped along with the tests it indexes. The design was
+right about its own risks (it named the two-writer truncation before the code
+existed, and this section measured exactly that), the ticket-to-barrier proof
+is the clearest statement of the durability rule anyone has written down here,
+and the next person to have this idea should find the measurement rather than
+have it again.
+
+Also kept, and new: `bench/aa_floor.sh` and `bench/summarise_barrier.py`. The
+summariser turns any of the four paired logs (`flush_duty_cycle.sh`,
+`gate_hold.sh`, `record_size.sh`, `aa_floor.sh`) into the tables above —
+per-arm medians and *paired* per-repetition ratios — because three sections in
+a row tabulated those by eye and each quoted a slightly different set of
+metrics. Its parser is tested in `bench/test_summarise.py` (which CI already
+runs) and mutation-tested seven ways: pairing by position instead of by
+repetition, reporting the idle share as the duty cycle, dropping the arm from
+the header, matching SQLite's row as InlaySQL's throughput, collapsing the
+writer levels, attributing pre-header output to an arm, and requiring the
+retracted pipeline clause that this very section removes from the log format.
+Each is caught, each by the test written for it.
+
+#### 5. The state of this area, restated
+
+Six negatives and one win: AHL-544 flat, AHL-547 0.90x, AHL-560 "already
+done", AHL-561 "not the syscall", AHL-562 "not the election either",
+**AHL-566 "not the election even after the gate moved"** — against AHL-563 and
+AHL-564, which both opened a critical section nobody had been inside and both
+measured. The pattern is not subtle and is now paid for twice over: **pricing a
+mechanism from a decomposition has lost six times in this area; measuring
+inside a lock has won twice.** `rebase` (0.040 ms of a 0.113 ms hold at sixteen
+writers, AHL-564 §5) and the change log written per statement whether or not
+anyone reads it are the two places nobody has been inside yet.
+
+**Gates.** `fmt`; `clippy --release --workspace --all-targets -D warnings`;
+`cargo test --release --workspace`; `RUSTDOCFLAGS="-D warnings" cargo doc
+--workspace --no-deps --document-private-items`; `cargo check -p inlaysql-wasm
+--target wasm32-unknown-unknown`; `python3 bench/test_summarise.py`; and all
+five DST sweeps `-- --ignored` — `dst_sweep`, `free_list_reuse_dst`,
+`backup_dst`, `durability_dst` on `-p inlaysql-core`, `index_recovery_dst` on
+`-p inlaysql`. No second flag-on pass this time: there is no flag.

@@ -478,9 +478,10 @@ four before it, ran only the default 1/2/4/8 levels), against SQLite's flat
 outside the concurrency-suite floor (3.6% core CoV), though the 8-writer
 point's own three runs disagree by 12% this time, so read it as the
 ~1,200 ±10% band `BENCHMARK.md` publishes rather than the point value.
-AHL-562's flush pipeline is in the range and **off by default**; the
+AHL-562's flush pipeline is in the range and was **off by default**; the
 suite's own counter reports zero handoffs, so this is still the flag-off
-engine. Durability: full, both sides, real OS
+engine — which AHL-566, having re-measured it flat against an A/A control,
+made the only engine by deleting the pipeline. Durability: full, both sides, real OS
 threads, one `fsync`/`F_FULLFSYNC` per commit or per coalesced batch.
 
 **MySQL, 1/4/16 connections (2026-08-31, `BENCHMARK.md` "Server-to-server,

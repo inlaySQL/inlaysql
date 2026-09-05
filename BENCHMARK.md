@@ -114,10 +114,12 @@ hoist — measured negative, no behaviour change; it left behind the
 measures the `fsync` mean and the idle share of the wall clock directly
 rather than inverting a rate — no engine code), and **AHL-562** (the next
 leader gathers while the current `fsync` is still in flight; it engages on
-88% of barriers under the flag and the duty cycle does not move, so it is
+88% of barriers under the flag and the duty cycle does not move, so it was
 **default off** behind `INLAYSQL_FLUSH_PIPELINE` and every run behind this
 page reports `pipeline 0 handoffs (0.00% of barriers)` — the flag-off
-engine, as published). Track F's server work in the same range
+engine, as published; AHL-566 re-ran it once the gate had widened, found it
+flat again against a real A/A control, and **deleted it**, so the flag-off
+engine these runs measured is now the only engine). Track F's server work in the same range
 (`--plaintext-network`, `inlaysql user list`, the packet fuzz targets) is
 in `crates/inlaysql-server` and the CLI, on no path any suite here runs.
 Nothing on this page is withheld.
@@ -584,9 +586,9 @@ SQLite's own side at 18% on ops/s and 12% on p50. Nothing in
 `be95cc3..ea1712c` is on this path with a measured effect: AHL-559 is a
 read-side comparator whose `batch-insert` arm was flat by design (a
 commit's time is the WAL record and the barrier, not key comparison), and
-AHL-562's flush pipeline is behind `INLAYSQL_FLUSH_PIPELINE` and off — the
+AHL-562's flush pipeline was behind `INLAYSQL_FLUSH_PIPELINE` and off — the
 raw output's own counter reads `pipeline 0 handoffs (0.00% of barriers)` in
-all three runs. Six sittings have now put this row at 241, 256, 243, 248,
+all three runs — and AHL-566 has since removed it entirely. Six sittings have now put this row at 241, 256, 243, 248,
 245 and 250 ops/s, so its real sitting-to-sitting band is roughly 240–260 —
 tighter than any other InlaySQL row's. Still the most stable row in this
 document across editions: the commit gate no longer re-derives the log on
@@ -652,7 +654,8 @@ output's own new counter reads `pipeline 0 handoffs (0.00% of barriers)` at
 every writer level in all three runs, so this table is the same engine
 behaviour as the previous edition's. (Under the flag `PERF.md` measured it
 engaging on 88% of barriers and moving the duty cycle not at all, which is
-why it ships off.) AHL-544 and AHL-547's commit-side absorption likewise
+why it shipped off — and why AHL-566, re-running it after the gate hold fell
+3.1x, retracted and deleted it.) AHL-544 and AHL-547's commit-side absorption likewise
 remains behind `EngineOptions::commit_absorption`, default `false`. Seven
 sessions have now put this one point at 1209, 1148, 1347, 1228, 1184, 1145
 and 1110 with the coalescing window unchanged throughout; the band holds,

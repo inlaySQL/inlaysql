@@ -1054,9 +1054,9 @@ commit-coalesce window (94d96a6) lets 8 writers do roughly 4.3x the work of
 one this sitting (seven sessions have put the 8-writer figure at 1,209,
 1,148, 1,347, 1,228, 1,184, 1,145 and 1,110 commits/s with that code
 unchanged, so read it as roughly 1,200 ±10%, not the point value; a flush
-pipeline landed in the range behind `INLAYSQL_FLUSH_PIPELINE` and is off by
+pipeline landed in the range behind `INLAYSQL_FLUSH_PIPELINE`, off by
 default — the benchmark's own counter reports zero handoffs, so this is the
-flag-off engine). Eight is not the peak, though — the fuller sweep in
+flag-off engine — and AHL-566 later measured it flat a second time and removed it). Eight is not the peak, though — the fuller sweep in
 `BENCHMARK.md` (carried forward from 2026-08-30; this edition re-ran only
 1/2/4/8 writers) finds it at 16 writers (1,616 commits/s) — and past the peak
 throughput falls (1,307 commits/s at 24 writers, 974 at 32) because every
