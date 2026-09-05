@@ -2027,10 +2027,11 @@ fn a_caching_sha2_client_authenticates() {
 
 /// The path a client with nothing cached takes: an empty first response,
 /// then the cleartext password once the server asks for full
-/// authentication. Acceptable here — and only here — because v1 is
-/// documented plaintext-localhost already (`docs/server.md`), so a
-/// cleartext password crossing this connection reveals nothing a network
-/// observer could not already read directly off the wire.
+/// authentication. Acceptable here — and only here — because this server
+/// has no certificate, so a cleartext password crossing this connection
+/// reveals nothing a network observer could not already read directly off
+/// the wire. With a certificate the same exchange is refused unless the
+/// link is encrypted.
 #[test]
 fn a_caching_sha2_client_completes_full_authentication() {
     let server = TestServer::start("caching-sha2-full");
@@ -2061,6 +2062,15 @@ fn the_rsa_exchange_is_refused_with_a_clear_reason() {
     assert!(
         lower.contains("caching_sha2_password"),
         "the refusal must name the plugin: {}",
+        error.message
+    );
+    // It must not describe a posture this server stopped having when TLS
+    // landed: an error that states a security property is read as one, and a
+    // client told "plaintext-localhost only" by a server serving TLS has been
+    // told something false about the connection it is on.
+    assert!(
+        !lower.contains("plaintext-localhost"),
+        "the refusal must describe this server, not a posture it no longer has: {}",
         error.message
     );
 }
@@ -7466,4 +7476,142 @@ fn mysql_match_against_translates_to_the_native_bm25_probe() {
     );
 
     client.quit();
+}
+
+// =====================================================================
+// `inlaysql user add` — accounts without a server
+// =====================================================================
+
+/// The remedy the bind refusal names has to work without a server, or it is a
+/// loop: the only way to run `CREATE USER` is a connection, and the server
+/// that would carry it is the one that just refused to start.
+///
+/// So this creates the account store on a file nothing is serving, and then
+/// proves the two halves that matter — the new account can log in, and the
+/// bootstrap flags have stopped meaning anything on that database.
+#[test]
+fn user_add_creates_an_account_store_the_flags_no_longer_override() {
+    let temp = TempDb::new("user-add");
+    let outcome = inlaysql_server::add_account(&temp.path, "app", "s3cret", true)
+        .expect("the first account must be creatable without a server");
+    assert_eq!(outcome, inlaysql_server::AccountAdded::StoreCreated);
+
+    let options = ServerOptions {
+        bind: "127.0.0.1".to_string(),
+        port: 0,
+        user: "root".to_string(),
+        password: "hunter2".to_string(),
+        ..ServerOptions::default()
+    };
+    let server = Server::bind(&temp.path, &options).expect("bind");
+    let addr = server.local_addr().expect("local_addr");
+    std::thread::spawn(move || {
+        let _ = server.run();
+    });
+
+    let mut client =
+        Client::connect(addr, "app", "s3cret", None).expect("the created account must log in");
+    client.ping().expect("ping");
+    client.quit();
+
+    // The file is the authority from the moment the store exists, so the
+    // bootstrap flags this server was started with are not a second way in.
+    let refused = Client::connect(addr, "root", "hunter2", None)
+        .expect_err("--user/--password must not work on a database that has accounts");
+    assert_eq!(refused.code, 1045, "{refused:?}");
+}
+
+/// An account added after the first one gets nothing unless it is asked for,
+/// which is what makes `user add` usable for the account an application
+/// actually connects with.
+#[test]
+fn a_second_account_added_this_way_holds_no_privileges_unless_asked() {
+    let temp = TempDb::new("user-add-second");
+    inlaysql_server::add_account(&temp.path, "admin", "s3cret", true).expect("first account");
+    let outcome = inlaysql_server::add_account(&temp.path, "app", "als0s3cret", false)
+        .expect("second account");
+    assert_eq!(outcome, inlaysql_server::AccountAdded::Added);
+
+    let options = ServerOptions {
+        bind: "127.0.0.1".to_string(),
+        port: 0,
+        user: "root".to_string(),
+        password: "hunter2".to_string(),
+        ..ServerOptions::default()
+    };
+    let server = Server::bind(&temp.path, &options).expect("bind");
+    let addr = server.local_addr().expect("local_addr");
+    std::thread::spawn(move || {
+        let _ = server.run();
+    });
+
+    let mut app = Client::connect(addr, "app", "als0s3cret", None).expect("app logs in");
+    let denied = app
+        .query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .expect_err("an account added without --superuser must hold nothing");
+    assert_eq!(denied.code, 1142, "{denied:?}");
+    app.quit();
+
+    let mut admin = Client::connect(addr, "admin", "s3cret", None).expect("admin logs in");
+    admin
+        .query("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .expect("the superuser this store was created around still holds everything");
+    admin.quit();
+}
+
+/// The three ways `user add` refuses, each with the reason in the message.
+///
+/// The empty-password one is the load-bearing refusal: without it this
+/// subcommand would be a way *around* the bind refusal it exists to serve.
+/// A database whose store holds one empty-password superuser has "accounts of
+/// its own", so the account conditions stop firing, and it is open to anyone
+/// who can reach the port.
+#[test]
+fn user_add_refuses_an_empty_password_a_non_superuser_first_account_and_a_duplicate() {
+    let temp = TempDb::new("user-add-refusals");
+
+    let empty = inlaysql_server::add_account(&temp.path, "app", "", true)
+        .expect_err("an empty password must be refused");
+    assert!(empty.to_string().contains("EMPTY password"), "{empty}");
+
+    let unprivileged = inlaysql_server::add_account(&temp.path, "app", "s3cret", false)
+        .expect_err("the first account must be a superuser");
+    assert!(
+        unprivileged.to_string().contains("--superuser"),
+        "the refusal must name the flag that fixes it: {unprivileged}"
+    );
+    assert!(
+        unprivileged.to_string().contains("first account"),
+        "{unprivileged}"
+    );
+
+    // Neither refusal wrote anything: the successful call is still the one
+    // that creates the store.
+    assert_eq!(
+        inlaysql_server::add_account(&temp.path, "app", "s3cret", true).expect("first account"),
+        inlaysql_server::AccountAdded::StoreCreated
+    );
+    let duplicate = inlaysql_server::add_account(&temp.path, "app", "other", true)
+        .expect_err("an existing account must not be silently rewritten");
+    assert!(duplicate.to_string().contains("CREATE USER"), "{duplicate}");
+    assert!(duplicate.to_string().contains("app"), "{duplicate}");
+
+    // And the duplicate did not rewrite the password it refused to set.
+    let options = ServerOptions {
+        bind: "127.0.0.1".to_string(),
+        port: 0,
+        user: "root".to_string(),
+        password: "hunter2".to_string(),
+        ..ServerOptions::default()
+    };
+    let server = Server::bind(&temp.path, &options).expect("bind");
+    let addr = server.local_addr().expect("local_addr");
+    std::thread::spawn(move || {
+        let _ = server.run();
+    });
+    let mut client = Client::connect(addr, "app", "s3cret", None)
+        .expect("the original password must still be the password");
+    client.ping().expect("ping");
+    client.quit();
+    assert!(Client::connect(addr, "app", "other", None).is_err());
 }

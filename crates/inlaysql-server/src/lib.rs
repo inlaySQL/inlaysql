@@ -103,7 +103,7 @@ mod sqltext;
 pub mod tls;
 
 use std::io::{self, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -382,6 +382,26 @@ pub struct ServerOptions {
     /// in the clear" a property of the server rather than a hope about its
     /// clients; without it a certificate only makes TLS *available*.
     pub tls_required: bool,
+    /// Assert that this bind address is a private network segment on which
+    /// plaintext is acceptable.
+    ///
+    /// The escape hatch from [`refuse_unsafe_exposure`]'s TLS conditions, and
+    /// the shape of it is the whole argument. A flag whose argument is the
+    /// operator's *state of mind* — `--i-know-this-is-insecure` — is
+    /// satisfiable by anyone, says nothing and constrains nothing, so it
+    /// degrades to "paste this to make the error stop". This one asserts a
+    /// *fact about the deployment*, and the server checks it: every address
+    /// the bind resolves to has to be private (RFC1918, link-local, CGNAT
+    /// `100.64.0.0/10` or IPv6 ULA `fc00::/7`), or the flag is refused for
+    /// claiming something untrue.
+    ///
+    /// It relaxes the two TLS conditions and **nothing else**. An
+    /// empty-password database and an account-less one stay refused on every
+    /// address other machines can reach, under every combination of flags,
+    /// which is what makes this flag unable to express the disaster case. And
+    /// it never becomes silent: every start that it actually relaxed prints a
+    /// warning that cannot be turned off.
+    pub plaintext_network: bool,
     /// Store passwords as salted, iterated PBKDF2 rather than the plugins'
     /// own unsalted two-hash verifiers.
     ///
@@ -457,6 +477,9 @@ impl Default for ServerOptions {
             tls_cert: None,
             tls_key: None,
             tls_required: false,
+            // An assertion about somebody else's network, which is not
+            // something to assume on their behalf. See the field's doc.
+            plaintext_network: false,
             strong_passwords: false,
             slow_query_log_ms: 0,
             // Holding statement text is a policy change about user data, so it
@@ -466,18 +489,205 @@ impl Default for ServerOptions {
     }
 }
 
-impl ServerOptions {
-    /// Whether the bind address is reachable from outside this machine.
-    ///
-    /// Used by the CLI to print a warning that names the risk, since the
-    /// connection is unencrypted.
-    pub fn is_public(&self) -> bool {
-        match self.bind.parse::<IpAddr>() {
-            Ok(address) => !address.is_loopback(),
-            // A host name that is not an IP literal cannot be assumed to be
-            // loopback.
-            Err(_) => !self.bind.eq_ignore_ascii_case("localhost"),
+/// Every address `(bind, port)` would actually listen on.
+///
+/// Resolution goes through [`ToSocketAddrs`] on the same tuple
+/// [`TcpListener::bind`] is given below, so the addresses judged here are
+/// exactly the addresses that would be bound — not a guess made from the
+/// string by a second, parallel parser.
+///
+/// A failure is reported rather than assumed either way: it is the same
+/// failure `TcpListener::bind` would produce one line later, and a name that
+/// does not resolve has no verdict to give.
+fn resolved(bind: &str, port: u16) -> Result<Vec<IpAddr>, String> {
+    let addresses: Vec<IpAddr> = (bind, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("cannot resolve --bind {bind}: {error}"))?
+        .map(|address| address.ip())
+        .collect();
+    if addresses.is_empty() {
+        return Err(format!("--bind {bind} resolves to no address at all"));
+    }
+    Ok(addresses)
+}
+
+/// Whether `address` is one only this machine can reach.
+fn is_loopback(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        // `Ipv6Addr::is_loopback()` is false for `::ffff:127.0.0.1`, which is
+        // a v4 loopback address written in v6: the packets never leave the
+        // host, so refusing that bind would be refusing loopback.
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
         }
+    }
+}
+
+/// Whether `address` is one only a private network segment can reach.
+///
+/// RFC1918, link-local, CGNAT `100.64.0.0/10`, IPv6 ULA `fc00::/7` and IPv6
+/// link-local `fe80::/10` — plus loopback, which is private in the only sense
+/// that matters here: nothing off this host reaches it at all.
+///
+/// The last two v4/v6 forms are hand-rolled masks because
+/// `Ipv4Addr::is_shared` and `Ipv6Addr::is_unique_local` are both still
+/// unstable. They have a unit test each for that reason: a mask written out by
+/// hand is a mask that can be written out wrong.
+fn is_private(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                // 100.64.0.0/10 — carrier-grade NAT.
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        }
+        IpAddr::V6(v6) => {
+            // A v4 address written in v6 is judged as the v4 address it is.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            v6.is_loopback()
+                // fc00::/7 — unique local.
+                || first & 0xfe00 == 0xfc00
+                // fe80::/10 — link-local.
+                || first & 0xffc0 == 0xfe80
+        }
+    }
+}
+
+/// Whether binding `(bind, port)` puts this server where another machine can
+/// reach it.
+///
+/// `any`, not `all`: a name that resolves to a loopback address *and* a
+/// routable one is bound on both, and the routable one is the whole question.
+/// The wildcards `0.0.0.0` and `::` are deliberately not special-cased as
+/// "probably a container" — they are every interface, including whichever
+/// public one this host has, and that is the single most common way a database
+/// ends up on the internet by accident.
+fn reaches_the_network(bind: &str, port: u16) -> Result<bool, String> {
+    Ok(resolved(bind, port)?
+        .into_iter()
+        .any(|address| !is_loopback(address)))
+}
+
+/// Refuse to serve a database to the network in a posture that gives it away.
+///
+/// Four conditions, in this order, first match wins. All four need the bind to
+/// reach another machine at all; on loopback none of them apply, which is why
+/// the default path is untouched by any of this.
+///
+/// | # | Condition | Overridable |
+/// | --- | --- | --- |
+/// | C1 | the bootstrap or reset password is **empty** | no |
+/// | C2 | the database has no account store | no |
+/// | C3 | no certificate is configured | `--plaintext-network` |
+/// | C4 | a certificate is configured but TLS is not *required* | `--plaintext-network` |
+///
+/// [`ServerOptions::plaintext_network`] relaxes C3 and C4 and nothing else,
+/// and is itself refused unless every resolved address is private — see its
+/// doc comment for why the flag asserts a fact rather than a state of mind.
+///
+/// C1 before C2 because an empty password is the loudest fact and the operator
+/// should read it first — and because it catches a `--reset-superuser` to an
+/// empty password, which C2 does not.
+///
+/// C4 is separate from C3 because the remedy is different, and an operator who
+/// reads the wrong one goes and buys a certificate they already have. It is
+/// its own condition rather than folded into C3 because a certificate that is
+/// only *available* is the posture most likely to be mistaken for a safe one:
+/// a client that does not ask for TLS is still served, so an on-path attacker
+/// need only decline to offer the upgrade.
+fn refuse_unsafe_exposure(
+    options: &ServerOptions,
+    installed: &acl::Installed,
+    policy: tls::TlsPolicy,
+) -> Result<(), String> {
+    if !reaches_the_network(&options.bind, options.port)? {
+        return Ok(());
+    }
+    let bind = &options.bind;
+    let port = options.port;
+
+    // C1. `Reset` counts: a password given on the command line is a password
+    // whether or not it was empty, and an empty one that was just written into
+    // the store is the same open door as one that was never in it.
+    let empty_password = match installed {
+        acl::Installed::Bootstrap {
+            user,
+            empty_password,
+        }
+        | acl::Installed::Reset {
+            user,
+            empty_password,
+        } => empty_password.then_some(user),
+        acl::Installed::Existing => None,
+    };
+    if let Some(user) = empty_password {
+        return Err(format!(
+            "refusing to start: --bind {bind} is reachable from other machines and the account \
+             `{user}` has an EMPTY password, so any host that can reach port {port} can read and \
+             write this database. Set one with --password-env, or drop --bind to stay on \
+             127.0.0.1."
+        ));
+    }
+
+    // C2.
+    if let acl::Installed::Bootstrap { user, .. } = installed {
+        return Err(format!(
+            "refusing to start: --bind {bind} is reachable from other machines and this database \
+             has no accounts of its own, so `{user}` from --user/--password is the whole \
+             credential and a forgotten flag on any restart is a way back in. Run `inlaysql user \
+             add <database>` once, then restart with --bind. Or drop --bind to stay on 127.0.0.1."
+        ));
+    }
+
+    // The escape hatch, and it is checked before it is honoured. It reaches
+    // here only past C1 and C2, which it has no effect on at all: an
+    // empty-password or account-less database is refused this address under
+    // every combination of flags, which is what stops this one from being
+    // able to express the disaster case.
+    if options.plaintext_network {
+        for address in resolved(bind, port)? {
+            if address.is_unspecified() {
+                return Err(format!(
+                    "refusing to start: --plaintext-network says this is a private segment, but \
+                     --bind {bind} listens on every interface, including any public one this \
+                     host has. Name the private address or hostname to listen on instead."
+                ));
+            }
+            if !is_private(address) {
+                return Err(format!(
+                    "refusing to start: --plaintext-network says this is a private segment, but \
+                     {address} is a publicly routable address. There is no deployment where a \
+                     database on a public address should be plaintext."
+                ));
+            }
+        }
+        return Ok(());
+    }
+
+    match policy {
+        // C3.
+        tls::TlsPolicy::Disabled => Err(format!(
+            "refusing to start: --bind {bind} is reachable from other machines and no certificate \
+             is configured, so every statement, result and credential would cross the network in \
+             the clear. Serve it with --tls-cert <pem> --tls-key <pem> --tls-required. Drop --bind \
+             to stay on 127.0.0.1, or --plaintext-network if this is a private segment you accept \
+             plaintext on."
+        )),
+        // C4.
+        tls::TlsPolicy::Available => Err(format!(
+            "refusing to start: --bind {bind} is reachable from other machines and TLS is \
+             available but NOT required, so a client that does not ask for it still sends its \
+             credential in the clear and an on-path attacker need only decline to offer it. Add \
+             --tls-required. Drop --bind to stay on 127.0.0.1, or --plaintext-network if this is \
+             a private segment you accept plaintext on."
+        )),
+        tls::TlsPolicy::Required => Ok(()),
     }
 }
 
@@ -588,6 +798,16 @@ impl Server {
                 ))
             }
         };
+
+        // Before the socket, not after: a configuration that will be refused
+        // must never have been listening, not even for the moment it takes to
+        // notice. This is the fourth refusal in this function and it sits with
+        // the other three deliberately — a check only the CLI performs is a
+        // check every embedder silently skips.
+        let policy = tls_config
+            .as_ref()
+            .map_or(tls::TlsPolicy::Disabled, tls::TlsConfig::policy);
+        refuse_unsafe_exposure(options, &installed, policy).map_err(io::Error::other)?;
 
         let listener = TcpListener::bind((options.bind.as_str(), options.port))?;
         Ok(Self {
@@ -1011,35 +1231,102 @@ fn password_policy(options: &ServerOptions) -> acl::PasswordPolicy {
     }
 }
 
+/// What [`add_account`] did to the database, so a caller can say which it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountAdded {
+    /// The database had no account store, and it was created around this
+    /// account. From this point the file is the authority and
+    /// `--user`/`--password` are never consulted again.
+    StoreCreated,
+    /// The database already had accounts of its own, and this is one more.
+    Added,
+}
+
+/// Create one account in a database's own account store, without serving.
+///
+/// This is `inlaysql user add`, and it lives here rather than in the argument
+/// parser for the same reason [`print_exposure_warning`] does: it is the
+/// remedy [`Server::bind`] names when it refuses a network bind on a database
+/// that has no accounts, and a remedy an embedder cannot perform is not a
+/// remedy. Nothing about it starts a listener or touches the network.
+///
+/// The file is opened read-write and closed again, so it cannot be run
+/// against a database a server currently holds — which is the honest
+/// constraint: this is the first-run flow, and after the first run `CREATE
+/// USER` over the wire is the way to add accounts.
+pub fn add_account(
+    path: impl AsRef<Path>,
+    user: &str,
+    password: &str,
+    superuser: bool,
+) -> io::Result<AccountAdded> {
+    let path = path.as_ref();
+    let mut db = Database::open(path)
+        .map_err(|error| io::Error::other(format!("cannot open {}: {error}", path.display())))?;
+    acl::add_account(&mut db, user, password, superuser)
+        .map_err(|error| io::Error::other(error.message))
+}
+
 /// Write the warning the CLI prints, so the text lives beside the behaviour it
 /// describes rather than in an argument parser.
 pub fn print_exposure_warning(options: &ServerOptions, out: &mut impl Write) -> io::Result<()> {
     // The line an operator most needs is the one about *this* server, so it
     // states what is configured rather than a fact about the version.
-    match (options.tls_cert.is_some(), options.tls_required) {
-        (true, true) => writeln!(
+    let policy = match (options.tls_cert.is_some(), options.tls_required) {
+        (true, true) => tls::TlsPolicy::Required,
+        (true, false) => tls::TlsPolicy::Available,
+        (false, _) => tls::TlsPolicy::Disabled,
+    };
+    match policy {
+        tls::TlsPolicy::Required => writeln!(
             out,
             "inlaysql: the MySQL protocol is served over TLS, and logins without it are refused."
         )?,
-        (true, false) => writeln!(
+        tls::TlsPolicy::Available => writeln!(
             out,
             "inlaysql: TLS is available on the MySQL protocol, but NOT required — a client that \n\
              inlaysql:          does not ask for it still sends its credential in the clear. Use \n\
              inlaysql:          --tls-required to refuse those."
         )?,
-        (false, _) => writeln!(
+        tls::TlsPolicy::Disabled => writeln!(
             out,
             "inlaysql: the MySQL protocol is served in PLAINTEXT — no certificate is configured. \n\
              inlaysql:          Start with --tls-cert and --tls-key to encrypt it."
         )?,
     }
-    if options.is_public() {
-        writeln!(
-            out,
-            "inlaysql: WARNING: bound to {}, which is reachable from other machines. Every \n\
-             inlaysql:          statement, result and credential crosses the network in the clear.",
-            options.bind
-        )?;
+    // Unresolvable is treated as reaching the network: this is the warning
+    // path, `Server::bind` is where an address that cannot be resolved is
+    // reported as an error, and a warning is the wrong place to swallow one.
+    //
+    // Reaching this at all now means the configuration passed
+    // `refuse_unsafe_exposure`, so the line no longer claims the credential
+    // crosses in the clear — it cannot, or the server would not have started.
+    // What is left is the fact itself, stated without a verdict on it: the
+    // posture line above already says what protects the connection, and this
+    // one says who can open it.
+    if reaches_the_network(&options.bind, options.port).unwrap_or(true) {
+        // The escape hatch never becomes silent. It prints on every start it
+        // actually relaxed something on — a private bind with a required
+        // certificate did not need the flag, and telling that operator their
+        // connection is in the clear would be false, which is the one thing a
+        // warning may never be.
+        if options.plaintext_network && policy != tls::TlsPolicy::Required {
+            writeln!(
+                out,
+                "inlaysql: --plaintext-network: serving {}:{} WITHOUT TLS. Every statement, \n\
+                 inlaysql:          result and credential on this port crosses the network in the \n\
+                 inlaysql:          clear and any host on this segment can read them. This is not \n\
+                 inlaysql:          a production posture; --tls-cert/--tls-key/--tls-required is.",
+                options.bind, options.port
+            )?;
+        } else {
+            writeln!(
+                out,
+                "inlaysql: bound to {}, which is reachable from other machines: every host on \n\
+                 inlaysql:          the path between them and this port is on this connection.",
+                options.bind
+            )?;
+        }
     }
     if options.page_reuse {
         // Said at startup, not only in the docs: the constraint is about other
@@ -1092,25 +1379,117 @@ mod tests {
     fn the_default_bind_is_loopback() {
         let options = ServerOptions::default();
         assert_eq!(options.bind, "127.0.0.1");
-        assert!(!options.is_public());
+        assert!(!reaches_the_network(&options.bind, options.port).unwrap());
     }
 
+    /// The table from the F3 brief, and it is the specification: this
+    /// predicate decides whether the process starts, so every row of it is
+    /// pinned rather than inferred from a string comparison.
+    ///
+    /// No name but `localhost` appears here on purpose. Resolution is real
+    /// resolution now, and a test that needs a DNS server is a test that fails
+    /// on a machine with no network for a reason that has nothing to do with
+    /// the thing it asserts.
     #[test]
-    fn a_public_bind_is_recognised_as_public() {
-        for address in ["0.0.0.0", "192.168.1.10", "::", "example.com"] {
-            let options = ServerOptions {
-                bind: address.to_string(),
-                ..ServerOptions::default()
-            };
-            assert!(options.is_public(), "{address} should count as public");
+    fn what_reaches_the_network_is_judged_from_every_resolved_address() {
+        for address in [
+            // The wildcards are every interface, including whichever public
+            // one this host has. Not special-cased as "probably a container".
+            "0.0.0.0",
+            "::",
+            // Private, but reachable — from other machines on that segment,
+            // which is what this predicate is about.
+            "192.168.1.10",
+            "10.0.0.5",
+            "fd00::1",
+            // Routable.
+            "203.0.113.7",
+            "2001:db8::1",
+        ] {
+            assert!(
+                reaches_the_network(address, 0).unwrap(),
+                "{address} reaches other machines"
+            );
         }
-        for address in ["127.0.0.1", "::1", "localhost"] {
-            let options = ServerOptions {
-                bind: address.to_string(),
-                ..ServerOptions::default()
-            };
-            assert!(!options.is_public(), "{address} should count as loopback");
+        for address in [
+            "127.0.0.1",
+            "127.0.0.2",
+            "::1",
+            // A v4 loopback address written in v6. `Ipv6Addr::is_loopback()`
+            // says false for it; the packets still never leave this host.
+            "::ffff:127.0.0.1",
+            // Judged by the resolver, not assumed by its spelling.
+            "localhost",
+        ] {
+            assert!(
+                !reaches_the_network(address, 0).unwrap(),
+                "{address} is this machine only"
+            );
         }
+    }
+
+    /// `Ipv4Addr::is_shared` and `Ipv6Addr::is_unique_local` are unstable, so
+    /// CGNAT and ULA are hand-rolled masks here — and a mask written out by
+    /// hand is a mask that can be written out wrong. Both edges of each range
+    /// are pinned, because an off-by-one in either direction is the whole bug:
+    /// too wide and `--plaintext-network` accepts a routable address, too
+    /// narrow and it refuses a deployment it exists to serve.
+    #[test]
+    fn the_hand_rolled_private_ranges_have_both_of_their_edges() {
+        let address = |literal: &str| literal.parse::<IpAddr>().unwrap();
+        for private in [
+            "10.0.0.5",
+            "172.16.0.1",
+            "192.168.1.10",
+            "169.254.1.1",
+            // 100.64.0.0/10, both ends.
+            "100.64.0.0",
+            "100.127.255.255",
+            // fc00::/7, both ends.
+            "fc00::",
+            "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            // fe80::/10.
+            "fe80::1",
+            "febf:ffff::1",
+            // Loopback is private in the only sense that matters: nothing off
+            // this host reaches it at all.
+            "127.0.0.1",
+            "::1",
+            "::ffff:192.168.1.10",
+        ] {
+            assert!(is_private(address(private)), "{private} is private");
+        }
+        for public in [
+            "203.0.113.7",
+            "2001:db8::1",
+            // One below and one above 100.64.0.0/10.
+            "100.63.255.255",
+            "100.128.0.0",
+            // One below fc00::/7 and one above it.
+            "fbff:ffff::1",
+            "fe00::1",
+            // fec0::/10 is site-local, deprecated, and not fe80::/10.
+            "fec0::1",
+            // The wildcards are refused by name before this is asked, but
+            // they are not private either way.
+            "0.0.0.0",
+            "::",
+            "::ffff:203.0.113.7",
+        ] {
+            assert!(!is_private(address(public)), "{public} is not private");
+        }
+    }
+
+    /// A name that does not resolve has no verdict to give, so it is reported
+    /// rather than guessed at in either direction — the same failure
+    /// `TcpListener::bind` would produce one line later.
+    #[test]
+    fn an_address_that_does_not_resolve_is_an_error_and_not_a_verdict() {
+        let outcome = reaches_the_network("no-such-host.invalid", 0);
+        let Err(message) = outcome else {
+            panic!("an unresolvable name must not be answered with a verdict");
+        };
+        assert!(message.contains("no-such-host.invalid"), "{message}");
     }
 
     /// Both defaults that a running server's behaviour depends on, pinned:
@@ -1192,6 +1571,10 @@ mod tests {
         assert!(text.contains("PLAINTEXT"), "{text}");
         assert!(!text.contains("reachable from other machines"), "{text}");
 
+        // A bind that reaches other machines still says so — but it no longer
+        // says the credential crosses in the clear, because a configuration
+        // where it would have has been refused a socket by now. The refusals
+        // themselves are pinned in `tests/exposure.rs`.
         let mut out = Vec::new();
         print_exposure_warning(
             &ServerOptions {

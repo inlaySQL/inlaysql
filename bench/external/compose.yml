@@ -149,9 +149,20 @@ services:
   #
   # Security, stated rather than hidden (docs/server.md covers the rest): one
   # shared user/password, given here as a fixed value for a benchmark
-  # container rather than anything meant to be a secret; no TLS, because the
-  # protocol does not implement any yet, not because it was turned off for
-  # this comparison.
+  # container rather than anything meant to be a secret; no TLS, which the
+  # protocol does implement now (--tls-cert/--tls-key/--tls-required) and
+  # which this stack does not turn on, because a benchmark that measured a
+  # TLS handshake against MySQL's plaintext socket would be measuring the
+  # wrong thing.
+  #
+  # That is why this is the one place in the repository that starts a server
+  # off loopback and therefore the one place --plaintext-network appears. It
+  # binds the compose service name rather than 0.0.0.0, so the listener is on
+  # the RFC1918 bridge address and nothing on the developer's own machine or
+  # network can reach it — which the flag then checks rather than takes on
+  # trust. The account is created first, by `inlaysql user add` against the
+  # file, because a database whose only credential is --user/--password is
+  # refused a network bind under every flag, --plaintext-network included.
   #
   # Reuses ../../docker/Dockerfile, the same pinned Linux build image
   # `docker/test.sh` and `inlaysql-oltp` below use, rather than a second image.
@@ -166,11 +177,20 @@ services:
       # `postgres-oltp-data` are, not a host bind mount.
       - inlaysql-server-data:/data
     working_dir: /workspace
+    environment:
+      # Read by `inlaysql user add --password-env` below; there is no
+      # --password, so a password never reaches this container's process list.
+      INLAYSQL_BENCH_PASSWORD: bench
     command: >
+      bash -c "
       cargo run --release --quiet -p inlaysql-mcp --bin inlaysql --
+      user add /data/bench-oltp-server.inlay
+      --user bench --password-env INLAYSQL_BENCH_PASSWORD --superuser
+      || true;
+      exec cargo run --release --quiet -p inlaysql-mcp --bin inlaysql --
       serve --mysql /data/bench-oltp-server.inlay
-      --bind 0.0.0.0 --port 3306 --user root --password bench
-      --max-connections 128
+      --bind inlaysql-server --port 3306 --plaintext-network
+      --max-connections 128"
     # No `mysqladmin` in this image (it is the Rust build image, not a MySQL
     # client), and no Python either, so the check is a bare TCP connect
     # through bash's own `/dev/tcp` — the MySQL wire protocol sends its
@@ -180,7 +200,9 @@ services:
     # workspace the first time this volume is created, which is minutes, not
     # seconds, the same trade `docker/test.sh` documents for its own first run.
     healthcheck:
-      test: ["CMD-SHELL", "bash -c ': < /dev/tcp/127.0.0.1/3306' 2>/dev/null"]
+      # Its own service name, not 127.0.0.1: the listener is on the bridge
+      # address now, which is the whole point of the --bind above.
+      test: ["CMD-SHELL", "bash -c ': < /dev/tcp/inlaysql-server/3306' 2>/dev/null"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -206,7 +228,10 @@ services:
       MYSQL_DB: bench
       INLAYSQL_SERVER_HOST: inlaysql-server
       INLAYSQL_SERVER_PORT: "3306"
-      INLAYSQL_SERVER_USER: root
+      # The account `inlaysql user add` creates above. Not `root`: this
+      # database has accounts of its own, so --user/--password are not
+      # consulted and there is no `root` in it.
+      INLAYSQL_SERVER_USER: bench
       INLAYSQL_SERVER_PASSWORD: bench
       # `docker compose exec` does not forward the caller's shell
       # environment into the container, so `server_driver.py`'s tuning
