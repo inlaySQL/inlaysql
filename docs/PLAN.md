@@ -125,9 +125,14 @@ regeneration.
    successor gathers under the in-flight fsync on 83–92% of barriers and
    the duty cycle does not move, because the writers are queued at the
    reservation gate — 20/37/51% of commit latency at 4/8/16 writers, a
-   serialized 0.263 ms hold capping ~3,800 commits/s. **The next lever is
-   what that gate holds**: the WAL append and the data-area writes are
-   inside it, and MySQL's equivalent critical section is a memcpy.
+   serialized 0.263 ms hold capping ~3,800 commits/s. **AHL-563 halved the hold** and showed the
+   writes were never the problem: 22 µs of a 251 µs hold. The cost was a
+   region wrap invalidating all four regions' append offsets when it had
+   moved one, manufacturing 124 cache misses at 2.6 ms each. Hold 0.262 →
+   0.121 ms, throughput 1.54–1.70x at 8–16 writers. **Next: make wraps
+   rarer** — a single-row commit writes ~20 KiB of WAL record against
+   MySQL's 605 B because ours carries whole dirty pages — and re-run
+   AHL-562's flush pipeline, which the gate was suppressing.
    Superseded: diagnosed (AHL-555),
    not fixed.** Next experiment, named not built: split plan-and-validate from
    take-the-gate-and-commit in `Connection::run_on_engine`, and see whether the
