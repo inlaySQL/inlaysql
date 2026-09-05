@@ -731,10 +731,20 @@ impl CommitCoordinator {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let wait_started = now_nanos();
                     while flush.in_progress && !flush.handoff {
+                        // Timed, not indefinite. The handoff is a *directed*
+                        // wakeup, and the one failure mode a directed wakeup
+                        // has that a `notify_all` does not is losing it: the
+                        // state is in `handoff`, not in the notification, so
+                        // re-checking on a timer turns any wakeup this design
+                        // has not thought of from a file-wide deadlock into a
+                        // bounded hiccup. It costs nothing when the handoff
+                        // arrives, which is every time in every test and
+                        // measurement here.
                         flush = self
                             .successor_wake
-                            .wait(flush)
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            .wait_timeout(flush, SUCCESSOR_WAIT_POLL)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .0;
                     }
                     self.follower_wait_ns
                         .fetch_add(now_nanos().saturating_sub(wait_started), Ordering::Relaxed);
@@ -1241,6 +1251,14 @@ const COMMIT_COALESCE_MAX_YIELDS: usize = 16384;
 /// before any yield), and only ever adds latency when a real cohort is
 /// present to amortize an `fsync` over.
 const COMMIT_COALESCE_STALL_YIELDS: usize = 1500;
+
+/// How long a claimed successor sleeps between re-reads of
+/// [`FlushState::handoff`]. Not a timeout in the sense of giving up — the
+/// loop re-checks the same two flags and goes back to sleep — only a bound on
+/// how long a lost wakeup could cost, since the handoff's state lives in the
+/// flag rather than in the notification. See the wait itself for why a
+/// directed handoff wants this and a `notify_all` does not.
+const SUCCESSOR_WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The smallest amount of data area [`FileDevice::extend_for`] ever adds, and
 /// the largest.
@@ -3344,6 +3362,427 @@ mod group_commit_tests {
         coordinator.set_durability(Durability::Full);
         coordinator.set_durability(Durability::Normal);
         assert_eq!(coordinator.effective_durability(), Durability::Full);
+    }
+
+    // ---------------------------------------------------------------------
+    // Flush pipelining (AHL-562). `docs/research/flush-pipelining.md` is the
+    // design; §3 is the ticket-to-barrier rule the first test below is a
+    // randomised check of, and §4 is the crash/failure table the rest cover
+    // one row at a time.
+    // ---------------------------------------------------------------------
+
+    /// A `test_coordinator` with pipelining on, which is otherwise off by
+    /// default (it is read from `INLAYSQL_FLUSH_PIPELINE` at construction, and
+    /// a test must never depend on the ambient environment).
+    fn pipelined_coordinator(name: &str) -> CommitCoordinator {
+        let coordinator = test_coordinator(name);
+        coordinator.pipeline.store(true, Ordering::Relaxed);
+        coordinator
+    }
+
+    /// The durability rule, checked over randomised interleavings rather than
+    /// argued: **no ticket is ever reported durable by a barrier that started
+    /// before that ticket's write.**
+    ///
+    /// Each simulated barrier records `writes_completed` as observed *inside*
+    /// the sync closure — i.e. at the instant the barrier starts, which is
+    /// after that round captured its target — and pushes it once the barrier
+    /// has completed. A writer that returns `Ok` for ticket `t` must be able
+    /// to point at a completed barrier whose start observation is `>= t`,
+    /// which is exactly "some barrier that started after my write was
+    /// published covered me". A pipelined successor crediting its cohort to
+    /// the barrier it gathered underneath — the one mistake in this design
+    /// that would be silent data loss rather than a hang — fails this
+    /// immediately, because that barrier's observation was taken before those
+    /// tickets existed.
+    ///
+    /// Run with pipelining off and on, so the property is pinned for both
+    /// arms and a failure can be attributed to the flag.
+    #[test]
+    fn no_ticket_is_ever_durable_by_a_barrier_that_started_before_its_write() {
+        for pipeline in [false, true] {
+            let coordinator = if pipeline {
+                pipelined_coordinator("property-on")
+            } else {
+                test_coordinator("property-off")
+            };
+            let barrier_starts: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+            const WRITERS: usize = 6;
+            const ROUNDS: usize = 40;
+
+            thread::scope(|scope| {
+                let coordinator = &coordinator;
+                let barrier_starts = &barrier_starts;
+                for writer in 0..WRITERS {
+                    scope.spawn(move || {
+                        // A per-thread xorshift, so the interleaving varies
+                        // without the test depending on a wall clock.
+                        let mut rng = 0x9E37_79B9_7F4A_7C15u64 ^ (writer as u64 + 1);
+                        let mut next = move || {
+                            rng ^= rng << 13;
+                            rng ^= rng >> 7;
+                            rng ^= rng << 17;
+                            rng
+                        };
+                        for _ in 0..ROUNDS {
+                            // Stand in for a commit holding the reservation
+                            // gate: the gather window only opens while a
+                            // normal commit is inflight or queued.
+                            coordinator.normal_inflight.fetch_add(1, Ordering::Release);
+                            for _ in 0..(next() % 8) {
+                                std::thread::yield_now();
+                            }
+                            // The ticket is published after the "writes", the
+                            // same order `commit_ready` publishes in.
+                            let ticket =
+                                coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+                            coordinator.normal_inflight.fetch_sub(1, Ordering::Release);
+                            coordinator
+                                .make_commit_durable(ticket, || {
+                                    let observed =
+                                        coordinator.writes_completed.load(Ordering::SeqCst);
+                                    for _ in 0..(next() % 16) {
+                                        std::thread::yield_now();
+                                    }
+                                    barrier_starts
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .push(observed);
+                                    Ok(())
+                                })
+                                .expect("flush");
+                            // `durable_upto` first, the record of completed
+                            // barriers second: a barrier that completes
+                            // between the two reads is then in the snapshot
+                            // but not in the watermark, which is the safe
+                            // direction. Reading them the other way round
+                            // makes the assertion below a race rather than an
+                            // invariant, because a newer barrier can advance
+                            // the watermark past the snapshot's high mark.
+                            let durable = coordinator.durable_upto.load(Ordering::SeqCst);
+                            let starts = barrier_starts
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .clone();
+                            assert!(
+                                starts.iter().any(|&start| start >= ticket),
+                                "ticket {ticket} was reported durable but no completed \
+                                 barrier had started after it was written (pipeline \
+                                 {pipeline}); barrier starts: {starts:?}"
+                            );
+                            // The same rule stated over the watermark rather
+                            // than over one ticket, which is the form that
+                            // catches a barrier crediting itself with tickets
+                            // published after it started even when some other
+                            // thread's later barrier would have covered them:
+                            // no completed barrier can make anything durable
+                            // beyond what `writes_completed` had reached when
+                            // it began.
+                            let high = starts.iter().copied().max().unwrap_or(0);
+                            assert!(
+                                durable <= high,
+                                "durable_upto {durable} is beyond every completed \
+                                 barrier's start observation {high} (pipeline {pipeline})"
+                            );
+                        }
+                    });
+                }
+            });
+
+            let stats_handoffs = coordinator.handoffs.load(Ordering::Relaxed);
+            if !pipeline {
+                assert_eq!(
+                    stats_handoffs, 0,
+                    "with pipelining off no round may ever be handed over"
+                );
+            }
+        }
+    }
+
+    /// The mechanism itself, pinned deterministically rather than hoped for:
+    /// while a leader is inside its barrier, a second committer claims the
+    /// successor slot instead of parking, and when the leader finishes it
+    /// takes the round **by handoff** — `in_progress` never clears, so no
+    /// third thread can elect itself in between, and the successor never runs
+    /// a second gather on the critical path.
+    #[test]
+    fn a_successor_takes_the_next_round_by_handoff_and_never_re_elects() {
+        let coordinator = pipelined_coordinator("handoff");
+        let (in_sync_tx, in_sync_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let successor_flushed = Arc::new(AtomicBool::new(false));
+
+        let ticket_leader = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+
+        thread::scope(|scope| {
+            let coordinator = &coordinator;
+            let leader = scope.spawn(move || {
+                coordinator.make_commit_durable(ticket_leader, move || {
+                    in_sync_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+            });
+
+            // The leader is inside its barrier and has already captured a
+            // target of 1, so the ticket published now cannot be covered by it.
+            in_sync_rx.recv().unwrap();
+            let ticket_successor = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+            let successor_flushed_inner = Arc::clone(&successor_flushed);
+            let successor = scope.spawn(move || {
+                coordinator.make_commit_durable(ticket_successor, move || {
+                    successor_flushed_inner.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+
+            // Wait for the claim to be visible under the flush mutex before
+            // letting the leader finish, so the handoff — not an election —
+            // is the only way the successor can proceed.
+            loop {
+                let claimed = coordinator
+                    .flush
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .successor;
+                if claimed {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+
+            release_tx.send(()).unwrap();
+            leader.join().unwrap().unwrap();
+            successor.join().unwrap().unwrap();
+        });
+
+        assert!(successor_flushed.load(Ordering::SeqCst));
+        assert_eq!(
+            coordinator.handoffs.load(Ordering::Relaxed),
+            1,
+            "the second committer must have entered its round by handoff, not by \
+             winning an election after a notify_all"
+        );
+        let flush = coordinator.flush.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(!flush.in_progress, "the last round must have ended");
+        assert!(!flush.successor && !flush.handoff);
+        assert!(!coordinator.handoff_pending.load(Ordering::Acquire));
+    }
+
+    /// §4 row 5 and row 13: a successor that dies — panics in its gather, or
+    /// finds the round it claimed against ended without reserving one for it
+    /// — must give the claim back. If the outgoing leader had *already*
+    /// reserved the round, giving the claim back has to end that round too,
+    /// because `in_progress` is still set and nobody is going to flush it.
+    /// Getting this wrong is not data loss, it is every writer on the file
+    /// waiting forever for a barrier that will never be issued.
+    #[test]
+    fn a_successor_that_dies_before_taking_the_round_never_strands_it() {
+        for reserved in [false, true] {
+            let coordinator = pipelined_coordinator("successor-dies");
+            {
+                let mut flush = coordinator.flush.lock().unwrap_or_else(|p| p.into_inner());
+                flush.in_progress = true;
+                flush.successor = true;
+                flush.handoff = reserved;
+            }
+            coordinator
+                .handoff_pending
+                .store(reserved, Ordering::Release);
+            let epoch_before = coordinator
+                .flush
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .epoch;
+
+            // Exactly what an unwind out of the gather window runs.
+            drop(SuccessorGuard {
+                coordinator: &coordinator,
+                active: true,
+            });
+
+            let flush = coordinator.flush.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(!flush.successor, "the claim must be given back");
+            assert!(!flush.handoff);
+            assert!(!coordinator.handoff_pending.load(Ordering::Acquire));
+            assert_eq!(
+                flush.in_progress, !reserved,
+                "a reserved round must be ended by the successor that will not run it, \
+                 and an unreserved one left alone for its live leader"
+            );
+            if reserved {
+                assert_eq!(flush.epoch, epoch_before.wrapping_add(1));
+            }
+            drop(flush);
+
+            if reserved {
+                // And the file is still usable: the next committer leads.
+                let ticket = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+                let flushed = AtomicBool::new(false);
+                coordinator
+                    .make_commit_durable(ticket, || {
+                        flushed.store(true, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .unwrap();
+                assert!(flushed.load(Ordering::SeqCst));
+            }
+        }
+    }
+
+    /// §4 row 7: a leader that panics inside its barrier still performs the
+    /// handoff, so the successor inherits a live round rather than a stranded
+    /// one — and the successor's own barrier, which starts after its writes,
+    /// is what makes it durable. A panicking leader is the one case where the
+    /// round ends on an unwind, and pipelining must not turn that into a hang.
+    #[test]
+    fn a_leader_that_panics_hands_a_live_round_to_its_successor() {
+        let coordinator = pipelined_coordinator("leader-panics");
+        let (in_sync_tx, in_sync_rx) = mpsc::channel::<()>();
+        let successor_flushed = Arc::new(AtomicBool::new(false));
+        let ticket_leader = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+
+        thread::scope(|scope| {
+            let coordinator = &coordinator;
+            let leader = scope.spawn(move || {
+                coordinator.make_commit_durable(ticket_leader, move || -> Result<()> {
+                    in_sync_tx.send(()).unwrap();
+                    // Long enough for the successor to claim; the claim is
+                    // then confirmed below before the panic can be observed.
+                    for _ in 0..10_000 {
+                        std::thread::yield_now();
+                    }
+                    panic!("simulated barrier panic");
+                })
+            });
+
+            in_sync_rx.recv().unwrap();
+            let ticket_successor = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+            let successor_flushed_inner = Arc::clone(&successor_flushed);
+            let successor = scope.spawn(move || {
+                coordinator.make_commit_durable(ticket_successor, move || {
+                    successor_flushed_inner.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+
+            assert!(leader.join().is_err(), "the leader's panic must propagate");
+            successor.join().unwrap().unwrap();
+        });
+
+        assert!(
+            successor_flushed.load(Ordering::SeqCst),
+            "a commit whose leader panicked mid-barrier must fsync for itself, \
+             never be acknowledged on the strength of the flush that panicked"
+        );
+        assert!(
+            coordinator.durable_upto.load(Ordering::SeqCst) >= 2,
+            "the successor's own barrier covers both tickets"
+        );
+    }
+
+    /// §4 row 9: a successor can be handed a round whose predecessor already
+    /// covered it — it claimed before that barrier captured a target that
+    /// reached its ticket. It must return without flushing (that is the
+    /// batching half of the contract, unchanged) **and** release the round it
+    /// was reserved, rather than sitting on a reservation nobody will use.
+    #[test]
+    fn a_successor_already_covered_releases_the_round_instead_of_flushing() {
+        let coordinator = pipelined_coordinator("successor-covered");
+        let (in_sync_tx, in_sync_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let successor_flushed = Arc::new(AtomicBool::new(false));
+
+        // Both tickets exist before the leader captures its target, so the
+        // leader's target is 2 and covers the successor.
+        let ticket_leader = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+        let ticket_successor = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+        assert_eq!((ticket_leader, ticket_successor), (1, 2));
+
+        thread::scope(|scope| {
+            let coordinator = &coordinator;
+            let leader = scope.spawn(move || {
+                coordinator.make_commit_durable(ticket_leader, move || {
+                    in_sync_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+            });
+
+            in_sync_rx.recv().unwrap();
+            let successor_flushed_inner = Arc::clone(&successor_flushed);
+            let successor = scope.spawn(move || {
+                coordinator.make_commit_durable(ticket_successor, move || {
+                    successor_flushed_inner.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            });
+            loop {
+                let claimed = coordinator
+                    .flush
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .successor;
+                if claimed {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            release_tx.send(()).unwrap();
+            leader.join().unwrap().unwrap();
+            successor.join().unwrap().unwrap();
+        });
+
+        assert!(
+            !successor_flushed.load(Ordering::SeqCst),
+            "a successor the previous barrier already covered must not flush again"
+        );
+        let flush = coordinator.flush.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            !flush.in_progress && !flush.handoff && !flush.successor,
+            "the reserved round must be released by the successor that declined it"
+        );
+        drop(flush);
+        // And the coordinator still works.
+        let ticket = coordinator.writes_completed.fetch_add(1, Ordering::SeqCst) + 1;
+        let flushed = AtomicBool::new(false);
+        coordinator
+            .make_commit_durable(ticket, || {
+                flushed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        assert!(flushed.load(Ordering::SeqCst));
+    }
+
+    /// The overlapped gather is bounded by the barrier it hides behind: once
+    /// the outgoing leader reserves the round, the successor's window closes
+    /// on its next poll. Without this bound the window's own exit conditions
+    /// could outlive the barrier and delay the very cycle the pipeline exists
+    /// to shorten.
+    #[test]
+    fn the_overlapped_gather_stops_the_moment_the_round_is_handed_over() {
+        let coordinator = pipelined_coordinator("gather-bound");
+        // A writer is permanently "inflight" and tickets keep arriving, so
+        // neither of the window's own exits can fire: only the stop condition
+        // can end this.
+        coordinator.normal_inflight.fetch_add(1, Ordering::Release);
+        let stop_after = AtomicUsize::new(3);
+        coordinator.coalesce_normal_commits_until(|| {
+            coordinator.writes_completed.fetch_add(1, Ordering::SeqCst);
+            let left = stop_after.load(Ordering::Relaxed);
+            if left == 0 {
+                return true;
+            }
+            stop_after.store(left - 1, Ordering::Relaxed);
+            false
+        });
+        assert_eq!(
+            stop_after.load(Ordering::Relaxed),
+            0,
+            "the window must end on the stop condition, and only on it"
+        );
+        coordinator.normal_inflight.fetch_sub(1, Ordering::Release);
     }
 }
 
