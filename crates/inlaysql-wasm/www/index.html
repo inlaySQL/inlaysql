@@ -304,14 +304,14 @@
   </p>
   <div class="figures">
     <div class="figure">
-      <b>692,893</b>
+      <b>910,788</b>
       <span>point reads per second</span>
-      <em>~3-6.5× SQLite in journal mode, durable</em>
+      <em>~3-10× SQLite in journal mode, durable</em>
     </div>
     <div class="figure">
       <b>~13×</b>
       <span>SQLite on concurrent writes</span>
-      <em>1,184 commits/s at 8 writers, 0% aborted</em>
+      <em>1,145 commits/s at 8 writers, 0% aborted</em>
     </div>
     <div class="figure">
       <b>192 µs</b>
@@ -479,21 +479,21 @@
       <tbody>
         <tr>
           <td>Point read by primary key</td>
-          <td class="num">692,893 ops/s</td>
+          <td class="num">910,788 ops/s</td>
           <td>SQLite, journal (durable)</td>
-          <td class="win">~3-6.5× faster</td>
+          <td class="win">~3-10× faster</td>
         </tr>
         <tr>
           <td>Concurrent writes, 8 writers</td>
-          <td class="num">1,184 commits/s</td>
+          <td class="num">1,145 commits/s</td>
           <td>SQLite, journal</td>
           <td class="win">~13× faster</td>
         </tr>
         <tr>
           <td>Vector search, recall@10 1.000</td>
-          <td class="num">68.67 µs</td>
+          <td class="num">63.58 µs</td>
           <td><code>sqlite-vec</code></td>
-          <td class="win">~9× faster</td>
+          <td class="win">~10× faster</td>
         </tr>
         <tr>
           <td>Hybrid search (BM25 + vector)</td>
@@ -515,19 +515,19 @@
         </tr>
         <tr>
           <td>Secondary-index inner join, 20k × 160k rows</td>
-          <td class="num">3.63 ms</td>
+          <td class="num">3.51 ms</td>
           <td>SQLite</td>
-          <td class="win">~7-8× faster</td>
+          <td class="win">~8× faster</td>
         </tr>
         <tr>
           <td>Indexed range scan, 50 rows</td>
-          <td class="num">8.25 µs</td>
+          <td class="num">8.00 µs</td>
           <td>SQLite, journal</td>
           <td class="loss">~1.2× slower</td>
         </tr>
         <tr>
           <td>Indexed range scan, 50 rows <span class="note">(servers answer a client over a socket; SQLite in-process is ~6-10× them on the same shape)</span></td>
-          <td class="num">119,219 ops/s</td>
+          <td class="num">118,489 ops/s</td>
           <td>MySQL 8.4, PostgreSQL 17</td>
           <td class="win">~5-8× faster</td>
         </tr>
@@ -592,18 +592,23 @@
       </li>
       <li>
         <strong>Row iteration loses to SQLite.</strong> Range scans and both
-        <code>LIMIT 10</code> join shapes are slower than SQLite (roughly 1.5×
-        and 1.2-1.6×, both narrower than last edition after a borrowing row
-        API and a <code>LIMIT</code>-sized first batch); both full joins are
+        <code>LIMIT 10</code> join shapes are slower than SQLite (roughly 1.2×
+        and 1.15-1.35×, narrower again this edition); both full joins are
         faster, and against MySQL and PostgreSQL the range scan wins outright.
-        Measured, published above, and the current top priority. What is left
-        in the <code>LIMIT</code>-shape gap is profiled and has been narrowed
-        again since these figures were taken: a point lookup now retains the
-        path it descended and resumes from an ancestor rather than the root,
-        and the point read&rsquo;s throughput tail — a page cache that filled
-        with superseded pages during the benchmark&rsquo;s write phase — has
-        been found and fixed. Both are landed and await the next gated
-        regeneration, so the numbers above do not yet show them.
+        Measured, published above, and the current top priority. Two things
+        that used to sit in this bullet as landed-but-unpublished are now in
+        the numbers: a point lookup retains the path it descended and resumes
+        from the lowest ancestor whose span still admits the key rather than
+        walking from the root, and the point read&rsquo;s throughput tail — a
+        page cache that filled with 151,635 superseded pages during the
+        benchmark&rsquo;s write phase — has been found, fixed and measured.
+        <strong>The point read&rsquo;s throughput is no longer the standing
+        loss it was</strong>: p95 and p99 are three times and nearly three
+        times better than the previous edition, 2.2× and 3.1× SQLite WAL&rsquo;s
+        rather than 6.5× and 8.7×, and throughput is 0.74× WAL&rsquo;s where it
+        was 0.56×, with one run of three above it. The median p50 moved 20%
+        the other way inside a figure whose own three runs disagree by 67%,
+        and that is published rather than explained away.
       </li>
       <li>
         <strong>Batch inserts lose to PostgreSQL.</strong> <code>GROUP BY</code> was the worst shape we
@@ -618,8 +623,10 @@
         it is ~1.2× MySQL 8.4 and ~0.68× PostgreSQL 17. The first
         containerised commit profile puts 89.8% of a single-row commit in the
         barrier and 5.8% in this engine; the barrier no longer pays to grow
-        the file, which is worth ~1.18× on that shape and is also not yet in
-        the figures above.
+        the file, which is worth ~1.18× on that shape. That last one is the
+        only figure on this page still waiting: the containerised rows were
+        measured before it landed and have not been rerun, so they are known
+        to understate the engine by an amount nobody has measured.
       </li>
       <li>
         <strong>Write throughput over the wire does not scale the way MySQL&rsquo;s

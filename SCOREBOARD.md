@@ -208,22 +208,26 @@ email, body)` at 100,000 rows, index built after the rows, 100
 `WHERE email >= ? AND email < ?` queries returning exactly 50 rows, key
 sequence generated with the same seeded xorshift64* the Rust harness uses.
 **Regenerated 2026-09-02/03, `REPS=5`, quiet machine, MySQL 8.4**:
-InlaySQL 119,219 ops/s (110k–120k; the 2026-09-03 edition's gated `run.sh`
-median of three at `1f7921a`, reused for this cell as the two editions
+InlaySQL 118,489 ops/s (99k–120k; the 2026-09-05 edition's gated `run.sh`
+median of three at `be95cc3`, reused for this cell as the three editions
 before it reused their own `run.sh` figures — a different sitting from,
-and a later build than, the server columns, disclosed) — with SQLite,
-in-process on the same harness, at 143,954 ops/s (6.67 µs), i.e. ~10x MySQL
-and ~6.5x PostgreSQL itself, so this WIN is mostly the servers' client and
-socket rather than a storage-engine gap — vs MySQL 8.4 14,330
+and two engine editions later than, the server columns, disclosed) — with
+SQLite, in-process on the same harness, at 144,622 ops/s (6.67 µs), i.e.
+~10x MySQL and ~6.5x PostgreSQL itself, so this WIN is mostly the servers'
+client and socket rather than a storage-engine gap — vs MySQL 8.4 14,330
 ops/s (14,181–14,635, p50 67 µs) and PostgreSQL 21,824 ops/s
 (9,009–22,931, one outlier rep; p50 44 µs). **WIN ~8x vs MySQL, WIN ~5.5x
-vs PostgreSQL** — far outside the quiet floor. The `3cf0d85` cell was
-97,624 (~7x/~4.5x), and the step to 119,219 is AHL-550's compiled residual
-filter (1.22–1.36x interleaved on this shape); the 2026-08-31 figures were
-49,259 (desktop load) vs 13,124 (8.0.x) and 21,455 — the servers' columns
-barely moved across either step, so the wider multiple is InlaySQL's own
-cell (a quiet sitting, AHL-535's measured 1.40x and AHL-550's 1.22–1.36x
-on this shape), not the opponents getting slower. Durability:
+vs PostgreSQL** — far outside the quiet floor. The `1f7921a` cell was
+119,219 and this one is 118,489, −1% and inside its own 18% run-to-run
+spread — flat, despite AHL-551 measuring a further 3–7% on this exact shape
+interleaved, 6 of 6 non-overlapping, which a cell this noisy cannot
+resolve. The `3cf0d85` cell was 97,624 (~7x/~4.5x), and the step from it is
+AHL-550's compiled residual filter (1.22–1.36x interleaved on this shape);
+the 2026-08-31 figures were 49,259 (desktop load) vs 13,124 (8.0.x) and
+21,455 — the servers' columns barely moved across any step, so the wider
+multiple is InlaySQL's own cell (a quiet sitting, AHL-535's measured 1.40x
+and AHL-550's 1.22–1.36x on this shape), not the opponents getting
+slower. Durability:
 read-only after setup; MySQL
 `innodb_flush_log_at_trx_commit=1`, PG `synchronous_commit=on`, both
 servers on their named volumes, reached over unix sockets; InlaySQL
@@ -549,28 +553,30 @@ rep. Per the pre-fixed join rule, **both FROM orders are reported,
 worst-first**, and the p50 medians are compared:
 
 **Regenerated 2026-09-02/03, `REPS=5`, quiet machine, MySQL 8.4.** The
-InlaySQL column is the 2026-09-03 edition's gated `run.sh` median of three
-at `1f7921a` (a different sitting and a later build than the server
-columns — AHL-549 moved the two `LIMIT` cells from `3cf0d85`'s 4.25 / 6.88
-µs; and its `LIMIT` shapes are `LIMIT 10` where the drivers run `LIMIT 20`
-— not the same shape, disclosed):
+InlaySQL column is the 2026-09-05 edition's gated `run.sh` median of three
+at `be95cc3` (a different sitting and two engine editions later than the
+server columns — AHL-549 moved the two `LIMIT` cells from `3cf0d85`'s 4.25
+/ 6.88 µs to `1f7921a`'s 3.75 / 5.79, and AHL-551 is the named direction
+behind this edition's 3.46 / 5.54, at a size the gated row and the
+interleaved A/B disagree about; and its `LIMIT` shapes are `LIMIT 10` where
+the drivers run `LIMIT 20` — not the same shape, disclosed):
 
 | Shape | InlaySQL p50 | MySQL 8.4 p50 (median, range) | PostgreSQL 17 p50 (median, range) |
 | --- | --- | --- | --- |
-| PK inner, full join | **3.25 ms** | 13.68 ms (13.64–13.71) | 9.36 ms (9.28–9.47) |
-| Secondary-index inner, full join | **3.63 ms** | 13.71 ms (13.68–13.83) | 9.42 ms (9.30–9.49) |
-| PK inner, LIMIT (ours 10, theirs 20) | 3.75 µs | 44 µs (42–44) | 29 µs (28–30) |
-| Secondary-index inner, LIMIT (ours 10, theirs 20) | 5.79 µs | 51 µs (49–52) | 30 µs (28–30) |
+| PK inner, full join | **3.26 ms** | 13.68 ms (13.64–13.71) | 9.36 ms (9.28–9.47) |
+| Secondary-index inner, full join | **3.51 ms** | 13.71 ms (13.68–13.83) | 9.42 ms (9.30–9.49) |
+| PK inner, LIMIT (ours 10, theirs 20) | 3.46 µs | 44 µs (42–44) | 29 µs (28–30) |
+| Secondary-index inner, LIMIT (ours 10, theirs 20) | 5.54 µs | 51 µs (49–52) | 30 µs (28–30) |
 
-**vs MySQL 8.4 — WIN all four** (~4.2x/~3.8x on the full joins; the `LIMIT`
+**vs MySQL 8.4 — WIN all four** (~4.2x/~3.9x on the full joins; the `LIMIT`
 rows several-x on a smaller LIMIT). **vs PostgreSQL — WIN all four**
-(~2.9x/~2.6x full; `LIMIT` likewise). The 2026-08-31 edition's red cell —
+(~2.9x/~2.7x full; `LIMIT` likewise). The 2026-08-31 edition's red cell —
 PK-inner full join 13.04 ms, TIE vs MySQL (15.00 ms) and **LOSS ~1.24x vs
 PostgreSQL** (10.49 ms), "the shape where PG's planner picked the better
 order" — is gone for a named reason: AHL-524 (`PERF.md`, 2026-09-02) fixed
 AHL-512's inverted join cost model so both written orders run the same
 users-driving plan (9.34 → 3.21 ms single-run, 3.23 ms gated at `3cf0d85`,
-3.25 ms at `1f7921a`). Both
+3.25 ms at `1f7921a`, 3.26 ms at `be95cc3`). Both
 opponents still hash-join either FROM order in ~13.7/~9.4 ms; their
 columns moved from ~15.0/~10.5 on a quieter machine and, for MySQL, a
 version change — unattributed. The planner-epic decision the previous
