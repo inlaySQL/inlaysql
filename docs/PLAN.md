@@ -116,9 +116,13 @@ regeneration.
    pre-gate residual measures −1.2% to +2.1% and the named experiment had a
    ceiling of 1.02x against a 3.28x gap. What the numbers say instead: our
    barrier costs 2.67 ms against MySQL's 0.78 ms on the same volume class,
-   and barrier rate is pinned at one over that. **Why our fsync costs 3.4x
-   theirs is the open question**, and it is not the one the 2026-08-31
-   deferred-durability rejection answered. Superseded: diagnosed (AHL-555),
+   and barrier rate is pinned at one over that. **AHL-561 measured the
+   barrier and inverted that:** our `fsync` is 1.322 ms against MySQL's
+   1.215 — 1.09x — and the difference is the duty cycle, 51% against 96%.
+   Half our cycle is gather and idle gap, not flushing. `fdatasync` is
+   1.01x of `fsync` here, so the syscall is not the lever; **pipelining the
+   flush cycle is**, priced at 2.20x → ~1.13x on the published row.
+   Superseded: diagnosed (AHL-555),
    not fixed.** Next experiment, named not built: split plan-and-validate from
    take-the-gate-and-commit in `Connection::run_on_engine`, and see whether the
    unaccounted share moves into `gate_wait`/`follower_wait` (already
