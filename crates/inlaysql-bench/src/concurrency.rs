@@ -374,6 +374,39 @@ fn inlaysql_writers(
             stats.normal_tickets_flushed as f64 / (stats.normal_flushes.max(1)) as f64,
         );
     }
+    // AHL-561: the barrier cycle, wall-clock. AHL-560 derived a per-barrier
+    // cost by inverting the barrier *rate* (`ops/s / commits-per-barrier`),
+    // which is only the barrier's own latency if barriers run back to back.
+    // This line measures both ends of that assumption: `fsync` is the mean
+    // time actually spent inside the syscall, `interval` is the wall clock
+    // divided by the number of barriers, and `idle` is the difference — the
+    // share of the run during which no flush was in flight at all.
+    //
+    // `fsync_ns` is charged over `flushes`, not `normal_flushes`, because it
+    // accumulates on every barrier this file paid for — the schema-creating
+    // handle's checkpoint syncs included — so dividing it by the smaller
+    // count would inflate the mean by whatever share of the barriers were
+    // not user commits. `interval` divides the wall clock by the barriers
+    // the timed phase actually issued, which is `normal_flushes`; the two
+    // denominators differ by a couple of calls per run and the difference is
+    // named here rather than hidden in the subtraction.
+    if let Some(stats) = keeper.commit_stats() {
+        let flushes = stats.normal_flushes.max(1);
+        let interval_ms = elapsed.as_secs_f64() * 1e3 / flushes as f64;
+        let fsync_ms = stats.fsync_ns as f64 / 1e6 / stats.flushes.max(1) as f64;
+        println!(
+            "  barrier cycle: {writers} writers, {:.1} barriers/s — \
+             fsync {fsync_ms:.3} ms, interval {interval_ms:.3} ms, \
+             idle {:.3} ms ({:.1}% of the wall clock has no flush in flight); \
+             coordinator gather {:.3} post {:.3} gap {:.3} ms/barrier",
+            flushes as f64 / elapsed.as_secs_f64(),
+            interval_ms - fsync_ms,
+            100.0 * (interval_ms - fsync_ms) / interval_ms,
+            stats.gather_spin_ns as f64 / 1e6 / flushes as f64,
+            stats.post_ns as f64 / 1e6 / flushes as f64,
+            stats.gap_ns as f64 / 1e6 / flushes as f64,
+        );
+    }
     // AHL-560: where a writer thread's own time goes, split into the same
     // buckets AHL-555's `Inlaysql_thread_*` status counters split a server
     // connection into — printed here so the decomposition can be reproduced

@@ -6494,6 +6494,306 @@ happens — the comparison is now one or two word compares and there is nothing
 left to shave off it. The next slice for this shape is a cell layout the
 search can read a key out of without resolving it, not a cheaper comparator.
 
+### The barrier is not the gap: both engines' `fsync` costs the same, and InlaySQL keeps one in flight half the time (AHL-561, 2026-09-05)
+
+AHL-560 closed with an arithmetic identity and a conclusion drawn from it:
+InlaySQL-server 1,522.2 ops/s ÷ 4.06 commits per barrier = 375 barriers/s =
+**2.67 ms per barrier**; MySQL 4,992.0 ÷ 3.90 = 1,280 barriers/s = **0.78 ms
+per barrier**; therefore "the 3.4x barrier-rate gap is a 3.4x barrier-cost
+gap." The identity is right. **The conclusion is wrong, and this section
+measures it wrong rather than arguing it wrong.** Inverting a barrier *rate*
+gives a barrier *latency* only when barriers run back to back. Measured on
+the same volume, in the same minutes, with each engine's own instrument:
+**MySQL's duty cycle is 96% and InlaySQL's is 51%.** The two engines' actual
+barrier syscalls cost 1.215 ms and 1.322 ms — a **1.09x** gap, not 3.4x.
+
+This item was chartered to test a specific, cheap hypothesis first —
+`Durability::Full`'s `File::sync_all()` is `fsync`, the data area has been
+preallocated since AHL-553 so an ordinary commit does not extend the file,
+and on btrfs `fsync` might be markedly dearer than `fdatasync`. It is not.
+Both halves are recorded below, because the refutation is what made the
+duty-cycle measurement necessary.
+
+**The volume, stated once.** Everything below is on
+`inlaysql-bench_inlaysql-oltp-data` / `inlaysql-bench_mysql-oltp-data` /
+`inlaysql-bench_inlaysql-server-data` — btrfs on a virtio device inside
+OrbStack's Linux VM (`df -T` → `/dev/vdb1 btrfs`), the same volume class
+`BENCHMARK.md`'s containerised rows and `SCOREBOARD.md`'s server-to-server
+row are measured on. MySQL is the compose stack's own `mysql:8.4` with
+`--innodb-flush-log-at-trx-commit=1 --skip-log-bin`; note for the record that
+8.4's default `innodb_flush_method` is `O_DIRECT`, which is one of the arms
+swept below.
+
+#### 1. The `fdatasync` hypothesis, refuted by direct syscall measurement
+
+A dependency-free C probe (written, compiled with the container's own `gcc`,
+run, discarded) on a 64–100 MiB file that is preallocated, zero-filled and
+`fsync`ed before the timed phase, so no arm grows the file. Arms shuffled
+independently every round with a Fisher-Yates over an xorshift64\* PRNG — the
+position-in-round confound §3's 2026-08-31 in-container `fsync` sweep
+manufactured and then caught, avoided here by construction. 5 warm-up
+rounds discarded. p50 in microseconds, one column per independent run:
+
+| arm | run A (n=60) | run B (n=120) | run C (n=120) | run D (n=120) |
+| --- | --- | --- | --- | --- |
+| nothing dirty, `fsync` | 1.0 | 1.0 | 1.1 | 1.5 |
+| nothing dirty, `fdatasync` | 1.1 | 1.2 | 1.2 | 2.0 |
+| 1 KiB written, `fsync` | 946.1 | 937.5 | 965.0 | 945.3 |
+| 1 KiB written, **`fdatasync`** | **907.7** | **921.8** | **969.2** | **950.4** |
+| 20 KiB written, `fsync` | 898.5 | 919.3 | 984.2 | 949.1 |
+| 20 KiB written, **`fdatasync`** | **918.5** | **920.3** | **979.5** | **973.0** |
+| 20 KiB, file *grows*, `fsync` | 2094.4 | 2453.6 | 2733.5 | 2607.9 |
+| 20 KiB, file *grows*, `fdatasync` | 2086.9 | 2459.9 | 2419.5 | 2615.0 |
+
+**`fdatasync`/`fsync` at 20 KiB: 1.022, 1.001, 0.995, 1.025 — a ratio of
+1.01.** There is nothing there. A second probe swept four more axes on the
+same volume (100 repetitions × 2 seeds, same shuffle): `O_DIRECT` against
+buffered, and sequential in-place against random in-place — the InnoDB
+redo-log shape against InlaySQL's. Every one of the ten arms landed between
+**918 and 1,080 µs p50**. The barrier on this filesystem is a fixed ~1 ms
+device round trip, invariant to which syscall issues it, whether the page
+cache is in the path, whether the writes are sequential, and whether there
+are 4 KiB or 20 KiB of them.
+
+The one thing that *does* move it is growing the file: 2.09–2.73 ms against
+0.90–0.98 ms, a **2.3–2.9x** penalty. That is AHL-553's finding, re-measured
+from the syscall side rather than from throughput, and it is already banked.
+
+**The correctness rule, stated anyway, because the brief asked for it and
+because a future reader on a different filesystem will want it.** The rule
+would have to be: a commit may use the cheaper barrier only when the file has
+not grown since the last full barrier. Every path that can grow the file was
+audited, and there are exactly three:
+
+1. **`FileDevice::extend_for`** (`crates/inlaysql/src/device.rs`) — the only
+   `set_len` in the crate, under `CommitCoordinator::allocate_lock`. It would
+   have to `fsync` after its `set_len` + zero fill (once per 1–8 MiB
+   extension, amortised to nothing) and publish the new length as durable.
+   It does not sync today; that is deliberate and documented.
+2. **`FileDevice::write`'s `write_all_at`**, when `extend_for` declined to
+   act. It declines in three cases: no coordinator (the write then errors
+   before reaching the file), the layout not yet known (`boundary()` is
+   `None` — true for every write while a database is being created,
+   including the header that teaches the layout), and `offset < boundary`
+   (the header, state block and write-ahead log, at fixed offsets, which do
+   grow the file at creation time).
+3. Nothing else. There is no other `set_len` and no other `write_all_at` in
+   the crate.
+
+One `AtomicBool` on the coordinator covers all three: set in `extend_for`
+after its own `fsync`, cleared in `write` whenever `offset + len` exceeds
+`coordinator.allocated`. That is sufficient because `allocated` is zero until
+`extend_for`'s slow path has run and synced once, and is strictly greater
+than `boundary` from then on — so after the flag is first set, every
+below-boundary write and every data write is inside a length that has already
+been made durable. The fast path is one relaxed atomic load. **So the rule is
+provable, for every path, and it is worth nothing on this filesystem** —
+which is doubly true because Linux's `fdatasync` flushes a size extension in
+any case (`fdatasync(2)`: "a change to the file size ... would require a
+metadata flush"). Nothing was landed on the commit path. `commit_barrier` is
+untouched.
+
+#### 2. What the barrier is actually spending its time on
+
+Since the syscall is the same price for everyone, the 2.67 ms had to be
+somewhere else. It is, and both ends of AHL-560's assumption are now
+measured. `crates/inlaysql-bench/src/concurrency.rs` gains a `barrier cycle`
+line — barriers per second, mean time *inside* the syscall, wall-clock
+interval between barriers, and the difference, which is the share of the run
+with no flush in flight at all. `commit_growth.rs`'s `WRAP=1` mode gains the
+barrier's latency **distribution** rather than only its mean.
+
+The server-to-server comparison, which is the one AHL-560's numbers came
+from: eight connections, 2,000 single-row autocommit `INSERT`s, both engines
+reached with the identical `mysql.connector` client from the compose
+`drivers` container, **interleaved engine by engine and order-flipped every
+repetition**, eight repetitions. InlaySQL's barrier latency is read from
+`Inlaysql_commit_fsync_ns / Inlaysql_commit_flushes`, which the server has
+exposed since AHL-555; MySQL's is read from
+`performance_schema.file_summary_by_event_name`'s sync bucket
+(`COUNT_MISC`/`SUM_TIMER_MISC`) for `wait/io/file/innodb/innodb_log_file` —
+MySQL's own measurement of its own `fsync`s, not a figure derived by
+inverting a rate. Load 2.8–5.0 of this 18-CPU box's 4.5 quiet ceiling,
+disclosed; the pairing is what carries the result, not the absolute
+throughput.
+
+| rep | engine | ops/s | commits/barrier | interval ms | **`fsync` ms (measured)** | **duty** | gather ms | gap ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0 | MySQL | 3,065 | 3.88 | 1.267 | 1.222 | **96%** | — | — |
+| 0 | InlaySQL | 1,385 | 3.60 | 2.525 | 1.341 | **53%** | 0.576 | 0.563 |
+| 1 | InlaySQL | 1,429 | 3.76 | 2.567 | 1.317 | 51% | 0.606 | 0.585 |
+| 1 | MySQL | 3,254 | 3.85 | 1.184 | 1.141 | 96% | — | — |
+| 2 | MySQL | 3,072 | 3.86 | 1.257 | 1.208 | 96% | — | — |
+| 2 | InlaySQL | 1,440 | 3.71 | 2.506 | 1.280 | 51% | 0.627 | 0.543 |
+| 3 | InlaySQL | 1,399 | 3.70 | 2.567 | 1.319 | 51% | 0.605 | 0.642 |
+| 3 | MySQL | 3,112 | 3.88 | 1.245 | 1.181 | 95% | — | — |
+| 4 | MySQL | 3,066 | 3.86 | 1.259 | 1.208 | 96% | — | — |
+| 4 | InlaySQL | 1,403 | 3.73 | 2.588 | 1.309 | 51% | 0.662 | 0.552 |
+| 5 | InlaySQL | 1,326 | 3.68 | 2.693 | 1.355 | 50% | 0.627 | 0.659 |
+| 5 | MySQL | 2,933 | 3.80 | 1.294 | 1.255 | 97% | — | — |
+| 6 | MySQL | 2,966 | 3.84 | 1.294 | 1.274 | 98% | — | — |
+| 6 | InlaySQL | 1,299 | 3.47 | 2.583 | 1.324 | 51% | 0.627 | 0.627 |
+| 7 | InlaySQL | 1,258 | 3.36 | 2.584 | 1.350 | 52% | 0.590 | 0.599 |
+| 7 | MySQL | 2,807 | 3.85 | 1.373 | 1.344 | 98% | — | — |
+
+Medians: **InlaySQL — interval 2.575 ms, `fsync` 1.322 ms, gather 0.617 ms,
+gap 0.592 ms, duty 51%. MySQL — interval 1.263 ms, `fsync` 1.215 ms, duty
+96%.** Eight of eight repetitions on each side, and the two duty-cycle
+distributions do not overlap: InlaySQL's worst is 53%, MySQL's best is 95%.
+
+**The four headline answers this item was chartered to produce.**
+
+* **How long does each engine's barrier take, on the same volume?**
+  InlaySQL 1.322 ms, MySQL 1.215 ms — **1.09x**, and both sit on the ~1 ms
+  device floor the standalone probe measured. AHL-560's 2.67 ms and 0.78 ms
+  are not barrier latencies; they are barrier *intervals*, and only MySQL's
+  is nearly the same thing.
+* **How many bytes does each engine's barrier flush?** MySQL: 2,306–2,420 B
+  of redo per barrier, measured as `Innodb_os_log_written` over
+  `Innodb_os_log_fsyncs` (605–745 B per commit). InlaySQL: ~40.3 KiB per
+  commit (20,229 B of WAL record plus 20,117 B of data-area pages, from
+  AHL-553's per-offset accounting) — at 3.7 commits per barrier, **~149 KiB
+  per barrier, about 63x MySQL's**. This is *not* where the time goes, and
+  §1's probe is why: the barrier is flat from 0 B to 1 MiB, so 63x the bytes
+  buys the same ~1 ms. Recorded because the deliverable asked for it and
+  because it is the number everyone reaches for first.
+* **Where does the missing half of InlaySQL's cycle go?** It accounts
+  completely: 1.322 (`fsync`) + 0.617 (adaptive gather spin) + 0.592
+  (inter-cycle gap) + 0.03 (post) = **2.561 ms against a measured 2.575 ms
+  interval — 99.5% of it.** The gather spin is `coalesce_normal_commits`'s
+  `COMMIT_COALESCE_STALL_YIELDS = 1500` window — deliberate, and it is what
+  buys the 3.7 commits per barrier. The gap is the dead time between a
+  `LeaderGuard` drop and the next leader's election: `notify_all` wakes every
+  follower, they all re-lock `flush`, most find their ticket already covered
+  and return, and one becomes the next leader. **No flush is in flight for
+  either segment.**
+* **Is any of it scheduling?** AHL-560 said "nothing in a connection thread's
+  scheduling can touch it." That is right about the *connection* threads —
+  AHL-560's own pre-gate residual of ~1% still stands, and this section does
+  not disturb it — and wrong about the coordinator. 1.209 ms of every 2.575
+  ms barrier cycle is the coordinator waiting for threads to be scheduled.
+
+**The same measurement at one connection, which isolates the two segments.**
+Six interleaved repetitions, 1,000 rows, same clients and volume:
+
+| engine | ops/s | interval ms | `fsync` ms | duty | gather ms | gap ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| MySQL (6 reps) | 765 / 1,627 / 1,794 / 1,551 / 1,760 / 1,529 | 0.549–1.266 | 0.450–1.139 | 81–90% | — | — |
+| InlaySQL (6 reps) | 750 / 726 / 1,396 / 1,279 / 1,367 / 1,206 | 0.716–1.378 | 0.524–1.157 | 73–84% | **0.000** | 0.165–0.190 |
+
+Three things worth saying about this table. The gather spin is **exactly
+zero** at one connection, which confirms `coalesce_normal_commits`'s solo
+fast path does what its doc comment claims — it returns before taking a
+single scheduler turn. The gap survives at 0.165–0.190 ms even with one
+writer, so it is a fixed per-cycle handoff cost that then more than triples
+under a cohort of eight. And **both engines' `fsync` fell together**, 1.14 →
+0.45 ms for MySQL
+and 1.10 → 0.52 ms for InlaySQL, between the first repetition pair and the
+rest, as the machine's load average fell from 4.6 to 2.1 — the single
+clearest piece of evidence that the barrier's cost is a property of the
+device and the moment, not of the engine, and the reason every number in this
+section is paired and interleaved rather than quoted from separate runs.
+
+**In-process, in-container, for the shape without a wire.** The concurrency
+suite's new `barrier cycle` line, on the same btrfs volume,
+`Durability::Full`, `--writers 8 --txns 150`, two independent invocations
+(both values given; the machine's barrier cost moved between them, which is
+the point of showing both rather than a mean):
+
+| writers | commits/barrier | `fsync` ms | interval ms | idle ms | **duty** |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1.00 / 1.00 | 1.087 / 0.791 | 1.172 / 0.874 | 0.085 / 0.083 | **93% / 91%** |
+| 2 | 1.78 / 1.60 | 1.458 / 1.055 | 1.606 / 1.200 | 0.148 / 0.145 | **91% / 88%** |
+| 4 | 3.33 / 2.80 | 1.027 / 2.083 | 1.468 / 2.542 | 0.440 / 0.460 | **70% / 82%** |
+| 8 | 5.61 / 5.75 | 1.116 / 0.987 | 1.996 / 1.965 | 0.880 / 0.978 | **56% / 50%** |
+
+The idle segment grows monotonically with concurrency in both runs — 0.08 ms
+solo, 0.15 ms at two, 0.44–0.46 ms at four, 0.88–0.98 ms at eight — and the
+duty cycle falls with it, to 50–56% at eight writers. That is the same shape
+and very nearly the same number the server shows, in a harness with no wire,
+no protocol and no session, which rules all three out as its cause. (The
+`fsync` mean here is charged over every barrier the file paid for, including
+the schema-creating handle's two checkpoint syncs, while `interval` divides
+the wall clock by the timed phase's own barriers; the two denominators differ
+by a couple of calls per run, which is why `idle` is quoted to two decimals
+and not three.)
+
+**And the barrier as a distribution, not a mean.** `commit_growth`'s `WRAP=1`
+mode now reports one, over 1,500 durable single-row commits on the same
+volume, two repetitions: **p10
+0.581 / 0.575, p50 1.009 / 0.958, p90 1.806 / 1.801, p99 2.859 / 2.881, max
+62.8 / 86.0 ms.** The mean (1.214 / 1.223 ms) sits well above the median
+because of that tail; a barrier is a ~1 ms syscall that occasionally is not,
+and reporting only the mean had been quietly folding the tail into the
+"cost."
+
+#### 3. What would have to change, priced
+
+The lever is the duty cycle, and it has a ceiling that can be computed from
+the table above rather than guessed. Hold `fsync` and commits-per-barrier
+fixed at their measured values and drive the two idle segments to zero: the
+interval goes 2.575 → 1.322 ms, the barrier rate goes 388 → 756/s, and
+throughput goes 1,392 → **~2,710 ops/s** against MySQL's measured median of
+3,066 — closing the gap from **2.20x to 1.13x**. Removing only the
+inter-cycle gap and leaving the gather window alone is the conservative half:
+2.575 → 1.983 ms, ~1,807 ops/s, **2.20x → 1.70x**. Both are ceilings on an
+idealisation, not forecasts; they are stated so the next item can be judged
+against a number instead of a hope.
+
+The change that would collect it is *pipelining the cycle*, not shortening
+it: elect the next leader and let it run its gather window **while the
+current `fsync` is still in flight**, and hand leadership directly to a
+waiting thread on `LeaderGuard::drop` instead of `notify_all` plus a
+re-election race. The one-flush-at-a-time invariant is preserved — only the
+election and the gather move — and `coalesce_normal_commits`'s own durability
+argument is untouched, because it still only ever *delays* the moment
+`make_durable_with_cohort` captures `target`. Two costs have to be measured
+before anyone believes the ceiling: writers gathered during an in-flight
+`fsync` pay the "18–23x slower `pwrite` racing a concurrent flush" penalty
+`coalesce_normal_commits`'s doc comment already names and prices, and a
+directed handoff has to not lose a wakeup. That is a durability-critical
+concurrency change and it is the next item, not this one.
+
+**Landed:** the `barrier cycle` line in `crates/inlaysql-bench/src/
+concurrency.rs`, the barrier-latency distribution in
+`crates/inlaysql-bench/src/bin/commit_growth.rs`, and this section. **No
+engine, coordinator, commit-path, device or server change.** `commit_barrier`
+still issues `File::sync_all()` for `Durability::Full` on every platform, for
+the reason measured in §1: on the filesystem this project benchmarks on,
+`fdatasync` is the same price.
+
+The read and batch shapes named in the gate cannot move, and the code
+argument is the load-bearing one: the diff is two `println!`s that run after
+every timed phase has ended, plus one `Mutex::push` per barrier inside
+`commit_growth`'s counting wrapper, which is off unless `WRAP=1` and lives in
+a separate binary. Nothing on a read path, a write path or the commit path
+was touched, and `points`/`indexed`/`joins` do not reference either changed
+file. They were run anyway, on the host, interleaved binary by binary with
+order flipped every repetition, three repetitions — and the result is worth
+recording as a fifth A/A sample for §4 rather than as evidence about this
+diff. Paired ratios, this branch over `a2788eb`:
+
+| shape | rep 1 | rep 2 | rep 3 | median |
+| --- | --- | --- | --- | --- |
+| point read | 0.60 | 0.95 | 1.29 | 0.95 |
+| batched write | 0.96 | 1.04 | 2.43 | 1.04 |
+| indexed point | 0.96 | 1.12 | 1.18 | 1.12 |
+| indexed range | 0.94 | 0.80 | 1.28 | 0.94 |
+| joins, `LIMIT` | 0.95 | 1.05 | 1.06 | 1.05 |
+
+The same *base* binary produced 621,099 / 1,718,188 / 888,297 point reads per
+second across its three repetitions — a **2.77x** spread on unchanged code,
+load 2.6–4.6 — so every ratio above is inside the noise by a wide margin, in
+both directions, with the sign flipping repetition to repetition. This is
+§4's floor showing up again, worse than the 20.4% it recorded, and it is the
+reason the container measurements in §2 are all paired and interleaved.
+
+This is the fourth negative recorded in this area (AHL-544's flat, AHL-547's
+0.90x, AHL-560's "already done", and this section's "not the syscall"), and
+it is the first one that names a mechanism with a number attached. The
+question three items have circled — *why is InlaySQL's barrier rate a third
+of MySQL's* — has an answer now, and it is not that the barrier is expensive.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness

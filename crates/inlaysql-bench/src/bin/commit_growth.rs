@@ -45,7 +45,7 @@
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use inlaysql::{CommitStats, Database, FileDevice, Value};
@@ -75,6 +75,11 @@ struct Counters {
     sync_ns: AtomicU64,
     commit_syncs: AtomicU64,
     commit_sync_ns: AtomicU64,
+    /// Every individual [`Device::sync_commit`] duration, in nanoseconds, so
+    /// the barrier can be reported as a distribution rather than a mean
+    /// (AHL-561). A mean hides whether a 2.7 ms average barrier is one
+    /// 2.7 ms syscall or a 0.9 ms syscall that sometimes waits.
+    commit_sync_samples: Mutex<Vec<u64>>,
 }
 
 impl Counters {
@@ -175,11 +180,14 @@ impl<D: Device> Device for Counting<D> {
     fn sync_commit(&mut self) -> Result<()> {
         let at = Instant::now();
         let out = self.inner.sync_commit();
+        let ns = at.elapsed().as_nanos() as u64;
         self.counters.add(&self.counters.commit_syncs, 1);
-        self.counters.add(
-            &self.counters.commit_sync_ns,
-            at.elapsed().as_nanos() as u64,
-        );
+        self.counters.add(&self.counters.commit_sync_ns, ns);
+        self.counters
+            .commit_sync_samples
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(ns);
         out
     }
 
@@ -645,6 +653,28 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     100.0 * device_ns as f64 / total_ns,
                     100.0 * (total_ns - device_ns as f64) / total_ns,
                 );
+                let mut barriers = c
+                    .commit_sync_samples
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if !barriers.is_empty() {
+                    barriers.sort_unstable();
+                    let at = |q: f64| {
+                        let i = ((barriers.len() - 1) as f64 * q).round() as usize;
+                        barriers[i] as f64 / 1e6
+                    };
+                    println!(
+                        "         barrier latency ({} calls): p10 {:.3} p50 {:.3} p90 {:.3} \
+                         p99 {:.3} max {:.3} ms",
+                        barriers.len(),
+                        at(0.10),
+                        at(0.50),
+                        at(0.90),
+                        at(0.99),
+                        at(1.00),
+                    );
+                }
             }
         }
     }
