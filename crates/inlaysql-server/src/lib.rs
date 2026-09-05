@@ -82,6 +82,14 @@ mod auth;
 mod connection;
 mod control;
 mod errors;
+// The private packet path, opened to `fuzz/`'s targets under a non-default
+// feature. Also compiled under `cfg(test)`, so an ordinary `cargo test` builds
+// and exercises the wrappers even with the feature off — `fuzz/` is a separate
+// workspace that `cargo check --workspace` does not reach, and a wrapper that
+// stopped compiling should not wait for the nightly campaign to say so.
+#[cfg(any(feature = "fuzzing", test))]
+#[doc(hidden)]
+pub mod fuzz;
 mod infoschema;
 mod metrics;
 mod mysqlddl;

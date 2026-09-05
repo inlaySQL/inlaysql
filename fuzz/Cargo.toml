@@ -10,6 +10,10 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 inlaysql-core = { path = "../crates/inlaysql-core" }
+# The `fuzzing` feature opens `inlaysql-server`'s private packet path — the
+# framing, the handshake and the parameter decoders — to the four `server_*`
+# targets. It is off in every other build; see the crate's `src/fuzz.rs`.
+inlaysql-server = { path = "../crates/inlaysql-server", features = ["fuzzing"] }
 arbitrary = { version = "1", features = ["derive"] }
 
 [[bin]]
@@ -36,6 +40,34 @@ bench = false
 [[bin]]
 name = "json_parser"
 path = "fuzz_targets/json_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_packet_frame"
+path = "fuzz_targets/server_packet_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_handshake"
+path = "fuzz_targets/server_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_stmt_params"
+path = "fuzz_targets/server_stmt_params.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_command"
+path = "fuzz_targets/server_command.rs"
 test = false
 doc = false
 bench = false

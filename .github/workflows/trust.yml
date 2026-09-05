@@ -34,9 +34,16 @@ jobs:
   fuzz:
     name: coverage-guided fuzzing
     runs-on: ubuntu-latest
-    # An hour of budget for four targets plus the toolchain. The per-target
-    # limit below is what actually bounds it; this is the backstop.
-    timeout-minutes: 60
+    # Ninety minutes of budget for eight targets plus the toolchain, and the
+    # arithmetic is why it is not sixty any more. Eight targets at the 300
+    # second budget below is forty minutes of fuzzing on its own; installing
+    # `cargo-fuzz` and building eight sanitizer-instrumented binaries — four of
+    # which now pull `inlaysql-server`, and with it `rustls` and `ring` — is
+    # most of another fifteen. Fifty-five against a sixty minute backstop is
+    # not a backstop, it is a coin flip, and a cancelled job buys no coverage
+    # at all. The per-target limit is what actually bounds the run; this is the
+    # thing that catches a target that stopped terminating.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
 
@@ -65,14 +72,33 @@ jobs:
       # named. A slow input is still a finding; it is now a finding that
       # reports in 25 seconds. `-rss_limit_mb` is pinned for the same reason:
       # so the budget is stated here rather than inherited.
+      #
+      # Note what `-rss_limit_mb` is *not*: it is not the allocation check. The
+      # four `server_*` targets count their own allocations with a global
+      # allocator and assert a bound on every input, because a process-level
+      # limit reports that the fuzzer died rather than that four bytes of
+      # header became sixteen mebibytes, and it names no input. See
+      # `fuzz/fuzz_targets/counted_alloc.rs`.
       - name: Fuzz every target
         run: |
           seconds="${{ github.event.inputs.fuzz_seconds || '300' }}"
           mkdir -p fuzz/status
           failed=0
-          for target in sql_parser storage row_codec json_parser; do
+          for target in sql_parser storage row_codec json_parser \
+                        server_packet_frame server_handshake \
+                        server_stmt_params server_command; do
             echo "::group::$target (${seconds}s)"
-            if cargo +nightly fuzz run "$target" -- \
+            # Two corpus directories, and only the first is written to.
+            # `fuzz/corpus/` is where libFuzzer puts what it discovers and is
+            # `.gitignore`d; `fuzz/seeds/` is the hand-written inputs that get
+            # a target past its first four bytes, and is committed. A target
+            # with no seeds simply has no second directory.
+            mkdir -p "fuzz/corpus/$target"
+            seeds=""
+            if [ -d "fuzz/seeds/$target" ]; then
+              seeds="fuzz/seeds/$target"
+            fi
+            if cargo +nightly fuzz run "$target" "fuzz/corpus/$target" $seeds -- \
                  -max_total_time="$seconds" -timeout=25 -rss_limit_mb=2048 \
                  > "fuzz/status/$target.log" 2>&1; then
               echo "$target: clean" >> fuzz/status/summary.txt

@@ -12,6 +12,13 @@ rust-version.workspace = true
 # (rustls, chrono, regex, nom, ...) for a protocol subset that is a few hundred
 # lines, which is the same trade `inlaysql-mcp` already refused when it
 # hand-rolled JSON-RPC rather than taking the Tokio-based MCP SDK.
+# `fuzzing` opens the private packet path to `fuzz/`'s targets and is off in
+# every normal build; see `src/fuzz.rs` for why it is a feature rather than a
+# widened public API. It adds no dependency and changes no behaviour — the one
+# thing it changes is that a module exists.
+[features]
+fuzzing = []
+
 [dependencies]
 inlaysql = { workspace = true }
 rustls = { workspace = true }

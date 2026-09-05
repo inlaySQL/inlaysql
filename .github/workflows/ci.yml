@@ -132,9 +132,19 @@ jobs:
           toolchain: nightly
 
       # The fuzzers themselves run in `trust.yml`, not on every pull request.
-      # What must not rot is the targets: a target that stopped compiling is a
-      # fuzzing gap nobody notices until the next campaign.
-      # `tests/fuzz_smoke.rs` covers the properties on stable in the main job.
+      # What must not rot is the targets: `fuzz/` is a separate cargo
+      # workspace, so `cargo check --workspace` never reaches it and a target
+      # that stopped compiling is a fuzzing gap nobody notices until the next
+      # campaign.
+      #
+      # Three layers cover that, and this job is only the outermost. The
+      # properties are asserted on stable in the `check` job above:
+      # `inlaysql-core/tests/fuzz_smoke.rs` for the first four targets, and
+      # `inlaysql-server`'s `src/fuzz` module — compiled under `cfg(test)` even
+      # though its `fuzzing` feature is off — for the four `server_*` ones,
+      # which also replays every committed seed in `fuzz/seeds/`. What is left
+      # for this job is the part that genuinely needs nightly and libFuzzer:
+      # that the `#![no_main]` target bodies themselves still build.
       - name: Check the targets compile
         run: cargo +nightly check --manifest-path fuzz/Cargo.toml --all-targets
 
