@@ -95,7 +95,7 @@ mod sqltext;
 pub mod tls;
 
 use std::io::{self, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -458,19 +458,54 @@ impl Default for ServerOptions {
     }
 }
 
-impl ServerOptions {
-    /// Whether the bind address is reachable from outside this machine.
-    ///
-    /// Used by the CLI to print a warning that names the risk, since the
-    /// connection is unencrypted.
-    pub fn is_public(&self) -> bool {
-        match self.bind.parse::<IpAddr>() {
-            Ok(address) => !address.is_loopback(),
-            // A host name that is not an IP literal cannot be assumed to be
-            // loopback.
-            Err(_) => !self.bind.eq_ignore_ascii_case("localhost"),
+/// Every address `(bind, port)` would actually listen on.
+///
+/// Resolution goes through [`ToSocketAddrs`] on the same tuple
+/// [`TcpListener::bind`] is given below, so the addresses judged here are
+/// exactly the addresses that would be bound — not a guess made from the
+/// string by a second, parallel parser.
+///
+/// A failure is reported rather than assumed either way: it is the same
+/// failure `TcpListener::bind` would produce one line later, and a name that
+/// does not resolve has no verdict to give.
+fn resolved(bind: &str, port: u16) -> Result<Vec<IpAddr>, String> {
+    let addresses: Vec<IpAddr> = (bind, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("cannot resolve --bind {bind}: {error}"))?
+        .map(|address| address.ip())
+        .collect();
+    if addresses.is_empty() {
+        return Err(format!("--bind {bind} resolves to no address at all"));
+    }
+    Ok(addresses)
+}
+
+/// Whether `address` is one only this machine can reach.
+fn is_loopback(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        // `Ipv6Addr::is_loopback()` is false for `::ffff:127.0.0.1`, which is
+        // a v4 loopback address written in v6: the packets never leave the
+        // host, so refusing that bind would be refusing loopback.
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
         }
     }
+}
+
+/// Whether binding `(bind, port)` puts this server where another machine can
+/// reach it.
+///
+/// `any`, not `all`: a name that resolves to a loopback address *and* a
+/// routable one is bound on both, and the routable one is the whole question.
+/// The wildcards `0.0.0.0` and `::` are deliberately not special-cased as
+/// "probably a container" — they are every interface, including whichever
+/// public one this host has, and that is the single most common way a database
+/// ends up on the internet by accident.
+fn reaches_the_network(bind: &str, port: u16) -> Result<bool, String> {
+    Ok(resolved(bind, port)?
+        .into_iter()
+        .any(|address| !is_loopback(address)))
 }
 
 /// A bound listener, ready to serve.
@@ -1025,7 +1060,10 @@ pub fn print_exposure_warning(options: &ServerOptions, out: &mut impl Write) -> 
              inlaysql:          Start with --tls-cert and --tls-key to encrypt it."
         )?,
     }
-    if options.is_public() {
+    // Unresolvable is treated as reaching the network: this is the warning
+    // path, `Server::bind` is where an address that cannot be resolved is
+    // reported as an error, and a warning is the wrong place to swallow one.
+    if reaches_the_network(&options.bind, options.port).unwrap_or(true) {
         writeln!(
             out,
             "inlaysql: WARNING: bound to {}, which is reachable from other machines. Every \n\
@@ -1084,25 +1122,65 @@ mod tests {
     fn the_default_bind_is_loopback() {
         let options = ServerOptions::default();
         assert_eq!(options.bind, "127.0.0.1");
-        assert!(!options.is_public());
+        assert!(!reaches_the_network(&options.bind, options.port).unwrap());
     }
 
+    /// The table from the F3 brief, and it is the specification: this
+    /// predicate decides whether the process starts, so every row of it is
+    /// pinned rather than inferred from a string comparison.
+    ///
+    /// No name but `localhost` appears here on purpose. Resolution is real
+    /// resolution now, and a test that needs a DNS server is a test that fails
+    /// on a machine with no network for a reason that has nothing to do with
+    /// the thing it asserts.
     #[test]
-    fn a_public_bind_is_recognised_as_public() {
-        for address in ["0.0.0.0", "192.168.1.10", "::", "example.com"] {
-            let options = ServerOptions {
-                bind: address.to_string(),
-                ..ServerOptions::default()
-            };
-            assert!(options.is_public(), "{address} should count as public");
+    fn what_reaches_the_network_is_judged_from_every_resolved_address() {
+        for address in [
+            // The wildcards are every interface, including whichever public
+            // one this host has. Not special-cased as "probably a container".
+            "0.0.0.0",
+            "::",
+            // Private, but reachable — from other machines on that segment,
+            // which is what this predicate is about.
+            "192.168.1.10",
+            "10.0.0.5",
+            "fd00::1",
+            // Routable.
+            "203.0.113.7",
+            "2001:db8::1",
+        ] {
+            assert!(
+                reaches_the_network(address, 0).unwrap(),
+                "{address} reaches other machines"
+            );
         }
-        for address in ["127.0.0.1", "::1", "localhost"] {
-            let options = ServerOptions {
-                bind: address.to_string(),
-                ..ServerOptions::default()
-            };
-            assert!(!options.is_public(), "{address} should count as loopback");
+        for address in [
+            "127.0.0.1",
+            "127.0.0.2",
+            "::1",
+            // A v4 loopback address written in v6. `Ipv6Addr::is_loopback()`
+            // says false for it; the packets still never leave this host.
+            "::ffff:127.0.0.1",
+            // Judged by the resolver, not assumed by its spelling.
+            "localhost",
+        ] {
+            assert!(
+                !reaches_the_network(address, 0).unwrap(),
+                "{address} is this machine only"
+            );
         }
+    }
+
+    /// A name that does not resolve has no verdict to give, so it is reported
+    /// rather than guessed at in either direction — the same failure
+    /// `TcpListener::bind` would produce one line later.
+    #[test]
+    fn an_address_that_does_not_resolve_is_an_error_and_not_a_verdict() {
+        let outcome = reaches_the_network("no-such-host.invalid", 0);
+        let Err(message) = outcome else {
+            panic!("an unresolvable name must not be answered with a verdict");
+        };
+        assert!(message.contains("no-such-host.invalid"), "{message}");
     }
 
     /// Both defaults that a running server's behaviour depends on, pinned:
