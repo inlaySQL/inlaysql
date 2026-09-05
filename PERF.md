@@ -6988,6 +6988,17 @@ measured from both ends, the barrier is at parity and the idle half is
 demand, so the next item in this area is about the reservation gate or it is
 about nothing.
 
+**Gates.** `fmt`; `clippy --release --workspace --all-targets -D warnings`;
+`cargo test --release --workspace`; `RUSTDOCFLAGS="-D warnings" cargo doc
+--workspace --no-deps --document-private-items`; `cargo check -p inlaysql-wasm
+--target wasm32-unknown-unknown`; and all five DST sweeps — `dst_sweep`,
+`free_list_reuse_dst`, `backup_dst`, `durability_dst`, `index_recovery_dst`,
+each `-- --ignored`. `index_recovery_dst` and `concurrent_writers` were run a
+second time **with `INLAYSQL_FLUSH_PIPELINE=1`**, because they are the two
+that drive a real `FileDevice` and therefore the only ones that reach this
+coordinator at all; the four `inlaysql-core` sweeps run on the in-memory
+environment and cannot.
+
 **Landed:** the pipeline in `crates/inlaysql/src/device.rs` behind
 `INLAYSQL_FLUSH_PIPELINE` (default off), its tests,
 `bench/flush_duty_cycle.sh`, two counters
