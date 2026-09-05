@@ -374,6 +374,46 @@ fn inlaysql_writers(
             stats.normal_tickets_flushed as f64 / (stats.normal_flushes.max(1)) as f64,
         );
     }
+    // AHL-560: where a writer thread's own time goes, split into the same
+    // buckets AHL-555's `Inlaysql_thread_*` status counters split a server
+    // connection into — printed here so the decomposition can be reproduced
+    // in process, without a wire and without Docker, on a machine too loaded
+    // for the external driver to give a trustworthy throughput number.
+    //
+    // `busy` is the sum of every *successful* commit's own latency across
+    // every writer (the suite's own `samples`), so the residual below —
+    // `busy` minus every commit-machinery bucket — is exactly the work a
+    // write statement does **outside** the reservation gate: parse, plan,
+    // validate, build the row, apply it to the tree. It is an upper bound on
+    // the server's own residual, because this suite calls `Database::execute`
+    // and so re-parses the statement on every iteration where the server runs
+    // a prepared one.
+    if let Some(stats) = keeper.commit_stats() {
+        let busy: u64 = samples.iter().map(|d| d.as_nanos() as u64).sum();
+        let share = |ns: u64| 100.0 * ns as f64 / (busy.max(1)) as f64;
+        let accounted = stats.gate_wait_ns
+            + stats.gate_hold_ns
+            + stats.follower_wait_ns
+            + stats.gather_spin_ns
+            + stats.fsync_ns
+            + stats.post_ns;
+        println!(
+            "  buckets: {writers} writers, busy {:.1} ms over {committed} commits — \
+             gate_wait {:.1}%, gate_hold {:.1}%, follower_wait {:.1}%, gather_spin {:.1}%, \
+             fsync {:.1}%, post {:.1}%, pre-gate residual {:.1}% \
+             ({} gate waits, {} racing holds)",
+            busy as f64 / 1e6,
+            share(stats.gate_wait_ns),
+            share(stats.gate_hold_ns),
+            share(stats.follower_wait_ns),
+            share(stats.gather_spin_ns),
+            share(stats.fsync_ns),
+            share(stats.post_ns),
+            100.0 - share(accounted),
+            stats.gate_waits,
+            stats.gate_hold_racing_count,
+        );
+    }
     drop(keeper);
     let _ = std::fs::remove_file(path);
     Ok(Outcome {
