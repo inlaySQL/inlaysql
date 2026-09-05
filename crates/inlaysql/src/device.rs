@@ -2397,6 +2397,19 @@ impl Device for FileDevice {
         }
     }
 
+    /// v6 unless `INLAYSQL_WHOLE_PAGE_WAL_RECORD` asks for v5 — see
+    /// [`whole_page_wal_record`] and
+    /// [`inlaysql_core::wal::HOLE_ELIDED_FORMAT_VERSION`]. Creation only: a
+    /// database that already exists keeps the version its header carries, so
+    /// setting this cannot change how an existing file is read or written.
+    fn create_format_version(&self) -> u32 {
+        if whole_page_wal_record() {
+            inlaysql_core::wal::MULTI_REGION_FORMAT_VERSION
+        } else {
+            inlaysql_core::btree::FORMAT_VERSION
+        }
+    }
+
     fn wal_region(&self) -> usize {
         self.wal_region
     }
@@ -2823,6 +2836,17 @@ fn gate_phases_enabled() -> bool {
 fn wide_wrap_forget() -> bool {
     static WIDE: OnceLock<bool> = OnceLock::new();
     *WIDE.get_or_init(|| std::env::var_os("INLAYSQL_WIDE_WRAP_FORGET").is_some_and(|v| v != "0"))
+}
+
+/// AHL-564's A/B switch: create new databases in the v5 format, whose commit
+/// records copy whole page images, instead of v6's hole-eliding one. Read once
+/// per process, like [`wide_wrap_forget`], and consulted only when a file is
+/// *created* — an existing database always keeps the version in its header.
+fn whole_page_wal_record() -> bool {
+    static WHOLE: OnceLock<bool> = OnceLock::new();
+    *WHOLE.get_or_init(|| {
+        std::env::var_os("INLAYSQL_WHOLE_PAGE_WAL_RECORD").is_some_and(|v| v != "0")
+    })
 }
 
 fn shared_read_cache_budget() -> usize {
@@ -3968,6 +3992,116 @@ mod group_commit_tests {
     /// gets a test instead of a sentence. Removing that branch fails this on
     /// the first injected failure.
     ///
+    /// Every write of an ordinary v6 commit, broken in turn, and every row
+    /// acknowledged before it still readable from a cold handle (AHL-564).
+    ///
+    /// Format version 6 changed what a commit record's page entries contain,
+    /// and `docs/recovery.md` is a contract about what survives a crash at any
+    /// point in a commit's write sequence. The sequence itself did not change
+    /// — the same dirty pages to the same offsets, then one record append —
+    /// but the bytes of that append did, and "the write sequence is the same
+    /// shape" is exactly the kind of claim that is true right up until it is
+    /// not. `a_wrap_that_fails_at_any_write_forgets_the_whole_cache` above
+    /// walks the *wrapping* commit's writes; this walks an ordinary one's, in
+    /// the steady state where almost every commit lives.
+    ///
+    /// What it asserts, for each injection point: the failure is reported
+    /// rather than swallowed, nothing the failed commit wanted is visible, and
+    /// every row committed before it survives a reopen. It counts the
+    /// injections it actually made against the writes the commit performs, so
+    /// a version that quietly stopped writing something cannot pass by simply
+    /// succeeding.
+    #[test]
+    fn an_ordinary_commit_survives_a_failure_at_every_one_of_its_writes() {
+        use inlaysql_core::btree::{CowBTree, DEFAULT_PAGE_SIZE};
+
+        // Wide enough to dirty a root-to-leaf path and leave a real hole in
+        // every page, which is the shape the v6 entry encodes.
+        let value = vec![0x5Au8; DEFAULT_PAGE_SIZE / 8];
+        // Far enough in to be past the first splits and well short of a wrap.
+        const BEFORE: u32 = 40;
+
+        // Pass one: how many writes does the commit at `BEFORE` issue?
+        let probe_path = scratch_path("ordinary-failure-probe");
+        let _ = std::fs::remove_file(&probe_path);
+        let probe = FileDevice::open(&probe_path).expect("open probe");
+        let coordinator = Arc::clone(probe.coordinator.as_ref().expect("coordinator"));
+        let probe = FailNthWrite::new(probe, std::rc::Rc::new(std::cell::Cell::new(false)));
+        let mut tree = CowBTree::open_or_create(probe, DEFAULT_PAGE_SIZE).expect("create");
+        for i in 0..BEFORE {
+            tree.put(&i.to_be_bytes(), &value).expect("put");
+            tree.commit().expect("commit");
+        }
+        let before_writes = tree.device().writes();
+        tree.put(&BEFORE.to_be_bytes(), &value).expect("put");
+        tree.commit().expect("commit");
+        let writes_in_commit = tree.device().writes() - before_writes;
+        assert_eq!(
+            coordinator.gate_state_writes.load(Ordering::Relaxed),
+            0,
+            "this has to be an ordinary commit, not a wrapping one"
+        );
+        drop(tree);
+        drop(coordinator);
+        let _ = std::fs::remove_file(&probe_path);
+        assert!(
+            writes_in_commit >= 2,
+            "a commit writes at least one dirty page and its record"
+        );
+
+        let mut injections = 0usize;
+        for fail_at in 0..writes_in_commit {
+            let path = scratch_path(&format!("ordinary-failure-{fail_at}"));
+            let _ = std::fs::remove_file(&path);
+            let inner = FileDevice::open(&path).expect("open");
+            let failed = std::rc::Rc::new(std::cell::Cell::new(false));
+            let device = FailNthWrite::new(inner, std::rc::Rc::clone(&failed));
+            let mut tree = CowBTree::open_or_create(device, DEFAULT_PAGE_SIZE).expect("create");
+            for i in 0..BEFORE {
+                tree.put(&i.to_be_bytes(), &value).expect("put");
+                tree.commit().expect("commit");
+            }
+
+            tree.device().arm(fail_at);
+            tree.put(&BEFORE.to_be_bytes(), &value).expect("put");
+            let outcome = tree.commit();
+            if failed.get() {
+                injections += 1;
+                assert!(
+                    outcome.is_err(),
+                    "an injected write failure has to be reported, not swallowed \
+                     (fail_at={fail_at})"
+                );
+            }
+            drop(tree);
+
+            let reader = FileDevice::open(&path).expect("reopen");
+            let check = CowBTree::open_or_create(reader, DEFAULT_PAGE_SIZE).expect("reopen tree");
+            for i in 0..BEFORE {
+                assert_eq!(
+                    check.get(&i.to_be_bytes()).expect("get").as_deref(),
+                    Some(&value[..]),
+                    "row {i} was acknowledged before the injected failure \
+                     (fail_at={fail_at})"
+                );
+            }
+            if failed.get() {
+                assert_eq!(
+                    check.get(&BEFORE.to_be_bytes()).expect("get"),
+                    None,
+                    "the commit that failed at write {fail_at} must not be visible"
+                );
+            }
+            drop(check);
+            let _ = std::fs::remove_file(&path);
+        }
+        assert_eq!(
+            injections, writes_in_commit,
+            "every write the commit issues has to have been broken in turn, or this \
+             test is asserting about commits that simply succeeded"
+        );
+    }
+
     /// The injection walks every write of the wrapping commit: the state
     /// block, the megabyte of zeros, each dirty page, and the record append.
     #[test]

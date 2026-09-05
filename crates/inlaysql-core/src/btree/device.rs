@@ -668,6 +668,27 @@ pub trait Device {
     /// the shipped commit path pays one relaxed atomic load per boundary.
     fn gate_phase(&self, _phase: u32) {}
 
+    /// The format version a *new* database on this device is stamped with.
+    ///
+    /// The default is the newest this build writes, and every device but one
+    /// takes it. It exists so a benchmark can run both sides of a format
+    /// change as one binary one environment variable apart — the shape
+    /// `Device::forget_append_offset` already has — rather than as two
+    /// builds, which is the difference between a paired measurement and a
+    /// pair of measurements. `FileDevice` overrides it when
+    /// `INLAYSQL_WHOLE_PAGE_WAL_RECORD` is set, stamping
+    /// [`crate::wal::MULTI_REGION_FORMAT_VERSION`] so the file's records copy
+    /// whole pages the way v5 did.
+    ///
+    /// It cannot make a file unreadable: the version is written into the
+    /// header, every read path already dispatches on it, and a version this
+    /// build does not know is refused at `parse_header` rather than guessed
+    /// at. An existing database is untouched either way — it keeps the
+    /// version it was created with.
+    fn create_format_version(&self) -> u32 {
+        crate::btree::FORMAT_VERSION
+    }
+
     /// The WAL region assigned to this device handle.
     ///
     /// Single-region and simulation devices use region zero. Native file
@@ -939,6 +960,10 @@ impl<T: Device> Device for Rc<RefCell<T>> {
 
     fn forget_append_offset(&self, region: usize) {
         self.borrow().forget_append_offset(region);
+    }
+
+    fn create_format_version(&self) -> u32 {
+        self.borrow().create_format_version()
     }
 
     fn wal_region(&self) -> usize {

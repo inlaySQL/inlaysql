@@ -65,6 +65,42 @@ pub const WAL_REGIONS: usize = 4;
 /// First format version whose layout contains multiple WAL regions.
 pub const MULTI_REGION_FORMAT_VERSION: u32 = 5;
 
+/// First format version whose commit-record page entries elide the zero hole
+/// a page carries between its slot directory and its packed cells.
+///
+/// # Why (AHL-564)
+///
+/// A commit record copies **whole pages** — that is what makes it
+/// self-contained, and `docs/recovery.md` explains why the copies cannot be
+/// dropped. But a page is a fixed-size block with a hole in the middle:
+/// `page::PageWriter` starts from a zeroed block, grows the slot directory
+/// forward from the header and packs the cells backwards from the end, and
+/// never writes what is left between them. Measured on a steady-state
+/// single-row `INSERT` (`inlaysql-bench --bin record_anatomy`), **73% of a
+/// 20,747-byte record is that hole** — including two metadata leaves that
+/// spend 4,096 bytes each to carry 45 and 79 bytes of counter.
+///
+/// So a v6 page entry stores the bytes on either side of the longest run of
+/// zeros in the image and names the run, and the decoder puts the zeros back.
+/// **The record still carries the page's exact image** — this is the same
+/// physical logging it always was, one encoding tighter — so nothing about
+/// what recovery may assume changes: it never has to know a page's prior
+/// state, and a v6 record rebuilds a torn page byte-for-byte exactly as a v5
+/// one did. That is the whole reason this is a re-encoding rather than the
+/// physiological record `docs/recovery.md` prices and does not take.
+pub const HOLE_ELIDED_FORMAT_VERSION: u32 = 6;
+
+/// The largest page image a v6 entry may claim to reconstruct.
+///
+/// Belt and braces behind the checksum, which [`decode_record_for_version`]
+/// verifies before it parses a single page entry. A page image cannot exceed
+/// the record that carries it, and a record cannot exceed one WAL region
+/// ([`max_record_len`]) — one mebibyte at the default page size. A checksum
+/// collision that also flipped a hole length is not a thing anyone has seen,
+/// but the cost of the bound is one comparison and the cost of not having it
+/// is a four-gigabyte allocation on a corrupt file.
+const MAX_PAGE_IMAGE_LEN: usize = 1 << 20;
+
 /// Number of WAL regions present in `format_version`.
 pub fn region_count(format_version: u32) -> usize {
     if format_version >= MULTI_REGION_FORMAT_VERSION {
@@ -150,6 +186,9 @@ pub struct WalRecord {
 }
 
 // V5 layout: [len][seq][prev_seq][prev_root][root][next][count][pages...][crc]
+// A v5 page entry is [id u64][len u32][bytes]; a v6 one is
+// [id u64][stored u32][hole_at u32][hole_len u32][bytes], and the image it
+// names is `bytes[..hole_at] ++ 0 * hole_len ++ bytes[hole_at..]`.
 const R_LEN: usize = 0;
 const R_SEQ: usize = 4;
 const R_PREV_SEQ: usize = 12;
@@ -244,10 +283,20 @@ where
     push_u64(out, meta.root);
     push_u64(out, meta.next);
     push_u32(out, pages.len() as u32);
+    let elide = format_version >= HOLE_ELIDED_FORMAT_VERSION;
     for (id, bytes) in pages {
         push_u64(out, id);
-        push_u32(out, bytes.len() as u32);
-        out.extend_from_slice(bytes);
+        if elide {
+            let (hole_at, hole_len) = longest_zero_run(bytes);
+            push_u32(out, (bytes.len() - hole_len) as u32);
+            push_u32(out, hole_at as u32);
+            push_u32(out, hole_len as u32);
+            out.extend_from_slice(&bytes[..hole_at]);
+            out.extend_from_slice(&bytes[hole_at + hole_len..]);
+        } else {
+            push_u32(out, bytes.len() as u32);
+            out.extend_from_slice(bytes);
+        }
     }
     let total = (out.len() - start + 8) as u32;
     out[start + R_LEN..start + R_LEN + 4].copy_from_slice(&total.to_le_bytes());
@@ -255,8 +304,72 @@ where
     push_u64(out, checksum);
 }
 
-/// Encode a commit record into its on-disk form.
+/// The longest run of zero bytes in `bytes`, as `(start, len)`.
+///
+/// This is the whole of what a v6 page entry elides, and it is deliberately
+/// *not* derived from the page header: `wal` knows nothing about page layout,
+/// and a rule read out of `page.rs` ("the hole runs from the end of the slot
+/// directory to `free_start`") would be a durability-path dependency on
+/// another module's invariant. Scanning finds the same run on a leaf or an
+/// internal node, finds an overflow page's trailing padding, and is correct by
+/// construction on a page shape that does not exist yet.
+///
+/// `position` over a byte slice vectorises, so this reads the page at memory
+/// speed — against the fifteen kilobytes per commit of `memcpy` it removes.
+fn longest_zero_run(bytes: &[u8]) -> (usize, usize) {
+    let (mut best_at, mut best_len) = (0usize, 0usize);
+    let mut at = 0usize;
+    while at < bytes.len() {
+        let Some(offset) = bytes[at..].iter().position(|b| *b == 0) else {
+            break;
+        };
+        let start = at + offset;
+        let len = bytes[start..]
+            .iter()
+            .position(|b| *b != 0)
+            .unwrap_or(bytes.len() - start);
+        if len > best_len {
+            best_at = start;
+            best_len = len;
+        }
+        at = start + len;
+    }
+    (best_at, best_len)
+}
+
+/// How many bytes a page entry's fixed header costs in `format_version`.
+///
+/// v5 spends the page id and one length; v6 spends the page id, the stored
+/// length and the two numbers that name the elided run.
+pub fn page_entry_header_len(format_version: u32) -> usize {
+    if format_version >= HOLE_ELIDED_FORMAT_VERSION {
+        20
+    } else {
+        12
+    }
+}
+
+/// Exactly what `bytes` will occupy as one page entry of `format_version`,
+/// header included — the answer [`crate::btree::CowBTree::pending_record_len`]
+/// needs to stay exact rather than merely safe.
+pub fn page_entry_len(format_version: u32, bytes: &[u8]) -> usize {
+    let hole = if format_version >= HOLE_ELIDED_FORMAT_VERSION {
+        longest_zero_run(bytes).1
+    } else {
+        0
+    };
+    page_entry_header_len(format_version) + bytes.len() - hole
+}
+
+/// Encode a commit record into its on-disk form, in the newest layout.
 pub fn encode_record(record: &WalRecord) -> Vec<u8> {
+    encode_owned(record, HOLE_ELIDED_FORMAT_VERSION)
+}
+
+/// Encode a commit record using the v5 layout, whose page entries copy the
+/// whole page image. A v5 database keeps being written as a v5 database, so
+/// this is a live path and not only a test fixture.
+pub fn encode_multi_region_record(record: &WalRecord) -> Vec<u8> {
     encode_owned(record, MULTI_REGION_FORMAT_VERSION)
 }
 
@@ -285,7 +398,7 @@ fn encode_owned(record: &WalRecord, format_version: u32) -> Vec<u8> {
 /// Decode a commit record. Returns `None` for an empty slot, a torn/corrupt
 /// record, or a record whose length or checksum does not check out.
 pub fn decode_record(bytes: &[u8]) -> Option<WalRecord> {
-    decode_record_for_version(bytes, MULTI_REGION_FORMAT_VERSION)
+    decode_record_for_version(bytes, HOLE_ELIDED_FORMAT_VERSION)
 }
 
 /// Decode a commit record according to its file format.
@@ -325,20 +438,39 @@ pub fn decode_record_for_version(bytes: &[u8], format_version: u32) -> Option<Wa
     let next = read_u64(bytes, next_offset);
     let count = read_u32(bytes, count_offset) as usize;
 
+    let elide = format_version >= HOLE_ELIDED_FORMAT_VERSION;
+    let entry_header = if elide { 20 } else { 12 };
     let mut pages = Vec::with_capacity(count.min(1024));
     let mut offset = pages_offset;
     for _ in 0..count {
-        if offset + 12 > checksum_offset {
+        if offset + entry_header > checksum_offset {
             return None;
         }
         let id = read_u64(bytes, offset);
-        let len = read_u32(bytes, offset + 8) as usize;
-        offset += 12;
-        if offset + len > checksum_offset {
+        let stored = read_u32(bytes, offset + 8) as usize;
+        // A v5 entry has no hole: `hole_len` of zero makes the reconstruction
+        // below a plain copy, which is what it always was.
+        let (hole_at, hole_len) = if elide {
+            (
+                read_u32(bytes, offset + 12) as usize,
+                read_u32(bytes, offset + 16) as usize,
+            )
+        } else {
+            (stored, 0)
+        };
+        offset += entry_header;
+        if offset + stored > checksum_offset
+            || hole_at > stored
+            || stored + hole_len > MAX_PAGE_IMAGE_LEN
+        {
             return None;
         }
-        pages.push((id, bytes[offset..offset + len].to_vec()));
-        offset += len;
+        let mut image = Vec::with_capacity(stored + hole_len);
+        image.extend_from_slice(&bytes[offset..offset + hole_at]);
+        image.resize(hole_at + hole_len, 0);
+        image.extend_from_slice(&bytes[offset + hole_at..offset + stored]);
+        pages.push((id, image));
+        offset += stored;
     }
     if offset != checksum_offset {
         return None;
@@ -510,7 +642,11 @@ mod tests {
                     MULTI_REGION_FORMAT_VERSION - 1,
                     encode_legacy_record(&original),
                 ),
-                (MULTI_REGION_FORMAT_VERSION, encode_record(&original)),
+                (
+                    MULTI_REGION_FORMAT_VERSION,
+                    encode_multi_region_record(&original),
+                ),
+                (HOLE_ELIDED_FORMAT_VERSION, encode_record(&original)),
             ] {
                 let mut borrowed = Vec::new();
                 encode_record_into(
@@ -554,7 +690,7 @@ mod tests {
         for original in [&big, &small, &big, &small] {
             encode_record_into(
                 &mut buf,
-                MULTI_REGION_FORMAT_VERSION,
+                HOLE_ELIDED_FORMAT_VERSION,
                 RecordMeta {
                     seq: original.seq,
                     prev_seq: original.prev_seq,
@@ -566,6 +702,212 @@ mod tests {
             );
             assert_eq!(buf, encode_record(original));
             assert_eq!(decode_record(&buf).as_ref(), Some(original));
+        }
+    }
+
+    /// Every v6 page entry has to rebuild the image that went into it. That is
+    /// the whole safety argument: the record is still a *physical* copy of the
+    /// page, one encoding tighter, so nothing about what recovery may assume
+    /// moves (`docs/recovery.md`). The shapes are the ones where an off-by-one
+    /// in `longest_zero_run` or in the reconstruction would hide — no zeros at
+    /// all, all zeros, a run at the very start, a run running to the very end,
+    /// the ordinary middle hole a `page::PageWriter` leaves, two runs of equal
+    /// length (only one may be elided), an empty image, and the one-byte
+    /// cases.
+    #[test]
+    fn a_v6_page_entry_rebuilds_the_page_byte_for_byte() {
+        let mut middle_hole = vec![7u8; 4096];
+        middle_hole[24..3800].fill(0);
+        let mut two_equal_runs = vec![1u8; 64];
+        two_equal_runs[8..16].fill(0);
+        two_equal_runs[40..48].fill(0);
+        let mut leading = vec![0u8; 4096];
+        leading[4000..].fill(3);
+        let mut trailing = vec![9u8; 4096];
+        trailing[100..].fill(0);
+        let shapes: Vec<Vec<u8>> = vec![
+            vec![0xAB; 4096],
+            vec![0u8; 4096],
+            leading,
+            trailing,
+            middle_hole,
+            two_equal_runs,
+            Vec::new(),
+            vec![0u8],
+            vec![5u8],
+        ];
+        for (i, page) in shapes.iter().enumerate() {
+            let original = WalRecord {
+                seq: 11,
+                prev_seq: 10,
+                prev_root: 3,
+                root: 4,
+                next: 5,
+                // Twice, so a wrong `stored` length misaligns the second entry
+                // rather than merely truncating the record.
+                pages: vec![(1, page.clone()), (2, page.clone())],
+            };
+            assert_eq!(
+                decode_record(&encode_record(&original)).as_ref(),
+                Some(&original),
+                "shape {i} did not round trip"
+            );
+        }
+    }
+
+    /// The elision is worth having, and this is the number that says so:
+    /// AHL-564 measured a real single-row `INSERT` at 20,747 B of v5 record
+    /// against 5,725 B of v6, and the mechanism is that a leaf is about half
+    /// hole. A record built from half-empty pages must actually shrink — a v6
+    /// encoder that quietly fell back to copying whole pages would pass every
+    /// round-trip test above and buy nothing.
+    #[test]
+    fn a_half_empty_page_costs_about_half_a_page() {
+        let mut page = vec![0u8; 4096];
+        page[..32].fill(1);
+        page[2048..].fill(2);
+        let record = WalRecord {
+            seq: 1,
+            prev_seq: 0,
+            prev_root: 0,
+            root: 1,
+            next: 2,
+            pages: vec![(1, page.clone()), (2, page.clone()), (3, page)],
+        };
+        let v5 = encode_multi_region_record(&record).len();
+        let v6 = encode_record(&record).len();
+        assert!(
+            v6 * 10 < v5 * 6,
+            "a page that is half hole has to cost about half a page: v5 {v5}, v6 {v6}"
+        );
+        // And the decode is still the same record, from the smaller bytes.
+        assert_eq!(decode_record(&encode_record(&record)), Some(record));
+    }
+
+    /// A v5 database keeps being written and read as a v5 database — the
+    /// version lives in the file header and every codec path dispatches on it
+    /// — so the two layouts have to stay separable. Encoding as one and
+    /// decoding as the other must not quietly produce a *different* record:
+    /// the entry headers are different widths, so the page bytes land
+    /// somewhere else and the trailing-offset check rejects it.
+    #[test]
+    fn the_two_page_entry_layouts_do_not_decode_as_each_other() {
+        let mut page = vec![4u8; 512];
+        page[16..400].fill(0);
+        let record = WalRecord {
+            seq: 3,
+            prev_seq: 2,
+            prev_root: 1,
+            root: 9,
+            next: 10,
+            pages: vec![(7, page)],
+        };
+        let v5 = encode_multi_region_record(&record);
+        let v6 = encode_record(&record);
+        assert_ne!(v5, v6, "the two layouts have to differ or there is no v6");
+        assert_eq!(
+            decode_record_for_version(&v5, MULTI_REGION_FORMAT_VERSION).as_ref(),
+            Some(&record)
+        );
+        assert_eq!(
+            decode_record_for_version(&v6, HOLE_ELIDED_FORMAT_VERSION).as_ref(),
+            Some(&record)
+        );
+        for cross in [
+            decode_record_for_version(&v5, HOLE_ELIDED_FORMAT_VERSION),
+            decode_record_for_version(&v6, MULTI_REGION_FORMAT_VERSION),
+        ] {
+            assert_ne!(
+                cross.as_ref(),
+                Some(&record),
+                "a record read in the wrong layout must not come back looking right"
+            );
+        }
+    }
+
+    /// [`decode_record_for_version`] validates the checksum before it parses a
+    /// single page entry, so a hole length large enough to matter cannot be
+    /// reached on a file. [`MAX_PAGE_IMAGE_LEN`] is the belt behind that
+    /// brace, and it is here because the failure mode it prevents — a
+    /// four-gigabyte `Vec::with_capacity` driven by four corrupt bytes — is
+    /// not one anybody wants to discover from a bug report. The checksum is
+    /// recomputed so the record is *valid* and only the hole length is absurd.
+    #[test]
+    fn an_absurd_hole_length_is_refused_rather_than_allocated() {
+        let record = WalRecord {
+            seq: 2,
+            prev_seq: 1,
+            prev_root: 0,
+            root: 5,
+            next: 6,
+            pages: vec![(1, vec![0u8; 128])],
+        };
+        let mut bytes = encode_record(&record);
+        assert_eq!(decode_record(&bytes).as_ref(), Some(&record));
+        // `[len][seq][prev_seq][prev_root][root][next][count]` then the entry:
+        // id u64, stored u32, hole_at u32, hole_len u32.
+        let hole_len_at = R_PAGES + 8 + 4 + 4;
+        bytes[hole_len_at..hole_len_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let checksum_offset = bytes.len() - 8;
+        let checksum = crate::checksum::fnv1a(&bytes[..checksum_offset]);
+        bytes[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
+        assert_eq!(
+            decode_record(&bytes),
+            None,
+            "a page image larger than a whole WAL region is not a page image"
+        );
+    }
+
+    /// `hole_at` names an offset inside the *stored* bytes. One past their end
+    /// is out of bounds, and a decoder that sliced first would panic on a
+    /// corrupt file rather than reject it.
+    #[test]
+    fn a_hole_offset_past_the_stored_bytes_is_refused() {
+        let record = WalRecord {
+            seq: 2,
+            prev_seq: 1,
+            prev_root: 0,
+            root: 5,
+            next: 6,
+            pages: vec![(1, vec![1u8; 64])],
+        };
+        let mut bytes = encode_record(&record);
+        let hole_at = R_PAGES + 8 + 4;
+        bytes[hole_at..hole_at + 4].copy_from_slice(&999u32.to_le_bytes());
+        let checksum_offset = bytes.len() - 8;
+        let checksum = crate::checksum::fnv1a(&bytes[..checksum_offset]);
+        bytes[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
+        assert_eq!(decode_record(&bytes), None);
+    }
+
+    /// [`page_entry_len`] is what `CowBTree::pending_record_len` budgets a
+    /// commit against, and a budget that disagrees with the encoder is either
+    /// a transaction refused that would have fitted or — the one that matters
+    /// — a record that overruns its region. So it is checked against the
+    /// encoder rather than against arithmetic: the difference between a
+    /// record with one page and the same record without it *is* that page's
+    /// entry.
+    #[test]
+    fn the_entry_length_is_what_the_encoder_writes() {
+        let mut page = vec![6u8; 4096];
+        page[40..3000].fill(0);
+        for version in [MULTI_REGION_FORMAT_VERSION, HOLE_ELIDED_FORMAT_VERSION] {
+            let meta = RecordMeta {
+                seq: 1,
+                prev_seq: 0,
+                prev_root: 0,
+                root: 1,
+                next: 2,
+            };
+            let mut empty = Vec::new();
+            encode_record_into(&mut empty, version, meta, core::iter::empty());
+            let mut one = Vec::new();
+            encode_record_into(&mut one, version, meta, core::iter::once((3u64, &page[..])));
+            assert_eq!(
+                one.len() - empty.len(),
+                page_entry_len(version, &page),
+                "format {version}"
+            );
         }
     }
 

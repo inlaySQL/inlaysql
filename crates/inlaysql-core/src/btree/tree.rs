@@ -57,10 +57,15 @@ const MAGIC: &[u8; 8] = b"INLAYSQL";
 ///     hold a value larger than one page, rather than storing it inline.
 /// 4 — opt-in int8 vector row/catalog/index payloads.
 /// 5 — four per-writer WAL regions with an explicitly ordered recovery chain.
+/// 6 — commit-record page entries elide the page's zero hole. The file's
+///     *layout* is byte-for-byte v5's — the data area starts at the same
+///     offset, because `region_count` is the same — and only the encoding of
+///     a page inside a record changes. See
+///     [`crate::wal::HOLE_ELIDED_FORMAT_VERSION`].
 ///
 /// The version is checked on open and a mismatch is reported as
 /// [`Error::FormatVersion`], never corruption; see `docs/recovery.md`.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 /// Version 3 exact-vector files remain readable. They cannot acquire a
 /// v4-only column type because the storage capability is exposed to the SQL
 /// engine and checked at `CREATE TABLE`.
@@ -388,17 +393,23 @@ impl DirtyPage {
         }
     }
 
-    /// How many bytes this page will occupy in the commit record.
+    /// How many bytes this page will occupy in the commit record, entry
+    /// header included.
     ///
-    /// Exact for both forms: [`page::encode_leaf`] and
-    /// [`page::encode_internal`] always fill a whole page, so a node that has
-    /// not been encoded yet is `page_size` bytes and
-    /// [`CowBTree::pending_record_len`] stays the exact answer its callers
-    /// depend on.
-    fn encoded_len(&self, page_size: usize) -> usize {
+    /// Exact for an [`DirtyPage::Encoded`] page in either layout — a v6 entry
+    /// elides the page's longest zero run, and that run can only be measured
+    /// on the bytes. An undecoded node is an **upper bound**: a whole page,
+    /// because [`page::encode_leaf`] and [`page::encode_internal`] always fill
+    /// one, plus the entry header. That is the safe direction and the only one
+    /// available — the hole is not known until the node is encoded, and
+    /// [`CowBTree::materialize_dirty`] runs before anything in the commit path
+    /// asks, so the commit's own arithmetic is exact and only a caller asking
+    /// mid-transaction ([`CowBTree::projected_record_len`], which already
+    /// over-reserves on purpose) sees the bound.
+    fn record_entry_len(&self, page_size: usize, format_version: u32) -> usize {
         match self {
-            DirtyPage::Encoded(bytes) => bytes.len(),
-            DirtyPage::Decoded(_) => page_size,
+            DirtyPage::Encoded(bytes) => crate::wal::page_entry_len(format_version, bytes),
+            DirtyPage::Decoded(_) => crate::wal::page_entry_header_len(format_version) + page_size,
         }
     }
 }
@@ -790,11 +801,18 @@ impl<D: Device> CowBTree<D> {
             )));
         }
         let generation = device.commit_generation();
-        let mut tree = Self::new(device, page_size, FORMAT_VERSION, 0, 1, 0);
+        // The device gets to name the version, so a benchmark can create the
+        // previous format's file without a second binary; every device but
+        // `FileDevice`-under-an-environment-variable answers `FORMAT_VERSION`.
+        // See `Device::create_format_version`.
+        let version = device.create_format_version();
+        let mut tree = Self::new(device, page_size, version, 0, 1, 0);
         tree.seen_generation = generation;
         tree.update_watermark(0);
-        tree.device
-            .write(crate::wal::header_offset(), &encode_header(page_size))?;
+        tree.device.write(
+            crate::wal::header_offset(),
+            &encode_header_with_version(page_size, version),
+        )?;
         tree.device
             .write(crate::wal::state_offset(page_size), &encode_state(0, 1, 0))?;
         // The log must start empty so recovery does not mistake stale bytes for
@@ -1130,7 +1148,7 @@ impl<D: Device> CowBTree<D> {
             + self
                 .dirty
                 .values()
-                .map(|page| 8 + 4 + page.encoded_len(self.page_size))
+                .map(|page| page.record_entry_len(self.page_size, self.format_version))
                 .sum::<usize>()
     }
 
@@ -1169,10 +1187,13 @@ impl<D: Device> CowBTree<D> {
         } else {
             0
         };
-        // Per entry: the page id, its length, and the page — the same three
+        // Per entry: the entry header and the page — the same two things
         // `pending_record_len` counts, because a free-list row's cost to the
-        // record is a copied page like any other.
-        self.pending_record_len() + owed * (8 + 4 + self.page_size)
+        // record is a copied page like any other. A whole page rather than an
+        // elided one, deliberately: this is a reserve, and a v6 entry can only
+        // ever be smaller than the page it names.
+        self.pending_record_len()
+            + owed * (crate::wal::page_entry_header_len(self.format_version) + self.page_size)
     }
 
     /// The largest transaction this tree can commit, in bytes.
@@ -6253,10 +6274,6 @@ fn key_fits(page_size: usize, key: &[u8]) -> bool {
     let leaf = 16 + 2 + 2 + key.len() + 1 + 16;
     let internal = 16 + 2 + 2 + key.len() + 8;
     leaf <= page_size / 2 && internal <= page_size / 2
-}
-
-fn encode_header(page_size: usize) -> Vec<u8> {
-    encode_header_with_version(page_size, FORMAT_VERSION)
 }
 
 /// Encode a header stamped with an explicit version, for the format-version

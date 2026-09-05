@@ -122,6 +122,20 @@ fn loaded_with_capacity(name: &str, rows: usize, width: usize, capacity: usize) 
     db
 }
 
+/// The replacement body these tests write, and why it is as wide as the row it
+/// replaces (AHL-564).
+///
+/// A v6 commit record elides each page's zero hole, so what bounds a statement
+/// is the *used* bytes of the pages it writes rather than a count of pages. An
+/// `UPDATE` that rewrote 512-byte rows to the eight-byte literal `'replaced'`
+/// therefore stopped being a size refusal at this fixture's scale — not because
+/// the ceiling went away, but because the pages it produces are 97% hole. The
+/// statement under test is "rewrite every row", so the honest fixture rewrites
+/// them to rows of the same width, and the refusal is about the bytes again.
+fn wide_body() -> String {
+    "r".repeat(512)
+}
+
 fn count(db: &mut Database, name: &str) -> i64 {
     match db.query(&format!("SELECT COUNT(*) FROM {name}"), &[]) {
         Ok(result) => match result.rows.first().and_then(|row| row.first()) {
@@ -152,13 +166,17 @@ fn assert_refused_for_size(result: Result<Outcome, Error>) {
 /// the table is copied into the commit record.
 #[test]
 fn a_wide_update_is_refused_rather_than_half_applied() {
-    let mut db = loaded("t", 2_000, 512);
-    assert_refused_for_size(db.execute("UPDATE t SET body = 'replaced'", &[]));
+    let mut db = loaded("t", 2_500, 512);
+    let body = wide_body();
+    assert_refused_for_size(db.execute(&format!("UPDATE t SET body = '{body}'"), &[]));
 
     // The whole point: the statement did not happen. Not some of it.
-    assert_eq!(count(&mut db, "t"), 2_000);
+    assert_eq!(count(&mut db, "t"), 2_500);
     let replaced = db
-        .query("SELECT COUNT(*) FROM t WHERE body = 'replaced'", &[])
+        .query(
+            &format!("SELECT COUNT(*) FROM t WHERE body = '{body}'"),
+            &[],
+        )
         .expect("the handle still answers after a refusal");
     assert_eq!(replaced.rows, vec![vec![Value::Integer(0)]]);
 }
@@ -167,9 +185,9 @@ fn a_wide_update_is_refused_rather_than_half_applied() {
 /// it reads, so its record is the whole of the new data.
 #[test]
 fn a_bulk_insert_select_is_refused_rather_than_half_applied() {
-    let mut db = loaded("t", 2_000, 512);
+    let mut db = loaded("t", 2_500, 512);
     assert_refused_for_size(db.execute("INSERT INTO t (body) SELECT body FROM t", &[]));
-    assert_eq!(count(&mut db, "t"), 2_000);
+    assert_eq!(count(&mut db, "t"), 2_500);
 }
 
 /// `DELETE FROM t` with no `WHERE`, and the reason it breaks.
@@ -267,7 +285,8 @@ fn an_explicit_transaction_is_refused_before_the_statement_runs() {
 #[test]
 fn a_commit_refused_for_size_leaves_a_usable_handle() {
     for sql_spelling in [false, true] {
-        let mut db = loaded("t", 2_000, 512);
+        let mut db = loaded("t", 2_500, 512);
+        let body = wide_body();
 
         if sql_spelling {
             db.execute("BEGIN", &[]).expect("begin");
@@ -276,7 +295,7 @@ fn a_commit_refused_for_size_leaves_a_usable_handle() {
         }
         // Under the half-region margin when it starts, over the whole region by
         // the time it ends: this is the shape that can only fail at `COMMIT`.
-        db.execute("UPDATE t SET body = 'replaced'", &[])
+        db.execute(&format!("UPDATE t SET body = '{body}'"), &[])
             .expect("the statement itself buffers fine");
 
         let committed = if sql_spelling {
@@ -288,9 +307,12 @@ fn a_commit_refused_for_size_leaves_a_usable_handle() {
 
         // Nothing was applied, and the write set is gone rather than lying in
         // wait for the next commit.
-        assert_eq!(count(&mut db, "t"), 2_000);
+        assert_eq!(count(&mut db, "t"), 2_500);
         let replaced = db
-            .query("SELECT COUNT(*) FROM t WHERE body = 'replaced'", &[])
+            .query(
+                &format!("SELECT COUNT(*) FROM t WHERE body = '{body}'"),
+                &[],
+            )
             .expect("query after a refused commit");
         assert_eq!(replaced.rows, vec![vec![Value::Integer(0)]]);
 
@@ -300,9 +322,12 @@ fn a_commit_refused_for_size_leaves_a_usable_handle() {
             &[Value::Integer(999_999), Value::Text("small".into())],
         )
         .expect("a small write after a refused commit");
-        assert_eq!(count(&mut db, "t"), 2_001);
+        assert_eq!(count(&mut db, "t"), 2_501);
         let replaced = db
-            .query("SELECT COUNT(*) FROM t WHERE body = 'replaced'", &[])
+            .query(
+                &format!("SELECT COUNT(*) FROM t WHERE body = '{body}'"),
+                &[],
+            )
             .expect("query after the small write");
         assert_eq!(
             replaced.rows,
@@ -380,11 +405,11 @@ fn the_row_counts_where_each_statement_breaks() {
         }
     }
 
-    bisect(4_000, 20_000, 8, "UPDATE t SET body = 'x'");
-    bisect(4_000, 20_000, 8, "INSERT INTO t (body) SELECT body FROM t");
-    bisect(20_000, 80_000, 8, "DELETE FROM t");
-    bisect(1_000, 2_000, 512, "UPDATE t SET body = 'x'");
-    bisect(1_000, 2_000, 512, "INSERT INTO t (body) SELECT body FROM t");
+    bisect(4_000, 24_000, 8, "UPDATE t SET body = 'x'");
+    bisect(4_000, 24_000, 8, "INSERT INTO t (body) SELECT body FROM t");
+    bisect(20_000, 90_000, 8, "DELETE FROM t");
+    bisect(1_000, 24_000, 512, "UPDATE t SET body = 'x'");
+    bisect(1_000, 8_000, 512, "INSERT INTO t (body) SELECT body FROM t");
     // `DELETE` is the odd one out: it barely notices row width, because what
     // bounds it is the change-log record rather than the rows. Not bisected —
     // a 512-byte × 70,000-row database is 36 MB of load for a cell whose

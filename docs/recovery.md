@@ -476,10 +476,58 @@ The header carries a format version, and it now means something:
   indexes may carry the `VECTOR(n, INT8)` encodings.
 * **5** — four per-writer WAL regions; records carry predecessor sequence/root
   links and recovery merges the regions into one validated commit order.
+* **6** — a commit record's page entries elide the page's zero hole
+  (AHL-564, below). The file *layout* is byte-for-byte v5's — same region
+  count, so the data area starts at the same offset — and only the encoding of
+  a page inside a record changes.
 
-Policy: this build creates **version 5** files and opens versions **3, 4 and
-5**. Versions 3 and 4 retain their original single-region layout and remain
-read/write compatible; they do not silently acquire the v5 layout.
+Policy: this build creates **version 6** files and opens versions **3, 4, 5 and
+6**. Versions 3 and 4 retain their original single-region layout and remain
+read/write compatible; they do not silently acquire the v5 layout. A version 5
+database is likewise read *and written* as a version 5 database — its records
+keep copying whole page images — and does not acquire the v6 encoding by being
+written to (`crates/inlaysql/tests/old_format_records.rs`).
+
+### A v6 page entry (AHL-564)
+
+The record still carries **a copy of every page the commit wrote**, and the
+paragraph below ("Why the record copies the pages") is unchanged: that copy is
+the only thing guaranteed to have a surviving prefix when the data-area pages
+it describes are gone. What changed is how the copy is spelled.
+
+A page is a fixed-size block with a hole in the middle. `page::PageWriter`
+starts from a zeroed block, grows the slot directory forward from the header
+and packs the cells backwards from the end, and never writes what is left
+between them. Measured on a steady-state single-row `INSERT`
+(`inlaysql-bench --bin record_anatomy`), **73% of a 20,747-byte record was that
+hole**, including two metadata leaves that each spent 4,096 bytes to carry 45
+and 79 bytes of counter.
+
+So a v6 page entry is `page id u64 | stored u32 | hole_at u32 | hole_len u32 |
+bytes`, and the image it names is `bytes[..hole_at]` followed by `hole_len`
+zeros followed by `bytes[hole_at..]`. The run is found by scanning the image
+for its longest run of zeros — deliberately not by reading `free_start` out of
+the page header, because `wal` knows nothing about page layout and a rule
+copied out of `page.rs` would make the durability path depend on another
+module's invariant.
+
+**What this does not change, which is the point.** The entry reconstructs the
+page's exact bytes, so recovery replays exactly what it replayed before: it
+still never has to know a page's prior state, still writes whole page images at
+fresh ids, and still heals a torn write byte-for-byte. This is the same
+*physical* logging it always was, one encoding tighter — **not** the
+physiological record ("insert this cell into page P at slot S") that "What
+lifting the one-region ceiling would take" prices below and does not take.
+A physiological record would make recovery's correctness depend on the page on
+disk being exactly what the log assumed; this one depends on nothing but its
+own checksum, as before.
+
+The consequence the change was made for is that records are ~3.6× smaller, so
+a 1 MiB region wraps every ~184 single-row commits instead of every ~51 — and
+a wrap runs an `fsync` inside the reservation gate (`docs/research/gate-hold.md`
+§1, and AHL-563 in `PERF.md`). The side effect is that the one-region ceiling
+below rises by whatever fraction of the refused transaction's pages was hole;
+`crates/inlaysql/tests/large_statements.rs` carries the re-measured numbers.
 
 Version 3 is the one compatibility exception to the pre-1.0 no-migration
 policy: its page/WAL layout is identical, and its exact-vector catalog and row
@@ -566,7 +614,10 @@ data area begins at `(region_count × WAL_BLOCKS + 1) × page_size`
 every page in the file: changing it relocates the entire database. That alone
 makes it a format change, before anything about the protocol is touched.
 
-**Why the record copies the pages.** Not redundancy for its own sake. Under the
+**Why the record copies the pages.** Not redundancy for its own sake. (v6
+elides each page's zero hole, which shrinks the copy by about 3.6× on real
+data — see "A v6 page entry" above — but it is still a copy, so the argument
+below is unaffected and the ceiling is still O(bytes the commit wrote).) Under the
 torn-write model above, the record is written last and is the only thing
 guaranteed to have a surviving prefix; the data-area pages it describes may be
 gone. A record that cannot rebuild its own pages is not a commit. So the record
@@ -609,7 +660,7 @@ shapes follow from that:
    record shrinks to roughly 20 bytes per 4 KiB of commit, so one region covers
    a few hundred MiB. Cost: the spilled pages are consumed permanently (never
    recorded in the free list, reclaimed only by `vacuum`), and it is a new
-   record kind — format version 6.
+   record kind — format version 7.
 2. **Give every data page a checksum and name pages instead of copying them.**
    Strictly better where it applies — no spill pages, ~340× smaller records —
    and it retires the "a data page carries no checksum of its own" caveat that
@@ -617,9 +668,9 @@ shapes follow from that:
    currently have to work around. Cost: the page header changes, so
    `page::decode` and every page ever written change with it, and recovery
    grows a validate-don't-replay path beside the existing replay path, because
-   v5 records still carry bytes.
+   v5 and v6 records still carry bytes.
 
-Either is a format version 6 change to the on-disk record layout **and** the
+Either is a format version 7 change to the on-disk record layout **and** the
 recovery protocol, so per architecture constraint 3 it needs a deterministic
 simulation pass of its own — and specifically a sweep that asserts it actually
 exercised the spilled path, the way `free_list_reuse_dst.rs` asserts
