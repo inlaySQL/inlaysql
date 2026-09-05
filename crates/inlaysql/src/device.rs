@@ -261,6 +261,11 @@ struct CommitCoordinator {
     /// re-derive the committed state and the region's append offset from the
     /// file, inside the hold (AHL-563).
     gate_point_misses: AtomicU64,
+    /// `INLAYSQL_WIDE_WRAP_FORGET`: restore the pre-AHL-563 total forget on
+    /// the wrap path, so the two arms of that item's measurement are one
+    /// binary and one environment variable apart. See
+    /// [`Device::forget_append_offset`]'s implementation below.
+    wide_wrap_forget: AtomicBool,
     follower_wait_ns: AtomicU64,
     follower_waits: AtomicU64,
     /// Time the elected leader spent inside the adaptive gather window before
@@ -2368,10 +2373,21 @@ impl Device for FileDevice {
     /// manufactured ~2.4 full re-derivations of the committed state, each
     /// ~2.6 ms, each inside the reservation gate with every other writer
     /// queued behind it — 53% of all the time spent in the gate.
+    ///
+    /// `INLAYSQL_WIDE_WRAP_FORGET` puts the total forget back, which is what
+    /// makes that a *paired* measurement rather than two runs quoted at each
+    /// other: one binary, one environment variable apart, both arms in every
+    /// repetition (`bench/gate_hold.sh`). It is the same measurement-switch
+    /// shape `INLAYSQL_DISABLE_SHARED_READ_CACHE` already has, and it costs
+    /// one relaxed load per *wrap* — about one commit in fifty.
     fn forget_append_offset(&self, region: usize) {
         let Some(coordinator) = self.coordinator.as_ref() else {
             return;
         };
+        if coordinator.wide_wrap_forget.load(Ordering::Relaxed) {
+            self.set_commit_point(region, None);
+            return;
+        }
         let mut gate = coordinator
             .gate
             .lock()
@@ -2742,6 +2758,7 @@ fn coordinator_for(path: &Path, file_id: FileId) -> Result<Arc<CommitCoordinator
         gate_phase_ns: [const { AtomicU64::new(0) }; GATE_PHASES],
         gate_phases_enabled: AtomicBool::new(gate_phases_enabled()),
         gate_point_misses: AtomicU64::new(0),
+        wide_wrap_forget: AtomicBool::new(wide_wrap_forget()),
         follower_wait_ns: AtomicU64::new(0),
         follower_waits: AtomicU64::new(0),
         gather_spin_ns: AtomicU64::new(0),
@@ -2799,6 +2816,13 @@ fn flush_pipelining_enabled() -> bool {
 fn gate_phases_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("INLAYSQL_GATE_PHASES").is_some_and(|v| v != "0"))
+}
+
+/// AHL-563's A/B switch: the pre-change total forget on the wrap path.
+/// Read once per process, like [`flush_pipelining_enabled`].
+fn wide_wrap_forget() -> bool {
+    static WIDE: OnceLock<bool> = OnceLock::new();
+    *WIDE.get_or_init(|| std::env::var_os("INLAYSQL_WIDE_WRAP_FORGET").is_some_and(|v| v != "0"))
 }
 
 fn shared_read_cache_budget() -> usize {
@@ -2950,6 +2974,9 @@ mod group_commit_tests {
             // `pipeline` is not: a test means the same thing either way.
             gate_phases_enabled: AtomicBool::new(false),
             gate_point_misses: AtomicU64::new(0),
+            // Never from the ambient environment, for the same reason
+            // `pipeline` is not: a test means the same thing either way.
+            wide_wrap_forget: AtomicBool::new(false),
             follower_wait_ns: AtomicU64::new(0),
             follower_waits: AtomicU64::new(0),
             gather_spin_ns: AtomicU64::new(0),

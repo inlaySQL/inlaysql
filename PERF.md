@@ -7339,3 +7339,265 @@ is about the *read* path only, which does not fsync, matching the brief.
   once per whole run) dropped R² to 0.017. Any sweep whose factor of interest
   also determines position-in-round needs the order re-randomised per round,
   not merely chosen once before the loop starts.
+
+### The gate hold is 84% not-I/O, and 70% of it was one WAL region wrap (AHL-563, 2026-09-05)
+
+AHL-562 closed by naming the reservation gate as the constraint above two
+writers — `gate_wait` at 20/37/51% of a writer's commit latency at 4/8/16
+writers, and a serialized 0.263 ms hold capping the file at ~3,800 commits/s
+against 2,850 observed — and by leaving one question: **what is inside that
+0.263 ms, and does it have to be?**
+
+**It is not the writes.** The WAL record append and the dirty-page `pwrite`s
+— AHL-561's ~40 KiB per commit, the writes the retracted "shrink the gate"
+proposal wanted to move outside — cost **22 µs of a 251 µs hold**. **It is a
+process-local cache invalidation whose scope was wider than the event that
+provoked it:** `CowBTree::commit`'s WAL-region-wrap branch called
+`Device::set_commit_point(region, None)`, which on `FileDevice` discards the
+file-wide committed state *and all four regions' append offsets*. The
+wrapping writer republishes its own; the other three are gone, and the next
+commit in each pays a full `read_committed_state` plus `wal::scan_region`
+**inside its own gate hold**, at ~2.6 ms a time with every other writer
+queued behind it.
+
+Narrowing that one call — a wrap forgets where *its* region's next record
+goes and nothing else — **halves the gate hold at four writers and up, 6/6
+repetitions, non-overlapping**, and takes commit-point misses from 132 to 3.
+`docs/research/gate-hold.md` is the design, written before the code, with the
+safety argument and the mutation table.
+
+#### 1. The measurement that found it
+
+Two instruments, landed first and separately (`329d59d`), both off or free by
+default. **Device-call attribution:** every `Device::read`/`write` a handle
+issues between `begin_normal_commit` and `end_normal_commit`, timed at the
+syscall and bucketed by the file's own layout, so `gate_hold_ns` minus their
+sum is by construction the in-gate CPU work. **`Device::gate_phase`:** a
+no-op trait default the core calls at each internal boundary of the critical
+section, which the native device charges to the phase that ended
+(`INLAYSQL_GATE_PHASES`). Nothing in `inlaysql-core` reads either answer; the
+core still cannot read a clock, it only says *where* it is.
+
+The device split, sixteen writers, before the change — **15.9% I/O, 84.1%
+not**:
+
+| writers | hold ms | read | state | log | data | of which extend | device | residual |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0.062 | 0.005 | 0.000 | 0.009 | 0.012 | 0.006 | 0.026 (41.5%) | 0.036 |
+| 4 | 0.151 | 0.010 | 0.000 | 0.008 | 0.011 | 0.005 | 0.029 (19.0%) | 0.123 |
+| 8 | 0.180 | 0.010 | 0.000 | 0.008 | 0.010 | 0.004 | 0.027 (15.2%) | 0.153 |
+| 16 | 0.251 | 0.017 | 0.000 | 0.011 | 0.011 | 0.006 | 0.040 (15.9%) | 0.211 |
+
+And the phase split says what the 84% is. Sixteen writers, before:
+`read_state` **0.101 ms (40.2%)**, `scan_region` **0.032 (12.9%)**, `wrap`
+**0.043 (17.0%)**, `encode` 0.028 (11.2%), `rebase` 0.022 (8.6%),
+`data_writes` 0.015, `wal_append` 0.008, `materialize` 0.002, everything else
+0.000.
+
+`read_state` and `scan_region` are free when `Device::commit_point` answers
+and a full re-derivation from the file when it does not — and it **almost
+always answers: 124 misses out of 2,403 holds, 5.2%.** Those 124 holds carry
+`(0.101 + 0.032) × 2,403 = 320 ms`, which is **2.6 ms per miss**, ten times
+the mean hold, inside the process-wide critical section.
+
+The misses are manufactured, and the arithmetic is exact at every level: 8
+wraps → 22 misses, 20 → 51, 52 → 124. Between 2.4 and 2.8 induced misses per
+wrap, against a theoretical 3 (four regions, minus the wrapping writer's
+own, which it republishes before it leaves the gate).
+
+`wrap` is the third block and a different animal: 0.043 × 2,403 = 103 ms over
+52 wraps is **2.0 ms per wrap**, and `CowBTree::write_state_values` is why —
+a state-block write followed by `Device::sync()`. **A region wrap runs a full
+`fsync` inside the reservation gate**, which is AHL-547's "barrier inside the
+gate is a disaster" arriving by a different route. That barrier must happen
+before a region is reused and it is **not** touched here; §4 says why.
+
+Putting the two together: **one region wrap cost the file ~8.2 ms of
+serialized gate time**, and at sixteen writers the 52 wraps were `103 + 320 =
+423` ms of the run's `2,403 × 0.251 = 603` ms of total gate hold — **70% of
+it**. The per-commit work the gate exists for is the other 30%.
+
+#### 2. What needs the exclusion, and what was merely inside it
+
+The gate orders three things: the commit sequence, the root handoff, and
+`rebase_pending`'s comparison against the latest committed root. The third is
+what makes the retracted proposal unsafe, and **that retraction stands
+unconditionally here.** `docs/research/commit-group-logical.md` §1 has the
+counterexample: a writer that releases the gate before its dirty pages are
+`pwrite`-landed lets the next writer's `rebase_pending` walk a root naming
+page ids whose bytes are not there. **Nothing here defers a write past gate
+release, and nothing here reserves an offset inside the gate to write outside
+it either.** Both are proposals about the writes, and the writes are 22 µs of
+a 251 µs hold — there is nothing there worth the risk even if it were safe.
+That is the direct answer to this item's design question, and it is worth
+stating as a result rather than as a preamble: **MySQL's critical section is
+a memcpy because InnoDB's redo is 605 B per commit; ours is not a memcpy, but
+it was never the bytes either.**
+
+What was merely inside the gate is the cache invalidation, and a wrap of
+region *r* changes exactly one fact: where region *r*'s next record goes. It
+moves no root, no page id, no sequence number, and no other region's log.
+
+#### 3. The change, and why it is safe
+
+`Device::forget_append_offset(region)`, **whose trait default is the total
+forget** — so no device can be made less safe by its existence — with
+`FileDevice` overriding it to clear one region's slot. One call site: the
+wrap branch. **Every other `set_commit_point(_, None)` is untouched,**
+including the `!written` failure path and `CowBTree::checkpoint`'s own.
+
+* **Nothing a reader can now see was invisible a moment earlier.** During the
+  window between the forget and the republish, `refill_free_candidates` reads
+  this cache from outside the gate. It now sees the committed state and the
+  three untouched regions instead of `None` — exactly what it would have seen
+  one instruction before the wrap began, because a wrap changes none of them.
+* **The one fact the wrap does change is still forgotten,** on the same
+  instruction as before, before the zeroing write.
+* **A failed wrap still ends in a total forget.** If the state write or the
+  zero fill fails, the closure returns `Err`, `written` is false, and
+  `commit`'s existing `set_commit_point(region, None)` runs before the gate is
+  released. The failure behaviour is bit-identical.
+* **It cannot loosen the free list.** `refill_free_candidates` offers a page
+  only when `freed_at < min(point.seq, min_reader)`, and `point.seq` is the
+  same pre-wrap sequence it was. Fewer declines, never a different verdict.
+
+**Tests, each mutation-checked** (`3b231ee`):
+
+| Test | Mutation that fails it |
+| --- | --- |
+| `forgetting_an_append_offset_leaves_the_other_regions_and_the_state` | `forget_append_offset` falling back to the total forget; `forget_append_offset` clearing nothing; clearing the wrong region |
+| `the_total_forget_is_still_total` | narrowing `set_commit_point(_, None)` itself |
+| `a_region_wrap_costs_no_other_region_a_re_derivation` | the total-forget fallback (asserts on `gate_point_misses`, so it fails on the bug, not on a timing) |
+| `a_wrap_that_fails_at_any_write_forgets_the_whole_cache` | deleting the `!written` total forget |
+| `every_row_survives_repeated_region_wraps` | (data-safety backstop; see below) |
+
+The last one drives four handles over four regions until every region has
+wrapped, then reopens the file cold and requires every acknowledged row. It
+is a backstop rather than a discriminator, and one mutation is worth
+recording as **checked and equivalent rather than missed**: deleting the
+wrap's forget *entirely* fails nothing. On the success path the same commit
+republishes the offset before releasing the gate, and on the failure path the
+`!written` branch forgets everything — so the only thread that could observe
+a stale offset is an out-of-gate reader, and neither `refill_free_candidates`
+nor `resolve_state_at_least` reads `append_offset`. The forget is kept as
+defence in depth, and this paragraph is the honest reason no test can tell.
+
+`a_wrap_that_fails_at_any_write_forgets_the_whole_cache` needed a
+`FailNthWrite` device — the production `FileDevice` with one `pwrite`
+replaced by an error — because `CowBTree::commit`'s failure paths are
+otherwise unreachable on a real file. It walks **every** write the wrapping
+commit issues (the state block, the megabyte of zeros, each dirty page, the
+record append), and asserts the count it broke equals the count that commit
+performs, so a commit that merely succeeded cannot pass it.
+
+**There is no crash injection at a new step, because there is no new step.**
+The wrap's write sequence is byte-identical before and after; the diff moves
+one in-memory cache line and nothing that reaches the file. That is the
+reason this is a small change rather than a protocol change.
+
+#### 4. On the clock
+
+`bench/gate_hold.sh`, the same harness as AHL-562's: the `inlaysql-oltp`
+compose service, its own named volume (`/dev/vdb1 btrfs` inside OrbStack's
+Linux VM), `--txns 150`, `WRITER_LEVELS=1,2,4,8,16`, `Durability::Full`.
+**Six repetitions, both arms in every repetition, arm order flipped every
+repetition, one binary one environment variable apart**
+(`INLAYSQL_WIDE_WRAP_FORGET` restores the old total forget, the same
+measurement-switch shape `INLAYSQL_DISABLE_SHARED_READ_CACHE` already has).
+Host load 2.7–4.0 of 18. Medians of six:
+
+| writers | arm | ops/s | commits/barrier | **hold ms** | device | residual | **misses** | `gate_wait` | duty | interval ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | wide | 1,422 | 1.00 | 0.066 | 0.019 | 0.043 | **0** | 0.0% | 90.4% | 0.707 |
+| 1 | narrow | 1,609 | 1.00 | 0.054 | 0.021 | 0.034 | **0** | 0.0% | 89.3% | 0.621 |
+| 2 | wide | 2,030 | 1.52 | 0.083 | 0.022 | 0.058 | 5 | 1.5% | 84.3% | 0.748 |
+| 2 | narrow | 2,142 | 1.50 | 0.062 | 0.019 | 0.042 | 1 | 1.2% | 86.7% | 0.700 |
+| 4 | wide | 2,822 | 3.33 | 0.160 | 0.030 | 0.128 | 22 | 18.5% | 62.2% | 1.192 |
+| 4 | narrow | 3,360 | 3.46 | **0.087** | 0.029 | 0.059 | **3** | 9.2% | 74.4% | 1.025 |
+| 8 | wide | 2,998 | 5.70 | 0.200 | 0.032 | 0.169 | 54 | 35.6% | 51.0% | 1.873 |
+| 8 | narrow | 4,789 | 6.88 | **0.092** | 0.026 | 0.067 | **3** | 20.4% | 61.4% | 1.415 |
+| 16 | wide | 2,811 | 8.10 | 0.262 | 0.044 | 0.216 | 132 | 49.5% | 46.2% | 2.865 |
+| 16 | narrow | 4,624 | 11.77 | **0.121** | 0.030 | 0.092 | **3** | 31.7% | 54.5% | 2.470 |
+
+Paired ratios, one per repetition, narrow over wide:
+
+| writers | **gate hold** (lower is better) | median | **ops/s** | median |
+| --- | --- | --- | --- | --- |
+| **1 (A/A)** | 1.10 1.06 0.62 1.77 0.39 0.65 | **0.85** | 1.28 0.93 0.98 0.33 4.28 2.50 | **1.13** |
+| 2 | 0.63 0.77 0.82 1.52 0.66 0.72 | 0.74 | 2.63 0.96 1.00 0.30 2.25 1.05 | 1.02 |
+| 4 | 0.65 0.55 0.42 0.98 0.40 0.50 | 0.53 | 1.75 1.24 1.41 0.48 1.86 1.14 | 1.32 |
+| 8 | 0.46 0.49 0.43 0.55 0.44 0.55 | **0.48** | 2.19 1.55 1.81 1.03 2.05 1.37 | 1.68 |
+| 16 | 0.45 0.50 0.48 0.46 0.49 0.47 | **0.48** | 1.70 1.54 1.64 1.67 1.62 1.58 | **1.63** |
+
+**Read the one-writer row first, and note what makes it a real A/A.** A solo
+writer owns one region, so the wide arm's total forget wipes nothing anybody
+else was using and the narrow arm has nothing extra to keep: **0 commit-point
+misses, 0.000 ms of `read_state` and 0.000 ms of `scan_region` in all six
+repetitions of both arms.** The two arms produce an identical cache state
+there, and that row still reports **1.13x with a spread of 0.33 to 4.28**.
+That is this harness's floor, in the same shape AHL-561 and AHL-562 both
+found it.
+
+Against that floor: the **gate hold** at 8 and 16 writers is 0.43–0.55 and
+0.45–0.50, **six of six, in a band narrower than the A/A's noise and nowhere
+near 1.0** — and the misses are 3 in every repetition of the narrow arm at
+every writer count, against 122–140 at sixteen. The phase split says exactly
+where it went: at sixteen writers `read_state` 0.105 → **0.000** and
+`scan_region` 0.032 → **0.000**, with `wrap` (0.043 → 0.042), `encode`
+(0.028 → 0.029), `rebase` (0.023 → 0.025) and the writes unchanged. Nothing
+moved except the thing this change was aimed at.
+
+**The throughput column is the weaker claim and is reported as one.** At
+sixteen writers it is 1.54–1.70, six of six, tightly clustered in a way the
+A/A's scatter never is; at four and two it is inside the floor and should be
+read as "did not regress". The deliverables are the hold, the miss count and
+`gate_wait`'s share — ratios measured inside the same run — exactly as
+AHL-562 argued.
+
+#### 5. What this leaves
+
+`gate_wait` is still 31.7% of a writer's time at sixteen writers, and the
+duty cycle is still only 54.5%. The gate is no longer the dominant term but
+it has not disappeared, and the remaining hold decomposes into things that
+each have an owner:
+
+1. **The wrap's own 2.0 ms is now the largest single item in the hold**
+   (0.042 of 0.121 ms/hold at sixteen writers, ~35%), and 1.3 ms of it is a
+   real `fsync` that must precede reusing a region. Moving *that* barrier out
+   of the gate is the retracted proposal in a new costume. What is not
+   retracted is **making wraps rarer**, and the lever there is AHL-561's
+   other unbanked number: a single-row commit writes ~20 KiB of WAL record
+   against MySQL's 605 B, so a 1 MiB region wraps every ~52 commits. A
+   smaller record buys fewer barriers in the gate *and* fewer bytes per
+   barrier, and it is the same lever twice.
+2. **`encode` (0.029) and `rebase` (0.025) are now the per-commit remainder,**
+   and both are consequences of the same record size and of the COW rebase
+   replaying every pending op against the moved root. Neither is a cache bug;
+   both are real work that genuinely needs the exclusion.
+3. **Flush pipelining is still built, still default off, and still waiting.**
+   AHL-562's ceiling arithmetic assumed writers waiting on the coordinator
+   rather than on each other. They are less queued on each other now (duty
+   46.2% → 54.5% at sixteen writers, commits per barrier 8.10 → 11.77 —
+   *both* moved in the direction AHL-562 predicted the gate was suppressing),
+   which makes re-running that experiment on top of this change the obvious
+   next measurement rather than a hope.
+
+**This is the first item in this area that is not a negative** — AHL-544's
+flat, AHL-547's 0.90x, AHL-560's "already done", AHL-561's "not the syscall",
+AHL-562's "not the election either" — and it is worth saying why it broke the
+run: every one of those five priced a mechanism, and this one measured a
+critical section it had never been inside. The 0.263 ms had been quoted four
+times without anyone opening it.
+
+**Gates.** `fmt`; `clippy --release --workspace --all-targets -D warnings`;
+`cargo test --release --workspace`; `RUSTDOCFLAGS="-D warnings" cargo doc
+--workspace --no-deps --document-private-items`; `cargo check -p inlaysql-wasm
+--target wasm32-unknown-unknown`; and all five DST sweeps — `dst_sweep`,
+`free_list_reuse_dst`, `backup_dst`, `durability_dst` on `-p inlaysql-core`,
+`index_recovery_dst` on `-p inlaysql`, each `-- --ignored`.
+`index_recovery_dst` and `concurrent_writers` were run a second time **with
+`INLAYSQL_WIDE_WRAP_FORGET=1`**, because they are the two that drive a real
+`FileDevice` and therefore the only ones that reach this cache at all; the
+four `inlaysql-core` sweeps run on the in-memory environment, whose device
+keeps no commit point, so `forget_append_offset` there is the trait default
+and byte-for-byte unchanged.
