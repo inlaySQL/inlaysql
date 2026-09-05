@@ -21,6 +21,17 @@ them and lives in `PERF.md`'s dated sections and `git log`.
 
 ## Current state (2026-09-04)
 
+- 2026-09-05: the fifth `run.sh` edition published (point read p95 6.50 →
+  2.17 µs, p99 10.50 → 3.79, AHL-552's tail fix visible at last), and
+  **Track F's F3 and F4 landed**. Binding off loopback now refuses under
+  four conditions before the socket is bound; `--plaintext-network`
+  relaxes only the plaintext pair and refuses itself on a wildcard or a
+  routable address; `inlaysql user add` creates the account store without
+  serving. The packet path gained four fuzz targets with 79 seeds, and
+  reading it first found three defects, all fixed: a wire-reachable
+  overflow panic, a 16 MiB pre-authentication allocation from four bytes,
+  and a `CLIENT_SSL` shortcut that meant a real MySQL client could never
+  have logged in over TLS.
 - **Published figures.** `BENCHMARK.md`'s current edition is the `run.sh`
   suites at `1f7921a` (2026-09-03, gated median of three) and every
   `compare.sh`- and driver-sourced table at `bdc64eb` (regenerated under the
