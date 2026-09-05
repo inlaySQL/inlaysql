@@ -645,6 +645,34 @@ pub struct CowBTree<D: Device> {
     /// means the free list this batch was read against may no longer be
     /// current. See [`CowBTree::refill_free_candidates`].
     free_candidates: Vec<(u64, PageId)>,
+    /// Where the last [`CowBTree::refill_free_candidates`] scan of
+    /// [`FREE_LIST_PREFIX`] stopped, so the next one resumes instead of
+    /// starting over at the oldest row. Cleared wherever `free_candidates`
+    /// is (commit, rollback, conflict, rebase), because those are exactly
+    /// the points at which the free list this cursor was read against stops
+    /// being current.
+    ///
+    /// Without it, one transaction's repeated refills each rescanned the
+    /// *same* [`FREE_CANDIDATE_BATCH`] oldest rows — rows this transaction
+    /// had already drawn and would skip again via `consumed_ever_this_txn`,
+    /// at a linear membership test apiece — so a commit's allocation cost
+    /// grew with the square of the free list's length (AHL-565). Resuming
+    /// is only ever *conservative*: a row the cursor has passed is not
+    /// offered again this transaction, so the worst a stale cursor can do
+    /// is fall back to a fresh page id, which `alloc_page` documents as
+    /// always correct and only less space-efficient.
+    free_scan_cursor: Option<Vec<u8>>,
+    /// Whether a refill in this transaction has already scanned to the end
+    /// of the reclaimable rows and found nothing more to offer, so further
+    /// refills would repeat that scan for nothing.
+    ///
+    /// The end of the reclaimable range is not the end of the prefix: the
+    /// scan stops at the first row whose `freed_at` is not yet durable-and-
+    /// unread (see below), and this transaction's *own* freed pages are
+    /// written past that boundary by [`CowBTree::finalize_free_list`], so
+    /// the prefix keeps growing while the reclaimable part of it does not.
+    /// Latched here and cleared with `free_scan_cursor`.
+    free_list_exhausted: bool,
     /// Committed page ids this open transaction has superseded (replaced or
     /// dropped an entry from) and not itself reused, recorded here until
     /// [`CowBTree::finalize_free_list`] turns them into durable free-list
@@ -692,6 +720,18 @@ pub struct CowBTree<D: Device> {
     /// way to prove reclamation actually fired rather than silently declining
     /// every candidate, the same role `page_cache_len` plays for the cache.
     pages_reused: u64,
+    /// How many times [`CowBTree::refill_free_candidates`] has actually
+    /// scanned the free list, over this handle's whole lifetime.
+    ///
+    /// Diagnostic only, and it exists for one specific reason: this is the
+    /// number that went superlinear (AHL-565). Every other symptom — the
+    /// commit's dirty-page count, the record's size, the wall clock — is
+    /// downstream of it and much noisier, so a regression test that wants to
+    /// pin the *shape* of the cost has to be able to see this directly. It is
+    /// the same role `pages_reused` plays for "did reclamation fire at all",
+    /// one level down: `pages_reused` says the free list worked,
+    /// `free_list_scans` says what it cost to work.
+    free_list_scans: u64,
 }
 
 impl<D: Device> Drop for CowBTree<D> {
@@ -890,11 +930,14 @@ impl<D: Device> CowBTree<D> {
             reuse_enabled: false,
             durability: Durability::Full,
             free_candidates: Vec::new(),
+            free_scan_cursor: None,
+            free_list_exhausted: false,
             freed_this_txn: Vec::new(),
             consumed_this_txn: Vec::new(),
             consumed_ever_this_txn: Vec::new(),
             reader_token,
             pages_reused: 0,
+            free_list_scans: 0,
         }
     }
 
@@ -1028,6 +1071,19 @@ impl<D: Device> CowBTree<D> {
     /// `pages_reused`.
     pub fn pages_reused(&self) -> u64 {
         self.pages_reused
+    }
+
+    /// How many free-list scans [`CowBTree::refill_free_candidates`] has run
+    /// over this handle's lifetime — see the field of the same name.
+    ///
+    /// Diagnostic only. What makes it worth exposing is that it is the one
+    /// quantity whose growth *shape* distinguishes a healthy free list from
+    /// the AHL-565 one: a scan is paid per batch of candidates drawn, so a
+    /// commit should cost a small constant number of them however long the
+    /// free list has grown. When it instead grows with the list's length,
+    /// every allocation is rescanning rows it has already rejected.
+    pub fn free_list_scans(&self) -> u64 {
+        self.free_list_scans
     }
 
     /// Clear this handle's page cache and retained read cursor, when page
@@ -1957,6 +2013,8 @@ impl<D: Device> CowBTree<D> {
         self.pending_ops.clear();
         self.has_pending = false;
         self.free_candidates.clear();
+        self.free_scan_cursor = None;
+        self.free_list_exhausted = false;
         self.freed_this_txn.clear();
         self.consumed_this_txn.clear();
         self.consumed_ever_this_txn.clear();
@@ -1985,6 +2043,8 @@ impl<D: Device> CowBTree<D> {
         self.pending_ops.clear();
         self.has_pending = false;
         self.free_candidates.clear();
+        self.free_scan_cursor = None;
+        self.free_list_exhausted = false;
         self.freed_this_txn.clear();
         self.consumed_this_txn.clear();
         self.consumed_ever_this_txn.clear();
@@ -3336,6 +3396,8 @@ impl<D: Device> CowBTree<D> {
         self.pending_ops.clear();
         self.has_pending = false;
         self.free_candidates.clear();
+        self.free_scan_cursor = None;
+        self.free_list_exhausted = false;
         self.freed_this_txn.clear();
         self.consumed_this_txn.clear();
         self.consumed_ever_this_txn.clear();
@@ -3461,6 +3523,8 @@ impl<D: Device> CowBTree<D> {
 
         self.dirty.clear();
         self.free_candidates.clear();
+        self.free_scan_cursor = None;
+        self.free_list_exhausted = false;
         self.freed_this_txn.clear();
         self.consumed_this_txn.clear();
         self.consumed_ever_this_txn.clear();
@@ -3549,6 +3613,9 @@ impl<D: Device> CowBTree<D> {
     /// order), so the scan can stop at the first ineligible row instead of
     /// filtering the whole prefix.
     fn refill_free_candidates(&mut self) -> Result<()> {
+        if self.free_list_exhausted {
+            return Ok(());
+        }
         let region = self.device.wal_region() % crate::wal::region_count(self.format_version);
         let Some(point) = self.device.commit_point(region) else {
             return Ok(());
@@ -3557,14 +3624,26 @@ impl<D: Device> CowBTree<D> {
             return Ok(());
         };
         let eligible_before = point.seq.min(min_reader);
-        let rows = self.scan_prefix_from(FREE_LIST_PREFIX, None, FREE_CANDIDATE_BATCH)?;
+        let cursor = core::mem::take(&mut self.free_scan_cursor);
+        let rows =
+            self.scan_prefix_from(FREE_LIST_PREFIX, cursor.as_deref(), FREE_CANDIDATE_BATCH)?;
+        self.free_list_scans += 1;
+        let scanned = rows.len();
+        // Advanced only over rows this scan is done with for good — see the
+        // `break` below, which leaves it at the last row it *did* examine so
+        // the ineligible one is reconsidered rather than skipped.
+        let mut cursor = cursor;
+        let mut hit_boundary = false;
         for (key, _) in rows {
             let Some((freed_at, id)) = decode_free_list_key(&key) else {
+                cursor = Some(key);
                 continue;
             };
             if freed_at >= eligible_before {
+                hit_boundary = true;
                 break;
             }
+            cursor = Some(key.clone());
             // The row's own deletion (from an earlier `alloc_page` call in
             // *this* transaction) is deferred to `CowBTree::finalize_free_list`
             // at commit time, so the scan above still sees it — without this
@@ -3585,6 +3664,19 @@ impl<D: Device> CowBTree<D> {
                 continue;
             }
             self.free_candidates.push((freed_at, id));
+        }
+        self.free_scan_cursor = cursor;
+        // The reclaimable range is over for this transaction once the scan
+        // has either reached the not-yet-eligible boundary — the rows are
+        // oldest-freed-first, so everything past it is ineligible too — or
+        // run off the end of the prefix without filling its batch. Either
+        // way every further refill would repeat this scan for the same
+        // nothing, which is precisely the cost AHL-565 measured: 73% of one
+        // commit's refills returned zero candidates. Latch it off; the next
+        // transaction clears the latch along with the cursor, so a page
+        // freed by *this* commit is still offered by the next one.
+        if hit_boundary || scanned < FREE_CANDIDATE_BATCH {
+            self.free_list_exhausted = true;
         }
         Ok(())
     }

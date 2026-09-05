@@ -448,6 +448,115 @@ fn raw_scan_sweep(seed: u64) -> u64 {
     reused
 }
 
+/// The same heavy-churn workload `sweep` runs, with the fault schedule off
+/// and no crash to recover from, measuring only what it *costs* — how many
+/// times `CowBTree::refill_free_candidates` has to scan the free list to
+/// keep a commit supplied with page ids.
+///
+/// Returns `(scans, commits, reused)` for the first `commits` batches and,
+/// separately, for the last quarter of them.
+fn scan_cost(seed: u64, batches: usize) -> (u64, u64, u64) {
+    // Faults off on purpose. This measures a growth curve, and a drawn crash
+    // truncates the workload at an arbitrary point — which is exactly how the
+    // superlinearity hid for as long as it did (`PERF.md`, AHL-564: the
+    // one-region record ceiling was breaking the loop out early). A cost
+    // measurement that can be cut short measures the cut, not the cost.
+    let sim = Simulator::with_disk(
+        seed,
+        SimDisk::with_block_size(BLOCK, CAPACITY),
+        FaultSchedule::random_with(seed, 0, 0, 0),
+    );
+    let mut db = CowBTree::create(TrustedDevice::new(sim), PAGE).unwrap();
+    db.set_page_reuse(true);
+
+    let mut rng = SeededRng::new(seed ^ 0xA5A5_5A5A_1234_9E37);
+    let mut scans_at_half = 0u64;
+
+    for batch in 0..batches {
+        let ops = 1 + (rng.next_u64() % 6) as usize;
+        for _ in 0..ops {
+            let key = format!("k{:04}", rng.next_u64() % KEY_SPACE).into_bytes();
+            if rng.next_u64().is_multiple_of(3) {
+                db.delete(&key).unwrap();
+            } else {
+                let value = format!("v{:016x}-{batch}", rng.next_u64()).into_bytes();
+                db.put(&key, &value).unwrap();
+            }
+        }
+        db.commit()
+            .unwrap_or_else(|err| panic!("seed {seed} batch {batch}: commit failed: {err}"));
+        if batch + 1 == batches / 2 {
+            scans_at_half = db.free_list_scans();
+        }
+        if rng.next_u64().is_multiple_of(6) {
+            db.checkpoint().unwrap();
+        }
+    }
+    let total = db.free_list_scans();
+    (total, total - scans_at_half, db.pages_reused())
+}
+
+/// The free list's cost per commit must not grow with the free list's length.
+///
+/// This is the regression test for AHL-565, and it pins a *shape*, not a
+/// wall-clock number. `refill_free_candidates` used to restart every scan at
+/// the oldest free-list row, so once a transaction had drawn more than
+/// `FREE_CANDIDATE_BATCH` (64) candidates, every subsequent allocation
+/// rescanned the same 64 already-drawn rows, rejected all of them against a
+/// linear walk of `consumed_ever_this_txn`, and returned nothing — then the
+/// next allocation did it again. Measured on this workload: at commit 190,
+/// 163 scans, 10,432 rows read, 98 of them returning zero candidates, for a
+/// single commit; at commit 10, one scan. That is the superlinearity
+/// `PERF.md`'s AHL-564 section named and did not chase.
+///
+/// Two assertions, because either alone can be passed for the wrong reason:
+///
+/// * **Absolute.** A commit draws its ids in batches of 64, and this workload
+///   frees a few hundred pages per commit at steady state, so a handful of
+///   scans per commit is the right order and 16 is a wide ceiling. This is
+///   the one that fires today: reverting either half of the fix takes it to
+///   76.6 scans/commit. A cap alone, though, would still pass on a workload
+///   short enough that the free list never grows.
+/// * **Shape.** The second half of the run must not cost meaningfully more
+///   per commit than the whole run does. The free list is ~10x longer by
+///   then, so under the bug this ratio *was* the growth itself. It is stated
+///   separately rather than folded into the cap because the two fail for
+///   different reasons — a cap catches a cost that is high, this catches a
+///   cost that is still climbing — and only the second survives someone
+///   later raising the cap to accommodate a heavier workload.
+///
+/// Worth recording, since it is the other half of AHL-564's story: with the
+/// fix reverted this workload does not merely get slow, it stops committing.
+/// The free-list rows grow the record until a commit is refused for
+/// exceeding the one-region ceiling, on a tree of twenty-four keys. That
+/// refusal is what `free_list_reuse_dst`'s own loop used to break out on, and
+/// why the sweep looked cheap while the free list was not.
+#[test]
+fn a_commits_free_list_scan_count_does_not_grow_with_the_free_list() {
+    const BATCHES_HERE: usize = 200;
+    for seed in 0..8u64 {
+        let (total, second_half, reused) = scan_cost(seed, BATCHES_HERE);
+        assert!(
+            reused > 0,
+            "seed {seed}: no page was reused, so this measures nothing"
+        );
+        let per_commit = total as f64 / BATCHES_HERE as f64;
+        assert!(
+            per_commit <= 16.0,
+            "seed {seed}: {total} free-list scans over {BATCHES_HERE} commits \
+             ({per_commit:.1}/commit) — allocation is rescanning rows it has \
+             already rejected (AHL-565)"
+        );
+        let second_half_per_commit = second_half as f64 / (BATCHES_HERE / 2) as f64;
+        assert!(
+            second_half_per_commit <= 3.0 * per_commit,
+            "seed {seed}: {second_half_per_commit:.1} scans/commit over the \
+             second half against {per_commit:.1} over the whole run — the cost \
+             of an allocation is growing with the free list's length (AHL-565)"
+        );
+    }
+}
+
 #[test]
 fn raw_scan_under_reuse_recovers_to_a_committed_snapshot() {
     let mut total_reused = 0u64;
