@@ -138,8 +138,15 @@ regeneration.
    every 150 commits; hold 0.166 → 0.113 ms at 16 writers.** Throughput
    (1.14–1.22x at 8–16 writers) is the weak column and is published as one.
    **Next:** re-run AHL-562's flush pipeline, which the gate was
-   suppressing, and chase the superlinear free-list growth the old record
-   ceiling was masking (`free_list_reuse_dst` 187 s → 1,902 s).
+   suppressing, and **AHL-565** then found what the old record ceiling had been
+   masking, and it was not the free list's length (which is self-balancing)
+   but the cost of scanning it: every allocation restarted at the oldest row,
+   so past 64 candidates each scan reread rows it had already drawn and
+   returned nothing — 400x wall clock for 36x list length. A resume cursor
+   and an exhausted latch, no format change, **13.3x against a ±1.3% A/A**;
+   the release sweep is **1,801 s → 183 s** and now runs its seeds to
+   completion. It also reclaims ~40% more pages, since the old scan had an
+   accidental 64-page-per-transaction reuse ceiling.
    Superseded: diagnosed (AHL-555),
    not fixed.** Next experiment, named not built: split plan-and-validate from
    take-the-gate-and-commit in `Connection::run_on_engine`, and see whether the
