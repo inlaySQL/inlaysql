@@ -1038,6 +1038,42 @@ fn password_policy(options: &ServerOptions) -> acl::PasswordPolicy {
     }
 }
 
+/// What [`add_account`] did to the database, so a caller can say which it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountAdded {
+    /// The database had no account store, and it was created around this
+    /// account. From this point the file is the authority and
+    /// `--user`/`--password` are never consulted again.
+    StoreCreated,
+    /// The database already had accounts of its own, and this is one more.
+    Added,
+}
+
+/// Create one account in a database's own account store, without serving.
+///
+/// This is `inlaysql user add`, and it lives here rather than in the argument
+/// parser for the same reason [`print_exposure_warning`] does: it is the
+/// remedy [`Server::bind`] names when it refuses a network bind on a database
+/// that has no accounts, and a remedy an embedder cannot perform is not a
+/// remedy. Nothing about it starts a listener or touches the network.
+///
+/// The file is opened read-write and closed again, so it cannot be run
+/// against a database a server currently holds — which is the honest
+/// constraint: this is the first-run flow, and after the first run `CREATE
+/// USER` over the wire is the way to add accounts.
+pub fn add_account(
+    path: impl AsRef<Path>,
+    user: &str,
+    password: &str,
+    superuser: bool,
+) -> io::Result<AccountAdded> {
+    let path = path.as_ref();
+    let mut db = Database::open(path)
+        .map_err(|error| io::Error::other(format!("cannot open {}: {error}", path.display())))?;
+    acl::add_account(&mut db, user, password, superuser)
+        .map_err(|error| io::Error::other(error.message))
+}
+
 /// Write the warning the CLI prints, so the text lives beside the behaviour it
 /// describes rather than in an argument parser.
 pub fn print_exposure_warning(options: &ServerOptions, out: &mut impl Write) -> io::Result<()> {

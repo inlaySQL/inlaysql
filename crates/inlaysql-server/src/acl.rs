@@ -571,6 +571,89 @@ fn ensure_store(db: &mut Database, bootstrap: &Bootstrap) -> Result<(), MysqlErr
     )
 }
 
+/// Create one account from outside a running server.
+///
+/// The non-serving entry point behind `inlaysql user add`, and it exists
+/// because [`crate::Server::bind`] refuses a network bind on a database whose
+/// only credential is `--user`/`--password`: a refusal whose remedy is "create
+/// an account" is a loop if the only way to create one is to connect to the
+/// server that just refused to start.
+///
+/// **The first account must be a superuser.** Creating the store is what makes
+/// `--user`/`--password` stop being consulted, so an account store whose only
+/// account cannot grant anything is a database nobody can ever administer —
+/// and unlike a lost password, there is no flag back out of it. Refused here,
+/// where the operator can add one word, rather than discovered later.
+///
+/// Passwords are stored under the default policy. `--strong-passwords` is a
+/// property of a *server* — a strong account can only authenticate over TLS —
+/// and this subcommand starts no server, so it does not get to choose that on
+/// one's behalf.
+pub fn add_account(
+    db: &mut Database,
+    name: &str,
+    password: &str,
+    superuser: bool,
+) -> Result<crate::AccountAdded, MysqlError> {
+    if name.is_empty() {
+        return Err(MysqlError::new(
+            1396,
+            "HY000",
+            "an account name cannot be empty",
+        ));
+    }
+    if password.is_empty() {
+        // Without this, `user add` would be a way around the refusal it exists
+        // to serve: a database whose store holds one empty-password superuser
+        // has "accounts of its own", so the account conditions in
+        // `Server::bind` stop firing, and the database is open to anyone who
+        // can reach the port. An account created here is created to be bound
+        // to a network, so it gets a password.
+        return Err(MysqlError::new(
+            1819,
+            "HY000",
+            format!(
+                "`{name}` would have an EMPTY password, and an account with one is a way in \
+                 for anybody who can reach the port. Set the environment variable \
+                 --password-env names to a real password."
+            ),
+        ));
+    }
+    if db.catalog().table(USER_TABLE).is_none() {
+        if !superuser {
+            return Err(MysqlError::new(
+                1227,
+                "42000",
+                format!(
+                    "`{name}` would be the first account in this database, and the first account \
+                     has to be a superuser or nothing could ever grant anything: this is the \
+                     write that makes --user/--password stop being consulted. Add --superuser, \
+                     then create the unprivileged accounts against it."
+                ),
+            ));
+        }
+        // The store is created *around* this account: `ensure_store` writes its
+        // bootstrap credential in first and as a superuser, and here that
+        // credential is the account being added rather than a flag's.
+        ensure_store(db, &Bootstrap::new(name, password))?;
+        return Ok(crate::AccountAdded::StoreCreated);
+    }
+    if stored_account(db, name)?.is_some() {
+        return Err(MysqlError::new(
+            1396,
+            "HY000",
+            format!("Operation CREATE USER failed for '{name}'@'%'"),
+        ));
+    }
+    let global = if superuser {
+        Privileges::ALL.with(Privileges::GRANT_OPTION)
+    } else {
+        Privileges::NONE
+    };
+    insert_account(db, name, password, None, global, PasswordPolicy::Scramble)?;
+    Ok(crate::AccountAdded::Added)
+}
+
 /// Read one account, or `None` if there is no such name.
 ///
 /// Read afresh on **every** statement rather than cached on the connection.

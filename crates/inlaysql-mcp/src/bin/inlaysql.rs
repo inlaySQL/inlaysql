@@ -3,6 +3,7 @@
 //! ```sh
 //! inlaysql serve --mcp app.inlay [--allow-writes] [--max-rows N] [--max-bytes N]
 //! inlaysql serve --mysql app.inlay [--port N] [--bind ADDR] [--user U]
+//! inlaysql user add app.inlay --user app --password-env INLAYSQL_PASSWORD
 //! inlaysql changes app.inlay [--from N]
 //! inlaysql backup app.inlay app-2026-08-25.inlay
 //! inlaysql vacuum app.inlay
@@ -21,6 +22,7 @@ inlaysql — an embedded database with first-class hybrid retrieval
 USAGE:
     inlaysql serve --mcp <database> [OPTIONS]
     inlaysql serve --mysql <database> [OPTIONS]
+    inlaysql user add <database> --user <name> --password-env <VAR> [--superuser]
     inlaysql changes <database> [--from <version>]
     inlaysql backup <database> <destination>
     inlaysql vacuum <database>
@@ -187,6 +189,28 @@ SERVE --mysql OPTIONS:
     batches and commit each one. See docs/server.md, The ~1 MiB transaction
     ceiling.
 
+USER ADD OPTIONS:
+    --user <name>      The account to create.
+    --password-env <VAR>
+                       Read its password from this environment variable.
+                       There is no --password: this is the one credential
+                       entry point built from scratch, so it does not inherit
+                       the flag that puts a password in the machine's process
+                       list where every other account on the host can read it.
+                       An empty password is refused — an account created to be
+                       reachable gets one.
+    --superuser        Give it every privilege, with GRANT OPTION. The FIRST
+                       account in a database must have this: creating the
+                       account store is the write that makes --user/--password
+                       stop being consulted, so a store whose only account
+                       cannot grant anything is a database nobody can ever
+                       administer, and there is no flag back out of that.
+
+    This is the way to give a database accounts of its own without starting a
+    server, which is what `serve --mysql --bind` refuses to run without. Do it
+    once, against a database no server currently holds; after that, CREATE
+    USER and GRANT over the wire are how accounts are managed.
+
 CHANGES OPTIONS:
     --from <version>   Start after this version. 0 (the default) means the whole
                        retained log.
@@ -240,6 +264,7 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("serve") => serve(&args[1..]),
+        Some("user") => user(&args[1..]),
         Some("changes") => changes(&args[1..]),
         Some("backup") => backup(&args[1..]),
         Some("vacuum") => vacuum(&args[1..]),
@@ -408,6 +433,79 @@ fn serve_mcp(args: &[String]) -> Result<(), String> {
     server
         .serve(BufReader::new(io::stdin()), io::stdout())
         .map_err(|error| error.to_string())
+}
+
+/// `user` is the non-serving door into a database's account store.
+///
+/// It has one subcommand today, and the shape is `user <verb>` rather than
+/// `user-add` so that the verbs to come — listing accounts, rotating a
+/// password — do not each need a new top-level command.
+fn user(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("add") => user_add(&args[1..]),
+        Some(other) => Err(format!("unknown user command `{other}`\n\n{USAGE}")),
+        None => Err(format!("user needs a command: add\n\n{USAGE}")),
+    }
+}
+
+fn user_add(args: &[String]) -> Result<(), String> {
+    let mut path = None;
+    let mut user = None;
+    let mut password = None;
+    let mut superuser = false;
+
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--user" => {
+                user = Some(
+                    rest.next()
+                        .cloned()
+                        .ok_or_else(|| "--user needs a name".to_string())?,
+                )
+            }
+            "--password-env" => {
+                let variable = rest
+                    .next()
+                    .ok_or_else(|| "--password-env needs a variable name".to_string())?;
+                password = Some(std::env::var(variable).map_err(|_| {
+                    format!("--password-env: `{variable}` is not set in the environment")
+                })?);
+            }
+            "--superuser" => superuser = true,
+            other if path.is_none() && !other.starts_with("--") => path = Some(other.to_string()),
+            other => return Err(format!("unknown option `{other}`\n\n{USAGE}")),
+        }
+    }
+
+    let path = path.ok_or_else(|| format!("user add needs a database\n\n{USAGE}"))?;
+    let user = user.ok_or_else(|| format!("user add needs --user <name>\n\n{USAGE}"))?;
+    // Deliberately no fallback to a prompt or to an empty string: an account
+    // created without being asked for a password is the failure this whole
+    // subcommand exists upstream of.
+    let password = password.ok_or_else(|| {
+        format!(
+            "user add needs --password-env <VAR>; there is no --password, because a \
+                 password on a command line is in this machine's process list\n\n{USAGE}"
+        )
+    })?;
+
+    let outcome = inlaysql_server::add_account(&path, &user, &password, superuser)
+        .map_err(|error| error.to_string())?;
+
+    // stderr, like every other diagnostic in this file.
+    match outcome {
+        inlaysql_server::AccountAdded::StoreCreated => eprintln!(
+            "inlaysql: created the account store in {path} with `{user}` as a superuser. \
+             --user/--password are never consulted on this database again; this account is \
+             the credential now."
+        ),
+        inlaysql_server::AccountAdded::Added => eprintln!(
+            "inlaysql: added `{user}` to {path}{}",
+            if superuser { " as a superuser" } else { "" }
+        ),
+    }
+    Ok(())
 }
 
 fn backup(args: &[String]) -> Result<(), String> {
