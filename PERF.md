@@ -6794,6 +6794,209 @@ it is the first one that names a mechanism with a number attached. The
 question three items have circled — *why is InlaySQL's barrier rate a third
 of MySQL's* — has an answer now, and it is not that the barrier is expensive.
 
+### Flush pipelining works, and the duty cycle does not move: the idle half is not the coordinator's latency, it is the absence of writers (AHL-562, 2026-09-05)
+
+AHL-561 measured the barrier at parity (1.322 ms against MySQL's 1.215) and
+put the whole 3.4x barrier-rate gap in the **duty cycle: 51% against 96%**. It
+priced the lever it did not build — pipeline the cycle: elect the next leader
+and run its gather *while the current `fsync` is still in flight*, and hand
+leadership over on `LeaderGuard::drop` instead of `notify_all` plus a
+re-election — and computed a ceiling from its own measured numbers: cycle
+2.575 → 1.322 ms, throughput 1,392 → ~2,710 ops/s, the server-to-server gap
+2.20x → 1.13x.
+
+**That change is built, it is correct, it engages on 83–92% of barriers, it
+moves 0.15–0.68 ms of gather per barrier out from under the critical path —
+and the duty cycle does not move at all.** 44.3% → 44.1% at sixteen writers,
+53.6% → 48.2% at eight (*worse*), and the barrier interval is unchanged to
+within the noise at every writer count. The mechanism is not the problem. The
+premise is: **the coordinator is not idle because it is slow to elect a
+leader. It is idle because there is nothing to flush.**
+
+`docs/research/flush-pipelining.md` is the design, written before the code,
+with the ticket-to-barrier proof and the crash table; §7 of it is the mutation
+table. The code is behind `INLAYSQL_FLUSH_PIPELINE`, **default off, and it
+should stay off** until the paragraph headed "what would have to change"
+below is true.
+
+#### 1. What was built
+
+`CommitCoordinator`, and nothing else — no format change, no core change, no
+`Device` trait change, no server change. A committer that arrives at
+`make_durable_with_cohort` while a barrier is in flight claims a successor
+slot instead of parking, drops the flush mutex, and runs its gather window
+underneath the running `fsync`; `LeaderGuard::drop` then keeps `in_progress`
+set, marks `handoff` and wakes it directly, so the round is *reserved* across
+the boundary and no third thread can elect itself into the gap. The successor
+takes the round already gathered and syncs immediately.
+
+Three things make it safe, and each has a test rather than an argument:
+
+* **The ticket-to-barrier rule is untouched.** Within a round the order is
+  still `load target` → `sync()` → `fetch_max(target)`, and pipelining moves
+  none of the three. A ticket published while barrier *k* runs is strictly
+  greater than `target_k`, which was loaded before `sync` started, so it can
+  only ever be covered by *k+1*, whose target is loaded after the handoff. A
+  randomised property test asserts, on every commit, that some completed
+  barrier's `writes_completed`-at-entry is `>=` its ticket and that
+  `durable_upto` never passes the highest such observation. Injecting the
+  mutation this whole design is written against — the successor crediting its
+  cohort to the barrier it gathered underneath — fails it on 3 of 3 runs.
+* **Nobody is stranded.** `SuccessorGuard` gives the claim back on any unwind,
+  and ends the round if one had already been reserved for it. A leader that
+  panics inside `sync` hands over a *live* round. A successor that wakes
+  already covered by the barrier it waited for returns without flushing and
+  releases the reservation. Each is a test; the mutation table names which.
+* **The handoff cannot lose a wakeup.** The state is `FlushState::handoff`,
+  checked under the mutex before the successor ever parks, and the park is a
+  50 ms `wait_timeout` rather than an indefinite `wait` — so any wakeup this
+  design has not thought of costs a bounded hiccup instead of a file-wide
+  deadlock. That is not theoretical tidiness: before the poll was added, the
+  "leader never hands off" mutation *hung* the suite instead of failing it.
+
+#### 2. The measurement
+
+The container harness AHL-561 used, scripted this time as
+`bench/flush_duty_cycle.sh` so the table below regenerates with one command:
+the `inlaysql-oltp` compose service, its own named volume (`/dev/vdb1 btrfs`
+inside OrbStack's Linux VM), the concurrency suite at `--txns 150` and
+`WRITER_LEVELS=1,2,4,8,16`, `Durability::Full`. **Six repetitions, both arms in every repetition, arm
+order flipped every repetition** (off-first on odd, on-first on even), one
+binary, one environment variable apart. Medians of six:
+
+| writers | arm | ops/s | commits/barrier | `fsync` ms | interval ms | **duty** | gather ms | gap ms | overlapped gather ms | handoffs |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | off | 1,280 | 1.00 | 0.710 | 0.782 | **90.8%** | 0.000 | 0.069 | — | 0% |
+| 1 | on | 1,750 | 1.00 | 0.503 | 0.571 | **88.2%** | 0.000 | 0.066 | 0.000 | **0%** |
+| 2 | off | 1,404 | 1.50 | 0.961 | 1.085 | **88.0%** | 0.028 | 0.081 | — | 0% |
+| 2 | on | 2,192 | 1.34 | 0.524 | 0.607 | **86.0%** | 0.019 | 0.077 | 0.000 | 68% |
+| 4 | off | 2,816 | 3.42 | 0.682 | 1.167 | **61.5%** | 0.205 | 0.303 | — | 0% |
+| 4 | on | 3,024 | 3.58 | 0.627 | 1.148 | **56.2%** | 0.247 | 0.294 | 0.146 | 92% |
+| 8 | off | 3,044 | 5.54 | 0.962 | 1.781 | **53.6%** | 0.408 | 0.510 | — | 0% |
+| 8 | on | 3,312 | 6.30 | 0.892 | 1.892 | **48.2%** | 0.453 | 0.549 | 0.361 | 88% |
+| 16 | off | 2,852 | 8.29 | 1.282 | 2.904 | **44.3%** | 0.774 | 0.806 | — | 0% |
+| 16 | on | 2,838 | 8.52 | 1.305 | 2.957 | **44.1%** | 0.793 | 0.943 | 0.679 | 83% |
+
+Paired on/off throughput ratios, one per repetition:
+
+| writers | rep 1 | 2 | 3 | 4 | 5 | 6 | median |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 1.39 | 2.28 | 1.29 | 0.93 | 1.48 | 0.99 | **1.34** |
+| 2 | 1.39 | 1.76 | 1.70 | 0.92 | 1.97 | 0.95 | 1.55 |
+| 4 | 1.10 | 1.17 | 1.12 | 0.91 | 1.17 | 1.03 | 1.11 |
+| 8 | 0.97 | 1.19 | 1.17 | 0.86 | 1.12 | 1.11 | 1.12 |
+| 16 | 0.90 | 0.98 | 1.06 | 0.99 | 1.20 | 0.99 | 0.99 |
+
+**Read the first row before any of the others.** At one writer the pipeline
+records **zero handoffs** — a solo committer never finds a barrier in flight,
+so it never claims a successor slot and not one line of the new code executes.
+That row is an A/A test that happens to be built into the experiment, and it
+reports **1.34x**, with a per-repetition spread of 0.93 to 2.28. Whatever the
+1.11 and 1.12 at four and eight writers are, they are smaller than the number
+this harness produces on code that provably did not run. This is §4's
+measurement floor, in the same shape AHL-561's own A/A saw it, and it is why
+the duty cycle — a *ratio* of two quantities measured inside the same run —
+is the deliverable and throughput is not.
+
+And the duty cycle is flat. It is flat while the mechanism is demonstrably
+working: 83–92% of barriers at four writers and up are entered by handoff, and
+0.146/0.361/0.679 ms per barrier of gather really does run underneath the
+previous `fsync` at 4/8/16 writers.
+
+#### 3. Why it is flat, which is the actual finding
+
+Two numbers, both from instruments that already existed.
+
+**The critical-path gather did not shrink; it concentrated.** At eight
+writers the gather is 0.408 ms/barrier with the pipeline off and 0.453 with it
+on — but with it on, 88% of barriers skip the gather entirely. Multiply out:
+the *total* time spent gathering on the critical path is the same to within a
+few percent in both arms, packed into the 12% of rounds that were still
+entered by election. The window's length is not a property of where it sits in
+the cycle. It is a property of the arrival process: `coalesce_normal_commits`
+closes when no normal commit is inflight or queued, so it lasts exactly as
+long as it takes for the writers to stop arriving — and moving it under the
+barrier does not make them arrive sooner.
+
+**The writers are not arriving because they are queued at the reservation
+gate.** The suite's own writer decomposition, medians of six, in the same
+runs:
+
+| writers | busy ms/commit | gate_wait | gate_hold | (gate hold, ms) | follower_wait |
+| --- | --- | --- | --- | --- | --- |
+| 4 | 1.40 / 1.31 | 20.1% / 21.9% | 11.1% / 11.8% | 0.155 / 0.155 | 44.4% / 40.2% |
+| 8 | 2.60 / 2.39 | 36.5% / 37.8% | 7.5% / 7.3% | 0.194 / 0.176 | 43.3% / 40.5% |
+| 16 | 5.55 / 5.56 | **51.0%** / 51.2% | 4.8% / 4.8% | 0.263 / 0.264 | 34.2% / 32.5% |
+
+(off / on.) At sixteen writers **half of every writer's commit latency is
+spent waiting for the reservation gate**, and the gate is serialized: one
+commit at a time appends its record and its pages. A 0.263 ms hold is a
+ceiling of ~3,800 commits/s no matter what the flush side does, and the
+measured 2,838–2,852 is within 1.35x of it. The commit rate sets the barrier
+rate (barriers = commits ÷ commits-per-barrier), the barrier rate sets the
+interval, and the interval minus the `fsync` *is* the idle half. **The duty
+cycle is a symptom of the gate, not a property of the flush.** A coordinator
+that could elect its next leader instantly would still have nothing to flush
+until the gate let the next writer through.
+
+That also re-reads AHL-561's own accounting rather than contradicting it. Its
+1.209 ms of "coordinator waiting for threads to be scheduled" was correct and
+is confirmed here; what was wrong was the implicit next step — that the wait
+was the coordinator's *own* latency and could be engineered away on the flush
+side. It is the queue in front of the gate, seen from the other end.
+
+The one thing that did move in the intended direction, and it is small:
+`follower_wait` falls 2–3 percentage points of writer time at every level
+above two, and commits per barrier rises (5.54 → 6.30 at eight, 8.29 → 8.52 at
+sixteen). The pipeline gathers slightly *bigger* cohorts, exactly as designed.
+The gate reabsorbs the gain.
+
+#### 4. What would have to change
+
+The two segments AHL-561 named are real, and this item's ceiling arithmetic
+still holds — but only for a workload where writers are waiting on the
+coordinator. At four writers and up on this harness they are waiting on each
+other. So the ordering is now the other way round from how AHL-561 left it:
+
+1. **The reservation gate is the constraint above two writers.** Anything that
+   shortens the hold (0.155–0.263 ms, growing with concurrency) or lets two
+   commits hold it at once raises the commit rate, and the barrier rate,
+   and the duty cycle, for free. AHL-547's commit-side absorption is the
+   attempt already on the board; it measured 0.90x for reasons that section
+   records, and its own two named preconditions are unchanged.
+2. **Only then is flush pipelining worth turning on.** It is built, proven and
+   instrumented; the cost of leaving it behind a default-off flag is one
+   branch on a relaxed atomic load in `make_durable_with_cohort`. If the gate
+   is never widened, deleting it is a one-commit revert and this section is
+   the reason.
+
+Two costs were named in the design before the numbers arrived and both should
+be recorded as measured. The "18–23x slower `pwrite` racing a concurrent
+flush" penalty: racing holds are 2,176 (off) against 2,189 (on) of 2,400
+commits at sixteen writers — the writers were already racing a barrier
+whether or not anyone gathered under it, so the pipeline did not add that
+cost. And the truncated gather: at *two* writers it is real and visible,
+commits per barrier 1.50 → 1.34, because a successor that claims late in a
+short barrier gathers nothing and then declines to re-gather. That is the
+design's deliberate choice, and at two writers it is the wrong one.
+
+**This is the fifth negative in this area** — AHL-544's flat, AHL-547's 0.90x,
+AHL-560's "already done", AHL-561's "not the syscall", and this one's "not the
+election either". Unlike the four before it, this one moves the question
+somewhere else rather than closing a door: the flush side has now been
+measured from both ends, the barrier is at parity and the idle half is
+demand, so the next item in this area is about the reservation gate or it is
+about nothing.
+
+**Landed:** the pipeline in `crates/inlaysql/src/device.rs` behind
+`INLAYSQL_FLUSH_PIPELINE` (default off), its tests,
+`bench/flush_duty_cycle.sh`, two counters
+(`overlap_gather_ns`, `handoffs`) reaching `CommitStats` and the `barrier
+cycle` line, `docs/research/flush-pipelining.md`, and this section. With the
+flag off the commit path is one relaxed load different from AHL-561's, and
+every read and batch shape is untouched by construction: no read path, no
+write path and no planner file is in the diff.
+
 ## 4. The measurement floor (2026-08-30): A/A test, noise-growth recompute, and the point-read dissection
 
 Every engine optimisation decision is frozen pending this section. The harness
