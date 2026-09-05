@@ -146,7 +146,15 @@ regeneration.
    and an exhausted latch, no format change, **13.3x against a ±1.3% A/A**;
    the release sweep is **1,801 s → 183 s** and now runs its seeds to
    completion. It also reclaims ~40% more pages, since the old scan had an
-   accidental 64-page-per-transaction reuse ceiling.
+   accidental 64-page-per-transaction reuse ceiling. **AHL-566** re-ran flush
+   pipelining now that every suppressor AHL-562 blamed has moved, found it
+   engages harder than ever (handoffs 93–98%, 95% of the gather overlapped)
+   and is **still flat** — the cycle is arrival-bound, not gather-bound — so
+   752 lines came out and the commit path is AHL-561's again. Its A/A control
+   (`bench/aa_floor.sh`) is the lasting part: the harness's noise band is
+   **[0.42, 1.98] at one writer and [0.81, 1.27] at sixteen**, the opposite
+   of how four experiments had read it, which retroactively makes AHL-563's
+   1.54–1.70x a firm result rather than a hedged one.
    Superseded: diagnosed (AHL-555),
    not fixed.** Next experiment, named not built: split plan-and-validate from
    take-the-gate-and-commit in `Connection::run_on_engine`, and see whether the
