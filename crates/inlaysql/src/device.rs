@@ -2345,6 +2345,42 @@ impl Device for FileDevice {
         }
     }
 
+    /// Narrower than [`Device::set_commit_point`]`(region, None)`: forget
+    /// where `region`'s next record goes and keep the rest of the cache.
+    ///
+    /// The trait's default is the total forget, and that is still what every
+    /// *failure* path uses — a commit that stopped part-way through a
+    /// sequence the committed state depends on. This override exists for the
+    /// one caller that knows precisely what it invalidated: a WAL region wrap
+    /// is about to zero `region`, which changes where that region's next
+    /// record goes and nothing else. The committed root, the next page id and
+    /// the sequence number are the same values before and after it, and the
+    /// other regions' logs are not touched.
+    ///
+    /// So a thread reading this cache during the wrap — `refill_free_candidates`
+    /// does, outside the gate — sees exactly what it would have seen one
+    /// instruction before the wrap began, rather than `None`. That is the
+    /// whole of the safety argument, and `docs/research/gate-hold.md` §4 is
+    /// the long form of it, including why a *failed* wrap still ends in a
+    /// total forget before the gate is released.
+    ///
+    /// Measured worth: at sixteen writers a wrap of one of four regions
+    /// manufactured ~2.4 full re-derivations of the committed state, each
+    /// ~2.6 ms, each inside the reservation gate with every other writer
+    /// queued behind it — 53% of all the time spent in the gate.
+    fn forget_append_offset(&self, region: usize) {
+        let Some(coordinator) = self.coordinator.as_ref() else {
+            return;
+        };
+        let mut gate = coordinator
+            .gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(slot) = gate.append.get_mut(region) {
+            *slot = None;
+        }
+    }
+
     fn wal_region(&self) -> usize {
         self.wal_region
     }
@@ -3581,6 +3617,501 @@ mod group_commit_tests {
 
     /// A checkpoint is never absorbed and never leads a cohort.
     ///
+    /// A [`FileDevice`] that refuses its `n`th write from now on.
+    ///
+    /// The only way to reach `CowBTree::commit`'s failure paths on a real
+    /// file: everything else about the device is the production one, so the
+    /// bytes, the coordinator, the commit-point cache and the gate are all
+    /// real, and only one `pwrite` is replaced by an error. Every method is a
+    /// forward except [`Device::write`].
+    struct FailNthWrite {
+        inner: FileDevice,
+        countdown: std::cell::Cell<Option<usize>>,
+        writes: std::cell::Cell<usize>,
+        failed: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl FailNthWrite {
+        fn new(inner: FileDevice, failed: std::rc::Rc<std::cell::Cell<bool>>) -> Self {
+            Self {
+                inner,
+                countdown: std::cell::Cell::new(None),
+                writes: std::cell::Cell::new(0),
+                failed,
+            }
+        }
+
+        /// Fail the `n`th write from here (0 = the very next one).
+        fn arm(&self, n: usize) {
+            self.countdown.set(Some(n));
+        }
+
+        /// Writes issued so far, so a test can count the ones a particular
+        /// commit performs instead of hard-coding the number.
+        fn writes(&self) -> usize {
+            self.writes.get()
+        }
+    }
+
+    impl Device for FailNthWrite {
+        fn write(&mut self, offset: usize, data: &[u8]) -> Result<()> {
+            self.writes.set(self.writes.get() + 1);
+            if let Some(left) = self.countdown.get() {
+                if left == 0 {
+                    self.countdown.set(None);
+                    self.failed.set(true);
+                    return Err(Error::Storage("injected write failure".to_string()));
+                }
+                self.countdown.set(Some(left - 1));
+            }
+            self.inner.write(offset, data)
+        }
+
+        fn read(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
+            self.inner.read(offset, buf)
+        }
+        fn read_shared(&self, offset: usize, len: usize) -> Option<Arc<[u8]>> {
+            self.inner.read_shared(offset, len)
+        }
+        fn sync(&mut self) -> Result<()> {
+            self.inner.sync()
+        }
+        fn sync_commit(&mut self) -> Result<()> {
+            self.inner.sync_commit()
+        }
+        fn commit_ready(&self) {
+            self.inner.commit_ready();
+        }
+        fn set_durability(&self, durability: inlaysql_core::btree::Durability) {
+            self.inner.set_durability(durability);
+        }
+        fn begin_commit(&self) -> Result<()> {
+            self.inner.begin_commit()
+        }
+        fn begin_normal_commit(&self) -> Result<()> {
+            self.inner.begin_normal_commit()
+        }
+        fn end_commit(&self) -> Option<u64> {
+            self.inner.end_commit()
+        }
+        fn end_normal_commit(&self) -> Option<u64> {
+            self.inner.end_normal_commit()
+        }
+        fn commit_generation(&self) -> Option<u64> {
+            self.inner.commit_generation()
+        }
+        fn commit_point(&self, region: usize) -> Option<inlaysql_core::btree::CommitPoint> {
+            self.inner.commit_point(region)
+        }
+        fn set_commit_point(
+            &self,
+            region: usize,
+            point: Option<inlaysql_core::btree::CommitPoint>,
+        ) {
+            self.inner.set_commit_point(region, point);
+        }
+        fn forget_append_offset(&self, region: usize) {
+            self.inner.forget_append_offset(region);
+        }
+        fn wal_region(&self) -> usize {
+            self.inner.wal_region()
+        }
+        fn is_read_only(&self) -> bool {
+            self.inner.is_read_only()
+        }
+        fn register_reader(&self) -> Option<u64> {
+            self.inner.register_reader()
+        }
+        fn update_reader(&self, token: u64, seq: u64) {
+            self.inner.update_reader(token, seq);
+        }
+        fn release_reader(&self, token: u64) {
+            self.inner.release_reader(token);
+        }
+        fn min_reader_seq(&self) -> Option<u64> {
+            self.inner.min_reader_seq()
+        }
+        fn note_page_reuse_enabled(&self) {
+            self.inner.note_page_reuse_enabled();
+        }
+        fn page_reuse_enabled(&self) -> bool {
+            self.inner.page_reuse_enabled()
+        }
+    }
+
+    /// A test path that does not collide with a concurrent run of this suite.
+    fn scratch_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "inlaysql-{name}-{}-{}.inlay",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ))
+    }
+
+    /// [`Device::forget_append_offset`] forgets one region's append offset and
+    /// nothing else — the whole of what the wrap path is allowed to invalidate.
+    ///
+    /// Both halves matter and each catches a different mutation: dropping the
+    /// `*slot = None` leaves region 1 answering, and falling back to the
+    /// trait's default total forget takes region 0 and the committed state
+    /// with it. See `docs/research/gate-hold.md` §4.
+    #[test]
+    fn forgetting_an_append_offset_leaves_the_other_regions_and_the_state() {
+        let path = scratch_path("forget-append-offset");
+        let _ = std::fs::remove_file(&path);
+        let device = FileDevice::open(&path).expect("open");
+
+        let point = |append_offset| inlaysql_core::btree::CommitPoint {
+            root: 7,
+            next: 9,
+            seq: 11,
+            append_offset,
+        };
+        device.set_commit_point(0, Some(point(4096)));
+        device.set_commit_point(1, Some(point(8192)));
+        assert!(device.commit_point(0).is_some());
+        assert!(device.commit_point(1).is_some());
+
+        device.forget_append_offset(1);
+
+        assert!(
+            device.commit_point(1).is_none(),
+            "the wrapped region's append offset is the one fact a wrap invalidates"
+        );
+        let kept = device
+            .commit_point(0)
+            .expect("another region's append offset survives a wrap that is not its own");
+        assert_eq!(
+            (kept.root, kept.next, kept.seq, kept.append_offset),
+            (7, 9, 11, 4096),
+            "a wrap moves no root, no page id, no sequence number and no other region"
+        );
+
+        drop(device);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The *total* forget is still total. Every failure path uses it — the
+    /// `!written` branch of `CowBTree::commit` and `CowBTree::checkpoint`'s own
+    /// — and AHL-563 narrowed exactly one caller, the wrap, and nothing else.
+    /// Widening `forget_append_offset` without narrowing this would pass the
+    /// test above and fail this one.
+    #[test]
+    fn the_total_forget_is_still_total() {
+        let path = scratch_path("total-forget");
+        let _ = std::fs::remove_file(&path);
+        let device = FileDevice::open(&path).expect("open");
+
+        let point = |append_offset| inlaysql_core::btree::CommitPoint {
+            root: 7,
+            next: 9,
+            seq: 11,
+            append_offset,
+        };
+        device.set_commit_point(0, Some(point(4096)));
+        device.set_commit_point(1, Some(point(8192)));
+
+        device.set_commit_point(1, None);
+
+        assert!(device.commit_point(1).is_none());
+        assert!(
+            device.commit_point(0).is_none(),
+            "a failure the caller cannot bound must still forget the whole cache"
+        );
+
+        drop(device);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// AHL-563's finding, as a test: a wrap of one WAL region must not force
+    /// the next commit in any *other* region to re-derive the committed state
+    /// from the file inside its own gate hold.
+    ///
+    /// Two handles, two regions. Both commit once, so both regions' append
+    /// offsets are cached and the file-wide state is too. Then one handle
+    /// commits until its region wraps — proven by `gate_state_writes`, which
+    /// counts the in-gate state-block writes only a wrap performs — and the
+    /// other handle commits again. With the total forget, that last commit
+    /// finds an empty cache and pays `read_committed_state` plus
+    /// `wal::scan_region`; with the narrow one it finds its own offset intact.
+    ///
+    /// The assertion is on `gate_point_misses`, which counts exactly that
+    /// event, so the test fails on the mutation rather than on a timing.
+    #[test]
+    fn a_region_wrap_costs_no_other_region_a_re_derivation() {
+        use inlaysql_core::btree::{CowBTree, DEFAULT_PAGE_SIZE};
+
+        let path = scratch_path("wrap-keeps-other-regions");
+        let _ = std::fs::remove_file(&path);
+
+        let device_a = FileDevice::open(&path).expect("open a");
+        let coordinator = Arc::clone(device_a.coordinator.as_ref().expect("coordinator"));
+        let mut tree_a = CowBTree::open_or_create(device_a, DEFAULT_PAGE_SIZE).expect("create");
+        tree_a.put(b"a", &[0u8; 64]).expect("put");
+        tree_a.commit().expect("commit a");
+
+        let device_b = FileDevice::open(&path).expect("open b");
+        assert_ne!(
+            device_b.wal_region(),
+            0,
+            "the second handle on a file takes the next region, which is what this test is about"
+        );
+        let mut tree_b = CowBTree::open_or_create(device_b, DEFAULT_PAGE_SIZE).expect("open b");
+        tree_b.put(b"b", &[0u8; 64]).expect("put");
+        tree_b.commit().expect("commit b");
+
+        // One more commit each, because opening the second handle replays the
+        // log and can checkpoint, which forgets everything — including region
+        // 0's offset, which the first commit had published. After this round
+        // both regions and the file-wide state are genuinely cached, so
+        // everything the counter records past this point is what the *wrap*
+        // did to them and nothing else.
+        tree_a.put(b"a2", &[0u8; 64]).expect("put");
+        tree_a.commit().expect("commit a again");
+        tree_b.put(b"b1", &[0u8; 64]).expect("put");
+        tree_b.commit().expect("commit b again");
+
+        let misses_before = coordinator.gate_point_misses.load(Ordering::Relaxed);
+        let wraps_before = coordinator.gate_state_writes.load(Ordering::Relaxed);
+
+        // A region is 256 pages; a value near a page fills one quickly. This
+        // loop is bounded so a change that stops wrapping fails the assertion
+        // below rather than hanging.
+        let value = vec![7u8; DEFAULT_PAGE_SIZE / 2];
+        for i in 0..2_000u32 {
+            tree_a.put(&i.to_be_bytes(), &value).expect("put");
+            tree_a.commit().expect("commit");
+            if coordinator.gate_state_writes.load(Ordering::Relaxed) > wraps_before {
+                break;
+            }
+        }
+        assert!(
+            coordinator.gate_state_writes.load(Ordering::Relaxed) > wraps_before,
+            "the loop must actually wrap a region or this test proves nothing"
+        );
+
+        let misses_after_wrap = coordinator.gate_point_misses.load(Ordering::Relaxed);
+        assert_eq!(
+            misses_after_wrap, misses_before,
+            "the wrapping writer republishes its own region before leaving the gate"
+        );
+
+        tree_b.put(b"b2", &[1u8; 64]).expect("put");
+        tree_b.commit().expect("commit b after the wrap");
+
+        assert_eq!(
+            coordinator.gate_point_misses.load(Ordering::Relaxed),
+            misses_before,
+            "a wrap in another region must not send this one back to the file"
+        );
+
+        // And the data is still there, read through a handle that shares
+        // neither tree's in-memory state.
+        drop(tree_a);
+        drop(tree_b);
+        let reader = FileDevice::open(&path).expect("reopen");
+        let check = CowBTree::open_or_create(reader, DEFAULT_PAGE_SIZE).expect("reopen tree");
+        assert_eq!(
+            check.get(b"b2").expect("get").as_deref(),
+            Some(&[1u8; 64][..])
+        );
+        assert_eq!(
+            check.get(b"a").expect("get").as_deref(),
+            Some(&[0u8; 64][..])
+        );
+        drop(check);
+
+        drop(coordinator);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A wrap that fails at *any* of its writes must leave the commit-point
+    /// cache completely empty, and the file readable as a prefix: every row a
+    /// caller was told it committed is still there, and the one it was not
+    /// told about is not required to be.
+    ///
+    /// This is the property AHL-563's narrowing has to preserve rather than
+    /// improve. `CowBTree::commit`'s wrap branch now forgets only its own
+    /// region's append offset, so the guarantee that a *failed* wrap forgets
+    /// everything rests entirely on the `!written` branch further down —
+    /// unchanged code, but code this change now depends on, which is why it
+    /// gets a test instead of a sentence. Removing that branch fails this on
+    /// the first injected failure.
+    ///
+    /// The injection walks every write of the wrapping commit: the state
+    /// block, the megabyte of zeros, each dirty page, and the record append.
+    #[test]
+    fn a_wrap_that_fails_at_any_write_forgets_the_whole_cache() {
+        use inlaysql_core::btree::{CowBTree, DEFAULT_PAGE_SIZE};
+
+        let value = vec![5u8; DEFAULT_PAGE_SIZE / 2];
+
+        // Pass one, on its own file: how many commits does it take to wrap?
+        let probe_path = scratch_path("wrap-failure-probe");
+        let _ = std::fs::remove_file(&probe_path);
+        let probe = FileDevice::open(&probe_path).expect("open probe");
+        let coordinator = Arc::clone(probe.coordinator.as_ref().expect("coordinator"));
+        let probe = FailNthWrite::new(probe, std::rc::Rc::new(std::cell::Cell::new(false)));
+        let mut tree = CowBTree::open_or_create(probe, DEFAULT_PAGE_SIZE).expect("create");
+        let mut wrap = None;
+        for i in 0..2_000u32 {
+            let before = tree.device().writes();
+            tree.put(&i.to_be_bytes(), &value).expect("put");
+            tree.commit().expect("commit");
+            if coordinator.gate_state_writes.load(Ordering::Relaxed) > 0 {
+                wrap = Some((i, tree.device().writes() - before));
+                break;
+            }
+        }
+        drop(tree);
+        drop(coordinator);
+        let _ = std::fs::remove_file(&probe_path);
+        let (wrap_at, writes_in_wrap) = wrap.expect("the probe has to reach a region wrap");
+        assert!(
+            writes_in_wrap >= 3,
+            "a wrapping commit writes at least the state block, the zeros and its record"
+        );
+        let mut injections = 0usize;
+
+        // Pass two: replay up to just before that commit, then break each of
+        // its writes in turn.
+        for fail_at in 0..writes_in_wrap {
+            let path = scratch_path(&format!("wrap-failure-{fail_at}"));
+            let _ = std::fs::remove_file(&path);
+            let inner = FileDevice::open(&path).expect("open");
+            let coordinator = Arc::clone(inner.coordinator.as_ref().expect("coordinator"));
+            let failed = std::rc::Rc::new(std::cell::Cell::new(false));
+            let device = FailNthWrite::new(inner, std::rc::Rc::clone(&failed));
+            let mut tree = CowBTree::open_or_create(device, DEFAULT_PAGE_SIZE).expect("create");
+            for i in 0..wrap_at {
+                tree.put(&i.to_be_bytes(), &value).expect("put");
+                tree.commit().expect("commit");
+            }
+            assert_eq!(
+                coordinator.gate_state_writes.load(Ordering::Relaxed),
+                0,
+                "the replay must stop one commit short of the wrap"
+            );
+
+            tree.device().arm(fail_at);
+            tree.put(&wrap_at.to_be_bytes(), &value).expect("put");
+            let outcome = tree.commit();
+
+            if failed.get() {
+                injections += 1;
+                assert!(
+                    outcome.is_err(),
+                    "an injected write failure has to be reported, not swallowed"
+                );
+                let gate = coordinator
+                    .gate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert!(
+                    gate.state.is_none() && gate.append.iter().all(Option::is_none),
+                    "a commit that stopped part-way must leave no cached answer at all \
+                     (fail_at={fail_at})"
+                );
+            }
+            drop(tree);
+
+            // Whatever happened, every row committed before the failure is
+            // still readable from a handle with no memory of any of it.
+            let reader = FileDevice::open(&path).expect("reopen");
+            let check = CowBTree::open_or_create(reader, DEFAULT_PAGE_SIZE).expect("reopen tree");
+            for i in 0..wrap_at {
+                assert_eq!(
+                    check.get(&i.to_be_bytes()).expect("get").as_deref(),
+                    Some(&value[..]),
+                    "row {i} was acknowledged before the injected failure (fail_at={fail_at})"
+                );
+            }
+            drop(check);
+            drop(coordinator);
+            let _ = std::fs::remove_file(&path);
+        }
+        assert_eq!(
+            injections, writes_in_wrap,
+            "every write the wrapping commit issues has to have been broken in turn, \
+             or this test is asserting about commits that simply succeeded"
+        );
+    }
+
+    /// The same shape as a randomised property, and the one that would catch a
+    /// stale append offset rather than merely a slow one: four handles on four
+    /// regions, each wrapping its own region several times over, and every row
+    /// any of them was told it committed has to be readable from a handle
+    /// opened afterwards with a cold cache.
+    ///
+    /// A cached append offset that survived a wrap it should not have would
+    /// put a later record on top of a live one, and the reopen below is where
+    /// that shows up — as a missing row, not as a crash.
+    #[test]
+    fn every_row_survives_repeated_region_wraps() {
+        use inlaysql_core::btree::{CowBTree, DEFAULT_PAGE_SIZE};
+
+        const HANDLES: usize = 4;
+        const ROWS: usize = 240;
+
+        let path = scratch_path("repeated-region-wraps");
+        let _ = std::fs::remove_file(&path);
+
+        let seed = FileDevice::open(&path).expect("open seed");
+        let coordinator = Arc::clone(seed.coordinator.as_ref().expect("coordinator"));
+        let mut seed_tree = CowBTree::open_or_create(seed, DEFAULT_PAGE_SIZE).expect("create");
+        seed_tree.put(b"seed", b"value").expect("seed put");
+        seed_tree.commit().expect("seed commit");
+        drop(seed_tree);
+
+        let value = vec![3u8; DEFAULT_PAGE_SIZE / 2];
+        // `CowBTree` is not `Send` (see the checkpoint test above), so the
+        // handles run in sequence here; what this test is about is the shared
+        // commit-point cache, which they share either way.
+        for handle in 0..HANDLES {
+            let device = FileDevice::open(&path).expect("open");
+            let mut tree = CowBTree::open_or_create(device, DEFAULT_PAGE_SIZE).expect("open tree");
+            for row in 0..ROWS {
+                let key = format!("h{handle}-r{row}");
+                tree.put(key.as_bytes(), &value).expect("put");
+                assert!(
+                    matches!(
+                        tree.commit().expect("commit"),
+                        inlaysql_core::btree::CommitOutcome::Committed
+                    ),
+                    "these writers touch disjoint keys and must never conflict"
+                );
+            }
+        }
+        assert!(
+            coordinator.gate_state_writes.load(Ordering::Relaxed) >= HANDLES as u64,
+            "this workload has to wrap every region at least once to mean anything"
+        );
+
+        let reader = FileDevice::open(&path).expect("reopen");
+        let check = CowBTree::open_or_create(reader, DEFAULT_PAGE_SIZE).expect("reopen tree");
+        for handle in 0..HANDLES {
+            for row in 0..ROWS {
+                let key = format!("h{handle}-r{row}");
+                assert_eq!(
+                    check.get(key.as_bytes()).expect("get").as_deref(),
+                    Some(&value[..]),
+                    "row {key} was committed and must survive every wrap after it"
+                );
+            }
+        }
+        assert_eq!(
+            check.get(b"seed").expect("get").as_deref(),
+            Some(&b"value"[..])
+        );
+        drop(check);
+
+        drop(coordinator);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// It takes the gate through [`FileDevice::begin_commit`], not
     /// `begin_normal_commit`, so it never advertises itself as a leader — and
     /// a writer arriving behind it therefore parks on the reservation exactly

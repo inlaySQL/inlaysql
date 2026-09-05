@@ -1682,7 +1682,17 @@ impl<D: Device> CowBTree<D> {
                 // cohort never straddles this: only this writer's own record
                 // is in the buffer here, and a member that would overflow the
                 // region ends the cohort instead of wrapping it.
-                self.device.set_commit_point(region, None);
+                //
+                // Only this region's append offset, not the whole cache: a
+                // wrap moves where *this* region's next record goes and
+                // nothing else, and discarding the committed state and the
+                // other three regions' offsets with it forced the next commit
+                // in each of them into a full re-derivation from the file,
+                // inside its own gate hold. See `Device::forget_append_offset`
+                // and `docs/research/gate-hold.md`. The failure path below
+                // still forgets everything, so a wrap that does not complete
+                // leaves exactly what it left before.
+                self.device.forget_append_offset(region);
                 self.write_state_values(current_root, current_next, current_seq)?;
                 let zeros = vec![0u8; crate::wal::wal_region_len(self.page_size)];
                 append_offset =

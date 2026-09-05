@@ -624,6 +624,30 @@ pub trait Device {
     /// rule [`Device::end_commit`] follows, for the same reason.
     fn set_commit_point(&self, _region: usize, _point: Option<CommitPoint>) {}
 
+    /// Forget only where `region`'s next record goes, keeping whatever else a
+    /// cached commit point holds.
+    ///
+    /// This exists because [`Device::set_commit_point`]`(region, None)` is a
+    /// *total* forget — the committed state and every region's append offset —
+    /// and a caller that is about to reuse one region needs less than that. A
+    /// region wrap changes exactly one fact: where that region's next record
+    /// goes. It does not move the committed root, the next page id or the
+    /// sequence number, and it does not touch any other region's log. See
+    /// `docs/research/gate-hold.md` §3 for the measurement that made the
+    /// difference worth naming, and §4 for why the narrower forget is safe.
+    ///
+    /// **The default is the total forget**, so a device that has not thought
+    /// about the distinction keeps the conservative answer and this method
+    /// can never make one less safe than it was. `inlaysql`'s `FileDevice` is
+    /// the only implementation that overrides it.
+    ///
+    /// Called only from inside the reservation gate, before the writes that
+    /// make the old answer wrong — the same ordering rule
+    /// [`Device::set_commit_point`] follows, for the same reason.
+    fn forget_append_offset(&self, region: usize) {
+        self.set_commit_point(region, None);
+    }
+
     /// Mark the boundary between two phases of a commit's reservation-gate
     /// hold, for a device that can read a clock (AHL-563).
     ///
@@ -911,6 +935,10 @@ impl<T: Device> Device for Rc<RefCell<T>> {
 
     fn set_commit_point(&self, region: usize, point: Option<CommitPoint>) {
         self.borrow().set_commit_point(region, point);
+    }
+
+    fn forget_append_offset(&self, region: usize) {
+        self.borrow().forget_append_offset(region);
     }
 
     fn wal_region(&self) -> usize {
