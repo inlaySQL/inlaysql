@@ -7772,7 +7772,8 @@ upper bound. This is not the lift blocker 5 is waiting for — `DELETE FROM t` i
 still bounded by a change-log record the caller never asked for, unchanged.
 
 **A DST sweep got ~10× slower, and the reason is the ceiling.**
-`free_list_reuse_dst`'s heavy-churn sweep went from 187 s to over half an hour.
+`free_list_reuse_dst` went from **187 s for both its sweeps to 78 s + 1,465 s**
+— 8.3× — essentially all of it in the heavy-churn one.
 It is not a hang and not a regression in the engine: the workload's inner loop
 breaks out when a commit fails, and with page reuse on and heavy churn the
 free-list rows grow the record until it hits the region. Over 300 seeds, **v5

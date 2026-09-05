@@ -6966,14 +6966,26 @@ mod tests {
         assert_eq!(db.get(b"k").unwrap(), Some(RowBuf::Owned(b"v".to_vec())));
     }
 
-    /// [`CowBTree::pending_record_len`] says "exact, not an estimate", and a
-    /// caller sizing a bulk load against [`CowBTree::log_capacity`] is trusting
-    /// that word — a short answer hands back a record the log will refuse.
-    /// So it is checked against the encoder rather than against a constant,
-    /// which is what would have caught it returning the v2–v4 header for a v5
-    /// file (AHL-482).
+    /// A caller sizing a bulk load against [`CowBTree::log_capacity`] is
+    /// trusting [`CowBTree::pending_record_len`], and a *short* answer hands
+    /// back a record the log will refuse. So it is checked against the encoder
+    /// rather than against a constant, which is what would have caught it
+    /// returning the v2–v4 header for a v5 file (AHL-482).
+    ///
+    /// Under format version 6 it is a bound rather than the exact size, and
+    /// this asserts all three things that makes true (AHL-564):
+    ///
+    /// * **It is sound.** The record the encoder actually produces fits inside
+    ///   it. A bound that was ever short is the failure mode this test exists
+    ///   for, and it is the only one of the three that is about safety.
+    /// * **It is exactly the pre-v6 answer** — the v5 record's length plus v6's
+    ///   eight extra bytes of framing per page — which is what keeps
+    ///   `Storage::transaction_is_nearly_full` refusing at the point it always
+    ///   did rather than at a new one.
+    /// * **The v6 record is really smaller**, so a "bound" that had quietly
+    ///   become the whole page again could not pass.
     #[test]
-    fn the_pending_record_length_is_exactly_what_the_encoder_produces() {
+    fn the_pending_record_length_bounds_what_the_encoder_produces() {
         let mut db = CowBTree::create(disk(), PAGE).unwrap();
         assert_eq!(db.format_version(), FORMAT_VERSION);
         // An empty transaction, one page, and enough pages to split the tree —
@@ -7000,12 +7012,27 @@ mod tests {
                         .collect()
                 },
             };
-            assert_eq!(
-                db.pending_record_len(),
-                crate::wal::encode_record(&record).len(),
-                "{keys} keys, {} dirty pages",
-                db.dirty.len()
+            let pages = record.pages.len();
+            let bound = db.pending_record_len();
+            let v6 = crate::wal::encode_record(&record).len();
+            let v5 = crate::wal::encode_multi_region_record(&record).len();
+            assert!(
+                v6 <= bound,
+                "{keys} keys, {pages} dirty pages: the encoder wrote {v6} into a \
+                 budget of {bound}"
             );
+            assert_eq!(
+                bound,
+                v5 + pages * 8,
+                "{keys} keys, {pages} dirty pages: the bound has to stay the v5 \
+                 answer plus v6's framing"
+            );
+            if pages > 0 {
+                assert!(
+                    v6 < v5,
+                    "{keys} keys, {pages} dirty pages: v6 has to elide something"
+                );
+            }
             db.commit().unwrap();
         }
     }
