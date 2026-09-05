@@ -7601,3 +7601,214 @@ times without anyone opening it.
 four `inlaysql-core` sweeps run on the in-memory environment, whose device
 keeps no commit point, so `forget_append_offset` there is the trait default
 and byte-for-byte unchanged.
+
+### The commit record was 73% zero, and a region now wraps every 184 commits instead of every 51 (AHL-564, 2026-09-06)
+
+AHL-563 halved the reservation gate's hold to 0.121 ms and left the largest
+single item inside it named but unopened: **the WAL region wrap, ~2.0 ms, of
+which 1.3 ms is an `fsync` that must precede reusing a region.** Moving that
+barrier out of the gate is a proposal this project has retracted as unsafe and
+it stays retracted. The un-retracted lever is **making wraps rarer**, and the
+arithmetic was stark: a region is `WAL_BLOCKS` (256) × `page_size` = 1 MiB, a
+single-row commit writes ~20 KiB of record against MySQL's 605 B, so a region
+wraps roughly every 52 commits.
+
+Ours is that large because the record carries whole dirty pages. That is
+physical logging and it is the conservative choice — `docs/recovery.md` says
+why a record that cannot rebuild its own pages is not a commit. **But a page is
+not 4,096 bytes of content. It is a fixed-size block with a hole in the
+middle,** and nobody had measured the hole.
+
+#### 1. What is actually in a 20 KiB record
+
+`inlaysql-bench --bin record_anatomy` (`bc57595`) puts a `Device` between the
+tree and `FileDevice`, captures every byte appended into a WAL region, decodes
+each record with `wal::decode_record` and each page image with `page::decode`,
+and attributes every page by the key its cells carry. The classification is the
+file's own, not a guess.
+
+A steady-state single-row `INSERT` into `kv (id INTEGER PRIMARY KEY, body
+TEXT)`, 300 commits past a 200-commit warm-up — **20,747 B, 5.04 pages**:
+
+| page | B/commit | used B | used | cells | why it is there |
+| --- | --- | --- | --- | --- | --- |
+| leaf `kv\0…` | 4,198 | 2,236 | 52.6% | 21.3 | the row's own leaf |
+| leaf `\0cdc:…` | 4,151 | 2,246 | 54.1% | 44.9 | the change-log record |
+| internal (spine) | 4,096 | 962 | **23.5%** | 39.3 | the root |
+| leaf `\0next_row_id` | 4,096 | 45 | **1.1%** | 1.0 | one 8-byte counter |
+| leaf `\0write_version` | 4,096 | 79 | **1.9%** | 2.0 | two 8-byte counters |
+
+Plus 60 B of per-page framing and 56 B of record scalars and checksum.
+
+**Which are copy-on-write and which are incidental** — the question that
+decides where a cheap win lives. The first two and the spine are the
+root-to-leaf path a one-row insert genuinely rewrites: COW copies every page
+from the root down, so they are the price of the tree and not of the log. The
+last two are the other kind. `\0next_row_id` and `\0write_version` are bumped
+by every write statement (`Engine::end_write`), they land in different leaves
+because the 4,096 retained `\0cdc:…` keys sort between them, and **8,192 bytes
+of the record — 39.5% — carry 124 bytes of counter.**
+
+And the answer that made the rest of the item unnecessary: across all five
+pages, **73.0% of the record is the zero hole `page::PageWriter` leaves**
+between the slot directory and the packed cells. It starts from a zeroed block,
+grows the directory forward from the header, packs the cells backwards from the
+end, and never writes what is between them.
+
+#### 2. What was changed, and what it is not
+
+Format version 6. A page entry becomes `id u64 | stored u32 | hole_at u32 |
+hole_len u32 | bytes`, naming the image `bytes[..hole_at]` then `hole_len`
+zeros then `bytes[hole_at..]`. The run is found by scanning the image for its
+longest run of zeros — deliberately **not** by reading `free_start` out of the
+page header, because `wal` knows nothing about page layout and a rule copied
+out of `page.rs` would make the durability path depend on another module's
+invariant. Scanning is also automatically right for an overflow page, whose
+header is a different shape, and for a page shape that does not exist yet.
+
+**The record still carries the page's exact image.** That is the whole safety
+argument and it is worth stating as the answer to this item's third question
+rather than as a preamble. A *physiological* record — "insert this cell into
+page P at slot S" — would make recovery's correctness depend on the page on
+disk being exactly what the log assumed, which is why `docs/recovery.md` prices
+that shape and does not take it. This one depends on nothing but its own
+checksum, exactly as before: replay writes whole page images, at fresh ids,
+healing a torn write byte-for-byte, and never has to know a page's prior state.
+It is the same physical logging, one encoding tighter. **The trade this makes
+is not a durability trade at all; it is eight more bytes of framing per page.**
+
+The file layout does not move either: `region_count(6)` is `region_count(5)`,
+so the data area starts at the same offset and `WAL_BLOCKS` is untouched. That
+is the difference between this and the third candidate on the list — **a larger
+region**, which was measured first because it is trivial and then not taken:
+`data_offset_for` derives every page's address from `WAL_BLOCKS`, the constant
+is *not* recorded in the header (`encode_header_with_version` writes magic,
+page size, version, checksum and nothing else), so changing it relocates every
+page of every existing file. It would need the same format version this change
+spent, it would only remove the wrap's `fsync` and not the bytes, and it costs
+file space. A smaller record makes wraps rarer *and* the barrier smaller *and*
+the encode cheaper. It is the same lever three times.
+
+A v5 database is read **and written** as a v5 database and never migrates.
+
+#### 3. On the clock
+
+`bench/record_size.sh`, AHL-563's harness: the `inlaysql-oltp` compose service,
+its own named volume (`/dev/vdb1 btrfs` inside OrbStack's Linux VM), `--txns
+150`, `WRITER_LEVELS=1,2,4,8,16`, `Durability::Full`. **Six repetitions, both
+arms in every repetition, arm order flipped every repetition, one binary one
+environment variable apart** (`INLAYSQL_WHOLE_PAGE_WAL_RECORD` makes a newly
+created database a v5 one; the suite recreates its file every run and the
+version lives in the header, so an existing database is never affected). Host
+load 5.4 of 18. Medians of six:
+
+| writers | arm | ops/s | commits/barrier | **hold ms** | wrap | encode | rebase | device | **WAL KiB/hold** | `gate_wait` | duty | interval ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | whole | 1,026 | 1.00 | 0.084 | 0.013 | 0.018 | 0.018 | 0.036 | 27.8 | 0.0% | 87.7% | 0.999 |
+| 1 | elided | 987 | 1.00 | 0.060 | **0.000** | 0.012 | 0.020 | 0.030 | **4.5** | 0.0% | 89.7% | 1.014 |
+| 2 | whole | 1,523 | 1.53 | 0.086 | 0.024 | 0.021 | 0.010 | 0.031 | 30.8 | 1.4% | 84.7% | 1.000 |
+| 2 | elided | 1,471 | 1.60 | 0.060 | **0.000** | 0.014 | 0.013 | 0.028 | **4.8** | 0.9% | 89.4% | 1.087 |
+| 4 | whole | 2,622 | 3.07 | 0.109 | 0.028 | 0.022 | 0.021 | 0.039 | 32.4 | 8.0% | 77.3% | 1.288 |
+| 4 | elided | 2,688 | 3.47 | 0.069 | **0.000** | 0.014 | 0.021 | 0.030 | **5.3** | 5.0% | 82.1% | 1.200 |
+| 8 | whole | 3,723 | 6.36 | 0.121 | 0.036 | 0.024 | 0.028 | 0.039 | 36.6 | 20.4% | 62.2% | 1.705 |
+| 8 | elided | 4,136 | 6.75 | **0.083** | **0.005** | 0.015 | 0.026 | 0.035 | **9.4** | 13.3% | 68.5% | 1.587 |
+| 16 | whole | 3,659 | 10.48 | 0.166 | 0.054 | 0.029 | 0.038 | 0.052 | 46.5 | 33.0% | 52.9% | 2.800 |
+| 16 | elided | 4,583 | 12.30 | **0.113** | **0.016** | 0.019 | 0.040 | 0.042 | **14.4** | 26.2% | 52.7% | 2.674 |
+
+Paired ratios, one per repetition, elided over whole:
+
+| metric | 1 (see below) | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| **WAL bytes/hold** | 0.16 ×6 | 0.16 ×6 | **0.17** | **0.26** | **0.31** |
+| **`encode`** | 0.64 | 0.61 | 0.61 | 0.62 | **0.65** |
+| **`wrap`** | 0.00 | 0.00 | 0.00 | **0.14** | **0.35** |
+| **gate hold** | 0.81 | 0.74 | 0.67 | **0.68** | **0.71** |
+| ops/s | 0.96 | 0.90 | 1.03 | 1.14 | 1.22 |
+
+**Read the byte row first, because it is the only one with no noise in it at
+all.** `0.16 0.16 0.16 0.16 0.16 0.16` at one writer, and the same six-of-six
+determinism at every level — the WAL bytes a commit writes inside the gate went
+from 27.8 KiB to 4.5 KiB. (The ratio *rises* with writers because a cohort
+leader packs more records into one `pwrite`, so the divisor is a hold, not a
+commit.) `encode` is the next tightest: 0.61–0.65 medians in per-repetition
+bands of ±0.03, six of six, at every writer count. `wrap` is 0.00 below eight
+writers because a 150-transaction run at that concurrency **no longer wraps a
+region at all**, which is the change stated as a count rather than a time.
+
+**And the honest caveat about the floor.** AHL-562's and AHL-563's one-writer
+rows were true A/A tests, because a solo writer's arm difference was nothing.
+This one is not: a smaller record wraps less often with one writer too, so the
+one-writer row carries real signal and cannot be read as noise. What it can
+still do is bound the harness: **one-writer ops/s ran 0.29 1.54 0.86 1.00 2.41 0.92 across
+the six repetitions, median 0.96** — the same scatter AHL-561, AHL-562 and
+AHL-563 all found. So **the throughput column is again the weak claim and is
+reported as one**: 1.22 at sixteen writers, six of six above 1.0
+(1.02 1.20 1.14 1.32 1.55 1.24), is suggestive and no more. The deliverables
+are the bytes, `encode`, `wrap` and the hold — ratios measured inside the same
+run, exactly as AHL-562 and AHL-563 argued.
+
+The commit-record measurement itself, on a real file, one process at a time:
+**20,747 B/commit → 5,725 B, 3.62×.** A region therefore holds 183 records
+instead of 50, and the wraps the same run actually performed went from one
+every 50 commits to one every 150 — lower than the capacity ratio because the
+warm-up left the region part full, which is the honest reason to quote both.
+(`record_anatomy`, `INLAYSQL_WHOLE_PAGE_WAL_RECORD` for the other arm.) The predicted 5,705 from the v5 arm's own hole measurement and
+the observed 5,725 differ by exactly the eight bytes of new framing per page.
+
+#### 4. Two costs, both real, both named
+
+**The one-region ceiling rose, and it was never a design goal.** A record that
+is 3.6× smaller admits a transaction that is roughly that much larger, so
+`docs/enterprise-readiness.md` blocker 5 moves without being fixed. Re-measured
+by `the_row_counts_where_each_statement_breaks`: 8-byte rows, `UPDATE`
+17,000 → **19,625** ok; 512-byte rows, `UPDATE` 1,687 → **16,812**, which is the
+extreme case because it rewrites fat rows to an eight-byte literal and the
+pages it produces are ~97% hole. `INSERT ... SELECT` at 512 bytes barely moved
+(1,687 → 1,765) — it writes fat rows back into densely packed pages, which is
+the same result from the other side: the gain is exactly the hole, and a full
+page has none. The **buffered-`INSERT` refusal did not move at all** (11,340 and
+884, unchanged), because `transaction_is_nearly_full` is answered from the
+upper bound. This is not the lift blocker 5 is waiting for — `DELETE FROM t` is
+still bounded by a change-log record the caller never asked for, unchanged.
+
+**A DST sweep got ~10× slower, and the reason is the ceiling.**
+`free_list_reuse_dst`'s heavy-churn sweep went from 187 s to over half an hour.
+It is not a hang and not a regression in the engine: the workload's inner loop
+breaks out when a commit fails, and with page reuse on and heavy churn the
+free-list rows grow the record until it hits the region. Over 300 seeds, **v5
+hit that refusal 83 times and v6 hits it 15** — the same workload simply runs
+much further before the brake fires. Two things follow, and both are results
+rather than excuses: the sweep is now exercising more than it was, and **the
+record ceiling had been masking superlinear growth in the free list**, which is
+its own item and not this one's.
+
+#### 5. What this leaves
+
+`wrap` is no longer the largest item in the hold at sixteen writers (0.016 of
+0.113); **`rebase` is** (0.040, 35%), and it is real work that genuinely needs
+the exclusion — the COW rebase replaying every pending op against the moved
+root. `encode` is 0.019 and is now mostly checksum. `gate_wait` is 26.2% of a
+writer's time and the duty cycle did not move at all (52.9% → 52.7%), which
+says again what AHL-562 said: the idle half is the absence of writers, and
+re-running flush pipelining on top of this is the obvious next measurement.
+
+Two smaller things this measurement named and did not take. **`\0next_row_id`
+and `\0write_version` are still two whole page paths per commit for sixteen
+bytes of counter** — under v6 they cost 45 and 79 bytes of image instead of
+4,096, which is why chasing them stopped being worth a keyspace change, but
+they are still two root-to-leaf COW paths. And **the change log is now the
+largest single page in the record** (4,151 B of image, 2,246 B used), written
+per statement whether or not anybody reads it.
+
+**Gates.** `fmt`; `clippy --release --workspace --all-targets -D warnings`;
+`cargo test --release --workspace`; `RUSTDOCFLAGS="-D warnings" cargo doc
+--workspace --no-deps --document-private-items`; `cargo check -p inlaysql-wasm
+--target wasm32-unknown-unknown`; and all five DST sweeps — `dst_sweep`,
+`free_list_reuse_dst`, `backup_dst`, `durability_dst` on `-p inlaysql-core`,
+`index_recovery_dst` on `-p inlaysql`, each `-- --ignored`. Plus, because the
+log's content changed: `old_format_records.rs`, which drives a v5 file through
+a region wrap and a checkpoint and requires every acknowledged row back (making
+`encode_pending_record` always write v6 loses 147 of 700 rows), and
+`an_ordinary_commit_survives_a_failure_at_every_one_of_its_writes`, which
+breaks each write of a steady-state commit in turn on a real `FileDevice`.
+
