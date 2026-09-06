@@ -40,7 +40,16 @@
 //! the same volume class `bench/external/compose.yml` gives MySQL and
 //! PostgreSQL), `TXNS`, `REPS`, `ARMS` (comma-separated subset of
 //! `base,sparse,filled`), `PREALLOC_MB`, `WRAP`, `BATCH` (rows per statement;
-//! `1` is the OLTP shape, `100` the batch-insert one).
+//! `1` is the OLTP shape, `100` the batch-insert one), `ROW`.
+//!
+//! `ROW` picks the row, and at `BATCH=100` it is not cosmetic. The default,
+//! `text64`, is `(id INTEGER, body TEXT)` with a 64-byte body — the OLTP shape
+//! every earlier `PERF.md` section profiled, and ~8 KiB of row bytes per
+//! hundred-row statement. `ROW=int` is `(id INTEGER, body INTEGER)`, the table
+//! `bench/external/batch_driver.py` and `--bin sql_shapes --mode batch` both
+//! build for `BENCHMARK.md`'s batch-insert cell, and ~2 KiB. A hundred-row
+//! statement dirties a different number of leaves in the two, so the commit it
+//! produces is a different commit; profile the cell with the cell's own row.
 
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -395,17 +404,36 @@ fn percentile(sorted: &[Duration], q: f64) -> f64 {
     sorted[idx].as_secs_f64() * 1000.0
 }
 
+/// Everything a repetition needs that is the same in every repetition: the
+/// shape of the statement and the arms' knobs. One struct rather than eight
+/// positional arguments, which is also what clippy asks for at this width.
+#[derive(Clone, Copy)]
+struct Params {
+    txns: usize,
+    batch: usize,
+    /// `ROW=int` — see this file's header for why the row matters at
+    /// `BATCH=100`.
+    int_row: bool,
+    prealloc_bytes: u64,
+    chunk_bytes: u64,
+    wrap: bool,
+}
+
 /// One arm, one repetition: fresh file, schema, optional preallocation, then
 /// the timed loop of durable statements.
 fn measure(
     dir: &Path,
     arm: &str,
-    txns: usize,
-    batch: usize,
-    prealloc_bytes: u64,
-    chunk_bytes: u64,
-    wrap: bool,
+    p: &Params,
 ) -> std::result::Result<Run, Box<dyn std::error::Error>> {
+    let &Params {
+        txns,
+        batch,
+        int_row,
+        prealloc_bytes,
+        chunk_bytes,
+        wrap,
+    } = p;
     let path: PathBuf = dir.join(format!("commit-growth-{arm}.inlay"));
     let _ = fs::remove_file(&path);
 
@@ -413,7 +441,14 @@ fn measure(
     // to a file the engine has already finished creating and no handle holds.
     {
         let mut db = Database::open(&path)?;
-        db.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)", &[])?;
+        db.execute(
+            if int_row {
+                "CREATE TABLE kv (id INTEGER PRIMARY KEY, body INTEGER)"
+            } else {
+                "CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)"
+            },
+            &[],
+        )?;
     }
     match arm {
         "base" | "chunked" => {}
@@ -459,7 +494,13 @@ fn measure(
         args.clear();
         for _ in 0..batch {
             args.push(Value::Integer(next_id));
-            args.push(Value::Text(payload.clone().into()));
+            // `id % 1000` is `batch_driver.py`'s own `n`, so `ROW=int` is that
+            // driver's row byte for byte.
+            args.push(if int_row {
+                Value::Integer(next_id % 1000)
+            } else {
+                Value::Text(payload.clone().into())
+            });
             next_id += 1;
         }
         let at = Instant::now();
@@ -530,6 +571,12 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let txns = env_usize("TXNS", 1500);
     let reps = env_usize("REPS", 3);
     let batch = env_usize("BATCH", 1);
+    let row = std::env::var("ROW").unwrap_or_else(|_| "text64".to_string());
+    let int_row = match row.as_str() {
+        "text64" => false,
+        "int" => true,
+        other => return Err(format!("unknown ROW {other:?} (text64|int)").into()),
+    };
     let prealloc_mb = env_usize("PREALLOC_MB", 256) as u64;
     let chunk_mb = env_usize("CHUNK_MB", 8) as u64;
     let wrap = std::env::var("WRAP").is_ok_and(|v| v != "0");
@@ -541,8 +588,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .collect();
 
     println!(
-        "dir={} txns={txns} reps={reps} batch={batch} prealloc={prealloc_mb}MiB \
-         chunk={chunk_mb}MiB wrap={wrap} arms={}",
+        "dir={} txns={txns} reps={reps} batch={batch} row={row} \
+         prealloc={prealloc_mb}MiB chunk={chunk_mb}MiB wrap={wrap} arms={}",
         dir.display(),
         arms.join(",")
     );
@@ -572,14 +619,21 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // arm of the first round — a position effect the shuffle cannot spread
     // because it only ever lands on whatever runs first.
     let warmup = arms.first().expect("at least one arm").clone();
+    let params = Params {
+        txns,
+        batch,
+        int_row,
+        prealloc_bytes: prealloc_mb << 20,
+        chunk_bytes: chunk_mb << 20,
+        wrap,
+    };
     measure(
         &dir,
         &warmup,
-        txns / 4 + 1,
-        batch,
-        prealloc_mb << 20,
-        chunk_mb << 20,
-        wrap,
+        &Params {
+            txns: txns / 4 + 1,
+            ..params
+        },
     )?;
 
     for rep in 1..=reps {
@@ -588,15 +642,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             order.swap(i, (next() % (i as u64 + 1)) as usize);
         }
         for arm in order {
-            let run = measure(
-                &dir,
-                arm,
-                txns,
-                batch,
-                prealloc_mb << 20,
-                chunk_mb << 20,
-                wrap,
-            )?;
+            let run = measure(&dir, arm, &params)?;
             let s = &run.stats;
             println!(
                 "rep {rep} arm {arm:<7} {:>9.1} ops/s  p50 {:.3} ms  p99 {:.3} ms  \

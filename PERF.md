@@ -8185,3 +8185,227 @@ anyone reads it are the two places nobody has been inside yet.
 five DST sweeps `-- --ignored` — `dst_sweep`, `free_list_reuse_dst`,
 `backup_dst`, `durability_dst` on `-p inlaysql-core`, `index_recovery_dst` on
 `-p inlaysql`. No second flag-on pass this time: there is no flag.
+
+### The batch-insert loss is 0.88x, not 0.68x, and the `pwritev` candidate is 1.6% of the statement (AHL-570, 2026-09-07)
+
+`BENCHMARK.md`'s batch-insert row and `PLAN.md`'s item 4 both say the same
+thing: containerised, like for like, a hundred-row `INSERT` is **0.68x
+PostgreSQL 17** and ~1.2x MySQL 8.4, both engines paying one barrier per
+statement, and therefore the row is engine work — "~1.0 ms of engine work per
+hundred-row statement against PostgreSQL's ~0.6 ms". The named candidate was
+**coalescing the WAL record and the dirty pages into one `pwritev`**.
+
+Three of those four claims are now measured and none of them survives intact.
+The scoping predates AHL-553, AHL-563, AHL-564 and AHL-566, and the ~1.0 ms was
+never measured — it was a subtraction from throughput.
+
+#### 1. The cell, re-measured interleaved: 0.88x, not 0.68x
+
+The published row was assembled from `sql_shapes --mode batch` run once,
+`batch_driver.py TARGET=mysql` run once and `TARGET=postgres` run once — and
+worse, the InlaySQL cell came from a *different sitting a day later* than the
+two server cells, under three concurrent build agents, with a 17% spread it
+disclosed. That is exactly the shape `bench/profile_ab.sh` exists to refuse.
+
+`bench/batch_insert.sh` (this commit) runs one `REPS=5` repetition of each
+engine per round and rotates which engine goes first, so a drift lands on all
+three. Five rounds, `bench/load_gate.sh`'s sampler across the measured phases
+only, load 3.23/3.34/3.43 min/median/max of 18 against the 4.5 ceiling, not
+`CONTAMINATED`. All three engines in containers on named volumes,
+`Durability::Full` / `innodb_flush_log_at_trx_commit=1` /
+`synchronous_commit=on`, `bcbc9d4`:
+
+| round | InlaySQL rows/s | MySQL 8.4 | PostgreSQL 17 | ours/PG | ours/MySQL |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 76,176 | 58,045 | 101,381 | 0.75 | 1.31 |
+| 2 | 88,725 | 51,284 | 99,074 | 0.90 | 1.73 |
+| 3 | 94,459 | 51,097 | 100,076 | 0.94 | 1.85 |
+| 4 | 86,921 | 52,935 | 103,694 | 0.84 | 1.64 |
+| 5 | 88,456 | 55,727 | 100,305 | 0.88 | 1.59 |
+| **median** | **88,456** | **52,935** | **100,305** | **0.88** | **1.64** |
+| *published (`bdc64eb`)* | *67,484 (60,453–70,943)* | *56,700* | *99,212* | *0.68* | *1.19* |
+
+**The A/A spread beside the ratio, because the ratio is not much bigger than
+it.** InlaySQL's own round-to-round spread is 76,176–94,459 — **21% of its
+median**, on a workload whose reps are 0.11 s each; PostgreSQL's is 4.6% and
+MySQL's 13.1%. A 21% A/A does not by itself carry a 1.31x move.
+
+**What carries it is the control.** Both opponents reproduce their published
+cells in the same rounds: PostgreSQL 100,305 against 99,212 (**1.01x**), MySQL
+52,935 against 56,700 (**0.93x**). The machine has not moved. Ours has: **all
+five of today's round medians are above the published run's maximum** (76,176 >
+70,943), 5 of 5, which is the non-overlap rule §4 asks for. Between `bdc64eb`
+and here sit AHL-553 (measured 1.181x on the containerised single-row commit),
+AHL-563, AHL-564 and AHL-566; no attempt is made to split the +31% among them.
+
+**This changes a published cell and does not edit it.** `BENCHMARK.md`'s batch
+row and `SCOREBOARD.md`'s verdict for it are owed a gated regeneration; a
+second writer in that file would collide with the edition already in flight.
+
+#### 2. A harness hazard found on the way: the servers' volume state is worth 2x
+
+The first pass of §1 ran against the `inlaysql-bench_postgres-oltp-data` and
+`…_mysql-oltp-data` volumes as they had accumulated since 2026-09-02 — the
+other drivers' `users`, `posts`, `kv` and `jusers` tables still in the `bench`
+database. PostgreSQL measured **43,893–51,581 rows/s, median 50,267**: half its
+published figure. InlaySQL (79,568–87,859) and MySQL (49,075–64,298) were
+unaffected in the same rounds, so this is not load — it is PostgreSQL's own
+state. Recreating the two server volumes put PostgreSQL back at 99–104k, which
+is what §1 reports.
+
+`bench/compare.sh` ends in `docker compose down -v`, so every published
+`compare.sh` figure is a fresh-volume figure and the published 99,212 is
+sound. But `read_driver.py` and `batch_driver.py` are run by hand, in order,
+against whatever the volumes hold, and **the order they are run in is worth 2x
+on PostgreSQL's batch cell**. `bench/batch_insert.sh` documents the
+volume-recreation step; nothing else does yet.
+
+*(Disclosure: that first pass ran while another worktree held `/tmp/bench-hold`
+— the file was taken between this session's start-of-session check and the run.
+Its numbers are used here only for the direction of a 2x, PostgreSQL-only
+effect that its own InlaySQL and MySQL arms control for; nothing in §1, §3 or
+§4 comes from it.)*
+
+#### 3. Where the hundred-row statement actually goes — and the row shape nobody had matched
+
+`commit_growth`'s `WRAP=1` device wrapper, `ARMS=base`, `TXNS=1500`, `REPS=3`,
+in the `inlaysql-oltp` service on its own named btrfs volume — AHL-553's
+harness and AHL-553's method. One thing had to be added first, and it is not
+cosmetic: **every hundred-row profile in this file so far measured the wrong
+table.** `commit_growth` and `record_anatomy` both insert into `kv (id INTEGER,
+body TEXT)` with a 64-byte body — ~8 KiB of row bytes per hundred-row
+statement. `BENCHMARK.md`'s cell inserts into `batch (id, n)`, two integers,
+~2 KiB. A different number of leaves is dirtied, so it is a different commit.
+`ROW=int` (this commit, both binaries) builds the cell's own table. Medians of
+three:
+
+| | single row (`ROW=text64`) | **100-row, `ROW=int` — the published cell** | 100-row, `ROW=text64` (AHL-553's shape) |
+| --- | --- | --- | --- |
+| total per statement | 1.301 ms | **1.093 ms** | 1.221 ms |
+| **barrier (`sync_commit`, 1.000/commit)** | **1.230 ms — 94.5%** | **0.899 ms — 82.3%** | **0.989 ms — 81.0%** |
+| WAL record `pwrite` (1.00 calls) | 5,957 B, 0.003 ms — 0.2% | 17,106 B, 0.004 ms — **0.4%** | 24,605 B, 0.005 ms — 0.4% |
+| data-area `pwrite` (1.00 calls) | 20,117 B, 0.012 ms — 0.9% | 26,436 B, 0.013 ms — **1.2%** | 32,801 B, 0.018 ms — 1.5% |
+| region-zeroing `pwrite` | 0.006/cmt, 0.002 ms | 0.017/cmt, 0.002 ms | 0.024/cmt, 0.004 ms |
+| state block write + its `sync` | 0.006/cmt, 0.008 ms | 0.017/cmt, 0.014 ms | 0.024/cmt, 0.022 ms |
+| device reads (4.87–4.93/cmt) | 0.007 ms | 0.007 ms | 0.008 ms |
+| **engine above the storage layer** | **0.040 ms — 3.1%** | **0.154 ms — 14.1%** | **0.171 ms — 14.0%** |
+| gate hold | 0.060 ms | 0.126 ms | 0.153 ms |
+| state-block syncs (region wraps) | one per 187.5 commits | one per 62.5 | one per 42.9 |
+
+**The ~1.0 ms of engine work is 0.154 ms.** The figure `BENCHMARK.md` and
+`PLAN.md` both carry was a subtraction from throughput — the whole statement
+minus a guess at the barrier — and it is wrong by 6.5x. Measured, the engine
+above the storage layer is 14.1% of the statement, and every `pwrite`,
+`pwrite`-and-`sync` and `read` this engine issues put together is another 3.6%.
+
+**And the standing candidate dies on this table.** The WAL record's `pwrite`
+and the data area's `pwrite` cost **0.017 ms of a 1.093 ms statement — 1.6%**.
+That is the same answer AHL-563 got on the single-row path (22 µs of a 251 µs
+gate hold) and the brief asked for it to be checked here before anything was
+built. It is worse than that for the proposal: **the dirty pages are already
+one `pwrite`** — 1.00 data writes per statement carrying 26,436 B — so the
+"coalesce the dirty pages" half was done before it was proposed, and the other
+half asks one call to write two *different file offsets*, which is not what
+`pwritev` does. Ceiling: one syscall, ~5 µs, 0.5% of the statement. **Not
+built.**
+
+Also worth stating because AHL-553's arithmetic is quoted in the item: the
+state block is a second barrier once per **62.5** hundred-row commits on this
+shape, not the 33.3 the item carries (AHL-553 measured `ROW=text64`, where it
+is 42.9). It costs 0.014 ms per statement amortised — 1.3%.
+
+#### 4. PostgreSQL's own side of the same statement, with its own instrument
+
+`track_wal_io_timing=on` and `pg_stat_wal` bracketed exactly as
+`batch_driver.py` brackets `wal_sync`, eight repetitions, the six steady ones
+after the first two:
+
+| per 100-row statement | InlaySQL | PostgreSQL 17 |
+| --- | --- | --- |
+| total | 1.093 ms | 1.030 ms (0.986–1.164) |
+| **its own barrier** | **0.899 ms — 82%** | **0.78 ms (0.72–0.90) — 76%** |
+| WAL bytes | 17,106 B | 13,741 B (201.3 records) |
+| WAL write call | 0.004 ms | 0.006 ms |
+| bytes written to the data area *at commit* | 26,436 B, one `pwrite` | 0 — dirty pages go at checkpoint |
+| **everything else (the engine)** | **0.154 ms** | **~0.24 ms** |
+
+**We do less non-barrier work per hundred-row statement than PostgreSQL does.**
+That is the sentence this item was opened to disprove and it does not disprove
+it. The remaining difference is the barrier — 0.899 against 0.78, **1.15x** —
+and the barrier is 1.15x because of what goes through it: **43.5 KiB per
+statement (17.1 KiB of record plus 26.4 KiB of data area) against PostgreSQL's
+13.7 KiB**, into a file that grows 26 KiB per commit against a preallocated
+segment PostgreSQL recycles in place.
+
+#### 5. The record, and why AHL-564's 3.62x did not carry
+
+`record_anatomy`, `INLAYSQL_WHOLE_PAGE_WAL_RECORD` for the v5 arm, 300 commits
+past a 200-commit warm-up. These are byte counts and wrap counts, deterministic
+and load-free:
+
+| shape | v5 record | v6 record | ratio | region holds | wrap every |
+| --- | --- | --- | --- | --- | --- |
+| single row, `ROW=text64` | 20,747 B | 5,725 B | **3.64x** | 184 | 150 commits |
+| single row, `ROW=int` | 20,692 B | 5,764 B | 3.60x | 182 | 150 |
+| **100-row, `ROW=int`** | **27,265 B** | **17,505 B** | **1.56x** | **60** | **60** |
+| 100-row, `ROW=text64` | 33,331 B | 24,691 B | 1.35x | 43 | 43 |
+
+AHL-564 shrank the record by eliding each page image's zero hole, and a
+single-row commit's pages are 1.1–54% used, so it took 73% out. A hundred-row
+commit's pages are not:
+
+| bucket, 100-row `ROW=int` | pages/commit | B/commit | used |
+| --- | --- | --- | --- |
+| internal (spine) | 3.09 | 12,670 | 49.0% |
+| leaf `kv…` — the rows themselves | 2.03 | 8,315 | 75.9% |
+| leaf `\0cdc:…` — the change log | 1.50 | 6,144 | 78.0% |
+
+**69% of a hundred-row commit's record is not the rows** — 47% is three
+half-empty spine pages and 23% is the change log, which is the second of the
+two places AHL-566 §5 said nobody had been inside. That is where a byte lever
+would have to go, and it is a tree/`rebase` question, not a syscall one.
+
+#### 6. Verdict: a measured negative, and a published cell to regenerate
+
+Nothing was built. The profile does not support the candidate the item named,
+and it does not support a cheaper one either:
+
+* the syscalls are 3.6% of the statement and already coalesced where they can be;
+* the engine above the storage layer is 0.154 ms, **less** than PostgreSQL's own;
+* the barrier is 82% of the statement and costs 1.15x PostgreSQL's, because it
+  carries 3.2x the bytes and a growing file;
+* closing that means logging less than a whole page (physiological logging,
+  priced and declined in `docs/recovery.md` and again in AHL-564 §2) or not
+  writing dirty pages at commit (the deferred-durability proposal, measured and
+  rejected twice, and the `rebase_pending` counterexample in
+  `docs/research/commit-group-logical.md` §1 says why it is unsafe rather than
+  merely unprofitable).
+
+The result of this item is therefore **the number, not a change**: the cell is
+**0.88x PostgreSQL 17 and 1.64x MySQL 8.4**, against a published 0.68x/1.19x
+that was measured across two sittings on a build four commit-path changes old,
+and the "~1.0 ms of engine work" that justified opening it is 0.154 ms.
+
+**Seven negatives now in this area** (AHL-544 flat, AHL-547 0.90x, AHL-560
+"already done", AHL-561 "not the syscall", AHL-562 "not the election", AHL-566
+"not the election even after the gate moved", **AHL-570 "not the writes on the
+batch path either, and the gap was a third of what was published"**) against
+AHL-553, AHL-563 and AHL-564. The rule AHL-566 §5 wrote down — pricing a
+mechanism from a decomposition loses, measuring inside the thing wins — cost
+this item nothing to obey, because the measurement that killed the proposal
+took four minutes once the harness existed.
+
+**What this leaves.** Two levers, both named by the tables above and neither
+opened: the **three half-empty spine pages** a hundred-row insert logs
+(12,670 B/commit at 49% used) and the **change log written per statement**
+(6,144 B/commit) whether or not anyone reads it — 69% of the record between
+them, on the shape the published cell measures.
+
+**Gates.** `fmt`; `clippy --release --workspace --all-targets -D warnings`;
+`cargo test --release --workspace`; `RUSTDOCFLAGS="-D warnings" cargo doc
+--workspace --no-deps --document-private-items`; `cargo check -p inlaysql-wasm
+--target wasm32-unknown-unknown`; `python3 bench/test_summarise.py`. **No DST
+sweep**, and that is a claim about the diff rather than a shortcut: this commit
+touches two `inlaysql-bench` binaries and adds one shell script. Not one line
+of `inlaysql-core` or `inlaysql` changed, so the commit path, the WAL, recovery
+and every index format are byte-for-byte `bcbc9d4`'s.

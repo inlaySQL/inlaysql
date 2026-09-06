@@ -14,6 +14,7 @@ WRITER_LEVELS=1,32 SUITE=concurrency ./bench/run.sh
 WRITER_LEVELS=1,128 SUITE=concurrency ./bench/run.sh
 
 ./bench/compare.sh                  # vs DuckDB, pgvector, Meilisearch, MySQL, PostgreSQL (needs Docker)
+ROUNDS=5 ./bench/batch_insert.sh    # the batch-insert cell, all three engines interleaved (needs Docker)
 
 REPEATS=5 ./bench/repeat.sh         # run.sh five times, report the median and the spread
 REPEATS=5 SUITE=retrieval ./bench/repeat.sh
@@ -1199,6 +1200,43 @@ engine; see `BENCHMARK.md` for the full disclosure.
 `sql_shapes` deliberately duplicates none of `indexed`/`joins`' shapes —
 those cells' InlaySQL numbers come from the Rust suites, and this binary
 exists only for aggregate and batch insert so the two sides cannot drift.
+
+### `bench/batch_insert.sh` — the batch-insert cell, interleaved, and the volume state that is worth 2x
+
+Two things the three commands above do not do, both of which AHL-570 measured
+the cost of.
+
+**They are not interleaved.** Three engines run one after another — and the
+published cell went further, taking its InlaySQL row from a *different sitting
+a day later* than its two server rows. That is the reading `bench/profile_ab.sh`
+exists to refuse: a drift between the arms lands on one of them. AHL-570 found
+the cell had moved from 0.68x PostgreSQL to 0.88x, and could only say so
+because both opponents reproduced their published figures (1.01x and 0.93x) in
+the same interleaved rounds that moved ours. `./bench/batch_insert.sh` runs one
+`REPS=5` repetition of each engine per round and rotates which goes first, with
+`load_gate.sh`'s sampler across the measured phases and the build outside them.
+Read the per-engine spread across rounds as the harness's own A/A figure; on
+this workload InlaySQL's is ~21% and PostgreSQL's ~5%.
+
+**They inherit whatever the server volumes already hold.** `compare.sh` ends in
+`docker compose down -v`, so every figure it publishes is a fresh-volume
+figure. These drivers are run by hand, and on volumes carrying `read_driver.py`'s
+tables from an earlier sitting **PostgreSQL's batch cell measures half what it
+does on a fresh one** (median 50,267 rows/s against 100,305), while InlaySQL
+and MySQL are unaffected. Recreate the two server volumes before measuring:
+
+```sh
+docker compose -f bench/external/compose.yml rm -sf postgres mysql drivers
+docker volume rm inlaysql-bench_postgres-oltp-data inlaysql-bench_mysql-oltp-data
+docker compose -f bench/external/compose.yml up -d --no-deps postgres mysql drivers
+ROUNDS=5 ./bench/batch_insert.sh
+```
+
+The InlaySQL arm is the containerised one (the `inlaysql-oltp` service, its
+database on `inlaysql-oltp-data`), because the host arm's barrier is
+`F_FULLFSYNC` and is 89% of the statement — the host row is context, never a
+verdict against a containerised server. `PERF.md`'s AHL-570 has the
+per-statement split for both.
 
 ## ann-benchmarks — an external corpus, an external ground truth, an external protocol
 

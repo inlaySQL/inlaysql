@@ -32,7 +32,20 @@
 //!
 //! Env: `DIR` (where the database file goes), `TXNS`, `BATCH` (rows per
 //! statement), `SHAPE` (`insert`, `update`, `delete`, `insert_indexed`),
-//! `DETAIL` (print the first N commits page by page).
+//! `ROW` (`text64`, the default, or `int` — see below), `DETAIL` (print the
+//! first N commits page by page).
+//!
+//! # Why `ROW`
+//!
+//! The default row is `(id INTEGER, body TEXT)` with a 64-byte body, which is
+//! the OLTP shape every earlier section of `PERF.md` profiled. `BENCHMARK.md`'s
+//! batch-insert cell is a different table — `batch (id, n)`, two integers, the
+//! one `bench/external/batch_driver.py` and `--bin sql_shapes --mode batch`
+//! both build — and at a hundred rows per statement the difference is not
+//! cosmetic: ~8 KiB of row bytes per statement against ~2 KiB, which is a
+//! different number of leaves dirtied and therefore a different record.
+//! `ROW=int` makes this binary measure that table instead, so the record size
+//! behind the published cell is the published cell's own.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -388,13 +401,26 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let batch = env_usize("BATCH", 1);
     let detail = env_usize("DETAIL", 3);
     let shape = std::env::var("SHAPE").unwrap_or_else(|_| "insert".to_string());
+    let row = std::env::var("ROW").unwrap_or_else(|_| "text64".to_string());
+    let int_row = match row.as_str() {
+        "text64" => false,
+        "int" => true,
+        other => return Err(format!("unknown ROW {other:?} (text64|int)").into()),
+    };
     let warmup = env_usize("WARMUP", 200);
 
     let path = dir.join("record-anatomy.inlay");
     let _ = fs::remove_file(&path);
     {
         let mut db = Database::open(&path)?;
-        db.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)", &[])?;
+        if int_row {
+            db.execute(
+                "CREATE TABLE kv (id INTEGER PRIMARY KEY, body INTEGER)",
+                &[],
+            )?;
+        } else {
+            db.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, body TEXT)", &[])?;
+        }
         if shape == "insert_indexed" {
             db.execute("CREATE INDEX kv_body ON kv (body)", &[])?;
         }
@@ -415,6 +441,15 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     ))?;
 
     let payload = "x".repeat(64);
+    // The second column's value, per `ROW`. `id % 1000` is `batch_driver.py`'s
+    // own `n`, so `ROW=int` is that driver's row byte for byte.
+    let body = |id: i64| -> Value {
+        if int_row {
+            Value::Integer(id % 1000)
+        } else {
+            Value::Text(payload.clone().into())
+        }
+    };
     let mut sql = String::from("INSERT INTO kv (id, body) VALUES ");
     for row in 0..batch {
         if row > 0 {
@@ -436,7 +471,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             args.clear();
             for _ in 0..batch {
                 args.push(Value::Integer(*next_id));
-                args.push(Value::Text(payload.clone().into()));
+                args.push(body(*next_id));
                 *next_id += 1;
             }
             db.execute_prepared(&insert, &args)?;
@@ -456,10 +491,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "update" => {
             for i in 0..txns {
                 let id = 1 + (i as i64 % (seeded - 1));
-                db.execute_prepared(
-                    &update,
-                    &[Value::Text(payload.clone().into()), Value::Integer(id)],
-                )?;
+                db.execute_prepared(&update, &[body(id), Value::Integer(id)])?;
             }
         }
         "delete" => {
@@ -477,7 +509,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "shape={shape} txns={txns} batch={batch} warmup={warmup} page_size={DEFAULT_PAGE_SIZE}"
+        "shape={shape} row={row} txns={txns} batch={batch} warmup={warmup} page_size={DEFAULT_PAGE_SIZE}"
     );
     println!(
         "region {} bytes ({} blocks x {} B), {} regions; data area at {} B",
