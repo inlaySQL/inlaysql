@@ -507,72 +507,33 @@
         loudly rather than guessing.
       </li>
       <li>
-        <strong>Row iteration still loses to SQLite on two shapes.</strong>
-        The 50-row indexed range scan is roughly 1.1× behind journal-mode
-        SQLite and the secondary-index <code>LIMIT 10</code> join roughly
-        1.1× on p50 — behind in all three runs on both, both in the table
-        above, and the current top priority
-        (<a href="https://github.com/inlaySQL/inlaysql/blob/main/BENCHMARK.md">BENCHMARK.md</a>).
+        <strong>We lose on some shapes, and the table above says which.</strong>
+        Row iteration trails SQLite on the indexed range scan and the
+        secondary-index <code>LIMIT 10</code> join; batch insert is ~0.68×
+        PostgreSQL 17 like for like; server writes at eight connections are
+        ~0.30× MySQL 8.4, because the single-writer gate is the wall. Every
+        cell, with its spread and a fairness audit, is in
+        <a href="https://github.com/inlaySQL/inlaysql/blob/main/BENCHMARK.md">BENCHMARK.md</a>
+        and
+        <a href="https://github.com/inlaySQL/inlaysql/blob/main/SCOREBOARD.md">SCOREBOARD.md</a>.
       </li>
       <li>
-        <strong>The PK <code>LIMIT 10</code> join is ahead on p50 and a wash
-        on throughput</strong> — the throughput column counts the cold first
-        execution of a shape, ours is dearer than SQLite's, and this edition
-        it landed our way by 2% inside an 18% spread. Published as a wash,
-        not turned into a win.
+        <strong>Point reads are a warm number, and nothing above eight
+        concurrent writers is measured on this build.</strong> Our cache-miss
+        path is dearer than SQLite's, and where the writer throughput peak
+        sits is not something the published table answers yet.
       </li>
       <li>
-        <strong>Point reads are a warm number.</strong> Our miss path is still
-        dearer than SQLite's, so a cold handle warms up more slowly, and the
-        throughput line against SQLite in WAL mode is 0.88× — behind in all
-        three runs this edition.
+        <strong>Retrieval has edges.</strong> Recall on uniformly random
+        vectors is poor and no tuning fixes it, because distances in that
+        corpus concentrate; on text-derived embeddings it is 1.000. Join
+        reordering covers one two-table inner join and nothing wider.
       </li>
       <li>
-        <strong>Batch insert loses to PostgreSQL 17</strong> — ~0.68× like
-        for like in a container (~1.2× MySQL 8.4), and 2.4-4× behind on
-        the host, where every hundred-row statement is one
-        <code>F_FULLFSYNC</code>: the barrier, not the engine.
-      </li>
-      <li>
-        <strong>Server writes do not scale the way MySQL's do.</strong> At eight
-        connections we write ~0.30× MySQL 8.4 with commit batching at
-        parity; 70% of a connection thread's time is spent waiting behind other
-        writers, and the single-writer gate is the wall.
-      </li>
-      <li>
-        <strong>Single-row durable writes against the servers are a tie, not a
-        win</strong> — containerised, 876.0 ops/s against MySQL 8.4's 797.2 and
-        PostgreSQL 17's 977.4, ahead in one run of three against each.
-      </li>
-      <li>
-        <strong>Nothing above eight concurrent writers is measured on this
-        build.</strong> The wider writer sweep on the benchmark page is
-        carried forward from an older one, and the commit-path work behind
-        this edition was measured at sixteen writers on a different harness —
-        so where the throughput peak sits is not something the published
-        table currently answers.
-      </li>
-      <li>
-        <strong>Join reordering is new and narrow</strong> — one two-table inner
-        join, costed from <code>ANALYZE</code>. A <code>LIMIT</code> shape is
-        never reordered unless an <code>ORDER BY</code> asks for it.
-      </li>
-      <li>
-        <strong>Recall on uniformly random vectors is poor</strong> — and cannot
-        be fixed by tuning, because distances in that corpus concentrate. On
-        text-derived embeddings it is 1.000.
-      </li>
-      <li>
-        <strong>The MySQL server is plaintext unless you configure TLS.</strong>
-        It binds 127.0.0.1, and a <code>--bind</code> that reaches another
-        machine is refused — not warned about — without accounts, a non-empty
-        bootstrap password and required TLS
+        <strong>The MySQL server is plaintext unless you configure TLS</strong>,
+        and there is no clustering, no replication and no point-in-time
+        recovery — one process, one file
         (<a href="https://github.com/inlaySQL/inlaysql/blob/main/docs/server.md">docs/server.md</a>).
-      </li>
-      <li>
-        <strong>No clustering, no replication, no point-in-time recovery</strong>
-        — one process, one file
-        (<a href="https://github.com/inlaySQL/inlaysql#what-this-is-not">What this is not</a>).
       </li>
     </ul>
   </div>

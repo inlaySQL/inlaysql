@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/inlaySQL/inlaysql/actions/workflows/ci.yml"><img src="https://github.com/inlaySQL/inlaysql/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://github.com/inlaySQL/inlaysql/actions/workflows/wasm.yml"><img src="https://github.com/inlaySQL/inlaysql/actions/workflows/wasm.yml/badge.svg?branch=main" alt="WASM"></a>
-  <a href="https://github.com/inlaySQL/inlaysql/releases"><img src="https://img.shields.io/badge/version-0.0.1.beta-orange" alt="v0.0.1.beta"></a>
+  <a href="https://github.com/inlaySQL/inlaysql/releases"><img src="https://img.shields.io/badge/version-0.0.4-orange" alt="v0.0.4"></a>
   <a href="https://github.com/inlaySQL/inlaysql/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPLv3--or--commercial-blue" alt="license"></a>
 </p>
 
@@ -44,7 +44,7 @@ CLI.
 
 Download the library for your platform from the
 [releases page](https://github.com/inlaySQL/inlaysql/releases)
-([`v0.0.1.beta`](https://github.com/inlaySQL/inlaysql/releases/tag/v0.0.1.beta);
+([`v0.0.4`](https://github.com/inlaySQL/inlaysql/releases/tag/v0.0.4);
 macOS Apple silicon and Linux x86_64 today — the file layer is Unix-only, and
 the WASM module runs anywhere a browser or Node does), copy the ~40-line loader
 for your language from [`docs/clients.md`](docs/clients.md#the-5-minute-version)
@@ -210,33 +210,21 @@ and the SQL Logic Test pass rate (**1307/1307**) are in
 
 ## What this is not
 
-Explicit non-goals for the current stage, all of them scheduled work rather
-than oversights. Each is argued in full in
-[`docs/architecture.md`](docs/architecture.md#4-non-goals--what-this-is-not-in-full);
-if the question is specifically "could our organisation run this in
-production?", [`docs/enterprise-readiness.md`](docs/enterprise-readiness.md)
-answers it directly, and less flatteringly than this list.
+Explicit non-goals for this stage — scheduled work, not oversights. Each is
+argued in full in
+[`docs/architecture.md`](docs/architecture.md#4-non-goals--what-this-is-not-in-full),
+and if the question is "could our organisation run this in production?",
+[`docs/enterprise-readiness.md`](docs/enterprise-readiness.md) answers it
+directly and less flatteringly.
 
-- **Retrieval indexes are explicit, and a vector index is single-column on
-  purpose.** No column is full-text or ANN indexed until a `CREATE INDEX` says
-  so; a BM25 index may span several columns, a `VECTOR` one may not, because
-  two embedding columns are generally two different vector spaces.
-- **Join order is costed for one join, and only one.** A complete `ANALYZE`
-  snapshot lets the planner exchange which table drives a two-table inner
-  join; three or more tables, joins after the first, derived tables, outer
-  joins and retrieval-driven joins all keep their written order.
-- **The default retrieval indexes hold the whole corpus in RAM.** `HnswIndex`
-  and `Bm25Index` are in-memory (BM25 measured at ~1,800 bytes per document);
-  paged backends that live in the file behind a bounded cache exist
-  (`open_paged`, `EngineOptions::paged_text_indexes`) and are not the default,
-  because every cache miss during a search becomes a read —
+- **Retrieval indexes are explicit**, and a `VECTOR` index is single-column:
+  two embedding columns are usually two different vector spaces.
+- **Join order is costed for one two-table inner join** and nothing wider.
+- **The default retrieval indexes hold the whole corpus in RAM.** Paged
+  backends exist and are not the default —
   [`docs/indexes.md`](docs/indexes.md).
-- **No clustering, no multi-node replication and no point-in-time recovery.**
-  One process, one file — no leader election, no consensus, no read replica.
-  Online backup takes a full consistent copy of a live database, so the states
-  you can restore to are the ones you took a copy at, not any instant between;
-  rolling forward needs a log carrying row payloads and the CDC log
-  deliberately carries none.
+- **No clustering, no replication, no point-in-time recovery.** One process,
+  one file; backup restores to the instants you took a copy at.
 - **Full Postgres parity is not a goal**, now or later.
 
 What is being built next, in order and with the measurement that gates each
