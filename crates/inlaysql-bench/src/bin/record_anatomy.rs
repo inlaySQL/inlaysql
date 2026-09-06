@@ -554,7 +554,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "bucket (leaf shown by lowest key)", "per cmt", "B/cmt", "used B/cmt", "used %", "cells"
     );
     let mut buckets: Vec<_> = by_bucket.iter().collect();
-    buckets.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+    buckets.sort_by_key(|a| core::cmp::Reverse(a.1 .1));
     for (name, (count, bytes, used, cells)) in buckets {
         println!(
             "{:<34} {:>8.2} {:>10.0} {:>10.0} {:>8.1}% {:>8.1}",
