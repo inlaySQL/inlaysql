@@ -161,6 +161,33 @@ regeneration.
    unaccounted share moves into `gate_wait`/`follower_wait` (already
    overlapping, no gain) or `execute_ns` falls (real gain).
 
+7. **Reordering past the leading join.** The planner exchanges which table
+   drives a two-table inner join when a complete, current `ANALYZE` snapshot
+   says the other side is cheaper, and an `ORDER BY` with a `LIMIT` reorders
+   too. Nothing else does: three or more tables (a search problem, where this
+   is one comparison), any join after the first, a join with a derived table
+   on either side, an outer join, and any join whose driving table answers a
+   retrieval score all keep their written order and fall back to the
+   deterministic rule in
+   [Scalar indexes and joins that use them](sql.md#scalar-indexes-and-joins-that-use-them).
+8. **Deeper SQL Logic Test coverage, real SQLancer runs and continuous
+   fuzzing** beyond what `trust.yml` runs today (see
+   [`docs/sqlancer.md`](sqlancer.md)).
+9. **Read replicas over the existing CDC log**, and the serverless work that
+   shares its shape. `cdc.rs` is already pull-based and bounded, so the work
+   is shipping records and tracking replica position — the Turso model, no
+   consensus and no fork. Two things have to be answered before any of it:
+   the CDC log deliberately carries no row payloads, so there is nothing for a
+   replica to apply yet, and `open_read_only` takes no OS lock by design, so a
+   reader in another process cannot be proven absent — fine on one machine
+   today, unavoidable once a second machine reads the same file. Durable
+   storage/compute separation (an object-storage-backed `Device`, for corpora
+   too large to ship as an edge asset) is the same category of work and starts
+   as a research brief with measured S3 and R2 latencies, not as code.
+
+Full Postgres parity is deliberately not on this list — see the last point in
+[Non-goals](architecture.md#4-non-goals--what-this-is-not-in-full).
+
 Still open, not a published loss: B2's index-probe reorder, A3's WITHOUT ROWID
 cursor, B4's remaining kernel copy (an architecture decision — a recycled `Arc`
 pool or an `mmap` device — or nothing), C1 (closed as a measured loss until

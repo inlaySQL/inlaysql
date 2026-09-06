@@ -10,8 +10,8 @@ repository works, so a contribution lands well the first time.
   co-author on the fix commit.
 - **Feature ideas:** open an issue describing the *problem* before the
   design. A lot of what looks missing here is a deliberate sequence (see
-  [`PLAN.md`](PLAN.md) and the [Next](README.md#next) section) — an idea may
-  already be queued, refused for a written reason, or one message away from
+  [`docs/PLAN.md`](docs/PLAN.md), the ordered list of next work) — an idea
+  may already be queued, refused for a written reason, or one message away from
   being queued.
 - **Security:** never in a public issue — see [`SECURITY.md`](SECURITY.md).
 

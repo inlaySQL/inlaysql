@@ -133,7 +133,7 @@ change.
   and postMessage the queries; the same module loads unmodified in a worker.
 - **Search is native.** `bm25_score(col, ?)`, `vector_score(col, ?)` and
   `fuse(...)` work exactly as the [SQL
-  surface](../../README.md#the-sql-surface) describes; the site's own demo
+  surface](../../../../docs/sql.md) describes; the site's own demo
   is one hybrid query over this module.
 - **This module has no MySQL wire and no filesystem.** Serving a database to
   other processes is the `inlaysql serve --mysql` job; the browser module is
