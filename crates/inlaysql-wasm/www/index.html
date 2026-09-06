@@ -314,14 +314,14 @@
   </p>
   <div class="figures">
     <div class="figure">
-      <b>991,539</b>
+      <b>1,125,587</b>
       <span>point reads per second</span>
-      <em>~3-11× SQLite in journal mode, durable</em>
+      <em>~5-7× SQLite in journal mode, durable</em>
     </div>
     <div class="figure">
-      <b>~13×</b>
+      <b>~17×</b>
       <span>SQLite on concurrent writes</span>
-      <em>1,110 commits/s at 8 writers, 0% aborted</em>
+      <em>1,541 commits/s at 8 writers, 0% aborted</em>
     </div>
     <div class="figure">
       <b>167 µs</b>
@@ -423,19 +423,19 @@
       <tbody>
         <tr>
           <td>Point read by primary key</td>
-          <td class="num">991,539 ops/s</td>
+          <td class="num">1,125,587 ops/s</td>
           <td>SQLite, journal (durable)</td>
-          <td class="win">~3-11× faster</td>
+          <td class="win">~5-7× faster</td>
         </tr>
         <tr>
           <td>Concurrent writes, 8 writers</td>
-          <td class="num">1,110 commits/s</td>
+          <td class="num">1,541 commits/s</td>
           <td>SQLite, journal</td>
-          <td class="win">~13× faster</td>
+          <td class="win">~17× faster</td>
         </tr>
         <tr>
           <td>Vector search, recall@10 1.000</td>
-          <td class="num">59.42 µs</td>
+          <td class="num">58.04 µs</td>
           <td><code>sqlite-vec</code></td>
           <td class="win">~11× faster</td>
         </tr>
@@ -447,21 +447,21 @@
         </tr>
         <tr>
           <td>Secondary-index inner join, 20k × 160k rows</td>
-          <td class="num">3.60 ms</td>
+          <td class="num">3.38 ms</td>
           <td>SQLite</td>
           <td class="win">~8× faster</td>
         </tr>
         <tr>
           <td>PK inner join, <code>LIMIT 10</code></td>
-          <td class="num">3.25 µs p50</td>
-          <td>SQLite, journal (3.50 µs p50)</td>
-          <td class="win">faster in all three runs — though ~1.08× behind on throughput, which pays our dearer first execution of a shape</td>
+          <td class="num">3.29 µs p50</td>
+          <td>SQLite, journal (3.46 µs p50)</td>
+          <td class="win">faster in all three runs on p50; a wash on throughput, inside an 18% spread, so not claimed as a win there</td>
         </tr>
         <tr>
           <td>Indexed range scan, 50 rows</td>
-          <td class="num">7.29 µs</td>
-          <td>SQLite, journal</td>
-          <td class="loss">~1.15× slower</td>
+          <td class="num">7.13 µs</td>
+          <td>SQLite, journal (6.63 µs)</td>
+          <td class="loss">~1.1× slower</td>
         </tr>
         <tr>
           <td>Batch insert, 100 rows per statement, containerised like the servers</td>
@@ -508,21 +508,24 @@
       </li>
       <li>
         <strong>Row iteration still loses to SQLite on two shapes.</strong>
-        The 50-row indexed range scan is roughly 1.15× behind journal-mode
+        The 50-row indexed range scan is roughly 1.1× behind journal-mode
         SQLite and the secondary-index <code>LIMIT 10</code> join roughly
-        1.13× on p50 — both narrower again this edition, both in the table
+        1.1× on p50 — behind in all three runs on both, both in the table
         above, and the current top priority
         (<a href="https://github.com/inlaySQL/inlaysql/blob/main/BENCHMARK.md">BENCHMARK.md</a>).
       </li>
       <li>
-        <strong>The PK <code>LIMIT 10</code> join is ahead on p50 and still
-        behind on throughput</strong> — ~1.08×, because that figure counts
-        the cold first execution of a shape and ours is dearer than SQLite's.
+        <strong>The PK <code>LIMIT 10</code> join is ahead on p50 and a wash
+        on throughput</strong> — the throughput column counts the cold first
+        execution of a shape, ours is dearer than SQLite's, and this edition
+        it landed our way by 2% inside an 18% spread. Published as a wash,
+        not turned into a win.
       </li>
       <li>
         <strong>Point reads are a warm number.</strong> Our miss path is still
         dearer than SQLite's, so a cold handle warms up more slowly, and the
-        throughput line against SQLite in WAL mode is 0.85×.
+        throughput line against SQLite in WAL mode is 0.88× — behind in all
+        three runs this edition.
       </li>
       <li>
         <strong>Batch insert loses to PostgreSQL 17</strong> — ~0.68× like
@@ -540,6 +543,14 @@
         <strong>Single-row durable writes against the servers are a tie, not a
         win</strong> — containerised, 876.0 ops/s against MySQL 8.4's 797.2 and
         PostgreSQL 17's 977.4, ahead in one run of three against each.
+      </li>
+      <li>
+        <strong>Nothing above eight concurrent writers is measured on this
+        build.</strong> The wider writer sweep on the benchmark page is
+        carried forward from an older one, and the commit-path work behind
+        this edition was measured at sixteen writers on a different harness —
+        so where the throughput peak sits is not something the published
+        table currently answers.
       </li>
       <li>
         <strong>Join reordering is new and narrow</strong> — one two-table inner

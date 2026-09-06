@@ -126,16 +126,20 @@ cargo run --example hybrid_search                 # the query above, end to end
 
 | Workload | InlaySQL | Compared with |
 | --- | --- | --- |
-| Point read by primary key | **991,539 ops/s**, 0.75 µs p50 | SQLite journal, durable: 164,448 ops/s (**~3-11x**); SQLite WAL: 1,161,418 ops/s (0.85x on throughput, our p50 below its 0.792 µs in all three runs) |
-| Point read, secondary index | **527,067 ops/s**, 1.75 µs p50 | SQLite journal, durable: 265,615 ops/s (**~2x**) |
-| Join, secondary-index inner, full scan | **3.60 ms p50** | SQLite: 31.30 ms p50 (**~8x**) |
-| Durable write, one commit each | **250 ops/s**, 3.89 ms p50 | SQLite journal, durable: 89 ops/s (**~2.8x**) |
-| Concurrent durable writers, 8 threads | **1,110 commits/s**, 0.0% aborted | SQLite journal, durable: 88 commits/s (**~13x**) |
+| Point read by primary key | **1,125,587 ops/s**, 0.625 µs p50 | SQLite journal, durable: 168,505 ops/s (**~5-7x**); SQLite WAL: 1,273,101 ops/s (0.88x on throughput, our p50 below its 0.750 µs in two runs of three) |
+| Point read, secondary index | **535,879 ops/s**, 1.71 µs p50 | SQLite journal, durable: 266,073 ops/s (**~2x**) |
+| Join, secondary-index inner, full scan | **3.38 ms p50** | SQLite: 30.72 ms p50 (**~8x**) |
+| Durable write, one commit each | **255 ops/s**, 3.87 ms p50 | SQLite journal, durable: 90 ops/s (**~2.8x**) |
+| Concurrent durable writers, 8 threads | **1,541 commits/s**, 0.0% aborted | SQLite journal, durable: 90 commits/s (**~17x**) |
 | Hybrid retrieval, one SQL statement | **167.00 µs p50** | DuckDB 11.37 ms, pgvector 14.11 ms, Meilisearch 4.15 ms (**~25-90x**) |
 
 One developer machine — reproduce it, do not trust it. Repeating the identical
-binary against identical data moves these figures by a median 4.0-7.3%, so the
-multiples are rounded to what that floor supports (`~2-4x`, not `3.26x`).
+binary against identical data moves these figures by a median 4.0-7.3%, and on
+the concurrent-writer rows a true A/A control moves the paired throughput
+ratio between 0.42x and 1.98x at one writer and between 0.77x and 1.48x at
+eight, so the multiples are rounded to what that floor supports (`~2-4x`, not
+`3.26x`) and an edition-to-edition move inside it is published as movement
+with no cause attached.
 [`BENCHMARK.md`](BENCHMARK.md) is the full set with its provenance header,
 its opening note on precision and every table these six rows are drawn from;
 [`SCOREBOARD.md`](SCOREBOARD.md) is the win/loss matrix and the fairness audit;
@@ -143,16 +147,17 @@ its opening note on precision and every table these six rows are drawn from;
 
 **Where we lose.** A page that lists only wins is advertising:
 
-- **Indexed range scan, 50 rows: ~1.15x behind journal-mode SQLite** (7.29 µs
-  against 6.58 µs p50), from 1.20x — and a win of ~5.8-8.8x against MySQL 8.4
-  and PostgreSQL 17 on the same shape, which is a statement about the socket
-  they pay, not about our row loop —
-  [`BENCHMARK.md`](BENCHMARK.md#secondary-index-reads--point-win-range-loss-both-narrowing).
-- **The `LIMIT 10` join shapes.** The secondary-index one is ~1.13x behind
-  SQLite on p50, from 1.26x; the PK one is no longer a p50 loss (3.25 against
-  3.50 µs, ahead in all three runs) but is still ~1.08x behind on throughput,
-  which pays our dearer cold first execution —
-  [`BENCHMARK.md`](BENCHMARK.md#joins--we-win-both-full-shapes-and-the-pk-limit-shape-is-no-longer-a-loss-on-p50).
+- **Indexed range scan, 50 rows: ~1.1x behind journal-mode SQLite** (7.13 µs
+  against 6.63 µs p50, 1.13x on throughput, behind in all three runs) — and a
+  win of ~5.9-9.0x against MySQL 8.4 and PostgreSQL 17 on the same shape,
+  which is a statement about the socket they pay, not about our row loop —
+  [`BENCHMARK.md`](BENCHMARK.md#secondary-index-reads--point-win-range-loss-both-roughly-where-the-previous-edition-left-them).
+- **The secondary-index `LIMIT 10` join is ~1.1x behind SQLite on p50** (5.00
+  against 4.54 µs, behind in all three runs) and ~1.21x on throughput, from
+  1.13x and 1.2x. The PK `LIMIT` shape is no longer a published loss on
+  either column — ahead on p50 in all three runs and a wash on throughput —
+  and is disclosed as a wash rather than claimed as a win —
+  [`BENCHMARK.md`](BENCHMARK.md#joins--we-win-both-full-shapes-the-pk-limit-shape-is-ahead-on-p50-and-no-longer-behind-on-throughput-and-the-secondary-limit-shape-is-still-a-loss).
 - **Batch insert, 100 rows per statement: ~0.68x PostgreSQL 17** like for like
   in a container, ~1.2x MySQL 8.4; on the host it loses 2.4x/4.1x, where every
   statement pays one `F_FULLFSYNC` —
@@ -168,6 +173,12 @@ its opening note on precision and every table these six rows are drawn from;
 - **Recall on uniformly random vectors is 0.12 at a hundred thousand rows**,
   and no tuning fixes it; on text-derived embeddings it is 0.998-1.000 across
   a 20x range of corpus sizes — [`bench/README.md`](bench/README.md).
+- **The concurrent-writer table has no measurement above eight writers on
+  this build.** The eleven-level sweep on the page is carried forward from an
+  older one, and the commit-path work of 2026-09-05/06 was measured at
+  sixteen writers on a different harness — so the peak's location is not
+  something this page currently measures —
+  [`BENCHMARK.md`](BENCHMARK.md#concurrent-writers--every-row-rose-every-rise-is-inside-the-aa-floor-and-the-commit-path-wins-show-up-in-the-counters-instead).
 - Not measured anywhere here: sustained or multi-core saturation, cold-cache
   reads (every point-read row is warm, and our miss path is dearer than
   SQLite's), and whether Docker Desktop's virtual disk honours `fsync` as a
