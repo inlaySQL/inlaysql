@@ -471,9 +471,9 @@
         </tr>
         <tr>
           <td>Batch insert, 100 rows per statement, containerised like the servers</td>
-          <td class="num">67,484 rows/s</td>
-          <td>MySQL 8.4 (56,700 rows/s), PostgreSQL 17 (99,212 rows/s)</td>
-          <td class="loss">~1.2× MySQL, ~1.5× slower than PostgreSQL</td>
+          <td class="num">88,456 rows/s</td>
+          <td>MySQL 8.4 (52,935 rows/s), PostgreSQL 17 (100,305 rows/s)</td>
+          <td class="loss">1.64× MySQL, 0.88× PostgreSQL</td>
         </tr>
         <tr>
           <td>Server writes over MySQL wire, 8 connections</td>
@@ -515,7 +515,7 @@
       <li>
         <strong>We lose on some shapes, and the table above says which.</strong>
         Row iteration trails SQLite on the indexed range scan and the
-        secondary-index <code>LIMIT 10</code> join; batch insert is ~0.68×
+        secondary-index <code>LIMIT 10</code> join; batch insert is 0.88×
         PostgreSQL 17 like for like; server writes at eight connections are
         ~0.30× MySQL 8.4, because the single-writer gate is the wall. Every
         cell, with its spread and a fairness audit, is in

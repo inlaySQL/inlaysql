@@ -44,13 +44,15 @@ them and lives in `PERF.md`'s dated sections and `git log`.
   and ~4x / ~2.6-2.9x the servers; range scan ~8x / ~5.5x the servers;
   `GROUP BY` 1.9x / 1.26x and the scalar aggregate ~6x / ~5x the servers (both
   were the worst multiples in the matrix a week ago); durable single-row writes
-  ~2.5x SQLite and ~13x at eight concurrent writers; batch insert ~1.2x MySQL
-  8.4 like for like; bulk load 227k rows/s; ~9x `sqlite-vec`, ~60-70x
+  ~2.5x SQLite and ~13x at eight concurrent writers; batch insert 1.64x MySQL
+  8.4 like for like (re-measured interleaved 2026-09-07, was ~1.2x); bulk load 227k rows/s; ~9x `sqlite-vec`, ~60-70x
   DuckDB/pgvector on hybrid retrieval.
 - **Where we lose, and these five are the queue below:** `LIMIT 10` joins vs
   SQLite (1.1x / 1.3-1.5x slower), range scan vs SQLite (0.83x), point-read
   ops/s vs SQLite WAL (0.56x, while ahead on p50), batch insert vs PostgreSQL
-  like for like (0.68x), and server-to-server writes at eight connections
+  like for like (0.88x, re-measured interleaved 2026-09-07 — was 0.68x, and
+  the move is a better harness, not an engine change), and server-to-server
+  writes at eight connections
   (0.30x). Also open and published: p99 commit latency at 32 writers, and
   sequential durable writes against both containerised servers.
 - **Landed and not yet published** — do not quote these as published numbers;
@@ -100,12 +102,33 @@ regeneration.
 3. **Point-read ops/s vs SQLite WAL (0.56x).** The tail that explained it is
    fixed (AHL-552). This row needs the next gated regeneration, not a fix,
    before anything else is proposed for it.
-4. **Batch insert vs PostgreSQL like for like (0.68x).** ~1.0 ms of engine work
-   per hundred-row statement in the container against PG's ~0.6 ms, and the
-   host profile is 89% fsync and hides it. **Profile it in the container.** The
-   state block is not a second barrier per commit — AHL-553 measured one wrap
-   per 33.3 hundred-row commits — so the likely item is coalescing the WAL
-   record and the dirty pages into one `pwritev`.
+4. **Batch insert vs PostgreSQL like for like (0.88x).** Profiled in the
+   container (AHL-570, 2026-09-07). Three things this item used to say are
+   now measured and none survived. **The cell is 0.88x, not 0.68x** — five
+   interleaved gated rounds with the engine order rotated (`bench/batch_insert.sh`),
+   both opponents reproducing their published cells in the same rounds
+   (PG 1.01x, MySQL 0.93x) while all five of our round medians clear the
+   published run's maximum. It is still a loss against PostgreSQL, and it
+   moved because the measurement got better, not because anything got faster.
+   **The "~1.0 ms of engine work" was wrong by 6.5x**: measured, the statement
+   is 1.093 ms, the barrier is 0.899 ms (82.3%) and the engine above the
+   storage layer is **0.154 ms (14.1%)** — against PostgreSQL's own instrument,
+   PG's non-barrier work is ~0.24 ms, so **we do less engine work per statement
+   than PostgreSQL does**. **`pwritev` is retracted as a candidate**: the WAL
+   record's `pwrite` and the data area's `pwrite` are 1.6% of the statement
+   between them, and **the dirty pages are already one `pwrite`** (1.00 call,
+   26,436 B), so the half that was proposed was done and the other half asks
+   one call to write two different file offsets, which `pwritev` does not do.
+   Ceiling ~5 µs, 0.5%. What is left is bytes through the barrier — 43.5 KiB
+   per statement against PG's 13.7 KiB, into a growing file against a recycled
+   segment — and two unopened levers on the record, both tree questions rather
+   than syscall ones: the **3.09 half-empty spine pages** a hundred-row insert
+   logs (12,670 B/commit at 49% used) and the **per-statement change log**
+   (6,144 B/commit), 69% of the record between them. AHL-564's 3.62x record
+   shrink did not carry to this shape (1.56x) because these pages are 49–78%
+   used, not 1–54%. The only other levers are the two already priced and
+   declined: physiological logging and deferred durability. Do not re-propose
+   `pwritev`, and do not open this row on a syscall.
 5. **Three clean nightly fuzz campaigns** — the written trigger for
    deleting the site's localhost bullet. Track F is otherwise complete:
    F3, F4 and `user list` (AHL-558) all landed 2026-09-05.

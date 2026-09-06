@@ -61,16 +61,17 @@ docker exec inlaysql-bench-drivers-1 sh -c 'TARGET=mysql    REPS=5 python /drive
 docker exec inlaysql-bench-drivers-1 sh -c 'TARGET=postgres REPS=5 python /drivers/batch_driver.py'
 REPS=5 cargo run --release -p inlaysql-bench --bin sql_shapes -- --mode agg    # InlaySQL's aggregate side, host — carried forward
 REPS=5 cargo run --release -p inlaysql-bench --bin sql_shapes -- --mode batch  # InlaySQL's batch-insert side, host — carried forward
+ROUNDS=5 ./bench/batch_insert.sh                                   # the containerised batch-insert cell only: all three engines, five interleaved gated rounds with the engine order rotated — THIS edition, 2026-09-07, and NOT compare.sh
 ```
 
 | | |
 | --- | --- |
-| Commit | `run.sh` tables: `72d7ab1` (the seventh full regeneration; `ea1712c..72d7ab1` carries **AHL-563**, **AHL-564** and **AHL-565**, three commit-path changes that have never been published here, plus **AHL-566**, which deleted AHL-562's flush pipeline after re-measuring it flat against a real A/A control — the range is itemised under the table). **`compare.sh`-sourced tables (DuckDB/pgvector/Meilisearch, MySQL/PostgreSQL, server-to-server): still `b873f4e` of 2026-09-05, not regenerated this edition** — `repeat-compare.sh` was not run, and each of those sections says so. Driver-sourced tables (read shapes, batch insert): still `bdc64eb`, **not regenerated this time** either, and each of those sections says so. **Nothing in `ea1712c..72d7ab1` is on a read path**: AHL-563 narrows a cache invalidation inside the commit gate, AHL-564 shrinks the WAL commit record, AHL-565 removes a free-list rescan that only the DST sweep exercises, and AHL-566 removes code that was compiled out behind a default-off flag in every run this page has ever published. |
-| Date | 2026-09-06 (`run.sh`, 07:01–07:22 UTC, i.e. 15:01–15:22 local); 2026-09-05 (`compare.sh`, 06:26–06:36 UTC, i.e. 14:26–14:36 local, carried forward); 2026-09-02/03 (the read-shape and batch-insert drivers, 19:13 UTC) |
+| Commit | `run.sh` tables: `72d7ab1` (the seventh full regeneration; `ea1712c..72d7ab1` carries **AHL-563**, **AHL-564** and **AHL-565**, three commit-path changes that have never been published here, plus **AHL-566**, which deleted AHL-562's flush pipeline after re-measuring it flat against a real A/A control — the range is itemised under the table). **`compare.sh`-sourced tables (DuckDB/pgvector/Meilisearch, MySQL/PostgreSQL, server-to-server): still `b873f4e` of 2026-09-05, not regenerated this edition** — `repeat-compare.sh` was not run, and each of those sections says so. Driver-sourced tables (read shapes, batch insert): still `bdc64eb`, **not regenerated this time** either, and each of those sections says so — **with one cell excepted**: the batch-insert table's *containerised InlaySQL* row is `bcbc9d4` of 2026-09-07, re-measured by `bench/batch_insert.sh` (AHL-570), a **different harness from `compare.sh`** and from the drivers. That row moved from 67,484 to 88,456 rows/s and the like-for-like verdict from 0.68x/1.19x to 0.88x/1.64x; the MySQL, PostgreSQL and host cells beside it are still `bdc64eb`. No engine change was made for it — AHL-570 built nothing, and the section says so. **Nothing in `ea1712c..72d7ab1` is on a read path**: AHL-563 narrows a cache invalidation inside the commit gate, AHL-564 shrinks the WAL commit record, AHL-565 removes a free-list rescan that only the DST sweep exercises, and AHL-566 removes code that was compiled out behind a default-off flag in every run this page has ever published. |
+| Date | 2026-09-06 (`run.sh`, 07:01–07:22 UTC, i.e. 15:01–15:22 local); 2026-09-05 (`compare.sh`, 06:26–06:36 UTC, i.e. 14:26–14:36 local, carried forward); 2026-09-02/03 (the read-shape and batch-insert drivers, 19:13 UTC); **2026-09-07 (`bench/batch_insert.sh`, the containerised batch-insert cell alone, five interleaved rounds, load 3.23/3.34/3.43 of 18, no round `CONTAMINATED`)** |
 | Tree | source clean at measurement (`dirty: no` in all three `run.sh` raw outputs and in the `repeat.sh` summary). |
 | Machine | Apple Mac17,9, 18 cores, macOS 27.0 (Darwin 27.0.0 arm64) |
 | Toolchain | rustc 1.91.1 (ed61e7d7e 2025-11-07) |
-| Raw output | **The concurrency suite is the only one regenerated this edition, and it is the eleven-level sweep** (`WRITER_LEVELS=1,2,3,4,5,6,8,12,16,24,32 SUITE=concurrency ./bench/run.sh`, x3, `bcbc9d4`): `bench/results/20260906T150302Z-repeat.txt`, combined by `bench/summarise.py` from `bench/results/20260906T{150302,162311,172332}Z.txt`. Load, sampled every 5 s throughout, min/median/max per run: 1.42/2.19/3.58, 1.35/2.60/3.77 and 1.52/2.72/3.88 of 18 CPUs against the gate's 0.25/CPU (4.5) ceiling; **no run marked `CONTAMINATED`**, `dirty: no` throughout. **This is the eighth edition, and the first since 2026-08-30 in which the wide writer sweep is not carried forward** — it replaces both the seventh edition's fresh 1/2/4/8 table and the `2cb2539` eleven-level sweep that sat beside it, so the concurrency section is now one session and one build rather than two. It took four attempts across five hours to get three clean runs on this machine: the suite's own peak load sits ~2.4 above the machine's baseline, so with an 18-CPU ceiling of 4.5 a run only finishes clean if the baseline stays under ~2.0 for its whole 4.5 minutes, and `repeat.sh` was abandoned for three separate gated `run.sh` invocations plus `bench/summarise.py` (the path `bench/README.md` documents) precisely because `repeat.sh` discards a whole set when one run refuses at the start gate. **Every other `run.sh` suite is carried forward from the seventh edition at `72d7ab1`** (`bench/results/20260906T070128Z-repeat.txt`, built from `bench/results/20260906T{070128,070835,071517}Z.txt`) — **legitimately, because the engine did not change**: `git diff 72d7ab1..bcbc9d4 -- crates/` touches only the wasm demo page's HTML, and the four commits between them are documentation. The seventh edition's own provenance for those suites follows. Load, sampled every 5 s throughout the measured phases, min/median/max per run: 1.36/2.33/3.73, 1.81/2.59/3.73 and 1.65/2.50/3.75 of 18 CPUs against the gate's 0.25/CPU (4.5) ceiling; no run marked `CONTAMINATED`, `dirty: no` throughout, and all three runs came from the first attempt. **This sitting is quiet but not the quietest**: its median load (2.33–2.59) is the lowest of the seven, and its peak (3.75) is fractionally above the previous sitting's 3.67 — so the "quietest of the six" claim the previous edition made on both counts is not repeated here, and where a figure moved this edition the load samples are not offered as the reason. This is the seventh full regeneration since 2026-09-02; the sixth, at `ea1712c` on the evening of the 5th (`bench/results/20260905T133420Z-repeat.txt`, load 1.2–3.7/18), is the "previous edition" every section below compares against, and the ones before it — `be95cc3` that morning (`bench/results/20260905T020058Z-repeat.txt`), `1f7921a` on the evening of the 3rd (`bench/results/20260903T123928Z-repeat.txt`), `3cf0d85` on the evening of the 2nd (`bench/results/20260902T124832Z-repeat.txt`), `4f8e5dd` that afternoon (`bench/results/20260902T062536Z-repeat.txt`) and `7b20175` that morning (`bench/results/20260902T022325Z-repeat.txt`) — are named where a section's history needs them. **The harness changed again this edition, and again only in what the concurrency suite prints**: `ea1712c..72d7ab1` adds AHL-563's `gate hold:` line to `crates/inlaysql-bench/src/concurrency.rs` — the reservation gate's hold split into read, state, WAL, data, extend, device and residual, with a commit-point-miss count — and removes AHL-562's two pipeline counters from the `barrier cycle:` line along with the pipeline itself (AHL-566). **No suite's measurement changed**: every number in every table below is produced by the same timed code as the previous edition's. What it does change is the summariser's denominator again — 116 diagnostic counter values became 184 — and the ≥10% paragraph below counts like with like rather than quoting the raw total against an older one. **Carried forward from the 2026-08-30 edition at `2cb2539`, not regenerated this edition** (each section says so where it appears): the **quantisation spot-check at scale** (`bench/results/20260830T{125800,131326,132715}Z.txt`, `SUITE=quantization DOCS=100000 QUERIES=50`, median of three, load 2.3–4.8/18). **Carried forward from the gated sitting at `b873f4e` on 2026-09-05, not regenerated this edition** (each section says so where it appears; `repeat-compare.sh` was not run this time, so every one of these figures is the previous edition's unchanged): every **`compare.sh`-sourced table** — the **DuckDB/pgvector/Meilisearch retrieval** table, the **"Against MySQL and PostgreSQL"** OLTP table (host and containerised InlaySQL, MySQL **8.4**, PostgreSQL 17) and the **"Server-to-server"** 1/8-connection table — is the median of three complete `REPEATS=3 ./bench/repeat-compare.sh` runs (`bench/results/20260905T062213Z-repeat-compare.txt`, built from `bench/results/20260905T{062620,063102,063530}Z-compare.txt`; `dirty: no`; load sampled every 5 s through the measured phases, min/median/max per run 1.66/2.80/3.23, 2.13/3.30/4.25 and 1.58/2.35/3.66 of 18 against the 4.5 ceiling; no run marked `CONTAMINATED`; 30 s cooldown between repetitions; **58 of 146 metrics disagreed by 10% or more** across the three, listed in the summary file — more than the 53 the previous edition found, and the OLTP write column is most of the difference). The edition it replaces is `bdc64eb` (`bench/results/20260902T185304Z-repeat-compare.txt`, published by `832f89e`), which every one of those three sections compares against by name. **One thing about the server-to-server table's stack changed between the two editions and is not an engine change**: `inlaysql serve --mysql` now binds the compose service name rather than `0.0.0.0` and the driver authenticates as the account `bench`, created by `inlaysql user add`, rather than as `root` through `--user`/`--password` (Track F's compose change, verified working before this run) — the section says so where its read column moved. Still at `bdc64eb`, **not regenerated this time**: the **read-shape and batch-insert** tables' MySQL/PostgreSQL columns and InlaySQL aggregate/batch cells are `REPS=5` medians with min–max from `bench/results/20260902T191343Z-scoreboard/` (`read-{mysql,postgres}.txt`, `batch-{mysql,postgres}.txt`, `sql-shapes-inlaysql.txt`, `sql-shapes-inlaysql-batch.txt`; `provenance.txt` records `uptime` before and after — load 1.47–2.36/18 — rather than a mid-run sampler, a weaker gate than `compare.sh`'s, disclosed). **The MySQL container is `mysql:8.4` (LTS) from `e7cc895` (2026-09-02) on; every "MySQL 8" figure this file published before 2026-09-02 was 8.0.x**, and the version changed underneath every MySQL edition-to-edition comparison below — none of those moves is attributed to either engine. The InlaySQL range and join cells of the read-shape table are reused from this edition's `run.sh` tables at `ea1712c`, as the previous four editions reused their own `run.sh` figures, and say so — those cells are now three engine editions *later* than the server columns beside them, and AHL-559 moved every one of them. **Carried forward from 2026-08-31, not regenerated**: the two "Server-to-server, extended" 1/4/16-connection sweeps (5 interleaved repetitions each, manually load-gated; raw JSON not retained). **Carried forward from earlier still**: the concurrent-writer old-vs-new A/B (`08f5fd4`, 2026-08-30, `bench/results/ab-head-run{1,2,3}-*.txt` and `ab-pre94d96a6-run{1,2,3}-*.txt`), and, as history only, the 2026-08-30 interleaved OLTP rerun at `b4798ce` (`bench/results/20260830T095714Z-interleaved-oltp-compare.txt`), superseded by the 2026-09-02/03 gated repeat. |
+| Raw output | **The concurrency suite is the only one regenerated this edition, and it is the eleven-level sweep** (`WRITER_LEVELS=1,2,3,4,5,6,8,12,16,24,32 SUITE=concurrency ./bench/run.sh`, x3, `bcbc9d4`): `bench/results/20260906T150302Z-repeat.txt`, combined by `bench/summarise.py` from `bench/results/20260906T{150302,162311,172332}Z.txt`. Load, sampled every 5 s throughout, min/median/max per run: 1.42/2.19/3.58, 1.35/2.60/3.77 and 1.52/2.72/3.88 of 18 CPUs against the gate's 0.25/CPU (4.5) ceiling; **no run marked `CONTAMINATED`**, `dirty: no` throughout. **This is the eighth edition, and the first since 2026-08-30 in which the wide writer sweep is not carried forward** — it replaces both the seventh edition's fresh 1/2/4/8 table and the `2cb2539` eleven-level sweep that sat beside it, so the concurrency section is now one session and one build rather than two. It took four attempts across five hours to get three clean runs on this machine: the suite's own peak load sits ~2.4 above the machine's baseline, so with an 18-CPU ceiling of 4.5 a run only finishes clean if the baseline stays under ~2.0 for its whole 4.5 minutes, and `repeat.sh` was abandoned for three separate gated `run.sh` invocations plus `bench/summarise.py` (the path `bench/README.md` documents) precisely because `repeat.sh` discards a whole set when one run refuses at the start gate. **Every other `run.sh` suite is carried forward from the seventh edition at `72d7ab1`** (`bench/results/20260906T070128Z-repeat.txt`, built from `bench/results/20260906T{070128,070835,071517}Z.txt`) — **legitimately, because the engine did not change**: `git diff 72d7ab1..bcbc9d4 -- crates/` touches only the wasm demo page's HTML, and the four commits between them are documentation. The seventh edition's own provenance for those suites follows. Load, sampled every 5 s throughout the measured phases, min/median/max per run: 1.36/2.33/3.73, 1.81/2.59/3.73 and 1.65/2.50/3.75 of 18 CPUs against the gate's 0.25/CPU (4.5) ceiling; no run marked `CONTAMINATED`, `dirty: no` throughout, and all three runs came from the first attempt. **This sitting is quiet but not the quietest**: its median load (2.33–2.59) is the lowest of the seven, and its peak (3.75) is fractionally above the previous sitting's 3.67 — so the "quietest of the six" claim the previous edition made on both counts is not repeated here, and where a figure moved this edition the load samples are not offered as the reason. This is the seventh full regeneration since 2026-09-02; the sixth, at `ea1712c` on the evening of the 5th (`bench/results/20260905T133420Z-repeat.txt`, load 1.2–3.7/18), is the "previous edition" every section below compares against, and the ones before it — `be95cc3` that morning (`bench/results/20260905T020058Z-repeat.txt`), `1f7921a` on the evening of the 3rd (`bench/results/20260903T123928Z-repeat.txt`), `3cf0d85` on the evening of the 2nd (`bench/results/20260902T124832Z-repeat.txt`), `4f8e5dd` that afternoon (`bench/results/20260902T062536Z-repeat.txt`) and `7b20175` that morning (`bench/results/20260902T022325Z-repeat.txt`) — are named where a section's history needs them. **The harness changed again this edition, and again only in what the concurrency suite prints**: `ea1712c..72d7ab1` adds AHL-563's `gate hold:` line to `crates/inlaysql-bench/src/concurrency.rs` — the reservation gate's hold split into read, state, WAL, data, extend, device and residual, with a commit-point-miss count — and removes AHL-562's two pipeline counters from the `barrier cycle:` line along with the pipeline itself (AHL-566). **No suite's measurement changed**: every number in every table below is produced by the same timed code as the previous edition's. What it does change is the summariser's denominator again — 116 diagnostic counter values became 184 — and the ≥10% paragraph below counts like with like rather than quoting the raw total against an older one. **Carried forward from the 2026-08-30 edition at `2cb2539`, not regenerated this edition** (each section says so where it appears): the **quantisation spot-check at scale** (`bench/results/20260830T{125800,131326,132715}Z.txt`, `SUITE=quantization DOCS=100000 QUERIES=50`, median of three, load 2.3–4.8/18). **Carried forward from the gated sitting at `b873f4e` on 2026-09-05, not regenerated this edition** (each section says so where it appears; `repeat-compare.sh` was not run this time, so every one of these figures is the previous edition's unchanged): every **`compare.sh`-sourced table** — the **DuckDB/pgvector/Meilisearch retrieval** table, the **"Against MySQL and PostgreSQL"** OLTP table (host and containerised InlaySQL, MySQL **8.4**, PostgreSQL 17) and the **"Server-to-server"** 1/8-connection table — is the median of three complete `REPEATS=3 ./bench/repeat-compare.sh` runs (`bench/results/20260905T062213Z-repeat-compare.txt`, built from `bench/results/20260905T{062620,063102,063530}Z-compare.txt`; `dirty: no`; load sampled every 5 s through the measured phases, min/median/max per run 1.66/2.80/3.23, 2.13/3.30/4.25 and 1.58/2.35/3.66 of 18 against the 4.5 ceiling; no run marked `CONTAMINATED`; 30 s cooldown between repetitions; **58 of 146 metrics disagreed by 10% or more** across the three, listed in the summary file — more than the 53 the previous edition found, and the OLTP write column is most of the difference). The edition it replaces is `bdc64eb` (`bench/results/20260902T185304Z-repeat-compare.txt`, published by `832f89e`), which every one of those three sections compares against by name. **One thing about the server-to-server table's stack changed between the two editions and is not an engine change**: `inlaysql serve --mysql` now binds the compose service name rather than `0.0.0.0` and the driver authenticates as the account `bench`, created by `inlaysql user add`, rather than as `root` through `--user`/`--password` (Track F's compose change, verified working before this run) — the section says so where its read column moved. Still at `bdc64eb`, **not regenerated this time**: the **read-shape and batch-insert** tables' MySQL/PostgreSQL columns and InlaySQL aggregate/batch cells are `REPS=5` medians with min–max from `bench/results/20260902T191343Z-scoreboard/` (`read-{mysql,postgres}.txt`, `batch-{mysql,postgres}.txt`, `sql-shapes-inlaysql.txt`, `sql-shapes-inlaysql-batch.txt`; `provenance.txt` records `uptime` before and after — load 1.47–2.36/18 — rather than a mid-run sampler, a weaker gate than `compare.sh`'s, disclosed). **Not the containerised InlaySQL batch cell, which is this edition's one regenerated driver-side figure**: `bench/batch_insert.sh` at `bcbc9d4` on 2026-09-07, `ROUNDS=5`, one `REPS=5` repetition of each engine per round with the engine order rotated, the two server volumes recreated first, `bench/load_gate.sh` sampling across the measured phases only — load 3.23/3.34/3.43 min/median/max of 18 against the 4.5 ceiling, no round `CONTAMINATED`. It is a different harness from both `compare.sh` and the hand-run drivers, so it regenerates that one cell and nothing else; `PERF.md`'s AHL-570 has the five rounds and the per-statement split. **The MySQL container is `mysql:8.4` (LTS) from `e7cc895` (2026-09-02) on; every "MySQL 8" figure this file published before 2026-09-02 was 8.0.x**, and the version changed underneath every MySQL edition-to-edition comparison below — none of those moves is attributed to either engine. The InlaySQL range and join cells of the read-shape table are reused from this edition's `run.sh` tables at `ea1712c`, as the previous four editions reused their own `run.sh` figures, and say so — those cells are now three engine editions *later* than the server columns beside them, and AHL-559 moved every one of them. **Carried forward from 2026-08-31, not regenerated**: the two "Server-to-server, extended" 1/4/16-connection sweeps (5 interleaved repetitions each, manually load-gated; raw JSON not retained). **Carried forward from earlier still**: the concurrent-writer old-vs-new A/B (`08f5fd4`, 2026-08-30, `bench/results/ab-head-run{1,2,3}-*.txt` and `ab-pre94d96a6-run{1,2,3}-*.txt`), and, as history only, the 2026-08-30 interleaved OLTP rerun at `b4798ce` (`bench/results/20260830T095714Z-interleaved-oltp-compare.txt`), superseded by the 2026-09-02/03 gated repeat. |
 
 One developer machine. Reproduce it; do not trust it. Every `run.sh` table
 on this page — points, indexed, joins, vectors, concurrency at 1/2/4/8
@@ -2150,75 +2151,113 @@ That is the asymmetry this row is about.
 
 | Engine | rows/s (median, range) | commits/s | c/fsync |
 | --- | --- | --- | --- |
-| InlaySQL (host, `F_FULLFSYNC`) | 24,102 (23,219–24,736) | 241 | 1.00 |
-| **InlaySQL (containerised, same volume class as the servers)** | **67,484** (60,453–70,943) | 675 | 1.00 |
-| MySQL 8.4 (containerised) | 56,700 (45,244–68,901) | 567 | 0.71 (0.62–0.76) |
-| PostgreSQL 17 (containerised) | **99,212** (93,776–100,749) | 992 | 1.00 |
+| InlaySQL (host, `F_FULLFSYNC`, `bdc64eb`) | 24,102 (23,219–24,736) | 241 | 1.00 |
+| **InlaySQL (containerised, same volume class as the servers; `bench/batch_insert.sh`, `bcbc9d4`, 2026-09-07)** | **88,456** (76,176–94,459) | 885 (rows/s ÷ 100) | 1.00 |
+| MySQL 8.4 (containerised, `bdc64eb`) | 56,700 (45,244–68,901) | 567 | 0.71 (0.62–0.76) |
+| PostgreSQL 17 (containerised, `bdc64eb`) | **99,212** (93,776–100,749) | 992 | 1.00 |
 
-**Like for like — the containerised row against the containerised servers
-— InlaySQL is ~1.2x MySQL 8.4 and ~0.68x PostgreSQL 17**, on a build that
-predates AHL-553. **Stated precisely, because the neighbouring row is no
-longer in the same state**: AHL-553 has now been measured on the
-containerised *single-row* durable commit — `PERF.md`'s own interleaved
-A/B at 1.181x, 11 of 12, and the OLTP table above regenerated on a build
-that carries it — but **this batch row has not been re-run**, because it
-comes from `sql_shapes`/`batch_driver.py` at `REPS=5` and not from
-`repeat-compare.sh`, and the 2026-09-05 sitting regenerated only the
-latter. So this row is still expected to be better than published, by an
-amount that is now measured on a *neighbouring* shape rather than on this
-one, and no number is put on it here: the barrier is 84.4% of the
-hundred-row statement against 89.8% of the single-row one (`PERF.md`'s
-containerised commit split), so the single-row figure is an upper bound on
-what to expect here, not a substitute for running it.
-That row was
-measured on 2026-09-03 at 10:16 (load 2.88 before, 6.36 after — three
-build agents were running on the host, so its spread of 17% is wider than
-the servers' sitting; five reps, medians): `sql_shapes` in the
-`inlaysql-oltp` service of `bench/external/compose.yml`, the database on the
-`inlaysql-oltp-data` named volume, `DIR=/data MODE=batch REPS=5`, raw
-`bench/results/20260902T191343Z-scoreboard/sql-shapes-inlaysql-batch-container.txt`.
+**Like for like — the containerised row against the containerised servers —
+InlaySQL is 1.64x MySQL 8.4 and 0.88x PostgreSQL 17.** The previous edition
+published 1.19x and 0.68x. **Nothing was built to move it.** AHL-570 changed
+no engine code; it changed the harness. What it re-measured is `bcbc9d4`, the
+build every `run.sh` table in this edition already comes from, against a
+published cell taken at `bdc64eb` — four commit-path changes earlier
+(AHL-553, AHL-563, AHL-564, AHL-566) and, worse, taken in a way that could
+not have detected them. Read this as a better measurement of the same
+engine, not as a fix that landed.
+
+**The containerised row's provenance, and it is not this edition's other
+provenance.** It comes from `bench/batch_insert.sh` (added by AHL-570), which
+runs one `REPS=5` repetition of each of the three engines per round and
+**rotates which engine goes first**, so a drift lands on all three arms
+instead of one. Five rounds, 2026-09-07, `bcbc9d4`, all three engines in
+containers on named volumes (`Durability::Full` /
+`innodb_flush_log_at_trx_commit=1` / `synchronous_commit=on`), the server
+volumes recreated first, `bench/load_gate.sh`'s sampler across the measured
+phases only: load 3.23/3.34/3.43 min/median/max of 18 against the 4.5
+ceiling, **no round marked `CONTAMINATED`**. **This is a different harness
+from `compare.sh`**, so this is not a `repeat-compare.sh` edition and nothing
+else on this page moved with it: the neighbouring driver-sourced rows — the
+read shapes, and this table's own MySQL, PostgreSQL and host cells — are
+still `bdc64eb` of 2026-09-02/03.
+
+**Why the published cell could not have detected them.** It was assembled
+from `sql_shapes --mode batch` run once, `batch_driver.py TARGET=mysql` run
+once and `TARGET=postgres` run once — and its InlaySQL cell came from a
+*different sitting a day after* its two server cells, under three concurrent
+build agents, with the 17% spread it disclosed. That is the reading
+`bench/profile_ab.sh` exists to refuse.
+
+The five interleaved rounds, and the A/A spread beside the ratio because the
+ratio is not much bigger than it:
+
+| | InlaySQL | MySQL 8.4 | PostgreSQL 17 |
+| --- | --- | --- | --- |
+| median of five rounds | **88,456** | **52,935** | **100,305** |
+| round-to-round range | 76,176–94,459 | 51,097–58,045 | 99,074–103,694 |
+| spread as % of median | 21% | 13.1% | 4.6% |
+| same rounds vs the published cell | +31% | 0.93x | 1.01x |
+| ratio to ours | — | 1.64x | 0.88x |
+
+**A 21% A/A spread does not by itself carry a 1.31x move, and it is not
+offered as if it did.** What carries the move is the control. Both opponents
+reproduce their published cells in the same rounds — PostgreSQL 100,305
+against 99,212 (1.01x), MySQL 52,935 against 56,700 (0.93x) — so the machine
+has not moved; ours has. **All five of our round medians clear the published
+run's maximum** (76,176 > 70,943), 5 of 5, which is the non-overlap rule
+`PERF.md` §4 asks for. No attempt is made here to split the +31% among the
+four changes that sit between the two builds.
+
 **On the host the row is LOSS ~2.4x vs MySQL 8.4, ~4.1x vs PostgreSQL**
 (was ~1.6x/~3.1x on 2026-08-31), and **that ratio is the barrier, not the
-engine.**
-InlaySQL's 241 commits/s is 4.1 ms per statement, and the host single-row
-write in the OLTP table above pays the same barrier at 257.9 ops/s, 3.90 ms
-p50 — a hundred-row statement costs what a one-row statement costs, because
-both are one `F_FULLFSYNC`. The servers commit against the Docker volume's
-cheaper virtualised barrier, and the OLTP table above measures that
-difference, InlaySQL against itself: 257.9 on the host against 876.0
-containerised, **3.4x at the medians and 2.4–6.2x pairing the runs** — a
-band this edition, not the single 2.5x the previous one quoted, and wider
-than it partly because AHL-553 pays on the virtualised barrier and not on
-the host's. What the engine's own share of this
-row was, and is: `PERF.md`'s AHL-542 (2026-09-03) profiled exactly this
+engine.** InlaySQL's 241 commits/s is 4.1 ms per statement, and the host
+single-row write in the OLTP table above pays the same barrier at 257.9
+ops/s, 3.90 ms p50 — a hundred-row statement costs what a one-row statement
+costs, because both are one `F_FULLFSYNC`. The servers commit against the
+Docker volume's cheaper virtualised barrier, and the OLTP table above
+measures that difference, InlaySQL against itself: 257.9 on the host against
+876.0 containerised, **3.4x at the medians and 2.4–6.2x pairing the runs**.
+The host cell is context for the containerised one, never a verdict against a
+containerised server. `PERF.md`'s AHL-542 (2026-09-03) profiled exactly this
 shape and found the per-row root-to-leaf page round trip at 32% of the
-statement — a hundred-row `INSERT` decoded, cloned and re-encoded each of
-its ~3 path pages ~100 times to write them once — and removed it (each
-dirty page held decoded, encoded once at commit), measured interleaved at
-**1.29–1.44x on the engine's own batch-insert profile**, 3 of 3
-non-overlapping, with `sync_commit`'s share rising from 60.8% to 85.2% of
-the statement. `bdc64eb` has that fix. The published rows/s still reads
-24,102 against the previous edition's 26,254 (19,111–43,851, under
-desktop load) because at 4.1 ms per barrier the ceiling for this row is
-~245 statements/s, 24.5k rows/s, and 24,102 is 98% of it — the
-2026-08-31 median already sat near that ceiling on its good reps, and the
-engine work that AHL-542 removed was hidden under the barrier on the host
-where it was not on the profile. The loss widened because the servers'
-side rose on a quiet machine — MySQL 42,933 → 56,700 (and a version
-change), PostgreSQL 81,229 → 99,212 — while a barrier-bound row cannot.
-MySQL's c/fsync of 0.71 is InnoDB's log layer flushing ~1.4 times per
-commit at this batch size, its background flush counted, as before.
+statement — a hundred-row `INSERT` decoded, cloned and re-encoded each of its
+~3 path pages ~100 times to write them once — and removed it, measured
+interleaved at **1.29–1.44x on the engine's own batch-insert profile**, 3 of
+3 non-overlapping. The host row barely moved for it (24,102 against the
+previous edition's 26,254) because at 4.1 ms per barrier its ceiling is ~245
+statements/s, 24.5k rows/s, and 24,102 is 98% of it. MySQL's c/fsync of 0.71
+is InnoDB's log layer flushing ~1.4 times per commit at this batch size, its
+background flush counted, as before.
 
-The containerised row above is what this section used to owe. The
-arithmetic said a 2.5x cheaper barrier at an 85% barrier share should land
-it well above the host's and short of PostgreSQL's; it landed at 2.8x the
-host's (67,484 against 24,102) and 0.68x PostgreSQL's, which is the same
-statement with a number on it. What separates it from PostgreSQL now is
-not the barrier: both pay one per statement (c/fsync 1.00 on both sides);
-it is the ~1.0 ms of engine work per hundred-row statement that remains
-after AHL-542, against PostgreSQL's ~0.6 ms, and that is a per-row engine
-item again — the insert path's remaining costs the root plan lists
-(`leaf_split_point`, `encode_leaf`, index maintenance).
+**What separates us from PostgreSQL is not engine work, and the figure this
+section used to carry for it was wrong.** Previous editions said "~1.0 ms of
+engine work per hundred-row statement against PostgreSQL's ~0.6 ms". That
+was a subtraction from throughput, never a measurement, and it is wrong by
+6.5x. AHL-570 measured the statement with `commit_growth`'s device wrapper,
+on this cell's own two-integer table rather than the 64-byte-body table every
+earlier profile used: total **1.093 ms**, of which the barrier is **0.899 ms
+— 82.3%**, the WAL record's `pwrite` 0.004 ms (**0.4%**), the data area's
+`pwrite` 0.013 ms (**1.2%**), and **the engine above the storage layer 0.154
+ms — 14.1%**. Measured against PostgreSQL's own instrument (`pg_stat_wal`
+with `track_wal_io_timing=on`, bracketed as `batch_driver.py` brackets its
+sync), PostgreSQL's non-barrier work on the same statement is **~0.24 ms**
+against our 0.154: **we do less engine work per statement than PostgreSQL
+does.** The residual is bytes through the barrier — **43.5 KiB per statement
+(17.1 KiB of record plus 26.4 KiB of data area) against PostgreSQL's 13.7
+KiB**, into a file that grows against a segment PostgreSQL preallocates and
+recycles in place. Closing that needs physiological logging or deferred
+durability; both are priced and declined (`docs/recovery.md`, `PERF.md`
+AHL-564 §2 and AHL-570 §6).
+
+Two things the same profile found, and both are byte questions rather than
+syscall ones. **AHL-564's 3.62x WAL-record shrink did not carry to this
+shape**: it is 1.56x here (27,265 B to 17,505 B), because a hundred-row
+commit's pages are 49–78% used where a single-row commit's are 1–54%, and
+what AHL-564 removed was the zero hole. And **69% of a hundred-row commit's
+record is not the rows** — 47% is 3.09 spine pages at 49% used (12,670
+B/commit) and 23% is the per-statement change log (6,144 B/commit); the rows
+themselves are 8,315 B across 2.03 leaves. Those two are the open levers on
+this row.
 
 ---
 

@@ -197,7 +197,7 @@ configuration changed.
 | Point read by PK | WIN ~7x vs durable config (4.8-7.1x per run); **TIE** vs WAL/NORMAL, on weaker evidence than the edition before — 0.88x on ops/s, behind in 3 of 3 runs, and ahead on p50 in only 2 of 3, both inside this row's own floor (§3.1) | WIN ~200x (structural, §3.1) | WIN ~35x (structural, §3.1) |
 | Indexed range scan | LOSS ~1.13x (durable) / ~1.9x (WAL) — behind 3 of 3 on both, unchanged this edition (§3.2) | WIN ~9.0x (§3.2) | WIN ~5.9x (§3.2) |
 | Single-row insert (durable) | WIN ~2.8x | TIE (containerised; medians read 1.10x our way, but pairing the runs we are ahead in 1 of 3, 0.55–2.08x — was LOSS ~1.5x, §3.3) | TIE (containerised; medians read 0.90x, ahead in 1 of 3, 0.61–2.05x — was LOSS ~1.2x, §3.3) |
-| Batch insert | UNKNOWN — no SQLite-batched comparison published | WIN ~1.2x like for like (containerised InlaySQL 67,484 rows/s vs 56,700; on the host, LOSS ~2.4x on the barrier, §3.4) | LOSS ~1.5x like for like (67,484 vs 99,212; on the host ~4.1x, §3.4) |
+| Batch insert | UNKNOWN — no SQLite-batched comparison published | WIN ~1.6x like for like (containerised InlaySQL 88,456 rows/s vs 52,935 in the same interleaved rounds; was WIN ~1.2x; on the host, LOSS ~2.4x on the barrier, §3.4) | **LOSS ~1.1x** like for like (88,456 vs 100,305, 0.88x; was LOSS ~1.5x — a re-measurement, not an engine change; on the host ~4.1x, §3.4) |
 | Concurrent commits, 4/8/16 writers | WIN ~8.5x/17x at 4/8, fresh at `72d7ab1`; the 16-writer figure (~18x) is carried forward from a build that predates AHL-563/564/565 and is not this engine (§3.5) | LOSS @1,4,16 (~1.4-2.4x/~1.1-3.0x/~3.1-5.4x, widening with concurrency, 5 interleaved reps); LOSS @8 ~0.30x and LOSS @1 ~0.89x (gated median of 3 vs MySQL 8.4, 2026-09-05; batching at parity, barrier rate ~3.3x behind; the @1 loss narrowed from ~0.64x on AHL-553, §3.5) | UNKNOWN — no server exists (§3.4) |
 | Two-table join | MIXED: WIN both full shapes (~3x and ~8x); PK `LIMIT 10` **TIE** — ahead on p50 in 3 of 3 runs by ~5%, inside this row's own 14% p50 spread, and the throughput line that used to contradict it now agrees at 1.02x, itself inside an 18% spread; LOSS on the secondary `LIMIT 10` shape (~1.10x on p50, ~1.21x on throughput) (§3.6) | WIN all four shapes: ~4.1-4.4x on both full joins; several-x on `LIMIT`, on a smaller LIMIT than theirs (§3.6) | WIN all four shapes: ~2.8-3.0x on both full joins; several-x on `LIMIT`, same caveat (§3.6) |
 | Aggregate / `GROUP BY` | UNKNOWN — no harness | WIN ~1.9x group / WIN ~6x scalar (§3.7) | WIN ~1.26x group / WIN ~5x scalar (§3.7) |
@@ -477,52 +477,81 @@ competitive multiple. It isn't one. Recommend the prose in `README.md` and
 `BENCHMARK.md` state the comparison basis explicitly wherever this figure is
 quoted.
 
-**MySQL / PostgreSQL** (regenerated 2026-09-02/03, `bench/external/batch_driver.py`
-vs `inlaysql-bench --bin sql_shapes --mode batch`, unix socket, 5 reps,
-quiet machine, MySQL 8.4): 100 rows per multi-row INSERT statement,
-autocommitted, 100 statements per rep (10,000 rows per rep), explicit
-ids. Durability aligned: MySQL `innodb_flush_log_at_trx_commit=1`, PG
+**MySQL / PostgreSQL** (the containerised InlaySQL cell re-measured
+2026-09-07 by `bench/batch_insert.sh` at `bcbc9d4`; the other three cells
+still 2026-09-02/03 at `bdc64eb` from `bench/external/batch_driver.py` vs
+`inlaysql-bench --bin sql_shapes --mode batch`, unix socket, 5 reps, quiet
+machine, MySQL 8.4): 100 rows per multi-row INSERT statement, autocommitted,
+100 statements per rep (10,000 rows per rep), explicit ids. Durability
+aligned: MySQL `innodb_flush_log_at_trx_commit=1`, PG
 `synchronous_commit=on`, InlaySQL `Durability::Full` — one commit, one
 barrier per statement on every engine. **Correction to this section's
 previous wording**: the servers run in containers on named volumes;
-InlaySQL's cell runs `sql_shapes` on the host, and its barrier is the
-host's `F_FULLFSYNC`. "All in the same container environment" was wrong
-for InlaySQL's row and is withdrawn.
+InlaySQL's *host* cell runs `sql_shapes` on the host, and its barrier is the
+host's `F_FULLFSYNC`. "All in the same container environment" was wrong for
+that row and is withdrawn.
 
 | Engine | rows/s (median, range) | commits/s | c/fsync |
 | --- | --- | --- | --- |
-| InlaySQL (host, `F_FULLFSYNC`) | 24,102 (23,219–24,736) | 241 | 1.00 |
-| **InlaySQL (containerised, same volume class as the servers)** | **67,484 (60,453–70,943)** | 675 | 1.00 |
-| MySQL 8.4 (containerised) | 56,700 (45,244–68,901) | 567 | 0.71 |
-| PostgreSQL 17 (containerised) | 99,212 (93,776–100,749) | 992 | 1.00 |
+| InlaySQL (host, `F_FULLFSYNC`, `bdc64eb`) | 24,102 (23,219–24,736) | 241 | 1.00 |
+| **InlaySQL (containerised, same volume class as the servers; `bcbc9d4`, 2026-09-07)** | **88,456 (76,176–94,459)** | 885 | 1.00 |
+| MySQL 8.4 (containerised, `bdc64eb`) | 56,700 (45,244–68,901) | 567 | 0.71 |
+| PostgreSQL 17 (containerised, `bdc64eb`) | 99,212 (93,776–100,749) | 992 | 1.00 |
 
-**LOSS ~2.4x vs MySQL 8.4, LOSS ~4.1x vs PostgreSQL** (was ~1.6x/~3.1x on
-2026-08-31: InlaySQL 26,254 (19,111–43,851), MySQL 8.0 42,933, PostgreSQL
-81,229 under desktop load). The loss widened because the servers' side
-rose on a quiet machine while InlaySQL's cannot: at 241 commits/s the
-statement *is* the host barrier — 4.1 ms, the same `F_FULLFSYNC` the host
-single-row write in §3.3's table pays at 257.9 ops/s — and 24,102 rows/s
-is 98% of that barrier's ceiling. The servers commit against the Docker
-volume's cheaper virtualised barrier, measured InlaySQL-against-itself in
-`BENCHMARK.md`'s OLTP table at 3.4x cheaper at the medians and 2.4–6.2x
-pairing the runs on 2026-09-05. `PERF.md`'s AHL-542
-(2026-09-03) profiled this exact shape, found the per-row page round trip
-at 32% of the statement, removed it, and measured 1.29–1.44x on the
-engine's own batch-insert profile with `sync_commit` rising to 85% of the
-statement; `bdc64eb` carries that fix and the published cell barely moved,
-because on the host the barrier hides it. **The published ratio is the
-barrier, not the engine.** The c/fsync column is the noise-resistant
-metric and orders the same way: InlaySQL and PostgreSQL at exactly 1.00,
-MySQL at 0.71 (InnoDB's log layer flushing ~1.4x per commit at this batch
-size). What this cell owes as of 2026-09-05: a re-run on a build carrying
-AHL-553. The neighbouring single-row containerised row has now had one
-(§3.3) and AHL-553's own interleaved A/B measured 1.181x on it; this row
-came from `sql_shapes`/`batch_driver.py` at `REPS=5`, which the 2026-09-05
-`repeat-compare.sh` sitting did not regenerate, so it is still a
-pre-AHL-553 measurement. The barrier is 84.4% of the hundred-row statement
-against 89.8% of the single-row one (`PERF.md`'s containerised commit
-split), so the single-row figure bounds what to expect here rather than
-standing in for it, and no number is invented.
+**Like for like, containerised against containerised: WIN ~1.6x vs MySQL
+8.4, LOSS ~1.1x vs PostgreSQL** (1.64x and 0.88x). **It stays a loss against
+PostgreSQL** — 0.88x is a loss, and this section does not call it anything
+else — but the margin is a third of what was published (was LOSS ~1.5x at
+0.68x), and the MySQL win widens from ~1.2x to ~1.6x. **Nothing in the
+engine was built to move either.** AHL-570 wrote a harness and measured;
+what changed is the measurement.
+
+**What the re-derivation rests on.** The published cell was three
+single-shot runs, and its InlaySQL arm came from a *different sitting a day
+after* its two server arms, under three concurrent build agents, with the
+17% spread it disclosed. `bench/batch_insert.sh` runs one `REPS=5`
+repetition of each engine per round and rotates which engine goes first,
+five rounds, server volumes recreated first, `load_gate.sh` sampling across
+the measured phases: load 3.23/3.34/3.43 of 18 against the 4.5 ceiling, no
+round `CONTAMINATED`. Medians of those rounds: InlaySQL 88,456, MySQL
+52,935, PostgreSQL 100,305.
+
+**The A/A spread is stated beside the ratio because it is not much smaller
+than it.** Ours is 21% of median across rounds; PostgreSQL's 4.6%, MySQL's
+13.1%. A 21% A/A does not by itself carry a 1.31x move. What carries it is
+the control: both opponents reproduce their published cells in the same
+rounds (PostgreSQL 1.01x, MySQL 0.93x), and **all five of our round medians
+clear the published run's maximum** — 76,176 > 70,943, 5 of 5, the
+non-overlap rule `PERF.md` §4 asks for. Four commit-path changes sit between
+the two builds (AHL-553, AHL-563, AHL-564, AHL-566) and no attempt is made
+to split the +31% among them.
+
+**LOSS ~2.4x vs MySQL 8.4, LOSS ~4.1x vs PostgreSQL on the host** (was
+~1.6x/~3.1x on 2026-08-31: InlaySQL 26,254 (19,111–43,851), MySQL 8.0
+42,933, PostgreSQL 81,229 under desktop load). **That ratio is the barrier,
+not the engine**, and the host row is context rather than a verdict against
+a containerised server: at 241 commits/s the statement *is* the host barrier
+— 4.1 ms, the same `F_FULLFSYNC` the host single-row write in §3.3's table
+pays at 257.9 ops/s — and 24,102 rows/s is 98% of that barrier's ceiling.
+The c/fsync column is the noise-resistant metric and orders the same way:
+InlaySQL and PostgreSQL at exactly 1.00, MySQL at 0.71 (InnoDB's log layer
+flushing ~1.4x per commit at this batch size).
+
+**What this cell no longer owes, and what it does.** It owed a re-run on a
+build carrying AHL-553; it has had one. What it also owed and did not know
+it did was a *number for the engine's own share*: this section and
+`BENCHMARK.md` both carried "~1.0 ms of engine work per hundred-row
+statement", which was a subtraction from throughput rather than a
+measurement and is wrong by 6.5x. Measured (AHL-570 §3, on this cell's own
+two-integer table): total 1.093 ms, barrier 0.899 ms — 82.3%, engine above
+the storage layer **0.154 ms — 14.1%**, the WAL record's `pwrite` 0.4% and
+the data area's 1.2%. Measured against PostgreSQL's own instrument, its
+non-barrier work on the same statement is **~0.24 ms against our 0.154** —
+**we do less engine work per statement than PostgreSQL does**, and the
+residual is bytes through the barrier: 43.5 KiB against 13.7 KiB, into a
+growing file against a recycled segment. What this cell owes now is a
+`compare.sh`-class regeneration of the three cells still at `bdc64eb`, so
+the whole row comes from one sitting.
 
 ### 3.5 Concurrent commits at 4/8/16/32 writers
 
