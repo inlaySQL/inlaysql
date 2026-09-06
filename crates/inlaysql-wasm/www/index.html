@@ -40,6 +40,11 @@
     color: var(--ink);
     font: 16px/1.65 var(--sans);
     -webkit-font-smoothing: antialiased;
+    /* An inline `--plaintext-network` or `EngineOptions::paged_text_indexes`
+       is one unbreakable token wider than a 320px viewport. Breaking inside
+       it is uglier than a horizontal scrollbar on a phone; a page you can
+       drag sideways is worse than both. */
+    overflow-wrap: anywhere;
   }
 
   a { color: var(--accent); text-decoration: none; }
@@ -159,20 +164,6 @@
   }
   h2 + .sub { color: var(--ink-dim); margin: 0 0 2.5rem; max-width: 42rem; }
 
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
-    gap: 1.25rem;
-  }
-  .card {
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    padding: 1.5rem;
-    background: var(--bg-raised);
-  }
-  .card h3 { margin: 0 0 .5rem; font-size: 1.02rem; letter-spacing: -.01em; }
-  .card p { margin: 0; color: var(--ink-dim); font-size: .92rem; }
-
   /* ---- code ---- */
 
   pre.code {
@@ -220,6 +211,7 @@
     margin: .6rem 0 0;
     overflow-x: auto;
     white-space: pre-wrap;
+    overflow-wrap: anywhere;
     font-size: .82rem;
     color: var(--ink-dim);
     min-height: 1.2rem;
@@ -232,7 +224,10 @@
   .limits li { color: var(--ink-dim); margin-bottom: .8rem; }
   .limits strong { color: var(--ink); font-weight: 600; }
 
-  table.bench { width: 100%; border-collapse: collapse; font-size: .9rem; }
+  /* The table is four columns of prose and it does not fit a phone. It
+     scrolls inside its own box rather than making the page scroll. */
+  .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table.bench { width: 100%; min-width: 34rem; border-collapse: collapse; font-size: .9rem; }
   table.bench th, table.bench td {
     text-align: left;
     padding: .7rem .6rem;
@@ -263,8 +258,21 @@
 
   @media (max-width: 40rem) {
     header.hero { padding: 4.5rem 0 3rem; }
+    section.band { padding: 3rem 0; }
+    .wrap { padding: 0 1rem; }
+    .figures { margin: 2.5rem 0; }
+    .figures { grid-template-columns: 1fr; }
+    /* Controls stack; each one is a full-width tap target rather than a
+       shoulder of a row that does not fit. */
     .row { flex-wrap: wrap; }
-    .row input { flex: 1 1 100%; }
+    .row input, .row button { flex: 1 1 100%; }
+    /* 16px is the threshold below which iOS Safari zooms the page on focus —
+       and a zoomed page is a page you can drag sideways. The taller padding
+       takes the tap target past ~44px. */
+    input, button { font-size: 16px; padding: .85rem 1rem; }
+    pre.code { padding: 1rem; font-size: .8rem; }
+    .limits { padding-left: 1rem; }
+    table.bench { font-size: .84rem; }
   }
 </style>
 </head>
@@ -354,74 +362,6 @@
   </div>
 </section>
 
-<section class="band">
-  <div class="wrap">
-    <h2>What you get</h2>
-    <p class="sub">Every claim here is backed by a test or a script in the repository.</p>
-    <div class="grid">
-      <div class="card">
-        <h3>One file, no server</h3>
-        <p>
-          Embed it in a binary, a CLI, or a browser tab. The same file opens
-          natively, over WASM, and through the MySQL server — byte for byte.
-        </p>
-      </div>
-      <div class="card">
-        <h3>Writers that do not queue</h3>
-        <p>
-          MVCC by structure: writers touching disjoint rows commit concurrently
-          and are rebased rather than aborted. SQLite serialises at its file
-          lock; we measured 0% aborts at every writer count.
-        </p>
-      </div>
-      <div class="card">
-        <h3>Your ORM already speaks it</h3>
-        <p>
-          <code>inlaysql serve --mysql</code> talks the MySQL wire protocol. A
-          stock Laravel 11 app runs against it for real — <code>php artisan
-          migrate</code> completes, and ordinary Eloquent traffic works:
-          <code>upsert()</code>, eager loads, <code>whereHas</code>,
-          <code>paginate()</code>. Running the real thing found two shim bugs a
-          hand-written approximation had missed.
-        </p>
-      </div>
-      <div class="card">
-        <h3><code>MATCH … AGAINST</code> is the real BM25</h3>
-        <p>
-          MySQL's full-text spelling maps onto the engine's own retriever, not
-          an emulation of it: <code>MATCH (body) AGAINST (?)</code> becomes a
-          native BM25 probe, and as a whole <code>WHERE</code> conjunct it
-          drives the query. Boolean mode is refused by name rather than
-          quietly answered as if it were natural language.
-        </p>
-      </div>
-      <div class="card">
-        <h3>Crash safety you can replay</h3>
-        <p>
-          The core is <code>no_std</code>, so it cannot read a clock or touch a
-          file except through a trait. That is what lets thousands of crash and
-          torn-write schedules replay byte-for-byte on any machine.
-        </p>
-      </div>
-      <div class="card">
-        <h3>Tested against SQLite itself</h3>
-        <p>
-          1307 SQL Logic Tests at 100%, plus a differential fuzzer that runs
-          generated queries through both engines and compares the answers.
-        </p>
-      </div>
-      <div class="card">
-        <h3>No unsafe code</h3>
-        <p>
-          <code>inlaysql</code> and <code>inlaysql-core</code> are
-          <code>#![forbid(unsafe_code)]</code>. The one exception is the
-          <code>io_uring</code> backend, isolated behind a trait.
-        </p>
-      </div>
-    </div>
-  </div>
-</section>
-
 <section class="band" id="demo">
   <div class="wrap narrow">
     <h2>Run it here</h2>
@@ -472,8 +412,10 @@
     <h2>Measured, including where we lose</h2>
     <p class="sub">
       Every number regenerates from a script in the repository. A table that
-      contains only wins is advertising, so the losses are here too.
+      contains only wins is advertising, so the losses are here too — and the
+      rest of them are in the list below.
     </p>
+    <div class="table-scroll">
     <table class="bench">
       <thead>
         <tr><th>Workload</th><th>InlaySQL</th><th>Compared with</th><th>Result</th></tr>
@@ -504,52 +446,22 @@
           <td class="win">~70-90× faster</td>
         </tr>
         <tr>
-          <td>Durable write, one row per commit (containerised)</td>
-          <td class="num">876.0 ops/s</td>
-          <td>PostgreSQL 17 (977.4 ops/s)</td>
-          <td class="num">tie — 0.61–2.05× per run, ahead in one of three <span class="note">(published as a loss last edition; the engine's measured share of the move is 1.18×, the rest is the machine)</span></td>
-        </tr>
-        <tr>
-          <td>Durable write, one row per commit (containerised)</td>
-          <td class="num">876.0 ops/s</td>
-          <td>MySQL 8.4 (797.2 ops/s)</td>
-          <td class="num">tie — 0.55–2.08× per run, ahead in one of three <span class="note">(the medians read our way; the runs do not, so no win is claimed)</span></td>
-        </tr>
-        <tr>
           <td>Secondary-index inner join, 20k × 160k rows</td>
           <td class="num">3.60 ms</td>
           <td>SQLite</td>
           <td class="win">~8× faster</td>
         </tr>
         <tr>
-          <td>PK inner join, <code>LIMIT 10</code> <span class="note">(published as a loss for six editions; the key comparison stopped calling <code>memcmp</code>, worth +13% on this shape interleaved)</span></td>
+          <td>PK inner join, <code>LIMIT 10</code></td>
           <td class="num">3.25 µs p50</td>
           <td>SQLite, journal (3.50 µs p50)</td>
-          <td class="win">faster in all three runs — though on throughput, which pays our dearer first execution of a shape, ~1.08× behind</td>
+          <td class="win">faster in all three runs — though ~1.08× behind on throughput, which pays our dearer first execution of a shape</td>
         </tr>
         <tr>
           <td>Indexed range scan, 50 rows</td>
           <td class="num">7.29 µs</td>
           <td>SQLite, journal</td>
           <td class="loss">~1.15× slower</td>
-        </tr>
-        <tr>
-          <td>Indexed range scan, 50 rows <span class="note">(servers answer a client over a socket; SQLite in-process is ~6-10× them on the same shape)</span></td>
-          <td class="num">126,183 ops/s</td>
-          <td>MySQL 8.4, PostgreSQL 17</td>
-          <td class="win">~5.8-8.8× faster</td>
-        </tr>
-        <tr>
-          <td><code>GROUP BY</code>, 100 groups over 100k rows</td>
-          <td class="num">210/s</td>
-          <td>PostgreSQL 17 (167/s), MySQL 8.4 (110/s)</td>
-          <td class="win">~1.3-1.9× faster</td>
-        </tr>
-        <tr>
-          <td>Scalar <code>COUNT/MIN/MAX</code> over 100k rows</td>
-          <td class="num">1,914/s</td>
-          <td>PostgreSQL 17 (362/s), MySQL 8.4 (300/s)</td>
-          <td class="win">~5-6× faster</td>
         </tr>
         <tr>
           <td>Batch insert, 100 rows per statement, containerised like the servers</td>
@@ -565,22 +477,18 @@
         </tr>
       </tbody>
     </table>
+    </div>
     <p class="note">
-      These multiples are rounded to the precision <a
-      href="https://github.com/inlaySQL/inlaysql/blob/main/BENCHMARK.md">BENCHMARK.md</a>'s
-      own measured run-to-run spread supports — repeating the identical
-      binary against identical data moves these figures by several percent
-      on a quiet machine and more under normal load, so a bare "3.3×" would
-      claim more precision than the measurement has. See that file's opening
-      note.
-    </p>
-    <p class="note">
-      One developer machine, one commit, one sitting. Reproduce it; do not
-      trust it — <code>./bench/run.sh</code> and <code>./bench/compare.sh</code>
-      are in the repository, and
+      One developer machine, one sitting. These multiples are rounded to the
+      precision the measured run-to-run spread supports, so a bare "3.3×"
+      would claim more than the measurement has. Reproduce it; do not trust it —
+      <code>./bench/run.sh</code> and <code>./bench/compare.sh</code> are in the
+      repository, and
       <a href="https://github.com/inlaySQL/inlaysql/blob/main/BENCHMARK.md">BENCHMARK.md</a>
-      records the machine, the durability settings and the asymmetries that
-      remain.
+      records the machine, the durability settings, the provenance of every
+      table and the asymmetries that remain —
+      <a href="https://github.com/inlaySQL/inlaysql/blob/main/SCOREBOARD.md">SCOREBOARD.md</a>
+      is the win/loss matrix with its fairness audit.
     </p>
   </div>
 </section>
@@ -589,8 +497,8 @@
   <div class="wrap narrow">
     <h2>What this is not, yet</h2>
     <p class="sub">
-      Scheduled work rather than oversights — but you should know them before
-      you reach for this.
+      Scheduled work rather than oversights — one line each, with the detail
+      behind it. A page that lists only wins is advertising.
     </p>
     <ul class="limits">
       <li>
@@ -599,86 +507,61 @@
         loudly rather than guessing.
       </li>
       <li>
-        <strong>Row iteration still loses to SQLite, on two shapes rather
-        than three.</strong> The 50-row range scan is roughly 1.15× behind
-        journal-mode SQLite and the secondary-index <code>LIMIT 10</code>
-        join roughly 1.13× on p50 — both narrower again this edition — while
-        both full joins are faster and, against MySQL and PostgreSQL, the
-        range scan wins outright. Measured, published above, and the current
-        top priority. <strong>The PK <code>LIMIT 10</code> join has come off
-        this list on p50</strong>: 3.25 µs against SQLite&rsquo;s 3.50, ahead
-        in all three runs of the sitting, where it was published 1.15× behind
-        an edition ago. Its throughput line is still ~1.08× behind and stays
-        in the table above, because that figure counts the cold first
-        execution of a shape and ours is 62.71 µs against SQLite&rsquo;s 8.83.
-        The commit behind all of it is one: the B-tree&rsquo;s key comparison
-        stopped calling <code>memcmp</code> and now compares eight bytes at a
-        time as a big-endian integer, unconditionally identical in verdict to
-        the byte comparison — +25% on point reads, +15% on indexed lookups,
-        +14% on the range scan and +13% on the <code>LIMIT</code> join,
-        measured interleaved, 3 of 3 or better and non-overlapping each.
-        <strong>The point read is no longer a standing loss against SQLite in
-        WAL mode either</strong>: its p50 is now below WAL&rsquo;s in every
-        run of the sitting (0.75 µs against 0.792), its throughput is 0.85×
-        WAL&rsquo;s where it was 0.74× and 0.56×, and its p95 and p99 are
-        1.85× and 3.3× WAL&rsquo;s where they were 6.5× and 8.7× two editions
-        ago. What is left of that row is that it is a warm number: our miss
-        path is still dearer than SQLite&rsquo;s, so a cold handle warms up
-        more slowly.
+        <strong>Row iteration still loses to SQLite on two shapes.</strong>
+        The 50-row indexed range scan is roughly 1.15× behind journal-mode
+        SQLite and the secondary-index <code>LIMIT 10</code> join roughly
+        1.13× on p50 — both narrower again this edition, both in the table
+        above, and the current top priority
+        (<a href="https://github.com/inlaySQL/inlaysql/blob/main/BENCHMARK.md">BENCHMARK.md</a>).
       </li>
       <li>
-        <strong>Batch inserts lose to PostgreSQL.</strong> <code>GROUP BY</code> was the worst shape we
-        measured — three to five times slower than both — and after the
-        aggregate work of 2026-09-02/03 it wins against both, 5 of 5
-        repetitions; a whole-table <code>COUNT/MIN/MAX</code> answers from
-        the tree's ends and the leaves' cell counts, SQLite's own
-        optimisations, and wins ~5-6×. Batch insert loses ~2.4-4× on the host, where every
-        hundred-row statement is one <code>F_FULLFSYNC</code> (4.1 ms) against
-        the servers' cheaper virtualised barrier — the barrier, not the
-        engine; like for like, in a container on the servers' volume class,
-        it is ~1.2× MySQL 8.4 and ~0.68× PostgreSQL 17. The first
-        containerised commit profile puts 89.8% of a single-row commit in the
-        barrier and 5.8% in this engine; the barrier no longer pays to grow
-        the file, which is worth ~1.18× on that shape. That last one is the
-        only figure on this page still waiting: the containerised rows were
-        measured before it landed and have not been rerun, so they are known
-        to understate the engine by an amount nobody has measured.
+        <strong>The PK <code>LIMIT 10</code> join is ahead on p50 and still
+        behind on throughput</strong> — ~1.08×, because that figure counts
+        the cold first execution of a shape and ours is dearer than SQLite's.
       </li>
       <li>
-        <strong>Write throughput over the wire does not scale the way MySQL&rsquo;s
-        does.</strong> At eight connections we write ~0.30× MySQL 8.4 with
-        commit batching at parity, and a connection thread&rsquo;s own time
-        now says why: 70% of it is spent waiting behind other writers, 8% is
-        the barrier, 1-3% is the socket. The gate is a single-writer critical
-        section, and that is the wall.
+        <strong>Point reads are a warm number.</strong> Our miss path is still
+        dearer than SQLite's, so a cold handle warms up more slowly, and the
+        throughput line against SQLite in WAL mode is 0.85×.
       </li>
       <li>
-        <strong>Join reordering is new and narrow.</strong> <code>ANALYZE</code>
-        collects row counts and leading-key cardinalities; index selection,
-        hash-versus-probe and — since AHL-512 — which table drives a two-table
-        join are costed from them. The first cost model got that choice
-        backwards and the benchmark caught it (AHL-524); the fix is what puts
-        both full joins ahead of SQLite above. A <code>LIMIT</code> shape is
-        still never reordered unless an <code>ORDER BY</code> asks for it.
+        <strong>Batch insert loses to PostgreSQL 17</strong> — ~0.68× like
+        for like in a container (~1.2× MySQL 8.4), and 2.4-4× behind on
+        the host, where every hundred-row statement is one
+        <code>F_FULLFSYNC</code>: the barrier, not the engine.
+      </li>
+      <li>
+        <strong>Server writes do not scale the way MySQL's do.</strong> At eight
+        connections we write ~0.30× MySQL 8.4 with commit batching at
+        parity; 70% of a connection thread's time is spent waiting behind other
+        writers, and the single-writer gate is the wall.
+      </li>
+      <li>
+        <strong>Single-row durable writes against the servers are a tie, not a
+        win</strong> — containerised, 876.0 ops/s against MySQL 8.4's 797.2 and
+        PostgreSQL 17's 977.4, ahead in one run of three against each.
+      </li>
+      <li>
+        <strong>Join reordering is new and narrow</strong> — one two-table inner
+        join, costed from <code>ANALYZE</code>. A <code>LIMIT</code> shape is
+        never reordered unless an <code>ORDER BY</code> asks for it.
+      </li>
+      <li>
+        <strong>Recall on uniformly random vectors is poor</strong> — and cannot
+        be fixed by tuning, because distances in that corpus concentrate. On
+        text-derived embeddings it is 1.000.
       </li>
       <li>
         <strong>The MySQL server is plaintext unless you configure TLS.</strong>
-        <code>--tls-cert</code>/<code>--tls-key</code> turns it on,
-        <code>--tls-required</code> refuses logins that do not use it, and
-        <code>--strong-passwords</code> stores salted PBKDF2 so a stolen
-        database file is not a stolen password list. All three are off by
-        default, and it binds to 127.0.0.1. Without a certificate it will not
-        bind to anything else: a <code>--bind</code> that reaches another
-        machine is refused — not warned about — unless the database has
-        accounts of its own, the bootstrap password is not empty, and TLS is
-        required. <code>--plaintext-network</code> relaxes the two TLS
-        conditions on a segment the server checks is private, and relaxes
-        nothing else.
+        It binds 127.0.0.1, and a <code>--bind</code> that reaches another
+        machine is refused — not warned about — without accounts, a non-empty
+        bootstrap password and required TLS
+        (<a href="https://github.com/inlaySQL/inlaysql/blob/main/docs/server.md">docs/server.md</a>).
       </li>
       <li>
-        <strong>Recall on uniformly random vectors is poor</strong> — and
-        cannot be fixed by tuning, because distances in that corpus concentrate.
-        On text-derived embeddings it is 1.000.
+        <strong>No clustering, no replication, no point-in-time recovery</strong>
+        — one process, one file
+        (<a href="https://github.com/inlaySQL/inlaysql#what-this-is-not">What this is not</a>).
       </li>
     </ul>
   </div>
@@ -711,9 +594,9 @@ cargo run -p inlaysql-mcp --bin inlaysql -- serve --mysql app.inlay</pre>
       <a href="https://github.com/inlaySQL/inlaysql#readme">README</a> for the
       pitch and the architecture,
       <a href="https://github.com/inlaySQL/inlaysql/blob/main/TESTING.md">TESTING.md</a>
-      for what is covered and what is not, and the README's own
-      <a href="https://github.com/inlaySQL/inlaysql#next">Next</a> section for
-      what is being built and why.
+      for what is covered and what is not, and
+      <a href="https://github.com/inlaySQL/inlaysql/blob/main/docs/PLAN.md">docs/PLAN.md</a>
+      for what is being built next and why.
     </p>
   </div>
 </section>
