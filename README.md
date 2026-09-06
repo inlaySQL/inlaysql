@@ -130,14 +130,17 @@ cargo run --example hybrid_search                 # the query above, end to end
 | Point read, secondary index | **535,879 ops/s**, 1.71 µs p50 | SQLite journal, durable: 266,073 ops/s (**~2x**) |
 | Join, secondary-index inner, full scan | **3.38 ms p50** | SQLite: 30.72 ms p50 (**~8x**) |
 | Durable write, one commit each | **255 ops/s**, 3.87 ms p50 | SQLite journal, durable: 90 ops/s (**~2.8x**) |
-| Concurrent durable writers, 8 threads | **1,541 commits/s**, 0.0% aborted | SQLite journal, durable: 90 commits/s (**~17x**) |
+| Concurrent durable writers, 8 threads | **1,555 commits/s**, 0.0% aborted | SQLite journal, durable: 90 commits/s (**~17x**) |
+| Concurrent durable writers, 32 threads | **3,529 commits/s**, 0.0% aborted | SQLite journal, durable: 89 commits/s (**~40x**) |
 | Hybrid retrieval, one SQL statement | **167.00 µs p50** | DuckDB 11.37 ms, pgvector 14.11 ms, Meilisearch 4.15 ms (**~25-90x**) |
 
 One developer machine — reproduce it, do not trust it. Repeating the identical
 binary against identical data moves these figures by a median 4.0-7.3%, and on
 the concurrent-writer rows a true A/A control moves the paired throughput
-ratio between 0.42x and 1.98x at one writer and between 0.77x and 1.48x at
-eight, so the multiples are rounded to what that floor supports (`~2-4x`, not
+ratio between 0.42x and 1.98x at one writer, between 0.77x and 1.48x at
+eight and between 0.81x and 1.27x at sixteen — one writer is the noisiest
+point on that harness and sixteen the quietest — so the multiples are
+rounded to what that floor supports (`~2-4x`, not
 `3.26x`) and an edition-to-edition move inside it is published as movement
 with no cause attached.
 [`BENCHMARK.md`](BENCHMARK.md) is the full set with its provenance header,
@@ -173,12 +176,13 @@ its opening note on precision and every table these six rows are drawn from;
 - **Recall on uniformly random vectors is 0.12 at a hundred thousand rows**,
   and no tuning fixes it; on text-derived embeddings it is 0.998-1.000 across
   a 20x range of corpus sizes — [`bench/README.md`](bench/README.md).
-- **The concurrent-writer table has no measurement above eight writers on
-  this build.** The eleven-level sweep on the page is carried forward from an
-  older one, and the commit-path work of 2026-09-05/06 was measured at
-  sixteen writers on a different harness — so the peak's location is not
-  something this page currently measures —
-  [`BENCHMARK.md`](BENCHMARK.md#concurrent-writers--every-row-rose-every-rise-is-inside-the-aa-floor-and-the-commit-path-wins-show-up-in-the-counters-instead).
+- **Where the concurrent-writer peak sits is still unmeasured — but it is now
+  known to be above 32 writers, not below it.** The eleven-level sweep is
+  fresh on this build and rises monotonically to 3,529 commits/s at 32
+  threads instead of peaking at 16 and falling, so the curve has not turned
+  over inside the range measured and the top of it is off the end of the
+  table —
+  [`BENCHMARK.md`](BENCHMARK.md#concurrent-writers--the-sweep-is-fresh-and-wide-again-the-16-writer-row-clears-its-aa-floor-and-the-falloff-past-the-peak-is-gone).
 - Not measured anywhere here: sustained or multi-core saturation, cold-cache
   reads (every point-read row is warm, and our miss path is dearer than
   SQLite's), and whether Docker Desktop's virtual disk honours `fsync` as a

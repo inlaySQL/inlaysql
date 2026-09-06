@@ -524,39 +524,71 @@ against 89.8% of the single-row one (`PERF.md`'s containerised commit
 split), so the single-row figure bounds what to expect here rather than
 standing in for it, and no number is invented.
 
-### 3.5 Concurrent commits at 4/8/16 writers
+### 3.5 Concurrent commits at 4/8/16/32 writers
 
-**SQLite** (`BENCHMARK.md` "Concurrent writers"): 761/1541 commits/s at
-4/8 writers from the fresh gated median of three at `72d7ab1`, against
-SQLite's flat 85-91 at every level — **WIN, roughly 8.5x and 17x**
-(per-run pairings 7.4-9.8x and 15.7-17.5x). Far outside the
-concurrency-suite floor, though both points are in this run's own ≥10%
-list (22% and 14%), so read them as bands.
+**SQLite** (`BENCHMARK.md` "Concurrent writers"): 841 / 1555 / 2649 / 3529
+commits/s at 4 / 8 / 16 / 32 writers, against SQLite's flat 89-92 at every
+level — **WIN, roughly 9x, 17x, 29x and 40x** (per-run pairings 7.2-10.4x,
+16.7-17.4x, 28.8-29.7x and 37.5-40.8x). Median of three gated runs at
+`bcbc9d4`, none `CONTAMINATED`. Far outside the concurrency-suite floor at
+every level; the 4-writer cell is the loose one (37% spread across the three
+runs) and 16 and 8 are the tightest in the whole sweep (3.2% and 4.0%).
 
-**The 16-writer cell is no longer this engine.** Its 1616 commits/s comes
-from the carried-forward 2026-08-30 wide sweep at `2cb2539`, a build that
-predates AHL-563, AHL-564 and AHL-565 — all three on the commit path this
-suite measures. `BENCHMARK.md` now says so in place. **This page has no
-fresh measurement above eight writers**, which is exactly the range
-AHL-563's own 1.54–1.70x claim was made in, on a different harness.
+**The 16-writer cell is this engine again, and every level from 1 to 32 is
+now measured on one build in one sitting.** The eleven-level sweep is no
+longer carried forward from `2cb2539`: `BENCHMARK.md`'s eighth edition
+regenerated it (`WRITER_LEVELS=1,2,3,4,5,6,8,12,16,24,32 SUITE=concurrency`,
+x3, medians via `bench/summarise.py`). **The "no fresh measurement above
+eight writers" caveat this section carried is withdrawn** — it was true of
+the seventh edition and is not true of this one.
 
-**What this edition adds, and what it declines to claim.** All four writer
-counts rose against the previous edition — 1.04x, 1.20x, 1.31x and 1.39x at
-1/2/4/8 — and **not one of the four clears `bench/aa_floor.sh`'s measured
-A/A band at its own writer count** ([0.42, 1.98], [0.45, 3.58], [0.45,
-2.50], [0.77, 1.48]). So the wall-clock throughput column attributes
-nothing to the three commit-path landings. Where they do show is the
-within-run counters, which `PERF.md` names as the deliverable on this path:
-commits per `fsync` at 8 writers 4.88 → **7.11** (outside the [0.87, 1.22]
-A/A band for that counter, and AHL-564's stated mechanism), `gate_wait`
-share of a writer's busy time 18.7% → **9.0%** and `gate_hold` share 4.0% →
-**2.6%**, both non-overlapping between the two editions' ranges and both
-AHL-563's stated mechanism. AHL-562's flush pipeline was **off by default**
-in every run this page ever published and AHL-566 has now deleted it, so
-the engine measured here is unchanged on that axis. Durability: full, both
-sides, real OS threads, one `fsync`/`F_FULLFSYNC` per commit or per
-coalesced batch.
+**What this edition claims, and against which floor.** Level for level
+against the `2cb2539` sweep it replaces, each ratio quoted against its own
+A/A band from `bench/aa_floor.sh` (AHL-566): 1.06x at 1 writer ([0.42,
+1.98]), 1.19x at 2 ([0.45, 3.58]), 1.43x at 4 ([0.45, 2.50]), 1.29x at 8
+([0.77, 1.48]) — **all four inside their floors and attributing nothing** —
+and **1.64x at 16 writers against [0.81, 1.27], the one row that clears its
+band**, on the quietest and narrowest of the five bands the A/A control
+measured. The 3, 5, 6, 12, 24 and 32-writer levels (1.09x, 1.14x, 1.39x,
+1.39x, 2.56x, 3.62x) have **no A/A band at all** — `aa_floor.sh` was not run
+at those counts — and are published as unbounded directions, not magnitudes.
 
+**The 1.64x prices a window, not a commit.** `2cb2539..bcbc9d4` is a month of
+commit-path work: AHL-552 and AHL-553 are on the write path inside it,
+AHL-563 and AHL-564 are the last two, AHL-562's pipeline was deleted by
+AHL-566, and AHL-544/547's absorption has been default-off in every published
+run. That 1.64x lands inside AHL-563's own paired claim of 1.54-1.70x at 8-16
+writers, measured on a different harness against a paired control, is
+suggestive and is not upgraded to attribution here. **At 8 writers — the
+bottom of the range AHL-563 claimed — the ratio is 1.29x and inside its
+floor, which is the honest negative and is published as one.** AHL-564's own
+1.22x-at-16 claim sits inside [0.81, 1.27] and remains "suggestive and no
+more"; AHL-565 is on the free-list path and no suite here exercises it.
+
+**Two shape findings that are new to this scoreboard.** First, **the falloff
+past the peak is gone**: the old curve peaked at 16 and fell 19% to 24 and a
+further 26% to 32, and this one rises monotonically to 32 and only flattens
+(24 → 32 is +5.5%, inside both endpoints' spreads), so the peak is at or
+beyond 32 writers and is once again not located by this page. Second, **the
+tail loss has largely closed**: p99 at 32 writers is now roughly 1.7x
+SQLite's (1.63-1.83x per run, 23.05 ms against 14.15 ms) where the old build
+was roughly 8x (121.08 ms against 15.35 ms); at 8 writers p99 is at parity
+(0.97-1.15x) and at 1 writer roughly 3x better. There is no A/A floor for a
+latency percentile at any writer count, so that one is a wide non-overlapping
+gap with a named mechanism, not a measured result.
+
+Within-run counters, medians of the same three runs, 1 / 8 / 16 / 24 / 32
+writers: commits per `fsync` 1.00 / 7.14 / 13.38 / 18.77 / 21.40; `gate_wait`
+share of a writer's busy time 0.0% / 8.5% / 17.0% / 23.3% / 28.1%; `fsync`
+share 97.2% / 10.8% / 4.9% / 3.1% / 2.3%. **The 8-writer column reproduces
+the seventh edition's to within its spread** (7.11 → 7.14, 9.0% → 8.5%, 10.8%
+→ 10.8%), which is what licenses the four new columns; the seventh edition's
+finding that AHL-563/564 moved those counters against the pre-563 build
+stands unchanged. The `gate_wait` row is the remaining ceiling stated as a
+number: at 32 writers a writer spends 28.1% of its busy time queued for the
+process-wide reservation gate, which is what commit-side logical group commit
+(scoped, not started) would attack. Durability: full, both sides, real OS
+threads, one `fsync`/`F_FULLFSYNC` per commit or per coalesced batch.
 **MySQL, 1/4/16 connections (2026-08-31, `BENCHMARK.md` "Server-to-server,
 extended"): LOSS at every level, widening with concurrency, properly
 repeated this time.** `SERVER_CONCURRENCY_LEVELS=1,4,16`, 5 repetitions,
@@ -612,8 +644,11 @@ counter, and the `INLAYSQL_COMMIT_STATS=1` exit-time diagnostic never fires
 for a long-running server (§6) — a genuine instrument gap, not a claim that
 InlaySQL's mechanism is worse. The best available (harness-mismatched)
 comparison point is the in-process `WRITER_LEVELS` figure already published
-(4.76-6.31x at 8/32 writers, real OS threads, no wire protocol) — the same
-order of magnitude as MySQL's 7.42 at 16 connections, weak evidence that
+(**7.14 commits per `fsync` at 8 writers and 21.40 at 32** on the eighth
+edition's fresh eleven-level sweep at `bcbc9d4` — real OS threads, no wire
+protocol; the figure this paragraph used to quote, 4.76-6.31x, was the
+pre-AHL-563/564 sweep) — now *above* MySQL's 7.42 at 16 connections rather
+than the same order of magnitude, weak evidence that
 InlaySQL's own batching mechanism is roughly competitive when it runs, which
 would point the server's throughput and tail-latency loss at
 `inlaysql-server`'s thread-per-connection design rather than at inferior
@@ -1332,7 +1367,8 @@ not just an assertion of it.
 
 InlaySQL-server's own ratio could not be measured (see the instrument-gap
 paragraph above). The closest available evidence is the in-process
-`WRITER_LEVELS` figure already published (4.76-6.31x at 8/32 writers) —
+`WRITER_LEVELS` figure already published (7.14 commits per `fsync` at 8
+writers and 21.40 at 32, `bcbc9d4`) —
 a different harness (library, real OS threads, no wire protocol, no
 `inlaysql-server` connection-handling in the loop) and not a substitute
 measurement, but the two numbers sit in the same order of magnitude as

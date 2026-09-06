@@ -321,7 +321,7 @@
     <div class="figure">
       <b>~17×</b>
       <span>SQLite on concurrent writes</span>
-      <em>1,541 commits/s at 8 writers, 0% aborted</em>
+      <em>1,555 commits/s at 8 writers, 0% aborted</em>
     </div>
     <div class="figure">
       <b>167 µs</b>
@@ -429,9 +429,15 @@
         </tr>
         <tr>
           <td>Concurrent writes, 8 writers</td>
-          <td class="num">1,541 commits/s</td>
+          <td class="num">1,555 commits/s</td>
           <td>SQLite, journal</td>
           <td class="win">~17× faster</td>
+        </tr>
+        <tr>
+          <td>Concurrent writes, 32 writers</td>
+          <td class="num">3,529 commits/s</td>
+          <td>SQLite, journal</td>
+          <td class="win">~40× faster</td>
         </tr>
         <tr>
           <td>Vector search, recall@10 1.000</td>
@@ -518,10 +524,11 @@
         <a href="https://github.com/inlaySQL/inlaysql/blob/main/SCOREBOARD.md">SCOREBOARD.md</a>.
       </li>
       <li>
-        <strong>Point reads are a warm number, and nothing above eight
-        concurrent writers is measured on this build.</strong> Our cache-miss
-        path is dearer than SQLite's, and where the writer throughput peak
-        sits is not something the published table answers yet.
+        <strong>Point reads are a warm number, and we still cannot tell you
+        where the writer throughput peak is.</strong> Our cache-miss path is
+        dearer than SQLite's. The writer sweep now runs to 32 threads on this
+        build and rises the whole way instead of turning over at 16, so the
+        peak is above the last level measured rather than inside the table.
       </li>
       <li>
         <strong>Retrieval has edges.</strong> Recall on uniformly random
