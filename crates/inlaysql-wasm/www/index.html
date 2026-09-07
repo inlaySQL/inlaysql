@@ -473,7 +473,7 @@
           <td>Batch insert, 100 rows per statement, containerised like the servers</td>
           <td class="num">88,456 rows/s</td>
           <td>MySQL 8.4 (52,935 rows/s), PostgreSQL 17 (100,305 rows/s)</td>
-          <td class="loss">1.64× MySQL, 0.88× PostgreSQL</td>
+          <td class="loss">1.64× MySQL, 0.88× PostgreSQL (tie inside a 21% band)</td>
         </tr>
         <tr>
           <td>Server writes over MySQL wire, 8 connections</td>
@@ -516,7 +516,8 @@
         <strong>We lose on some shapes, and the table above says which.</strong>
         Row iteration trails SQLite on the indexed range scan and the
         secondary-index <code>LIMIT 10</code> join; batch insert is 0.88×
-        PostgreSQL 17 like for like; server writes at eight connections are
+        PostgreSQL 17 like for like — a tie, inside a 21% A/A band; server
+        writes at eight connections are
         ~0.30× MySQL 8.4, because the single-writer gate is the wall. Every
         cell, with its spread and a fairness audit, is in
         <a href="https://github.com/inlaySQL/inlaysql/blob/main/BENCHMARK.md">BENCHMARK.md</a>

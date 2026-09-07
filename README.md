@@ -161,11 +161,13 @@ its opening note on precision and every table these six rows are drawn from;
   either column — ahead on p50 in all three runs and a wash on throughput —
   and is disclosed as a wash rather than claimed as a win —
   [`BENCHMARK.md`](BENCHMARK.md#joins--we-win-both-full-shapes-the-pk-limit-shape-is-ahead-on-p50-and-no-longer-behind-on-throughput-and-the-secondary-limit-shape-is-still-a-loss).
-- **Batch insert, 100 rows per statement: 0.88x PostgreSQL 17** like for like
-  in a container, 1.64x MySQL 8.4 — re-measured 2026-09-07 on a harness that
-  interleaves the three engines and rotates their order, which the published
-  0.68x/1.19x did not; no engine change was made for it. On the host it loses
-  2.4x/4.1x, where every statement pays one `F_FULLFSYNC` —
+- **Batch insert, 100 rows per statement: a tie against PostgreSQL 17** like
+  for like in a container — 0.88x sits inside InlaySQL's own 21% round-to-round
+  A/A spread on that workload, and a delta inside its band is not a result —
+  and 1.64x MySQL 8.4 — re-measured 2026-09-07 on a harness that interleaves
+  the three engines and rotates their order, which the published 0.68x/1.19x
+  did not; no engine change was made for it. On the host it loses 2.4x/4.1x,
+  where every statement pays one `F_FULLFSYNC` —
   [`BENCHMARK.md`](BENCHMARK.md#batch-insert--like-for-like-a-win-against-mysql-84-and-a-loss-against-postgresql-on-the-host-the-barrier).
 - **Server-to-server writes at 8 connections: ~0.30x MySQL 8.4.** Commit
   batching is at parity (3.89 commits per barrier against InnoDB's 3.90); the

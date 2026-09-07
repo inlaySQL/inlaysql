@@ -2137,7 +2137,7 @@ tally on the engine's 100k aggregate profile is 85 ops/s before AHL-521 to
 210 after AHL-541 — the same 210 `sql_shapes` reads here, on a different
 harness, which is as close to a cross-check as this page has.
 
-### Batch insert — like for like, a WIN against MySQL 8.4 and a LOSS against PostgreSQL; on the host, the barrier
+### Batch insert — like for like, a WIN against MySQL 8.4 and a TIE against PostgreSQL (0.88x inside a 21% A/A band); on the host, the barrier
 
 100 rows per multi-row `INSERT` statement, autocommitted, 100 statements per
 rep (10,000 rows per rep), explicit ids, 5 reps, durability aligned (MySQL
@@ -2157,7 +2157,12 @@ That is the asymmetry this row is about.
 | PostgreSQL 17 (containerised, `bdc64eb`) | **99,212** (93,776–100,749) | 992 | 1.00 |
 
 **Like for like — the containerised row against the containerised servers —
-InlaySQL is 1.64x MySQL 8.4 and 0.88x PostgreSQL 17.** The previous edition
+InlaySQL is 1.64x MySQL 8.4 and 0.88x PostgreSQL 17.** The PostgreSQL cell is
+restated 2026-09-07 (T0.6) as a **TIE, not a LOSS**: 0.88x sits inside
+InlaySQL's own 21% round-to-round spread on this workload, and a delta inside
+its band is not a result. The verdict is re-measured at the next gated
+regeneration with the band attached, not edited again by hand. The previous
+edition
 published 1.19x and 0.68x. **Nothing was built to move it.** AHL-570 changed
 no engine code; it changed the harness. What it re-measured is `bcbc9d4`, the
 build every `run.sh` table in this edition already comes from, against a

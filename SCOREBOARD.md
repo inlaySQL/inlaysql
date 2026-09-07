@@ -197,7 +197,7 @@ configuration changed.
 | Point read by PK | WIN ~7x vs durable config (4.8-7.1x per run); **TIE** vs WAL/NORMAL, on weaker evidence than the edition before — 0.88x on ops/s, behind in 3 of 3 runs, and ahead on p50 in only 2 of 3, both inside this row's own floor (§3.1) | WIN ~200x (structural, §3.1) | WIN ~35x (structural, §3.1) |
 | Indexed range scan | LOSS ~1.13x (durable) / ~1.9x (WAL) — behind 3 of 3 on both, unchanged this edition (§3.2) | WIN ~9.0x (§3.2) | WIN ~5.9x (§3.2) |
 | Single-row insert (durable) | WIN ~2.8x | TIE (containerised; medians read 1.10x our way, but pairing the runs we are ahead in 1 of 3, 0.55–2.08x — was LOSS ~1.5x, §3.3) | TIE (containerised; medians read 0.90x, ahead in 1 of 3, 0.61–2.05x — was LOSS ~1.2x, §3.3) |
-| Batch insert | UNKNOWN — no SQLite-batched comparison published | WIN ~1.6x like for like (containerised InlaySQL 88,456 rows/s vs 52,935 in the same interleaved rounds; was WIN ~1.2x; on the host, LOSS ~2.4x on the barrier, §3.4) | **LOSS ~1.1x** like for like (88,456 vs 100,305, 0.88x; was LOSS ~1.5x — a re-measurement, not an engine change; on the host ~4.1x, §3.4) |
+| Batch insert | UNKNOWN — no SQLite-batched comparison published | WIN ~1.6x like for like (containerised InlaySQL 88,456 rows/s vs 52,935 in the same interleaved rounds; was WIN ~1.2x; on the host, LOSS ~2.4x on the barrier, §3.4) | **TIE** like for like (88,456 vs 100,305 = 0.88x, inside InlaySQL's own 21% round-to-round spread on that workload — by §1's rule a delta inside its band is not a result; was LOSS ~1.5x, re-measured interleaved 2026-09-07, not an engine change; on the host ~4.1x, §3.4) |
 | Concurrent commits, 4/8/16 writers | WIN ~8.5x/17x at 4/8, fresh at `72d7ab1`; the 16-writer figure (~18x) is carried forward from a build that predates AHL-563/564/565 and is not this engine (§3.5) | LOSS @1,4,16 (~1.4-2.4x/~1.1-3.0x/~3.1-5.4x, widening with concurrency, 5 interleaved reps); LOSS @8 ~0.30x and LOSS @1 ~0.89x (gated median of 3 vs MySQL 8.4, 2026-09-05; batching at parity, barrier rate ~3.3x behind; the @1 loss narrowed from ~0.64x on AHL-553, §3.5) | UNKNOWN — no server exists (§3.4) |
 | Two-table join | MIXED: WIN both full shapes (~3x and ~8x); PK `LIMIT 10` **TIE** — ahead on p50 in 3 of 3 runs by ~5%, inside this row's own 14% p50 spread, and the throughput line that used to contradict it now agrees at 1.02x, itself inside an 18% spread; LOSS on the secondary `LIMIT 10` shape (~1.10x on p50, ~1.21x on throughput) (§3.6) | WIN all four shapes: ~4.1-4.4x on both full joins; several-x on `LIMIT`, on a smaller LIMIT than theirs (§3.6) | WIN all four shapes: ~2.8-3.0x on both full joins; several-x on `LIMIT`, same caveat (§3.6) |
 | Aggregate / `GROUP BY` | UNKNOWN — no harness | WIN ~1.9x group / WIN ~6x scalar (§3.7) | WIN ~1.26x group / WIN ~5x scalar (§3.7) |
@@ -499,12 +499,15 @@ that row and is withdrawn.
 | PostgreSQL 17 (containerised, `bdc64eb`) | 99,212 (93,776–100,749) | 992 | 1.00 |
 
 **Like for like, containerised against containerised: WIN ~1.6x vs MySQL
-8.4, LOSS ~1.1x vs PostgreSQL** (1.64x and 0.88x). **It stays a loss against
-PostgreSQL** — 0.88x is a loss, and this section does not call it anything
-else — but the margin is a third of what was published (was LOSS ~1.5x at
-0.68x), and the MySQL win widens from ~1.2x to ~1.6x. **Nothing in the
-engine was built to move either.** AHL-570 wrote a harness and measured;
-what changed is the measurement.
+8.4, TIE vs PostgreSQL** (1.64x, and 0.88x inside InlaySQL's own 21%
+round-to-round spread on this workload). §1's rule is that a delta inside its
+band is not a result, and 0.88x is inside this workload's band, so it does not
+carry as a loss — but the margin is also a third of what was published (was
+LOSS ~1.5x at 0.68x), and the MySQL win widens from ~1.2x to ~1.6x. **Nothing
+in the engine was built to move either.** AHL-570 wrote a harness and
+measured; what changed is the measurement. The verdict is re-stated at the
+next gated regeneration (AHL-570 §1), which re-measures the cell on this
+harness with the band attached.
 
 **What the re-derivation rests on.** The published cell was three
 single-shot runs, and its InlaySQL arm came from a *different sitting a day
