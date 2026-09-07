@@ -206,6 +206,21 @@ because InlaySQL had none and driving SQLite through `Connection::query_row`
 AHL-373 it has them, so the caveat is gone and both engines are measured the way
 an application would actually use them.
 
+**The read window (2026-09-07 method change, T0.1).** The read phase now
+defaults to **200,000 lookups** (~0.25 s of work, `LOOKUPS` overrides), and
+both sides run a discarded **10,000-lookup warm-up** of the same shape before
+the timed window. The original 5,000-lookup phase was ~4 ms of work — a few
+dozen multiples of the 42 ns timer tick — and began the instant ~80 s of
+fsync-bound writes ended, on a core that had mostly been waiting on the disk,
+while SQLite WAL's began after 0.1 s of CPU-bound inserts. A window that short
+measures the timer tick and whatever frequency or core-placement ramp the write
+phase left behind, not the engine: the same binary published 500 / 625 / 916 ns
+p50 across editions, and the run on the busiest machine was the fastest. Any
+read-phase figure whose window is under ~1 s of work quotes the harness, not
+the engine; read a figure from before this change with that in mind. The
+historical table below keeps its original 5,000-lookup numbers because it is
+about the parser, whose effect was visible at any window length.
+
 The switch moved both engines, and it moved SQLite by less, because SQLite was
 never paying as much for parsing. On one developer machine (Apple silicon,
 20,000 rows, 5,000 lookups, seed 42), point-read p50:
@@ -789,7 +804,7 @@ sides.
 ## OLTP: MySQL and PostgreSQL, matched durability
 
 ```sh
-./bench/compare.sh                       # 20,000 rows, 5,000 lookups by default
+./bench/compare.sh                       # 20,000 rows, 200,000 lookups by default
 ROWS=2000 LOOKUPS=500 ./bench/compare.sh # override the workload size
 ```
 
@@ -1072,7 +1087,7 @@ should not be compared numerically with that retired row.
 **The workload size here is deliberately smaller than the OLTP section's own
 `ROWS`/`LOOKUPS`, and is its own separate knob** (`SERVER_ROWS`/
 `SERVER_LOOKUPS`, defaulting to 2,000 rows and 1,000 lookups against the OLTP
-section's 20,000/5,000). This driver measures **two engines at every
+section's 20,000/200,000). This driver measures **two engines at every
 concurrency level**, where the single-connection drivers above measure one
 engine once — reusing the full workload size unchanged would multiply an
 already-durable, one-fsync-per-row write phase by
