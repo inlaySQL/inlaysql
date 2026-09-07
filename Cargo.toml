@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.4"
 edition = "2021"
 # Dual licensed: AGPL-3.0-only, or a commercial licence from Solution Forest
 # Limited (`LICENSE-COMMERCIAL.md`). This field carries only the AGPL because
@@ -32,11 +32,11 @@ repository = "https://github.com/inlaySQL/inlaysql"
 rust-version = "1.89"
 
 [workspace.dependencies]
-inlaysql-core = { path = "crates/inlaysql-core", version = "0.0.1" }
-inlaysql = { path = "crates/inlaysql", version = "0.0.1" }
-inlaysql-uring = { path = "crates/inlaysql-uring", version = "0.0.1" }
-inlaysql-mcp = { path = "crates/inlaysql-mcp", version = "0.0.1" }
-inlaysql-server = { path = "crates/inlaysql-server", version = "0.0.1" }
+inlaysql-core = { path = "crates/inlaysql-core", version = "0.0.4" }
+inlaysql = { path = "crates/inlaysql", version = "0.0.4" }
+inlaysql-uring = { path = "crates/inlaysql-uring", version = "0.0.4" }
+inlaysql-mcp = { path = "crates/inlaysql-mcp", version = "0.0.4" }
+inlaysql-server = { path = "crates/inlaysql-server", version = "0.0.4" }
 
 # Core (no_std) dependencies.
 sqlparser = { version = "0.62", default-features = false }
