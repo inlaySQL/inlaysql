@@ -10,9 +10,10 @@ repository works, so a contribution lands well the first time.
   co-author on the fix commit.
 - **Feature ideas:** open an issue describing the *problem* before the
   design. A lot of what looks missing here is a deliberate sequence (see
-  [`docs/PLAN.md`](docs/PLAN.md), the ordered list of next work) — an idea
-  may already be queued, refused for a written reason, or one message away from
-  being queued.
+  the losses under [Performance](README.md#performance) and
+  [`SCOREBOARD.md` §5](SCOREBOARD.md#5-what-is-missing-to-fill-the-scoreboard-ranked-by-effort),
+  the ranked list of what is missing) — an idea may already be queued,
+  refused for a written reason, or one message away from being queued.
 - **Security:** never in a public issue — see [`SECURITY.md`](SECURITY.md).
 
 ## The rules of the road

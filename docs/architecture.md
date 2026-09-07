@@ -325,7 +325,8 @@ useful one.
   asset, and answered from the isolate that took the request — there is no
   node to be a replica of. Multi-node deployment (read replicas over the
   existing CDC log; durable storage/compute separation for corpora too large
-  to ship as an asset) is later-stage work — see [Next](PLAN.md#next-work-in-order).
+  to ship as an asset) is later-stage work, and none of it is started; the CDC
+  log's missing row payloads (`enterprise-readiness.md`) gate all of it.
 - **No point-in-time recovery.** [Online backup](using.md#online-backup) takes a full
   consistent copy of a live database, which is a different thing: the states
   you can restore to are the ones you took a copy at, not any instant in

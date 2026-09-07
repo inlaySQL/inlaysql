@@ -6008,7 +6008,7 @@ the comparison, and removing it is where the real cost lives — `child_index`
 re-compares the same table-name prefix against a fresh separator at *every*
 level of a descent, even though every separator inside a subtree once
 proven bounded to one table's key range shares that whole prefix already
-(`docs/PLAN.md`'s option (a): "the caller proves the prefix is equal once
+(the plan's option (a): "the caller proves the prefix is equal once
 per descent rather than per level"). That requires `child_index` and the
 leaf search to accept a common-prefix length established by whoever bounds
 the descent to one table (`WalkBounds`'s own `start`/`end`, or the retained

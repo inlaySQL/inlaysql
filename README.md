@@ -114,7 +114,7 @@ cargo run --example hybrid_search                 # the query above, end to end
 | [Framework examples](crates/inlaysql-wasm/www/frameworks/README.md) | React, Vue, jQuery and plain JS against the WASM build |
 | [`BENCHMARK.md`](BENCHMARK.md) and [`SCOREBOARD.md`](SCOREBOARD.md) | every benchmark, wins and losses, and the verdict matrix with its fairness audit |
 | [`docs/architecture.md`](docs/architecture.md) | the load-bearing design decisions, the crate layout, and what each rules out |
-| [`docs/PLAN.md`](docs/PLAN.md) | what is being built next, in order, and why |
+| [`PERF.md`](PERF.md) | where each microsecond goes, dated, and what that evidence says to build next |
 | [`TESTING.md`](TESTING.md) and [`docs/enterprise-readiness.md`](docs/enterprise-readiness.md) | what is covered, what is not, and the gaps that would stop a deployment |
 
 ## Performance
@@ -233,8 +233,11 @@ directly and less flatteringly.
   one file; backup restores to the instants you took a copy at.
 - **Full Postgres parity is not a goal**, now or later.
 
-What is being built next, in order and with the measurement that gates each
-item, is [`docs/PLAN.md`](docs/PLAN.md).
+What is built next is decided from the losses listed under
+[Performance](#performance), the ranked gaps in
+[`SCOREBOARD.md`](SCOREBOARD.md#5-what-is-missing-to-fill-the-scoreboard-ranked-by-effort)
+and the dated evidence in [`PERF.md`](PERF.md); the working queue itself is an
+internal file, and `AGENTS.md` says how a change to it is measured.
 
 ## Layout
 

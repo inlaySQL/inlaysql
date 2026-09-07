@@ -1077,7 +1077,7 @@ each applied where it mattered:
   range shows it hurt more (InlaySQL's batch-insert range is 1.8x wide; its
   best rep still does not beat MySQL's median, and the c/fsync column is
   unaffected either way).
-- The clean back-tests these cells would ideally cite (`docs/PLAN.md`'s
+- The clean back-tests these cells would ideally cite (the plan's
   `REPEATS=3` guarded repeats) remain owed; re-deferred with a date there.
   Every raw file this sitting produced is in `bench/results/`
   (`20260831T06*-repeat.txt`, `20260831T06*.txt`).

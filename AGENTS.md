@@ -161,7 +161,7 @@ Full map: [`README.md#layout`](README.md#layout). Short version:
 | --- | --- |
 | Anything — testing philosophy, what's covered and what isn't | [`TESTING.md`](TESTING.md) |
 | The load-bearing design decisions, and what each rules out | [`docs/architecture.md`](docs/architecture.md) |
-| Where a point read's time goes, and what to optimise next | [`PERF.md`](PERF.md) |
+| Where each microsecond goes, dated, and what that evidence says to build next | [`PERF.md`](PERF.md) |
 | MySQL server mode, its security posture and its divergences | [`docs/server.md`](docs/server.md) |
 | What stops a production deployment today, ranked, with verification status | [`docs/enterprise-readiness.md`](docs/enterprise-readiness.md) |
 | Crash recovery / WAL | [`docs/recovery.md`](docs/recovery.md) |
@@ -173,6 +173,49 @@ Full map: [`README.md#layout`](README.md#layout). Short version:
 | Benchmark methodology | [`bench/README.md`](bench/README.md) |
 | The current published numbers, wins and losses | [`BENCHMARK.md`](BENCHMARK.md) |
 | Win/lose/tie verdicts per workload x SQLite/MySQL/PostgreSQL, and the fairness audit behind them | [`SCOREBOARD.md`](SCOREBOARD.md) |
+
+## Performance work
+
+The working queue is the root `PLAN.md`, which is gitignored on purpose
+(`.gitignore` says why); if you do not have it, the queue is the losses under
+`README.md`'s "Performance" section plus `SCOREBOARD.md` §5, and `PERF.md`'s
+dated sections are the evidence behind every item. The rules below are what
+that queue has learnt the hard way — the measured dead ends are `PLAN.md`
+§9, and an idea on that list is not proposed again without new evidence.
+
+- **Regenerate before proposing anything on a published row.** Several
+  losses in the tables have been fixed in code and not yet re-measured, and
+  more than one "loss" has turned out to be the harness: a 5,000-lookup
+  read phase timed against a 42 ns tick, a profile suite calling a different
+  API from the bench it stands in for, a cell inside its own A/A band. Check
+  `BENCHMARK.md`'s provenance header for the commit each table was taken at,
+  and check the cell's spread against the delta you are chasing.
+- **Every landing carries an interleaved A/B**: three repetitions, the
+  control re-run each repetition, non-overlapping against the A/A band *for
+  the writer count being claimed* (`bench/aa_floor.sh`; one writer is the
+  noisiest point on that harness, sixteen the quietest). A delta inside the
+  band is not a result. `bench/profile_ab.sh` does this for the `bin/profile`
+  suites.
+- **A profile suite must run the bench's API.** `bin/profile` and
+  `bench/run.sh` have disagreed before (owning `query_prepared` against the
+  published `query_prepared_each_ref`); a share measured through the wrong
+  path justifies the wrong optimisation.
+- **The tail, not the median.** The point read's p50 already beats SQLite's;
+  what the ops/s column pays is p95/p99. Before shaving a per-probe cost,
+  check `bin/profile --suite points --tail true` and say which half of the
+  distribution the change targets.
+- **The build profile is part of the method.** Root `Cargo.toml` has no
+  `[profile.release]` as of 2026-09-07, so every published number is Cargo's
+  default (16 codegen units, no LTO). Changing it moves every table at once
+  and is landed only with a full regeneration in one sitting; never A/B one
+  suite under one profile against a published figure taken under another.
+- **Write amplification is a first-class number.** A single-row commit
+  writes tens of kilobytes; quote bytes per commit (`bench/record_size.sh`,
+  `record_anatomy`) beside any write-path claim, not only ops/s.
+- **The cheap levers are measured before the deep ones**: harness and build
+  first, then per-request and per-statement fixed costs, then
+  representation and format changes — a format bump is spent once, with a
+  DST sweep that proves the new path was exercised.
 
 ## PRs
 
