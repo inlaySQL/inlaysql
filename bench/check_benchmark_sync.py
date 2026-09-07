@@ -99,11 +99,40 @@ def extract(text: str) -> dict[float, set[str]]:
     return found
 
 
-def table_lines(text: str) -> str:
+def table_lines(text: str, skip_headerless: bool = False) -> str:
     """Every markdown table row in `text` — a line whose first non-blank
     character is `|` — joined back together. Prose, headings and code
-    fences are excluded on purpose; see the module docstring."""
-    return "\n".join(line for line in text.splitlines() if line.strip().startswith("|"))
+    fences are excluded on purpose; see the module docstring.
+
+    With `skip_headerless`, a table whose header row is empty (`| | |`) is
+    dropped whole. In `BENCHMARK.md` that shape means exactly one thing: a
+    provenance block, whose cells name commits, dates, raw files and — the
+    reason this matters — **the figures a regeneration has just retired**,
+    quoted so a reader can see what moved. Counting those as current made
+    the reference set a ratchet: once a figure had ever been published, the
+    presence check would accept it forever, which is the drift this script
+    exists to catch. Found on 2026-09-07, when the check passed against a
+    README carrying a batch-insert figure that had been deleted from its
+    table minutes earlier and survived only in the provenance header.
+    """
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        if line.strip().startswith("|"):
+            current.append(line)
+            continue
+        if current:
+            blocks.append(current)
+            current = []
+    if current:
+        blocks.append(current)
+    kept: list[str] = []
+    for block in blocks:
+        header = block[0].strip().strip("|")
+        if skip_headerless and not header.replace("|", "").strip():
+            continue
+        kept.extend(block)
+    return "\n".join(kept)
 
 
 def slice_between(text: str, start_marker: str, end_pattern: re.Pattern[str]) -> str:
@@ -120,7 +149,7 @@ def slice_block(text: str, start_marker: str, end_marker: str) -> str:
 
 
 def benchmark_reference(path: Path) -> dict[float, set[str]]:
-    return extract(table_lines(path.read_text(encoding="utf-8")))
+    return extract(table_lines(path.read_text(encoding="utf-8"), skip_headerless=True))
 
 
 def readme_figures(path: Path) -> dict[float, set[str]]:

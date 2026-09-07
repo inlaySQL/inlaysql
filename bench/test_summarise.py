@@ -27,6 +27,69 @@ summarise_barrier = importlib.util.module_from_spec(BARRIER_SPEC)
 sys.modules[BARRIER_SPEC.name] = summarise_barrier
 BARRIER_SPEC.loader.exec_module(summarise_barrier)
 
+SYNC_SPEC = importlib.util.spec_from_file_location(
+    "check_benchmark_sync", Path(__file__).with_name("check_benchmark_sync.py")
+)
+assert SYNC_SPEC is not None and SYNC_SPEC.loader is not None
+check_sync = importlib.util.module_from_spec(SYNC_SPEC)
+sys.modules[SYNC_SPEC.name] = check_sync
+SYNC_SPEC.loader.exec_module(check_sync)
+
+
+class ProvenanceTests(unittest.TestCase):
+    """A retired figure quoted in a provenance block is not a current figure.
+
+    `BENCHMARK.md`'s provenance header is itself a markdown table, and it
+    names the figures each regeneration superseded — that is the point of it.
+    Counting those rows as the reference set made the sync check a ratchet:
+    once published, a figure would satisfy it forever. Found on 2026-09-07,
+    when the check passed against a README carrying a batch-insert figure
+    that had been deleted from its own table minutes earlier.
+    """
+
+    HEADERLESS = (
+        "| | |\n"
+        "| --- | --- |\n"
+        "| Commit | `abc1234` — that row moved from 67,484 to 88,456 rows/s |\n"
+    )
+    REAL = (
+        "| Engine | rows/s |\n"
+        "| --- | --- |\n"
+        "| InlaySQL | 88,456 |\n"
+    )
+
+    def test_a_provenance_block_is_not_a_source_of_current_figures(self) -> None:
+        kept = check_sync.table_lines(
+            self.HEADERLESS + "\nprose\n\n" + self.REAL, skip_headerless=True
+        )
+        self.assertIn("88,456", kept)
+        self.assertNotIn("67,484", kept)
+
+    def test_a_real_table_survives_the_same_pass(self) -> None:
+        figures = check_sync.extract(
+            check_sync.table_lines(self.HEADERLESS + "\nprose\n\n" + self.REAL, True)
+        )
+        self.assertIn(88456.0, figures)
+        self.assertNotIn(67484.0, figures)
+
+    def test_the_reference_set_itself_skips_provenance(self) -> None:
+        # The helper being right is not enough: `benchmark_reference` is the
+        # caller that decides what "current" means, and a mutation that drops
+        # the flag there passes every test above while restoring the ratchet.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "BENCHMARK.md"
+            path.write_text(self.HEADERLESS + "\nprose\n\n" + self.REAL, encoding="utf-8")
+            reference = check_sync.benchmark_reference(path)
+        self.assertIn(88456.0, reference)
+        self.assertNotIn(67484.0, reference)
+
+    def test_without_the_flag_every_table_row_still_counts(self) -> None:
+        # `readme_figures` and the wasm page reader pass no flag: on those
+        # sides a table is a table, and dropping one would hide a figure
+        # rather than a stale reference.
+        kept = check_sync.table_lines(self.HEADERLESS + "\nprose\n\n" + self.REAL)
+        self.assertIn("67,484", kept)
+
 
 class ParseTests(unittest.TestCase):
     def test_comparison_crossing_parity_is_not_a_measured_row(self) -> None:
