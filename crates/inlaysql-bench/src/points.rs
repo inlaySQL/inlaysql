@@ -41,6 +41,17 @@
 //!   not as the like-for-like column.
 //! * **Same seeded key order** for the lookups, so both engines answer the
 //!   same questions in the same sequence.
+//! * **A read window long enough to mean something (T0.1).** The read phase
+//!   defaults to 200,000 lookups (~0.25 s of work, not ~4 ms), and both sides
+//!   run a discarded warm-up pass of the same shape first. The original
+//!   5,000-lookup window began the instant ~80 s of fsync-bound writes ended —
+//!   on a core that had mostly been idle-waiting on the disk — and at that
+//!   length the phase is a multiple of the 42 ns timer tick and rides whatever
+//!   frequency or core-placement ramp the write phase left behind. `PERF.md`
+//!   (C1) measured exactly that: the same code produced p50s of 500 / 625 /
+//!   916 ns across editions, and the run on the busiest machine was the
+//!   fastest. Both sides get the warm-up — a short read loop on SQLite's side
+//!   too — so neither measures its first-touch state.
 //!
 //! The numbers are wall-clock on one machine and mean nothing in the abstract;
 //! what they are for is catching a regression and telling us where we stand.
@@ -74,6 +85,17 @@ impl Timing {
 pub(crate) fn lookup_keys(seed: u64, rows: usize, lookups: usize) -> Vec<i64> {
     let mut rng = SeededRng::new(seed);
     (0..lookups)
+        .map(|_| 1 + (rng.next_u64() % rows as u64) as i64)
+        .collect()
+}
+
+/// The warm-up sequence: a fixed number of lookups of the same shape as the
+/// timed ones, run before either side's clock starts and discarded. It exists
+/// so the timed window measures the engine and not the state the preceding
+/// workload left behind — see the module note "A read window long enough".
+pub(crate) fn warmup_keys(rows: usize) -> Vec<i64> {
+    let mut rng = SeededRng::new(0x5741524Du64);
+    (0..WARMUP_LOOKUPS)
         .map(|_| 1 + (rng.next_u64() % rows as u64) as i64)
         .collect()
 }
@@ -159,6 +181,11 @@ fn report(workload: &str, operations: usize, timings: &[&Timing]) {
     }
 }
 
+/// Warm-up lookups, discarded, run by every engine before its timed read
+/// phase. Large enough to fill caches and settle clocks; cheap enough to stay
+/// invisible next to the write phase.
+pub(crate) const WARMUP_LOOKUPS: usize = 10_000;
+
 fn inlaysql_points(
     path: &Path,
     rows: usize,
@@ -190,6 +217,15 @@ fn inlaysql_points(
     // sides step, both sides read". `checksum` exists so the read cannot be
     // optimised away; it is `black_box`ed below.
     let mut checksum = 0u64;
+    let warmup = warmup_keys(rows);
+    for key in &warmup {
+        let delivered = db.query_prepared_each_ref(&lookup, &[Value::Integer(*key)], |row| {
+            checksum += row[0].as_str().map_or(0, str::len) as u64;
+            Ok(())
+        })?;
+        debug_assert_eq!(delivered, 1, "warm-up read missed row {key}");
+    }
+
     let mut reads = Vec::with_capacity(keys.len());
     let started = Instant::now();
     for key in keys {
@@ -369,6 +405,16 @@ fn sqlite_points(
     // length off the borrowed `&str` is what the InlaySQL side now does too —
     // see the module note "Both sides step, both sides read".
     let mut checksum = 0u64;
+    let warmup = warmup_keys(rows);
+    for key in &warmup {
+        lookup
+            .query_row([*key], |row| {
+                checksum += row.get_ref(0)?.as_str().map(str::len).unwrap_or(0) as u64;
+                Ok(())
+            })
+            .map_err(|e| format!("warm-up read failed: {e}"))?;
+    }
+
     let mut reads = Vec::with_capacity(keys.len());
     let started = Instant::now();
     for key in keys {

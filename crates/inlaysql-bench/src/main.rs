@@ -133,6 +133,14 @@ pub struct Config {
     /// Rows loaded by the point-workload suite.
     rows: usize,
     /// Primary-key lookups performed by the point-workload suite.
+    ///
+    /// 200,000, not 5,000: a 5,000-lookup window is ~4 ms of work — a
+    /// multiple of the 42 ns timer tick, and short enough to ride whatever
+    /// frequency or core-placement ramp the 80 s write phase that precedes it
+    /// leaves behind (PERF.md C1 measured the same code at 500 / 625 / 916 ns
+    /// p50 across editions because of this). 200k is ~0.25 s, long enough for
+    /// the mean to settle near the median and the percentiles to mean
+    /// something.
     lookups: usize,
     /// Payload bytes per row in the point-workload suite. Small on purpose:
     /// the point is to measure the tree and the sync, not memcpy.
@@ -170,7 +178,7 @@ impl Default for Config {
             dim: 384,
             limit: 10,
             rows: 20_000,
-            lookups: 5_000,
+            lookups: 200_000,
             payload: 64,
             writers: 8,
             txns: 200,

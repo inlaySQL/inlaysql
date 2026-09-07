@@ -452,8 +452,14 @@ fn run_indexed(config: &Config, path: &Path) -> Result<(), Box<dyn std::error::E
     announce_query_phase();
     let (iterations, elapsed) = run_for(config.seconds, || {
         let id = 1 + (rng.next_u64() % rows as u64) as i64;
-        let result = db.query_prepared(&lookup, &[Value::Text(email(id).into())])?;
-        debug_assert_eq!(result.rows.len(), 1);
+        // `query_prepared_each_ref`, not the owning `query_prepared`: the
+        // published indexed bench (`indexed.rs:274`) steps and drops one row
+        // at a time, and a profile that retains a `Vec<Vec<Value>>` per query
+        // optimises a different allocation profile from the one that
+        // publishes (T0.2).
+        let delivered =
+            db.query_prepared_each_ref(&lookup, &[Value::Text(email(id).into())], |_| Ok(()))?;
+        debug_assert_eq!(delivered, 1);
         Ok(())
     })?;
     report("indexed", iterations, elapsed);
@@ -552,7 +558,11 @@ fn run_aggregate(
     let (iterations, elapsed) = run_for(config.seconds, || {
         let shape = timed[cycle % timed.len()];
         cycle += 1;
-        db.query_prepared(shape, &[]).map(|_| ())
+        // `query_prepared_each`, not the owning `query_prepared` (T0.2):
+        // `sql_shapes.rs` — the driver behind the published aggregate cells —
+        // counts rows off a stepped answer, so the profile must too.
+        db.query_prepared_each(shape, &[], |_| Ok(()))?;
+        Ok(())
     })?;
     report(label, iterations, elapsed);
     Ok(())
@@ -725,7 +735,13 @@ fn run_joins(
     let (iterations, elapsed) = run_for(config.seconds, || {
         let shape = timed[cycle % timed.len()];
         cycle += 1;
-        db.query_prepared(shape, &[]).map(|_| ())
+        // `query_prepared_each`, not the owning `query_prepared`: the
+        // published joins bench (`joins.rs:300`) steps and drops one row at a
+        // time (T0.2), so the profile must consume the answer the same way.
+        // The warm-up loop above keeps the owning call — its cost is setup,
+        // not the measured window.
+        db.query_prepared_each(shape, &[], |_| Ok(()))?;
+        Ok(())
     })?;
     report(
         match shapes {
