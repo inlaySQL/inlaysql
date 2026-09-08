@@ -16,16 +16,30 @@ one file — but you do not need it to get started.
 
 ## The 5-minute version
 
-1. **Download** the library for your platform from the
-   [releases page](https://github.com/inlaySQL/inlaysql/releases)
-   (macOS Apple silicon or Linux x86_64 today — see the note on Windows at
-   the end), and unpack it. Inside: the shared library, `inlaysql.h`, and a
-   working example for your language.
-2. **Copy the loader for your language** from the quickstarts below — 15 to
-   60 lines, once, then never think about FFI again.
-3. **Use SQL.** Same dialect as SQLite (vectors and retrieval functions are
-   the additions); parameters bound as you would expect; results as plain
-   data.
+One command puts the engine library for this machine and the client file
+for your language in the current directory, checksums verified:
+
+```sh
+curl -fsSL https://github.com/inlaySQL/inlaysql/releases/latest/download/get-inlaysql.sh | sh -s -- php
+#                                                                                        python | ruby | csharp | java
+```
+
+`--dir vendor/inlaysql` puts them elsewhere; `VERSION=v0.0.5` pins a
+release; `--dry-run` only prints the URLs. Or take the two files by hand
+from the [releases page](https://github.com/inlaySQL/inlaysql/releases) —
+every release attaches each of them on its own, beside a `.sha256`, and
+`releases/latest/download/<file>` always names the newest:
+
+| file | what |
+| --- | --- |
+| `libinlaysql_ffi-aarch64-apple-darwin.dylib`, `libinlaysql_ffi-x86_64-unknown-linux-gnu.so` | the engine (macOS Apple silicon, Linux x86_64 — see the note on Windows at the end) |
+| `inlaysql.php`, `inlaysql.py`, `inlaysql.rb`, `InlaySQL.cs`, `InlaySQL.java` | the whole client for that language, one file |
+| `inlaysql-ffi-<version>-<target>.tar.gz` | the same things in one archive, with `inlaysql.h` |
+
+Then **use SQL**: same dialect as SQLite (vectors and retrieval functions
+are the additions), parameters bound as you would expect, results as plain
+data. The client looks for the library beside itself, so the two files stay
+together and nothing is configured.
 
 That is the whole integration. What follows is the per-language detail.
 
@@ -33,130 +47,127 @@ That is the whole integration. What follows is the per-language detail.
 
 ## PHP — quickstart
 
-PHP 7.4+ has FFI built in (enable `ffi=on` in php.ini, or it is always on in
-the CLI). Save this next to the unpacked library and run it:
+PHP 8.1+ has FFI built in (`ffi.enable=true` for FPM; it is on in the CLI).
+Copy `wrappers/inlaysql.php` from the release archive (or
+[`crates/inlaysql-ffi/wrappers/inlaysql.php`](../crates/inlaysql-ffi/wrappers/inlaysql.php))
+next to the unpacked library and `require` it. That file is the whole
+client — no Composer package, no extension to build.
 
 ```php
 <?php
-// inlaysql.php — the whole binding. Copy this file into your project.
-// Library path: pass it in, or hardcode the unpacked .dylib/.so path.
-define('INLAYSQL_LIB', $argv[1] ?? './libinlaysql_ffi.dylib');
+require 'inlaysql.php';
 
-final class InlaySQL
-{
-    private \FFI $ffi;
-    /** @var \FFI\CData */
-    private $handle;
+$db = InlaySQL::open('app.inlay');                          // creates if absent
+$db->execute('CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)');
 
-    public function __construct(string $path)
-    {
-        $this->ffi = \FFI::cdef(<<<'C'
-            typedef struct InlaysqlHandle InlaysqlHandle;
-            InlaysqlHandle *inlaysql_open(const char *path);
-            InlaysqlHandle *inlaysql_open_read_only(const char *path);
-            void inlaysql_close(InlaysqlHandle *handle);
-            int inlaysql_exec(InlaysqlHandle *handle, const char *sql,
-                              const char *params, char **out_json);
-            const char *inlaysql_last_error(void);
-            void inlaysql_free_string(char *s);
-            const char *inlaysql_version(void);
-        C, INLAYSQL_LIB);
+$id = $db->insert('users', ['name' => 'Ada', 'email' => 'ada@example.org']);   // 1
 
-        $this->handle = $this->ffi->inlaysql_open($path);
-        if (\FFI::isNull($this->handle)) {
-            throw new RuntimeException('open failed: ' . $this->ffi->inlaysql_last_error());
-        }
-    }
-
-    public function __destruct() { $this->ffi->inlaysql_close($this->handle); }
-
-    /** Run one statement. Rows come back as objects keyed by column name. */
-    public function run(string $sql, array $params = []): array
-    {
-        $out = $this->ffi->new('char *');
-        $code = $this->ffi->inlaysql_exec(
-            $this->handle, $sql,
-            $params === [] ? null : json_encode($params, JSON_UNESCAPED_SLASHES),
-            \FFI::addr($out),
-        );
-        if ($code !== 0) {
-            throw new RuntimeException($this->ffi->inlaysql_last_error() . " — $sql");
-        }
-        $result = json_decode(\FFI::string($out), true, flags: JSON_THROW_ON_ERROR);
-        $this->ffi->inlaysql_free_string($out);
-        return $result;
-    }
+foreach ($db->query('SELECT id, name FROM users WHERE id > :after', ['after' => 0]) as $user) {
+    echo $user['name'];                                      // rows as arrays
 }
+$ada   = $db->first('SELECT * FROM users WHERE id = ?', [$id]);   // one row, or null
+$count = $db->value('SELECT COUNT(*) FROM users');                // one cell
+$names = $db->column('SELECT name FROM users ORDER BY name');    // one column
 
-// ---- usage -------------------------------------------------------------
-$db = new InlaySQL('app.inlay');
-$db->run('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)');
-$db->run('INSERT INTO users (name, email) VALUES (?, ?)', ['Ada', 'ada@example.org']);
+$result = $db->execute('UPDATE users SET name = ? WHERE id = ?', ['Ada L.', $id]);
+$result->rowsAffected;                                       // 1
+$result->lastInsertId;                                       // the last INSERT's id, as SQLite
 
-$result = $db->run('SELECT id, name, email FROM users WHERE id = ?', [1]);
-print_r($result['rows']);   // [[1, "Ada", "ada@example.org"]]
+$db->transaction(function (InlaySQL $db) {                  // BEGIN … COMMIT; ROLLBACK
+    $db->insert('users', ['name' => 'Grace', 'email' => 'g@x']);   // on throw; rerun on a
+    $db->insert('users', ['name' => 'Linus', 'email' => 'l@x']);   // write conflict
+});
+
+try {
+    $db->insert('users', ['name' => 'Ada', 'email' => 'ada@example.org']);
+} catch (InlaySQLConstraintException $e) {                   // UNIQUE refused it
+    echo $e->getMessage();                                   // the engine's own words
+}
 ```
 
-A complete runnable script is in the release archive (`poc.php`) and at
-[`crates/inlaysql-ffi/examples/poc.php`](../crates/inlaysql-ffi/examples/poc.php) —
-it also shows the error path. **Laravel:** the same database also works
-through Eloquent over the MySQL wire (direction two below) — a stock
-Laravel 11 skeleton migrates and serves against it.
+What the class gives you, in one table:
+
+| Call | Returns |
+| --- | --- |
+| `InlaySQL::open($path, readonly: false, lib: null)` | a handle; `readonly: true` refuses writes and needs the file to exist |
+| `execute($sql, $params)` | `InlaySQLResult` — `rowsAffected`, `lastInsertId`, `isDdl`, `rows` (set only for a query) |
+| `query($sql, $params)` | `InlaySQLRows` — iterate as arrays; `count()`, `->all()`, `->objects()`, `->first()`, `->value()`, `->column($nameOrIndex)`, `->raw()` |
+| `first` / `value` / `column` | the same three shapes without the object |
+| `insert($table, ['col' => $v, …])` | the new row id |
+| `transaction(fn, retries: 3)` | `fn`'s return; nested calls join the outer transaction; a write conflict rolls back and reruns `fn` |
+| `run($sql, $params)` | the raw JSON shape, decoded — what everything above is built on |
+
+Parameters are positional `?` with a list, or `:name` with a string-keyed
+array (the rewrite skips string literals, so `':not_a_param'` is left
+alone). A PHP array of numbers binds as a vector. Exceptions:
+`InlaySQLConstraintException`, `InlaySQLConflictException` (another
+handle committed first — safe to retry, and `transaction()` does),
+`InlaySQLUnsupportedException` (a clause the engine refuses rather than
+silently ignores), and `InlaySQLException` for the rest.
+
+Under PHP-FPM every worker opens its own handle and every one of them may
+write — concurrent commits to one file are the thing this engine does that
+SQLite does not. The FFI definitions bind once per process; with opcache
+preloading (`ffi.enable=preload`) preload `inlaysql.php`.
+
+A minimal script that shows the raw ABI without the class is
+[`crates/inlaysql-ffi/examples/poc.php`](../crates/inlaysql-ffi/examples/poc.php).
+**Laravel:** the class is what a `DB::connection('inlaysql')` driver would
+call, and that driver is queued (`PLAN.md`); today, Eloquent and migrations
+run over the MySQL wire (direction two below) — a stock Laravel 11 skeleton
+migrates and serves against it — while the class serves raw SQL in-process.
 
 ## Python — quickstart
 
-Standard library only. Save this as `inlaysql.py` next to the unpacked
-library:
+Standard library only. Copy `wrappers/inlaysql.py` from the release archive
+(or [`crates/inlaysql-ffi/wrappers/inlaysql.py`](../crates/inlaysql-ffi/wrappers/inlaysql.py))
+next to the unpacked library. Same surface as the PHP class, spelt in Python:
 
 ```python
-# inlaysql.py — the whole binding. Copy this file into your project.
-import ctypes, json
+from inlaysql import connect, ConstraintError
 
-class InlaySQL:
-    def __init__(self, lib_path, db_path):
-        self.lib = ctypes.CDLL(lib_path)
-        lib = self.lib
-        lib.inlaysql_open.argtypes = [ctypes.c_char_p];  lib.inlaysql_open.restype = ctypes.c_void_p
-        lib.inlaysql_exec.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
-                                      ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
-        lib.inlaysql_exec.restype = ctypes.c_int
-        lib.inlaysql_last_error.argtypes = []; lib.inlaysql_last_error.restype = ctypes.c_char_p
-        lib.inlaysql_free_string.argtypes = [ctypes.c_char_p]; lib.inlaysql_free_string.restype = None
-        lib.inlaysql_close.argtypes = [ctypes.c_void_p]; lib.inlaysql_close.restype = None
+db = connect("app.inlay")                                    # creates if absent
+db.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)")
 
-        self.handle = lib.inlaysql_open(db_path.encode())
-        if not self.handle:
-            raise RuntimeError(f"open failed: {lib.inlaysql_last_error().decode()}")
+user_id = db.insert("users", name="Ada", email="ada@example.org")      # 1
 
-    def run(self, sql, params=None):
-        out = ctypes.c_char_p()
-        code = self.lib.inlaysql_exec(
-            self.handle, sql.encode(),
-            json.dumps(params).encode() if params is not None else None,
-            ctypes.byref(out))
-        if code != 0:
-            raise RuntimeError(f"{self.lib.inlaysql_last_error().decode()} — {sql}")
-        result = json.loads(out.value)
-        self.lib.inlaysql_free_string(out)
-        return result
+for user in db.query("SELECT id, name FROM users WHERE id > :after", {"after": 0}):
+    print(user["name"])                                      # rows as dicts
+ada = db.first("SELECT * FROM users WHERE id = ?", [user_id])   # one row, or None
+count = db.value("SELECT COUNT(*) FROM users")                  # one cell
+names = db.column("SELECT name FROM users ORDER BY name")       # one column
 
-    def close(self):
-        self.lib.inlaysql_close(self.handle)
+result = db.execute("UPDATE users SET name = ? WHERE id = ?", ["Ada L.", user_id])
+result.rows_affected, result.last_insert_id                  # 1, 1
 
-# ---- usage -------------------------------------------------------------
-db = InlaySQL('./libinlaysql_ffi.so', 'app.inlay')
-db.run('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)')
-db.run('INSERT INTO users (name, email) VALUES (?, ?)', ['Ada', 'ada@example.org'])
+with db.transaction():                                       # BEGIN … COMMIT; ROLLBACK on raise
+    db.insert("users", name="Grace", email="g@x")
+    db.insert("users", name="Linus", email="l@x")
 
-result = db.run('SELECT id, name, email FROM users WHERE id = ?', [1])
-print(result['rows'])   # [[1, 'Ada', 'ada@example.org']]
+db.transact(lambda db: db.insert("users", name="Ken", email="k@x"))   # same, rerun on a write conflict
+
+try:
+    db.insert("users", name="Ada", email="ada@example.org")
+except ConstraintError as e:
+    print(e)                                                 # the engine's own words
 ```
 
-A complete runnable script ships as
+`connect(path, readonly=False, lib=None)` returns a context manager.
+`execute` → `Result(rows_affected, last_insert_id, is_ddl, rows)`; `query`
+→ `Rows` (iterate as dicts, `len()`, `.all()`, `.first()`, `.value()`,
+`.column(name_or_index)`, `.raw()`); `insert(table, mapping | **values)` →
+row id; `transaction()` is a context manager and `transact(fn, retries=3)`
+its retrying form; `run` is the raw JSON. Errors: `ConstraintError`,
+`ConflictError`, `UnsupportedError`, `InlaySQLError`. Run the file itself
+(`python inlaysql.py [path/to/lib]`) for its self-test.
+
+A minimal script that shows the raw ABI without the class is
 [`poc.py`](../crates/inlaysql-ffi/examples/poc.py). SQLAlchemy's `sqlite`
-dialect will **not** open this file — the format is InlaySQL's own — but a
-thin `InlaySQL.run()` wrapper covers most of what an ORM is doing, and the
+dialect will **not** open this file — the format is InlaySQL's own — and the
 MySQL-wire direction below is the full-ORM path.
+
+---
 
 ## Ruby — quickstart
 
@@ -341,6 +352,29 @@ public final class InlaySQL implements AutoCloseable {
 The JSON-marshalling line is the only piece a real binding replaces (with
 Jackson, for instance). Older JDKs use JNI over the same header.
 
+## The client surface, for every language
+
+The PHP and Python files above implement one surface, and the Ruby, C# and
+Java files are being brought up to it (they carry `run`/`query`/`first`
+today). A client is complete when it has, in the language's own idiom:
+
+| Piece | Contract |
+| --- | --- |
+| `open(path, readonly, lib)` | creates the file unless read-only; the library is located beside the client file, its parent, then the working directory, and loaded once per process |
+| `execute(sql, params) → Result` | `rows_affected`, `last_insert_id` (SQLite's `last_insert_rowid()` contract), `is_ddl`, and `rows` when the statement was a query |
+| `query(sql, params) → Rows` | iterable rows keyed by column name; `count`, `all`, `first`, `value` (first cell), `column(name or index)`, `raw` (positional, as the ABI sent it) |
+| `first` / `value` / `column` | the three common shapes as one call |
+| `insert(table, row) → id` | column names quoted; the row id from the result |
+| `transaction(fn)` | `BEGIN` / `COMMIT` / `ROLLBACK`; nested calls join; a write conflict rolls back and reruns `fn` up to a retry count |
+| parameters | positional `?` with a list; named `:name` with a map, rewritten outside string literals and quoted identifiers |
+| errors | one base exception, plus `Constraint`, `Conflict`, `Unsupported` subclasses chosen by the engine message's prefix (`constraint failed`, `write conflict`, `unsupported`) |
+| `run(sql, params)` | the raw JSON, decoded — kept public so nothing above is a ceiling |
+
+One rule the surface keeps: `query()` on a statement that is not a query
+**runs it** and then complains — the ABI has one entry point and the client
+cannot know the shape before the engine answers. Use `execute()` when the
+statement may write.
+
 ## What crosses the boundary
 
 The result of every statement is JSON in one of three shapes, identical
@@ -348,7 +382,7 @@ across all of InlaySQL's foreign surfaces (WASM, MySQL wire, FFI):
 
 ```json
 {"kind":"ddl"}                                    // schema changed
-{"kind":"written","rows":1}                       // one row written
+{"kind":"written","rows":1,"last_insert_id":1}    // one row written; id as SQLite's last_insert_rowid()
 {"columns":["id","name"],"rows":[[1,"Ada"]]}      // a SELECT
 ```
 

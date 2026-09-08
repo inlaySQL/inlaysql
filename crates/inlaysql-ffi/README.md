@@ -33,7 +33,7 @@ more than the header).
 
 `params` is a JSON array string or NULL; a nested array of numbers is a
 vector. The result shapes are identical to the WASM surface's
-(`{"kind":"ddl"}`, `{"kind":"written","rows":n}`, `{"columns":…,"rows":…}`),
+(`{"kind":"ddl"}`, `{"kind":"written","rows":n,"last_insert_id":k}`, `{"columns":…,"rows":…}`),
 which is deliberate: documentation and demos written against one describe
 the other, and both are pinned to it by tests.
 

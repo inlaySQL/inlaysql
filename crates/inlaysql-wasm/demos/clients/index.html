@@ -457,7 +457,7 @@ cmd.Parameters.AddWithValue(<span class="com">"@b"</span>, body);
     <p>
       What crosses the C-ABI boundary: every statement returns JSON in one of
       three shapes (<code>{"kind":"ddl"}</code>,
-      <code>{"kind":"written","rows":n}</code>,
+      <code>{"kind":"written","rows":n,"last_insert_id":k}</code>,
       <code>{"columns":…,"rows":…}</code>) — the same shapes on every surface
       (WASM, wire, FFI). Params are a JSON array; a nested array of numbers is
       a vector. Errors return non-zero and

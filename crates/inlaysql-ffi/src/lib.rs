@@ -157,7 +157,10 @@ pub unsafe extern "C" fn inlaysql_close(handle: *mut Handle) {
 /// [`inlaysql_free_string`], shaped exactly as the WASM surface's is:
 ///
 /// - `{"kind":"ddl"}` — schema changed;
-/// - `{"kind":"written","rows":n}` — n rows written;
+/// - `{"kind":"written","rows":n,"last_insert_id":k}` — n rows written; `k`
+///   is the row id the most recent `INSERT` on this handle assigned (SQLite's
+///   `last_insert_rowid()` contract: an `UPDATE`/`DELETE` leaves it as the
+///   previous `INSERT` left it), or `null` when no `INSERT` has run yet;
 /// - `{"columns":[…],"rows":[[…],…]}` — a result set.
 ///
 /// The return value is [`INLAYSQL_OK`], [`INLAYSQL_ERR`] (statement failed —
@@ -270,7 +273,12 @@ fn run(db: &mut Database, sql: &str, params: &[Value]) -> Result<String, String>
     let outcome = db.execute(sql, params).map_err(|error| error.to_string())?;
     Ok(match outcome {
         inlaysql::Outcome::Ddl => r#"{"kind":"ddl"}"#.to_string(),
-        inlaysql::Outcome::Written(rows) => format!(r#"{{"kind":"written","rows":{rows}}}"#),
+        inlaysql::Outcome::Written(rows) => {
+            let last = db
+                .last_insert_row_id()
+                .map_or_else(|| "null".to_string(), |id| id.to_string());
+            format!(r#"{{"kind":"written","rows":{rows},"last_insert_id":{last}}}"#)
+        }
         inlaysql::Outcome::Rows(result) => render_rows(&result),
     })
 }

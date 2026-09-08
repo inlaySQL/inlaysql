@@ -137,7 +137,7 @@ fn ddl_insert_and_select_round_trip_through_the_abi() {
             "INSERT INTO docs (title, body) VALUES (?, ?)",
             Some(r#"["Hello", "a body with \"quotes\" and newline\n"]"#),
         ),
-        Some(r#"{"kind":"written","rows":1}"#.into()),
+        Some(r#"{"kind":"written","rows":1,"last_insert_id":1}"#.into()),
     );
     assert_eq!(
         client.exec("SELECT id, title, body FROM docs WHERE id = ?", Some("[1]")),
@@ -161,7 +161,7 @@ fn the_result_shapes_match_the_wasm_surfaces_exactly() {
             "INSERT INTO t (name, n) VALUES (?, ?)",
             Some(r#"["ada", 1.5]"#)
         ),
-        Some(r#"{"kind":"written","rows":1}"#.into()),
+        Some(r#"{"kind":"written","rows":1,"last_insert_id":1}"#.into()),
     );
     assert_eq!(
         client.exec("SELECT name, n, 2.0 * n AS doubled FROM t", None),

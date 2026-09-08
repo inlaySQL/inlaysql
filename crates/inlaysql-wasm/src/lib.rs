@@ -98,16 +98,21 @@ impl Database {
     /// Run a statement. `params` is a JSON array; an inner array of numbers is
     /// a vector.
     ///
-    /// Returns `{ "kind": "ddl" }`, `{ "kind": "written", "rows": n }` or the
+    /// Returns `{ "kind": "ddl" }`, `{ "kind": "written", "rows": n,
+    /// "last_insert_id": k | null }` (`k` as SQLite's `last_insert_rowid()`:
+    /// the most recent `INSERT`'s row id, untouched by other statements) or the
     /// same shape [`Database::query`] returns.
     pub fn execute(&mut self, sql: &str, params: Option<String>) -> Result<String, JsError> {
         let params = parse_params(params.as_deref())?;
         let outcome = self.engine.execute(sql, &params).map_err(to_js)?;
         Ok(match outcome {
             inlaysql_core::Outcome::Ddl => json!({ "kind": "ddl" }).to_string(),
-            inlaysql_core::Outcome::Written(rows) => {
-                json!({ "kind": "written", "rows": rows }).to_string()
-            }
+            inlaysql_core::Outcome::Written(rows) => json!({
+                "kind": "written",
+                "rows": rows,
+                "last_insert_id": self.engine.last_insert_row_id(),
+            })
+            .to_string(),
             inlaysql_core::Outcome::Rows(rows) => render(&rows),
         })
     }
