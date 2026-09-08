@@ -42,13 +42,20 @@ CLI.
 
 ## Install and run
 
-Download the library for your platform from the
-[releases page](https://github.com/inlaySQL/inlaysql/releases)
+One command puts the engine library for your machine and the one-file
+client for your language in the current directory, checksums verified
 ([`v0.0.5`](https://github.com/inlaySQL/inlaysql/releases/tag/v0.0.5);
 macOS Apple silicon and Linux x86_64 today — the file layer is Unix-only, and
-the WASM module runs anywhere a browser or Node does), copy the ~40-line loader
-for your language from [`docs/clients.md`](docs/clients.md#the-5-minute-version)
-(PHP, Python, Ruby, C# and Java each have a tested one), and open the file:
+the WASM module runs anywhere a browser or Node does):
+
+```sh
+curl -fsSL https://github.com/inlaySQL/inlaysql/releases/latest/download/get-inlaysql.sh | sh -s -- php   # or python, ruby, csharp, java
+```
+
+Every file is also its own asset on the
+[releases page](https://github.com/inlaySQL/inlaysql/releases), and
+[`docs/clients.md`](docs/clients.md#the-5-minute-version) is the per-language
+quickstart. Then open the file:
 
 ```php
 // PHP (FFI is built in) — Ruby and Python are the same shape

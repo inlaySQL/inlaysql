@@ -114,12 +114,22 @@ jobs:
           cp -R crates/inlaysql-ffi/wrappers "dist/$name/wrappers"
           tar -czf "dist/${name}.tar.gz" -C dist "$name"
           ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          # The bare library, named by target, as its own asset — so
+          # `releases/latest/download/libinlaysql_ffi-<target>.<ext>` is a
+          # stable URL and `get-inlaysql.sh` (and a human with curl) can take
+          # the one file without unpacking an archive.
+          lib="${{ matrix.lib }}"
+          bare="${lib%.*}-${{ matrix.target }}.${lib##*.}"
+          cp "target/${{ matrix.target }}/release/$lib" "dist/$bare"
+          ( cd dist && sha256sum "$bare" > "$bare.sha256" )
           ls -l dist
 
       - uses: actions/upload-artifact@v6
         with:
           name: ffi-${{ matrix.target }}
-          path: dist/*.tar.gz*
+          path: |
+            dist/*.tar.gz*
+            dist/libinlaysql_ffi-*
           retention-days: 7
 
   wasm:
@@ -200,6 +210,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="${GITHUB_REF_NAME#v}"
+          # Every one-file client and the installer as standalone assets,
+          # beside the archives: a developer takes exactly one library and
+          # one client file, and the `latest/download/<name>` URL for each
+          # never changes between versions.
+          for file in crates/inlaysql-ffi/wrappers/* crates/inlaysql-ffi/get-inlaysql.sh crates/inlaysql-ffi/include/inlaysql.h; do
+            cp "$file" dist/
+            ( cd dist && sha256sum "$(basename "$file")" > "$(basename "$file").sha256" )
+          done
           {
             echo "## InlaySQL ${GITHUB_REF_NAME}"
             echo
@@ -225,7 +243,27 @@ jobs:
             echo "been written. The WASM module runs anywhere a browser or"
             echo "Node does, Windows included."
             echo
-            echo "### Using the C-ABI libraries"
+            echo "### Use it like SQLite, in one command"
+            echo
+            echo "Downloads the library for this machine and the client file for"
+            echo "your language into the current directory, and verifies both:"
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://github.com/inlaySQL/inlaysql/releases/download/${GITHUB_REF_NAME}/get-inlaysql.sh | sh -s -- php     # or python, ruby, csharp, java"
+            echo '```'
+            echo
+            echo "Or take the two files by hand — each is its own asset below, with"
+            echo "a \`.sha256\` beside it, and \`releases/latest/download/<file>\`"
+            echo "always points at the newest release:"
+            echo
+            echo "| file | what it is |"
+            echo "| --- | --- |"
+            echo "| \`libinlaysql_ffi-aarch64-apple-darwin.dylib\` | the engine, macOS Apple silicon |"
+            echo "| \`libinlaysql_ffi-x86_64-unknown-linux-gnu.so\` | the engine, Linux x86_64 |"
+            echo "| \`inlaysql.php\` / \`inlaysql.py\` / \`inlaysql.rb\` / \`InlaySQL.cs\` / \`InlaySQL.java\` | the whole client for that language, one file |"
+            echo "| \`inlaysql.h\` | the C header, for anything else |"
+            echo
+            echo "### The archives"
             echo
             echo "Each FFI archive carries the \`${version}\` library, the"
             echo "\`inlaysql.h\` header, and the **wrappers/** directory — a"
