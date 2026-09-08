@@ -67,7 +67,7 @@ ROUNDS=5 ./bench/batch_insert.sh                                   # the contain
 | | |
 | --- | --- |
 | Commit | `run.sh` tables: `72d7ab1` (the seventh full regeneration; `ea1712c..72d7ab1` carries **AHL-563**, **AHL-564** and **AHL-565**, three commit-path changes that have never been published here, plus **AHL-566**, which deleted AHL-562's flush pipeline after re-measuring it flat against a real A/A control — the range is itemised under the table). **`compare.sh`-sourced tables (DuckDB/pgvector/Meilisearch, MySQL/PostgreSQL, server-to-server): still `b873f4e` of 2026-09-05, not regenerated this edition** — `repeat-compare.sh` was not run, and each of those sections says so. Driver-sourced tables (read shapes, batch insert): still `bdc64eb`, **not regenerated this time** either, and each of those sections says so — **with one cell excepted**: the batch-insert table's *containerised InlaySQL* row is `bcbc9d4` of 2026-09-07, re-measured by `bench/batch_insert.sh` (AHL-570), a **different harness from `compare.sh`** and from the drivers. That row moved from 67,484 to 88,456 rows/s and the like-for-like verdict from 0.68x/1.19x to 0.88x/1.64x; the MySQL, PostgreSQL and host cells beside it are still `bdc64eb`. No engine change was made for it — AHL-570 built nothing, and the section says so. **Nothing in `ea1712c..72d7ab1` is on a read path**: AHL-563 narrows a cache invalidation inside the commit gate, AHL-564 shrinks the WAL commit record, AHL-565 removes a free-list rescan that only the DST sweep exercises, and AHL-566 removes code that was compiled out behind a default-off flag in every run this page has ever published. |
-| Date | 2026-09-06 (`run.sh`, 07:01–07:22 UTC, i.e. 15:01–15:22 local); 2026-09-05 (`compare.sh`, 06:26–06:36 UTC, i.e. 14:26–14:36 local, carried forward); 2026-09-02/03 (the read-shape and batch-insert drivers, 19:13 UTC); **2026-09-07 (`bench/batch_insert.sh`, the containerised batch-insert cell alone, five interleaved rounds, load 3.23/3.34/3.43 of 18, no round `CONTAMINATED`)** |
+| Date | 2026-09-06 (`run.sh`, 07:01–07:22 UTC, i.e. 15:01–15:22 local); 2026-09-05 (`compare.sh`, 06:26–06:36 UTC, i.e. 14:26–14:36 local, carried forward); 2026-09-02/03 (the read-shape and batch-insert drivers, 19:13 UTC); **2026-09-07 (`bench/batch_insert.sh`, the containerised batch-insert cell alone, five interleaved rounds, load 3.23/3.34/3.43 of 18, no round `CONTAMINATED`)**; **2026-09-07/08 (the point-read method change, T0.1: one gated `run.sh` points run at `340467b`, 200k lookups + warm-up, load 2.42–3.89/18, `bench/results/20260907T101202Z.txt`, plus the first CI runner corroboration at the same method — see the point-read section, which now carries both)** |
 | Tree | source clean at measurement (`dirty: no` in all three `run.sh` raw outputs and in the `repeat.sh` summary). |
 | Machine | Apple Mac17,9, 18 cores, macOS 27.0 (Darwin 27.0.0 arm64) |
 | Toolchain | rustc 1.91.1 (ed61e7d7e 2025-11-07) |
@@ -223,11 +223,63 @@ column: it is the only one that makes a durability claim comparable to ours,
 and `fullfsync` is what makes a macOS number mean anything at all. WAL +
 `synchronous=NORMAL` is SQLite at its fastest, and is the harder target.
 
-### Point reads by primary key — ahead of SQLite's fastest configuration on the typical lookup in two runs of three, behind it on throughput in all three
+### Point reads by primary key — the harness was the number; with a real read window the row is a WIN (2.10x WAL, one gated run; runner trend 4.6x)
 
-20,000 rows, 5,000 lookups, prepared statements on both sides. Median of
-three runs (`bench/results/20260906T{070128,070835,071517}Z.txt`, load
-1.4–3.8/18 throughout, gate passed).
+**The read-window method change (2026-09-07/08, T0.1) — this section's
+figures below it are the old 5,000-lookup method and are retained as
+history; the new method's numbers follow.** The bench's read phase now runs
+**200,000 lookups** with a discarded 10,000-lookup warm-up on both sides
+(`bench/results/20260907T101202Z.txt`, one gated run at load 2.42–3.89/18,
+no contamination, commit `340467b`): InlaySQL **2,577,421 ops/s**, p50
+**0.334 µs**, p95 0.541 µs, p99 0.625 µs, against SQLite WAL **1,227,266
+ops/s**, p50 0.791 µs, p95 0.875 µs — **2.10x on ops/s, p50 2.4x, p95
+1.6x, p99 1.7x, all our side ahead**. The p95/p50 tail falls from 2.6x to
+1.6x and the mean finally sits beside the median, which is exactly what a
+window four hundred times longer than the timer tick should show. One run,
+not a median of three: the repeat sitting started the same evening was
+contaminated twice and refused once (a 100%-CPU OCR server and Docker
+helpers landing mid-run), and the third attempt likewise, so the gated
+median-of-three on the new method is still owed — this run is published
+now because three independent later measurements agree with its direction.
+
+**First corroboration: the CI runner (2026-09-08,
+`RUNNER-BENCHMARK.md`, gate off, shared 4-vCPU box — trend evidence only
+by its own header).** Same 200k method, median of three:
+InlaySQL **1,700,106 ops/s**, p50 0.541 µs, p95 0.661 µs against SQLite
+WAL 371,813 ops/s, p50 2.61 µs, p95 2.81 µs — **4.57x**, with SQLite WAL's
+side carrying the absolute-overhead wall a 4-vCPU shared runner adds
+(p50 2.61 µs against the 0.750–0.792 µs the same arm shows on the quiet
+Mac). The direction matches on every column that is not the runner's own
+offset, and the runner's indexed point read moves the same way:
+**305,786 vs WAL 259,249 = 1.18x**, where the table below publishes 0.70x
+— the indexed row's two per-probe allocations (T1.3) are the remaining gap
+on both machines, not a platform difference.
+
+The two measurements, side by side:
+
+| Point read, 200k window | ops/s | p50 | p95 | p99 |
+| --- | --- | --- | --- | --- |
+| **InlaySQL (quiet Mac, one gated run, `340467b`)** | **2,577,421** | **0.334 µs** | 0.541 µs | 0.625 µs |
+| **InlaySQL (CI runner, median of 3, gate off)** | 1,700,106 | 0.541 µs | 0.661 µs | 0.801 µs |
+| SQLite, WAL + `sync=NORMAL` (quiet Mac) | 1,227,266 | 0.791 µs | 0.875 µs | 1.08 µs |
+| SQLite, journal + `sync=FULL` (quiet Mac) | 341,023 | 2.88 µs | 3.21 µs | 3.75 µs |
+| SQLite, WAL + `sync=NORMAL` (CI runner) | 371,813 | 2.61 µs | 2.81 µs | 3.09 µs |
+
+**What the old method's tables are worth now.** Every table below with
+"5,000 lookups" in it measures a ~4 ms window — a few dozen timer ticks,
+started at the wake-up edge of an 80 s fsync-bound write phase. That is why
+this row published at 636,980, 342,747, 901,158, 522,562, 533,943,
+1,069,233, 872,474, 692,893, 910,788, 991,539 and 1,125,587 ops/s across
+eleven editions while five A/Bs measured the path flat: the window, not
+the engine. The tables are kept below unedited because each edition's
+*relative* statements were true of what was measured; absolute point-read
+figures from them are obsolete. The other suites' tables are untouched by
+this — only the points and indexed suites read `--lookups`.
+
+The original median-of-three table, method unchanged since AHL-535
+(20,000 rows, **5,000 lookups**, `bench/results/20260906T{070128,070835,071517}Z.txt`,
+load 1.4–3.8/18, gate passed):
+
 
 **The harness is the previous four editions', unchanged.** For the record,
 because the six editions before those were on a different loop: since
@@ -251,6 +303,10 @@ it as the comparison getting harder for InlaySQL rather than easier.
 † `p95`, `p99` and `max` (not shown) are tail samples and swing far more run
 to run than `ops/s` or `p50` — see the floor note at the top of this file —
 so they are not given a range here.
+
+*Everything from here to the Secondary-index section header is the old
+method's history, kept for the record it is; the new method's figures are
+the two paragraphs at the top of this section.*
 
 **Nothing in this edition's range touches this path, and the row moved
 anyway.** `ea1712c..72d7ab1` is AHL-563, AHL-564, AHL-565 and AHL-566: a

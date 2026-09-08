@@ -314,9 +314,9 @@
   </p>
   <div class="figures">
     <div class="figure">
-      <b>1,125,587</b>
+      <b>2,577,421</b>
       <span>point reads per second</span>
-      <em>~5-7× SQLite in journal mode, durable</em>
+      <em>2.10× SQLite WAL, ~7.6× SQLite journal (durable)</em>
     </div>
     <div class="figure">
       <b>~17×</b>
@@ -423,9 +423,9 @@
       <tbody>
         <tr>
           <td>Point read by primary key</td>
-          <td class="num">1,125,587 ops/s</td>
-          <td>SQLite, journal (durable)</td>
-          <td class="win">~5-7× faster</td>
+          <td class="num">2,577,421 ops/s</td>
+          <td>SQLite, journal (durable) / SQLite, WAL</td>
+          <td class="win">~7.6× faster durable; 2.10× vs WAL</td>
         </tr>
         <tr>
           <td>Concurrent writes, 8 writers</td>

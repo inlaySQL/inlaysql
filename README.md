@@ -126,7 +126,7 @@ cargo run --example hybrid_search                 # the query above, end to end
 
 | Workload | InlaySQL | Compared with |
 | --- | --- | --- |
-| Point read by primary key | **1,125,587 ops/s**, 0.625 µs p50 | SQLite journal, durable: 168,505 ops/s (**~5-7x**); SQLite WAL: 1,273,101 ops/s (0.88x on throughput, our p50 below its 0.750 µs in two runs of three) |
+| Point read by primary key | **2,577,421 ops/s**, 0.334 µs p50 | SQLite journal, durable: 341,023 ops/s (**~7.6x**); SQLite WAL: 1,227,266 ops/s (**2.10x** — the read window was lengthened 2026-09-07; the old 5,000-lookup window published 0.88x on this row, and the gap was the window, not the engine) |
 | Point read, secondary index | **535,879 ops/s**, 1.71 µs p50 | SQLite journal, durable: 266,073 ops/s (**~2x**) |
 | Join, secondary-index inner, full scan | **3.38 ms p50** | SQLite: 30.72 ms p50 (**~8x**) |
 | Durable write, one commit each | **255 ops/s**, 3.87 ms p50 | SQLite journal, durable: 90 ops/s (**~2.8x**) |
