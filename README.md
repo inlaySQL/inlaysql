@@ -242,11 +242,36 @@ directly and less flatteringly.
   one file; backup restores to the instants you took a copy at.
 - **Full Postgres parity is not a goal**, now or later.
 
-What is built next is decided from the losses listed under
-[Performance](#performance), the ranked gaps in
-[`SCOREBOARD.md`](SCOREBOARD.md#5-what-is-missing-to-fill-the-scoreboard-ranked-by-effort)
-and the dated evidence in [`PERF.md`](PERF.md); the working queue itself is an
-internal file, and `AGENTS.md` says how a change to it is measured.
+## Roadmap
+
+In order. Each item lands only with an interleaved A/B that clears the
+harness's own noise floor, and no published number changes without a gated
+regeneration ([`AGENTS.md`](AGENTS.md)).
+
+1. **Measure before optimising.** A longer point-read window, profile suites
+   on the bench's API, a tuned release build (the tree has never set
+   `[profile.release]`), a concurrent-reader benchmark, write amplification
+   as a published column. Then regenerate every table.
+2. **Writes.** FIFO handoff at the commit gate (the p99 tail at 32 writers is
+   fairness, not fsync); bookkeeping rows out of the gate; a record that
+   names pages instead of copying them — write amplification from ~500x to
+   ~1x of dirty pages.
+3. **Reads.** The tail, not the median: a raw-slot leaf search, a prepared
+   statement that keeps its shape between executions, the schema check as
+   a stamp. The three remaining losses to SQLite are all here.
+4. **MySQL wire.** Authorisation without re-parsing SQL, no plan clone per
+   execute, a statement cache for text-protocol clients.
+5. **Retrieval.** No over-fetch where nothing consumes it, a reusable visited
+   set, a paged HNSW cache that does not clone a record per hop — the
+   prerequisite for 10M vectors in bounded RAM.
+6. **Clients.** The five self-tests in CI; a Laravel driver in its own
+   repository over the PHP client; Django and Rails after it.
+7. **Serverless.** Object-storage durability tier and scale-to-zero, as a
+   measured brief before code. The control plane is not this repository.
+
+Losses are listed under [Performance](#performance); the gap matrix is
+[`SCOREBOARD.md` §5](SCOREBOARD.md#5-what-is-missing-to-fill-the-scoreboard-ranked-by-effort);
+the evidence behind each item is [`PERF.md`](PERF.md).
 
 ## Layout
 
