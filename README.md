@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/inlaySQL/inlaysql/actions/workflows/ci.yml"><img src="https://github.com/inlaySQL/inlaysql/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="https://github.com/inlaySQL/inlaysql/actions/workflows/wasm.yml"><img src="https://github.com/inlaySQL/inlaysql/actions/workflows/wasm.yml/badge.svg?branch=main" alt="WASM"></a>
-  <a href="https://github.com/inlaySQL/inlaysql/releases"><img src="https://img.shields.io/badge/version-0.0.4-orange" alt="v0.0.4"></a>
+  <a href="https://github.com/inlaySQL/inlaysql/releases"><img src="https://img.shields.io/badge/version-0.0.5-orange" alt="v0.0.5"></a>
   <a href="https://github.com/inlaySQL/inlaysql/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-AGPLv3--or--commercial-blue" alt="license"></a>
 </p>
 
@@ -30,7 +30,7 @@ backend), in [the browser as WebAssembly](https://inlaysql.github.io), over the
 CLI.
 
 > [!WARNING]
-> **Experimental — version 0.0.1, never run in production.** The on-disk
+> **Experimental — version 0.0.5, never run in production.** The on-disk
 > format is pre-1.0 (the policy is *recreate the database*, not migrate —
 > [`docs/recovery.md`](docs/recovery.md)); crash-safety is proven by
 > deterministic simulation rather than years of real hardware; and the known
@@ -44,7 +44,7 @@ CLI.
 
 Download the library for your platform from the
 [releases page](https://github.com/inlaySQL/inlaysql/releases)
-([`v0.0.4`](https://github.com/inlaySQL/inlaysql/releases/tag/v0.0.4);
+([`v0.0.5`](https://github.com/inlaySQL/inlaysql/releases/tag/v0.0.5);
 macOS Apple silicon and Linux x86_64 today — the file layer is Unix-only, and
 the WASM module runs anywhere a browser or Node does), copy the ~40-line loader
 for your language from [`docs/clients.md`](docs/clients.md#the-5-minute-version)
