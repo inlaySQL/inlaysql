@@ -47,7 +47,7 @@
 //
 // Self-test: from a console project's Main, `InlaySQL.SelfTest.Run(lib)`;
 // it makes the same checks the other clients' self-tests make. Run on
-// .NET 10 against libinlaysql_ffi from inlaySQL/inlaysql v0.0.5, outside CI
+// .NET 10 against libinlaysql_ffi from inlaySQL/inlaysql v0.0.6, outside CI
 // (there is no .NET runtime in this repository's CI yet); the C surface it
 // wraps is documented in include/inlaysql.h beside this file.
 

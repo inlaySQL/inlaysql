@@ -48,7 +48,7 @@ engine does that SQLite does not. The library is loaded once per process.
 Vector cells come back as the placeholder "<vector(n)>" — the raw floats do
 not cross the boundary in JSON.
 
-Tested against libinlaysql_ffi from inlaySQL/inlaysql v0.0.5; the C surface
+Tested against libinlaysql_ffi from inlaySQL/inlaysql v0.0.6; the C surface
 it wraps is documented in include/inlaysql.h beside this file.
 """
 
@@ -72,7 +72,7 @@ __all__ = [
     "ConflictError",
     "UnsupportedError",
 ]
-__version__ = "0.0.5"
+__version__ = "0.0.6"
 
 INLAYSQL_OK = 0
 INLAYSQL_ERR_BAD_HANDLE = 2

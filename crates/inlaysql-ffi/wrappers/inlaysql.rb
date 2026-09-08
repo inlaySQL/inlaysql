@@ -55,7 +55,7 @@
 # Run this file itself for its self-test: ruby inlaysql.rb [path/to/lib].
 #
 # Gem requirement: gem install ffi. Tested against libinlaysql_ffi from
-# inlaySQL/inlaysql v0.0.5; the C surface it wraps is documented in
+# inlaySQL/inlaysql v0.0.6; the C surface it wraps is documented in
 # include/inlaysql.h beside this file.
 
 require 'ffi'

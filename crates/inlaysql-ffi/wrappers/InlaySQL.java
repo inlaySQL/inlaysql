@@ -50,7 +50,7 @@
 //
 // Self-test: java InlaySQL.java [path/to/lib]   (JDK 22+, single-file launch)
 //
-// Tested against libinlaysql_ffi from inlaySQL/inlaysql v0.0.5; the C
+// Tested against libinlaysql_ffi from inlaySQL/inlaysql v0.0.6; the C
 // surface it wraps is documented in include/inlaysql.h beside this file.
 
 import java.lang.foreign.Arena;

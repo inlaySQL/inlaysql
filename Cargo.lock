@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "inlaysql"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "inlaysql-core",
  "inlaysql-uring",
@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "inlaysql-bench"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "inlaysql",
  "inlaysql-core",
@@ -263,7 +263,7 @@ dependencies = [
 
 [[package]]
 name = "inlaysql-core"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "libm",
  "sqlparser",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "inlaysql-ffi"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "inlaysql",
  "inlaysql-core",
@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "inlaysql-mcp"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "inlaysql",
  "inlaysql-server",
@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "inlaysql-server"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "inlaysql",
  "rcgen",
@@ -299,7 +299,7 @@ dependencies = [
 
 [[package]]
 name = "inlaysql-uring"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "inlaysql-core",
  "io-uring",
@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "inlaysql-wasm"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "inlaysql",
  "inlaysql-core",

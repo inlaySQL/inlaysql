@@ -24,7 +24,7 @@ curl -fsSL https://github.com/inlaySQL/inlaysql/releases/latest/download/get-inl
 #                                                                                        python | ruby | csharp | java
 ```
 
-`--dir vendor/inlaysql` puts them elsewhere; `VERSION=v0.0.5` pins a
+`--dir vendor/inlaysql` puts them elsewhere; `VERSION=v0.0.6` pins a
 release; `--dry-run` only prints the URLs. Or take the two files by hand
 from the [releases page](https://github.com/inlaySQL/inlaysql/releases) —
 every release attaches each of them on its own, beside a `.sha256`, and
