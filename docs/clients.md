@@ -171,192 +171,133 @@ MySQL-wire direction below is the full-ORM path.
 
 ## Ruby — quickstart
 
-One gem: `gem install ffi`. Save this as `inlaysql.rb` next to the unpacked
-library:
+One gem: `gem install ffi`. Copy `inlaysql.rb` from the release (or
+[`crates/inlaysql-ffi/wrappers/inlaysql.rb`](../crates/inlaysql-ffi/wrappers/inlaysql.rb))
+next to the library. Same surface as the PHP and Python clients:
 
 ```ruby
-# inlaysql.rb — the whole binding. Copy this file into your project.
-require 'ffi'
-require 'json'
+require 'inlaysql'
 
-class InlaySQL
-  INLAYSQL_OK = 0
-  INLAYSQL_ERR_BAD_HANDLE = 2
+InlaySQL.connect('app.inlay') do |db|                          # creates if absent; closed at block end
+  db.execute 'CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)'
 
-  module Native
-    extend FFI::Library
-    ffi_lib File.expand_path('./libinlaysql_ffi.dylib', __dir__)  # .so on Linux
-    attach_function :inlaysql_open, [:string], :pointer
-    attach_function :inlaysql_close, [:pointer], :void
-    attach_function :inlaysql_exec, [:pointer, :string, :string, :pointer], :int
-    attach_function :inlaysql_last_error, [], :string
-    attach_function :inlaysql_free_string, [:pointer], :void
+  id = db.insert('users', name: 'Ada', email: 'ada@example.org')      # 1
+
+  db.query('SELECT id, name FROM users WHERE id > :after', after: 0).each do |user|
+    puts user['name']                                            # rows as hashes
   end
+  ada   = db.first('SELECT * FROM users WHERE id = ?', [id])     # one row, or nil
+  count = db.value('SELECT COUNT(*) FROM users')                 # one cell
+  names = db.column('SELECT name FROM users ORDER BY name')     # one column
 
-  def initialize(db_path)
-    @handle = Native.inlaysql_open(db_path)
-    raise "open failed: #{Native.inlaysql_last_error}" if @handle.null?
+  result = db.execute('UPDATE users SET name = ? WHERE id = ?', ['Ada L.', id])
+  result.rows_affected                                           # 1
+
+  db.transaction do |tx|                                         # BEGIN … COMMIT; ROLLBACK on raise;
+    tx.insert('users', name: 'Grace', email: 'g@x')              # rerun on a write conflict
+    tx.insert('users', name: 'Linus', email: 'l@x')
   end
-
-  def run(sql, params = nil)
-    out = FFI::MemoryPointer.new(:pointer)
-    code = Native.inlaysql_exec(@handle, sql, params && JSON.generate(params), out)
-    case code
-    when INLAYSQL_OK
-      result = JSON.parse(out.read_pointer.read_string)
-      Native.inlaysql_free_string(out.read_pointer)
-      result
-    when INLAYSQL_ERR_BAD_HANDLE then raise 'bad handle'
-    else raise "#{Native.inlaysql_last_error} — #{sql}"
-    end
-  end
-
-  def close = Native.inlaysql_close(@handle)
+rescue InlaySQL::ConstraintError => e
+  puts e.message                                                 # the engine's own words
 end
-
-# ---- usage -------------------------------------------------------------
-db = InlaySQL.new('app.inlay')
-db.run('CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)')
-db.run('INSERT INTO users (name, email) VALUES (?, ?)', ['Ada', 'ada@example.org'])
-
-result = db.run('SELECT id, name, email FROM users WHERE id = ?', [1])
-p result['rows']   # [[1, "Ada", "ada@example.org"]]
 ```
 
-A complete runnable script ships as
-[`poc.rb`](../crates/inlaysql-ffi/examples/poc.rb).
+`execute` → `Result` (`rows_affected`, `last_insert_id`, `ddl?`, `rows`);
+`query` → `Rows` (Enumerable of hashes, `size`, `all`, `first`, `value`,
+`column(name_or_index)`, `raw`); `insert(table, hash | **kw)` → row id;
+`transaction(retries: 3)`; `run` is the raw JSON. Named parameters are a
+hash or keyword arguments. Errors: `InlaySQL::ConstraintError`,
+`ConflictError`, `UnsupportedError`, `Error`. `ruby inlaysql.rb
+[path/to/lib]` runs its self-test.
 
 ## C# / .NET — quickstart
 
-`DllImport` over the same seven functions; the JSON result comes back as a
-string you decode with `System.Text.Json`. The full program:
+.NET 8+, nothing beyond the BCL. Copy `InlaySQL.cs` from the release (or
+[`crates/inlaysql-ffi/wrappers/InlaySQL.cs`](../crates/inlaysql-ffi/wrappers/InlaySQL.cs))
+into your project and drop the library beside the application (or set
+`InlaySQL.LibraryPath` / `INLAYSQL_LIB`):
 
 ```csharp
-using System.Runtime.InteropServices;
-using System.Text.Json;
+using var db = InlaySQL.Open("app.inlay");                       // creates if absent
+db.Execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)");
 
-class InlaySQL : IDisposable
-{
-    const string LIB = "libinlaysql_ffi.so";   // "libinlaysql_ffi.dylib" on macOS
+long id = db.Insert("users", new Dictionary<string, object?> { ["name"] = "Ada", ["email"] = "ada@example.org" });
 
-    [DllImport(LIB)] static extern IntPtr inlaysql_open(string path);
-    [DllImport(LIB)] static extern void inlaysql_close(IntPtr handle);
-    [DllImport(LIB)] static extern int inlaysql_exec(IntPtr handle, string sql,
-        string? parameters, out IntPtr outJson);
-    [DllImport(LIB)] static extern IntPtr inlaysql_last_error();
-    [DllImport(LIB)] static extern void inlaysql_free_string(IntPtr ptr);
+foreach (var user in db.Query("SELECT id, name FROM users WHERE id > :after", new Dictionary<string, object?> { ["after"] = 0 }))
+    Console.WriteLine(user["name"]);                             // rows as dictionaries
+var ada   = db.First("SELECT * FROM users WHERE id = ?", id);    // one row, or null
+var count = db.Value("SELECT COUNT(*) FROM users");              // one cell (long)
+var names = db.Column("SELECT name FROM users ORDER BY name");  // one column
 
-    readonly IntPtr _handle;
-    public InlaySQL(string path) =>
-        (_handle = inlaysql_open(path)) != IntPtr.Zero
-            ? true : throw new Exception(Marshal.PtrToStringAnsi(inlaysql_last_error()));
+var result = db.Execute("UPDATE users SET name = ? WHERE id = ?", "Ada L.", id);
+result.RowsAffected;                                             // 1
 
-    public JsonElement Run(string sql, object?[]? parameters = null)
-    {
-        if (inlaysql_exec(_handle, sql,
-                parameters is null ? null : JsonSerializer.Serialize(parameters),
-                out var outJson) != 0)
-            throw new Exception($"{Marshal.PtrToStringAnsi(inlaysql_last_error())} — {sql}");
-        using var doc = JsonDocument.Parse(Marshal.PtrToStringUTF8(outJson)!);
-        var result = doc.RootElement.Clone();
-        inlaysql_free_string(outJson);
-        return result;
-    }
+db.Transaction(tx => {                                           // BEGIN … COMMIT; ROLLBACK on throw;
+    tx.Insert("users", new Dictionary<string, object?> { ["name"] = "Grace", ["email"] = "g@x" });   // rerun on a write conflict
+});
 
-    public void Dispose() => inlaysql_close(_handle);
-}
-
-// ---- usage -------------------------------------------------------------
-using var db = new InlaySQL("app.inlay");
-db.Run("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)");
-db.Run("INSERT INTO users (name, email) VALUES (?, ?)", new object?[] { "Ada", "ada@example.org" });
-
-var rows = db.Run("SELECT id, name, email FROM users WHERE id = ?", new object?[] { 1 });
-Console.WriteLine(rows.GetProperty("rows"));   // [[1,"Ada","ada@example.org"]]
+try { db.Insert("users", new Dictionary<string, object?> { ["name"] = "Ada", ["email"] = "ada@example.org" }); }
+catch (InlaySQLConstraintException e) { Console.WriteLine(e.Message); }
 ```
 
-**Entity Framework** over this file is future work; the MySQL-wire direction
-below (Pomelo provider against `inlaysql serve --mysql`) is the EF path
-today.
+`Execute` → `InlaySQLResult` (`RowsAffected`, `LastInsertId`, `IsDdl`,
+`Rows`); `Query` → `InlaySQLRows` (enumerable of dictionaries, `Count`,
+`All()`, `First()`, `Value()`, `Column(nameOrIndex)`, `Raw`); `Insert` →
+row id; `Transaction(Func|Action, retries)`; `Run` is the raw
+`JsonElement`. Integers come back as `long`, reals as `double`. Errors:
+`InlaySQLConstraintException`, `InlaySQLConflictException`,
+`InlaySQLUnsupportedException`, `InlaySQLException`. `InlaySQL.SelfTest.Run()`
+from a console `Main` runs the same checks the other clients make.
 
 ## Java — quickstart
 
-Java 22+ has the Foreign Function & Memory API (`java.lang.foreign`) in the
-JDK — no JNI C compilation:
+JDK 22+ (the Foreign Function & Memory API is final there), no dependency.
+Copy `InlaySQL.java` from the release (or
+[`crates/inlaysql-ffi/wrappers/InlaySQL.java`](../crates/inlaysql-ffi/wrappers/InlaySQL.java))
+into your project; run with `--enable-native-access=ALL-UNNAMED` (or the
+module's name) to silence the FFM warning:
 
 ```java
-// The whole binding. Java 22+, standard JDK.
-import java.lang.foreign.*;
-import java.lang.invoke.MethodHandle;
+try (InlaySQL db = InlaySQL.open(Path.of("app.inlay"))) {        // creates if absent
+    db.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT UNIQUE)");
 
-public final class InlaySQL implements AutoCloseable {
-    static final Linker LINKER = Linker.nativeLinker();
-    static final SymbolLookup LIB = SymbolLookup.libraryLookup("libinlaysql_ffi.so",
-        Arena.global());                                   // .dylib on macOS
-    static final Arena ARENA = Arena.ofShared();
+    long id = db.insert("users", Map.of("name", "Ada", "email", "ada@example.org"));
 
-    static final MethodHandle OPEN = linkerDowncall("inlaysql_open",
-        FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS));
-    static final MethodHandle EXEC = linkerDowncall("inlaysql_exec",
-        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS,
-            ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
-    static final MethodHandle LAST_ERROR = linkerDowncall("inlaysql_last_error",
-        FunctionDescriptor.of(ValueLayout.ADDRESS));
-    static final MethodHandle FREE = linkerDowncall("inlaysql_free_string",
-        FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+    for (Map<String, Object> user : db.query("SELECT id, name FROM users WHERE id > :after", Map.of("after", 0)))
+        System.out.println(user.get("name"));                    // rows as ordered maps
+    Map<String, Object> ada = db.first("SELECT * FROM users WHERE id = ?", id);   // one row, or null
+    Object count = db.value("SELECT COUNT(*) FROM users");                        // one cell (Long)
+    List<Object> names = db.column("SELECT name FROM users ORDER BY name");       // one column
 
-    final MemorySegment handle;
+    InlaySQL.Result r = db.execute("UPDATE users SET name = ? WHERE id = ?", "Ada L.", id);
+    r.rowsAffected();                                            // 1
 
-    static MethodHandle linkerDowncall(String name, FunctionDescriptor d) {
-        return LINKER.downcallHandle(LIB.find(name).orElseThrow(), d);
-    }
-
-    public InlaySQL(String path) throws Throwable {
-        var cpath = ARENA.allocateUtf8(path);
-        handle = (MemorySegment) OPEN.invoke(cpath);
-        if (handle.address() == 0)
-            throw new IllegalStateException((String) LAST_ERROR.invoke());
-    }
-
-    /** Run one statement; params is a Java array marshalled to JSON. */
-    public String run(String sql, Object... params) throws Throwable {
-        var csql = ARENA.allocateUtf8(sql);
-        var cparams = params.length == 0 ? MemorySegment.NULL
-            : ARENA.allocateUtf8(new com.google.gson.Gson().toJson(params));
-        var out = ARENA.allocate(ValueLayout.ADDRESS);
-        int code = (int) EXEC.invoke(handle, csql, cparams, out);
-        if (code != 0)
-            throw new IllegalStateException((String) LAST_ERROR.invoke() + " — " + sql);
-        var json = out.get(ValueLayout.ADDRESS, 0);
-        var text = json.getUtf8String(0);
-        FREE.invoke(json);
-        return text;
-    }
-
-    @Override public void close() throws Throwable {
-        LINKER.downcallHandle(LIB.find("inlaysql_close").orElseThrow(),
-            FunctionDescriptor.ofVoid(ValueLayout.ADDRESS)).invoke(handle);
-    }
-
-    public static void main(String[] args) throws Throwable {
-        try (var db = new InlaySQL("app.inlay")) {
-            db.run("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)");
-            db.run("INSERT INTO users (name, email) VALUES (?, ?)", "Ada", "ada@example.org");
-            System.out.println(db.run("SELECT id, name, email FROM users WHERE id = ?", 1));
-            // {"columns":["id","name","email"],"rows":[[1,"Ada","ada@example.org"]]}
-        }
-    }
+    db.inTransaction(tx -> {                                     // BEGIN … COMMIT; ROLLBACK on throw;
+        tx.insert("users", Map.of("name", "Grace", "email", "g@x"));   // rerun on a write conflict
+    });
+    long n = db.transaction(tx -> tx.insert("users", Map.of("name", "Linus", "email", "l@x")));
+} catch (InlaySQL.ConstraintException e) {
+    System.out.println(e.getMessage());
 }
 ```
 
-The JSON-marshalling line is the only piece a real binding replaces (with
-Jackson, for instance). Older JDKs use JNI over the same header.
+`execute` → `Result` record (`rowsAffected`, `lastInsertId`, `isDdl`,
+`rows`); `query` → `Rows` (`Iterable<Map>`, `size`, `all`, `first`, `value`,
+`column(nameOrIndex)`, `raw`); `insert(table, Map)` → row id;
+`transaction(Function)` / `inTransaction(Consumer)`; `runRaw` is the raw
+JSON text. Named parameters are a `Map`. Integers come back as `Long`,
+reals as `Double`. Errors are unchecked: `InlaySQL.ConstraintException`,
+`ConflictException`, `UnsupportedException`, `InlaySQLException`. The
+library is found through `-Dinlaysql.lib`, `INLAYSQL_LIB`, the working
+directory, or the loader's path. `java InlaySQL.java [path/to/lib]` runs its
+self-test.
+
+---
 
 ## The client surface, for every language
 
-The PHP and Python files above implement one surface, and the Ruby, C# and
-Java files are being brought up to it (they carry `run`/`query`/`first`
-today). A client is complete when it has, in the language's own idiom:
+All five files above implement one surface. A client is complete when it
+has, in the language's own idiom:
 
 | Piece | Contract |
 | --- | --- |
