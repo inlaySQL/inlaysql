@@ -12,25 +12,25 @@ Read two of these against each other, never one of them against
 `BENCHMARK.md`. A run-to-run swing under 20% on this machine class is
 noise, not signal.
 
-- generated: 2026-09-08T02:41:08Z
-- commit: 6556115
+- generated: 2026-09-14T09:41:13Z
+- commit: c576ac6
 - workflow: .github/workflows/benchmark.yml (schedule + manual)
 
 ## runner-points-repeat.txt
 
 ```
-date:   2026-09-08T02:13:05Z
-commit: 6556115
+date:   2026-09-14T09:17:48Z
+commit: c576ac6
 dirty:  no
 rustc:  rustc 1.98.1 (48a229cea 2026-09-01)
 host:   Linux 6.17.0-1022-azure x86_64
 
 runs:   3
-        /home/runner/work/inlaysql/inlaysql/bench/results/20260908T021032Z.txt
-        /home/runner/work/inlaysql/inlaysql/bench/results/20260908T021206Z.txt
-        /home/runner/work/inlaysql/inlaysql/bench/results/20260908T021236Z.txt
+        /home/runner/work/inlaysql/inlaysql/bench/results/20260914T091433Z.txt
+        /home/runner/work/inlaysql/inlaysql/bench/results/20260914T091637Z.txt
+        /home/runner/work/inlaysql/inlaysql/bench/results/20260914T091713Z.txt
 
-metrics: 46; disagreeing by 10% or more across runs: 17
+metrics: 46; disagreeing by 10% or more across runs: 24
 
 Widest disagreement first. A figure listed here is not worth quoting to
 three digits: the machine moved it further than that between runs. A `max`
@@ -39,23 +39,30 @@ figure is the measurement itself, and swinging is what it is not supposed
 to do.
 
   spread      column        median           min           max  row
-  295.0%         max       39.34ms       26.63ms      142.70ms  SQLite (journal, sync=FULL, fullfsync)
-  295.0%         max       39.34ms       26.63ms      142.70ms  SQLite (journal, sync=FULL, fullfsync)
-   64.2%         p99        3.44µs        3.26µs        5.47µs  InlaySQL (batched)
-   54.9%         max       65.49ms       63.49ms       99.47ms  InlaySQL
-   54.9%         max       65.49ms       63.49ms       99.47ms  InlaySQL
-   53.2%         max       34.32ms       16.66ms       34.91ms  SQLite (WAL, sync=NORMAL)
-   47.7%         max       35.92µs       29.04µs       46.16µs  SQLite (WAL, sync=NORMAL)
-   32.4%         p99        1.79ms        1.35ms        1.93ms  SQLite (journal, sync=FULL, fullfsync)
-   32.4%         p99        1.79ms        1.35ms        1.93ms  SQLite (journal, sync=FULL, fullfsync)
-   20.3%         max       23.37ms       18.68ms       23.43ms  InlaySQL (batched)
-   18.7%         max       24.65µs       23.35µs       27.96µs  InlaySQL
-   18.3%      engine        82.75x        70.49x        85.66x  InlaySQL (batched) is faster than InlaySQL
-   17.3%       ops/s        161812        151146        179106  InlaySQL (batched)
-   12.5%         p95      896.20µs      883.87µs      996.01µs  SQLite (journal, sync=FULL, fullfsync)
-   12.5%         p95      896.20µs      883.87µs      996.01µs  SQLite (journal, sync=FULL, fullfsync)
-   11.1%       ops/s          1131          1090          1216  SQLite (journal, sync=FULL, fullfsync)
-   11.1%       ops/s          1131          1090          1216  SQLite (journal, sync=FULL, fullfsync)
+  568.1%         max       22.98ms       13.33ms      143.89ms  SQLite (journal, sync=FULL, fullfsync)
+  568.1%         max       22.98ms       13.33ms      143.89ms  SQLite (journal, sync=FULL, fullfsync)
+  159.4%         max       48.13ms       32.79ms      109.51ms  InlaySQL
+  159.4%         max       48.13ms       32.79ms      109.51ms  InlaySQL
+   96.9%         p99        2.62ms        2.54ms        5.08ms  SQLite (journal, sync=FULL, fullfsync)
+   96.9%         p99        2.62ms        2.54ms        5.08ms  SQLite (journal, sync=FULL, fullfsync)
+   75.8%         max       20.66µs       17.42µs       33.08µs  SQLite (WAL, sync=NORMAL)
+   59.3%         max       53.76µs       38.56µs       70.42µs  SQLite (journal, sync=FULL, fullfsync)
+   50.4%         p50      359.14µs      316.05µs      496.96µs  InlaySQL
+   50.4%         p50      359.14µs      316.05µs      496.96µs  InlaySQL
+   50.2%         max       25.93µs       16.38µs       29.39µs  InlaySQL
+   45.3%         p99        5.81µs        3.39µs        6.02µs  InlaySQL (batched)
+   38.4%         p99        9.21µs        9.14µs       12.68µs  SQLite (WAL, sync=NORMAL)
+   23.9%      engine       109.17x       103.23x       129.30x  InlaySQL (batched) is faster than InlaySQL
+   21.8%       ops/s          1797          1520          1911  InlaySQL
+   21.8%       ops/s          1797          1520          1911  InlaySQL
+   17.4%         p95        1.32ms        1.26ms        1.49ms  SQLite (journal, sync=FULL, fullfsync)
+   17.4%         p95        1.32ms        1.26ms        1.49ms  SQLite (journal, sync=FULL, fullfsync)
+   12.8%         p95      630.39µs      597.13µs      677.89µs  InlaySQL
+   12.8%         p95      630.39µs      597.13µs      677.89µs  InlaySQL
+   12.4%       ops/s           858           758           864  SQLite (journal, sync=FULL, fullfsync)
+   12.4%       ops/s           858           758           864  SQLite (journal, sync=FULL, fullfsync)
+   12.4%         p99        1.70ms        1.68ms        1.89ms  InlaySQL
+   12.4%         p99        1.70ms        1.68ms        1.89ms  InlaySQL
 
 --- median of all runs, in the layout run.sh printed ---
 
@@ -65,41 +72,41 @@ to do.
 
 point write (one durable commit each)
 engine                                          ops/s        p50        p95        p99        max
-InlaySQL                                         2091   233.20µs   433.99µs     3.25ms    65.49ms
-SQLite (journal, sync=FULL, fullfsync)           1131   783.93µs   896.20µs     1.79ms    39.34ms
-SQLite (WAL, sync=NORMAL)                       39379     9.35µs    10.95µs    17.65µs    34.32ms
-InlaySQL is 1.79x faster than SQLite (journal, sync=FULL, fullfsync)
+InlaySQL                                         1797   359.14µs   630.39µs     1.70ms    48.13ms
+SQLite (journal, sync=FULL, fullfsync)            858     1.12ms     1.32ms     2.62ms    22.98ms
+SQLite (WAL, sync=NORMAL)                       66005     4.39µs     5.24µs     9.21µs    15.83ms
+InlaySQL is 2.01x faster than SQLite (journal, sync=FULL, fullfsync)
 
 batched write (many rows per commit)
 engine                                          ops/s        p50        p95        p99        max
-InlaySQL (batched)                             161812     2.54µs     2.94µs     3.44µs    23.37ms
-InlaySQL                                         2091   233.20µs   433.99µs     3.25ms    65.49ms
-SQLite (journal, sync=FULL, fullfsync)           1131   783.93µs   896.20µs     1.79ms    39.34ms
-InlaySQL (batched) is 82.75x faster than InlaySQL
+InlaySQL (batched)                             196488     2.40µs     2.95µs     5.81µs    15.13ms
+InlaySQL                                         1797   359.14µs   630.39µs     1.70ms    48.13ms
+SQLite (journal, sync=FULL, fullfsync)            858     1.12ms     1.32ms     2.62ms    22.98ms
+InlaySQL (batched) is 109.17x faster than InlaySQL
 
 point read (by primary key)
 engine                                          ops/s        p50        p95        p99        max
-InlaySQL                                      1700106   541.00ns   661.00ns   801.00ns    24.65µs
-SQLite (journal, sync=FULL, fullfsync)         121170     8.11µs     8.46µs     10.12µs    52.78µs
-SQLite (WAL, sync=NORMAL)                      371813     2.61µs     2.81µs     3.09µs    35.92µs
-InlaySQL is 13.99x faster than SQLite (journal, sync=FULL, fullfsync)
+InlaySQL                                      1537426   606.00ns   753.00ns   842.00ns    25.93µs
+SQLite (journal, sync=FULL, fullfsync)         304321     3.22µs     3.52µs     3.68µs    53.76µs
+SQLite (WAL, sync=NORMAL)                      789979     1.21µs     1.35µs     1.42µs    20.66µs
+InlaySQL is 4.93x faster than SQLite (journal, sync=FULL, fullfsync)
 ```
 
 ## runner-indexed-repeat.txt
 
 ```
-date:   2026-09-08T02:34:11Z
-commit: 6556115
+date:   2026-09-14T09:39:30Z
+commit: c576ac6
 dirty:  no
 rustc:  rustc 1.98.1 (48a229cea 2026-09-01)
 host:   Linux 6.17.0-1022-azure x86_64
 
 runs:   3
-        /home/runner/work/inlaysql/inlaysql/bench/results/20260908T021306Z.txt
-        /home/runner/work/inlaysql/inlaysql/bench/results/20260908T022004Z.txt
-        /home/runner/work/inlaysql/inlaysql/bench/results/20260908T022708Z.txt
+        /home/runner/work/inlaysql/inlaysql/bench/results/20260914T091748Z.txt
+        /home/runner/work/inlaysql/inlaysql/bench/results/20260914T092459Z.txt
+        /home/runner/work/inlaysql/inlaysql/bench/results/20260914T093217Z.txt
 
-metrics: 42; disagreeing by 10% or more across runs: 11
+metrics: 42; disagreeing by 10% or more across runs: 9
 
 Widest disagreement first. A figure listed here is not worth quoting to
 three digits: the machine moved it further than that between runs. A `max`
@@ -108,17 +115,15 @@ figure is the measurement itself, and swinging is what it is not supposed
 to do.
 
   spread      column        median           min           max  row
-   34.8%         max        2.67ms        2.31ms        3.24ms  InlaySQL (no index: full scan)
-   29.9%         p95        3.58µs        3.57µs        4.64µs  InlaySQL (B-tree index)
-   28.7%         max       45.67µs       40.55µs       53.64µs  InlaySQL (B-tree index)
-   22.7%         max       23.93µs       23.51µs       28.94µs  SQLite (journal, sync=FULL, fullfsync) (index)
-   22.4%         max       49.93µs       41.13µs       52.32µs  SQLite (WAL, sync=NORMAL) (index)
-   20.9%         p99       16.06µs       14.47µs       17.82µs  SQLite (WAL, sync=NORMAL) (index)
-   19.9%         p99       23.50µs       19.63µs       24.30µs  SQLite (journal, sync=FULL, fullfsync) (index)
-   18.2%         max       18.73µs       17.68µs       21.09µs  SQLite (WAL, sync=NORMAL) (index)
-   14.9%         p99        2.35ms        2.31ms        2.66ms  InlaySQL (no index: full scan)
-   12.9%         p99        5.13µs        5.00µs        5.66µs  InlaySQL (B-tree index)
-   10.3%         p99       22.03µs       19.94µs       22.20µs  InlaySQL (B-tree index)
+   69.7%         max       63.09µs       33.28µs       77.27µs  SQLite (journal, sync=FULL, fullfsync) (index)
+   52.5%         max       28.47µs       26.40µs       41.36µs  SQLite (WAL, sync=NORMAL) (index)
+   41.2%         p99       20.84µs       20.28µs       28.86µs  InlaySQL (B-tree index)
+   31.7%         max       44.15µs       42.86µs       56.86µs  InlaySQL (B-tree index)
+   30.4%         max       23.51µs       22.46µs       29.60µs  InlaySQL (B-tree index)
+   17.9%         max       17.08µs       15.53µs       18.59µs  SQLite (WAL, sync=NORMAL) (index)
+   17.1%         max        4.22ms        4.12ms        4.84ms  InlaySQL (no index: full scan)
+   15.4%         p99       13.94µs       12.68µs       14.82µs  SQLite (WAL, sync=NORMAL) (index)
+   13.9%         p95       11.38µs       10.76µs       12.34µs  SQLite (WAL, sync=NORMAL) (index)
 
 --- median of all runs, in the layout run.sh printed ---
 
@@ -128,36 +133,36 @@ to do.
 
 indexed point lookup (WHERE email = ?)
 engine                                                ops/s        p50        p95        p99        max
-InlaySQL (B-tree index)                              305786     3.16µs     3.58µs     5.13µs    45.67µs
-InlaySQL (no index: full scan)                          478     2.09ms     2.12ms     2.15ms     4.58ms
-SQLite (journal, sync=FULL, fullfsync) (index)       106684     8.93µs    10.62µs    12.79µs    62.69µs
-SQLite (WAL, sync=NORMAL) (index)                    259249     3.36µs     5.33µs     5.68µs    49.93µs
-InlaySQL (B-tree index) is 635.07x faster than InlaySQL (no index: full scan)
+InlaySQL (B-tree index)                              287414     3.39µs     3.86µs     5.14µs    44.15µs
+InlaySQL (no index: full scan)                          465     2.12ms     2.32ms     2.35ms     4.22ms
+SQLite (journal, sync=FULL, fullfsync) (index)       236728     4.05µs     5.01µs     5.51µs    63.09µs
+SQLite (WAL, sync=NORMAL) (index)                    452104     1.93µs     3.20µs     3.59µs    28.47µs
+InlaySQL (B-tree index) is 619.34x faster than InlaySQL (no index: full scan)
 
 indexed range lookup (WHERE email >= ? AND email < ?, RANGE_SIZE=50)
 engine                                                ops/s        p50        p95        p99        max
-InlaySQL (B-tree index)                               73560    13.20µs    15.58µs    22.03µs    22.74µs
-InlaySQL (no index: full scan)                          439     2.26ms     2.30ms     2.35ms     2.67ms
-SQLite (journal, sync=FULL, fullfsync) (index)        61339    15.84µs    18.78µs    23.50µs    23.93µs
-SQLite (WAL, sync=NORMAL) (index)                     93520    10.48µs    12.83µs    16.06µs    18.73µs
-InlaySQL (B-tree index) is 166.42x faster than InlaySQL (no index: full scan)
+InlaySQL (B-tree index)                               68596    14.22µs    15.37µs    20.84µs    23.51µs
+InlaySQL (no index: full scan)                          423     2.33ms     2.53ms     2.57ms     2.65ms
+SQLite (journal, sync=FULL, fullfsync) (index)        88519    10.93µs    12.50µs    16.46µs    16.83µs
+SQLite (WAL, sync=NORMAL) (index)                    106225     8.92µs    11.38µs    13.94µs    17.08µs
+InlaySQL (B-tree index) is 161.31x faster than InlaySQL (no index: full scan)
 ```
 
 ## runner-joins-repeat.txt
 
 ```
-date:   2026-09-08T02:35:33Z
-commit: 6556115
+date:   2026-09-14T09:40:50Z
+commit: c576ac6
 dirty:  no
 rustc:  rustc 1.98.1 (48a229cea 2026-09-01)
 host:   Linux 6.17.0-1022-azure x86_64
 
 runs:   3
-        /home/runner/work/inlaysql/inlaysql/bench/results/20260908T023411Z.txt
-        /home/runner/work/inlaysql/inlaysql/bench/results/20260908T023439Z.txt
-        /home/runner/work/inlaysql/inlaysql/bench/results/20260908T023507Z.txt
+        /home/runner/work/inlaysql/inlaysql/bench/results/20260914T093930Z.txt
+        /home/runner/work/inlaysql/inlaysql/bench/results/20260914T093957Z.txt
+        /home/runner/work/inlaysql/inlaysql/bench/results/20260914T094024Z.txt
 
-metrics: 74; disagreeing by 10% or more across runs: 12
+metrics: 74; disagreeing by 10% or more across runs: 20
 
 Widest disagreement first. A figure listed here is not worth quoting to
 three digits: the machine moved it further than that between runs. A `max`
@@ -166,18 +171,26 @@ figure is the measurement itself, and swinging is what it is not supposed
 to do.
 
   spread      column        median           min           max  row
-   97.1%         p99        4.50µs        4.38µs        8.75µs  SQLite (WAL, sync=NORMAL) (index)
-   22.3%         max       10.14µs        8.83µs       11.09µs  SQLite (WAL, sync=NORMAL) (index)
-   15.6%        cold        8.83µs        8.75µs       10.13µs  SQLite (WAL, sync=NORMAL) (index)
-   14.1%         max      125.22µs      119.10µs      136.76µs  InlaySQL
-   14.1%        cold      125.22µs      119.11µs      136.76µs  InlaySQL
-   13.3%         max       17.32µs       16.84µs       19.15µs  SQLite (journal, sync=FULL, fullfsync) (index)
-   13.3%        cold       17.32µs       16.84µs       19.15µs  SQLite (journal, sync=FULL, fullfsync) (index)
-   13.3%         p95       12.28µs       12.02µs       13.65µs  InlaySQL
-   10.7%         p99       11.07ms       10.93ms       12.11ms  InlaySQL
-   10.5%         p99       20.10µs       19.12µs       21.23µs  SQLite (journal, sync=FULL, fullfsync) (index)
-   10.3%         max       17.85µs       16.06µs       17.89µs  SQLite (WAL, sync=NORMAL) (index)
-   10.2%        cold       17.85µs       16.06µs       17.89µs  SQLite (WAL, sync=NORMAL) (index)
+   91.5%         p99        5.32µs        5.13µs       10.00µs  SQLite (journal, sync=FULL, fullfsync) (index)
+   80.9%         p99       15.38µs       12.08µs       24.52µs  InlaySQL
+   51.4%         p50        2.76µs        2.66µs        4.08µs  SQLite (WAL, sync=NORMAL) (index)
+   45.5%         p99       23.23µs       22.34µs       32.92µs  InlaySQL
+   38.5%         p99        3.95µs        3.11µs        4.63µs  SQLite (WAL, sync=NORMAL) (index)
+   38.4%         p99       12.25µs        8.27µs       12.98µs  SQLite (journal, sync=FULL, fullfsync) (index)
+   36.9%         p95        3.77µs        2.81µs        4.20µs  SQLite (WAL, sync=NORMAL) (index)
+   36.4%     joins/s        325446        239750        358279  SQLite (WAL, sync=NORMAL) (index)
+   21.3%         p95       16.70µs       14.41µs       17.96µs  InlaySQL
+   21.2%         max       13.74µs       12.27µs       15.18µs  SQLite (WAL, sync=NORMAL) (index)
+   21.2%        cold       13.74µs       12.27µs       15.18µs  SQLite (WAL, sync=NORMAL) (index)
+   20.8%         p95        5.14µs        4.85µs        5.92µs  SQLite (WAL, sync=NORMAL) (index)
+   18.6%         p99       15.30ms       13.54ms       16.38ms  InlaySQL
+   17.7%         p99        6.32µs        5.92µs        7.04µs  SQLite (WAL, sync=NORMAL) (index)
+   15.0%        cold       48.88µs       44.95µs       52.30µs  InlaySQL
+   15.0%         max       48.88µs       44.96µs       52.30µs  InlaySQL
+   12.4%         p50       11.48µs       11.36µs       12.78µs  InlaySQL
+   10.8%     joins/s         75190         68999         77134  InlaySQL
+   10.8%         p95        8.71µs        7.98µs        8.92µs  InlaySQL
+   10.8%     joins/s        112086        109680        121771  InlaySQL
 
 --- median of all runs, in the layout run.sh printed ---
 
@@ -187,48 +200,48 @@ to do.
 
 join, PK inner (FROM posts JOIN users ON posts.user_id = users.id)
 engine                                              joins/s       cold        p50        p95        p99        max
-InlaySQL                                                107     40.22ms     9.00ms     9.16ms     9.66ms    40.22ms
-SQLite (journal, sync=FULL, fullfsync) (index)           45     21.73ms    22.25ms    22.36ms    22.46ms    22.72ms
-SQLite (WAL, sync=NORMAL) (index)                        45     22.16ms    22.30ms    22.39ms    22.48ms    22.75ms
-InlaySQL is 2.40x faster than SQLite (journal, sync=FULL, fullfsync) (index)
+InlaySQL                                                 92    46.32ms    10.53ms    11.00ms    11.65ms    46.32ms
+SQLite (journal, sync=FULL, fullfsync) (index)           44    23.07ms    22.64ms    23.27ms    23.41ms    23.54ms
+SQLite (WAL, sync=NORMAL) (index)                        44     22.80ms    22.75ms    23.39ms    23.73ms    23.76ms
+InlaySQL is 2.05x faster than SQLite (journal, sync=FULL, fullfsync) (index)
 
 join, PK inner, LIMIT 10 (FROM posts JOIN users ON posts.user_id = users.id)
 engine                                              joins/s       cold        p50        p95        p99        max
-InlaySQL                                             129566    41.66µs     7.21µs     7.66µs    15.77µs    41.66µs
-SQLite (journal, sync=FULL, fullfsync) (index)       103276    17.32µs     9.46µs     9.70µs    16.29µs    17.32µs
-SQLite (WAL, sync=NORMAL) (index)                    244413     8.83µs     4.01µs     4.12µs     4.50µs     10.14µs
-InlaySQL is 1.25x faster than SQLite (journal, sync=FULL, fullfsync) (index)
+InlaySQL                                             112086    48.88µs     8.39µs     8.71µs    15.38µs    48.88µs
+SQLite (journal, sync=FULL, fullfsync) (index)       210856    10.29µs     4.60µs     4.71µs     5.32µs    10.29µs
+SQLite (WAL, sync=NORMAL) (index)                    325446     6.83µs     2.76µs     3.77µs     3.95µs     6.83µs
+InlaySQL is 1.92x slower than SQLite (journal, sync=FULL, fullfsync) (index)
 
 join, secondary-index inner (FROM users JOIN posts ON posts.user_id = users.id)
 engine                                              joins/s       cold        p50        p95        p99        max
-InlaySQL                                                 91     70.74ms    10.38ms    10.93ms    11.07ms    70.74ms
-SQLite (journal, sync=FULL, fullfsync) (index)           17     58.73ms    58.88ms    59.26ms    59.72ms    60.07ms
-SQLite (WAL, sync=NORMAL) (index)                        17     59.26ms    59.40ms    59.73ms    59.98ms    60.00ms
-InlaySQL is 5.53x faster than SQLite (journal, sync=FULL, fullfsync) (index)
+InlaySQL                                                 75     69.83ms    12.73ms    13.25ms    15.30ms    69.83ms
+SQLite (journal, sync=FULL, fullfsync) (index)           17     58.67ms    58.16ms    59.26ms    62.14ms    63.08ms
+SQLite (WAL, sync=NORMAL) (index)                        17     60.04ms    59.34ms    60.50ms    60.91ms    61.63ms
+InlaySQL is 4.31x faster than SQLite (journal, sync=FULL, fullfsync) (index)
 
 join, secondary-index inner, LIMIT 10 (FROM users JOIN posts ON posts.user_id = users.id)
 engine                                              joins/s       cold        p50        p95        p99        max
-InlaySQL                                              81410   125.22µs    10.83µs    12.28µs    19.16µs   125.22µs
-SQLite (journal, sync=FULL, fullfsync) (index)        84875    29.12µs    11.40µs    11.81µs    20.10µs    29.12µs
-SQLite (WAL, sync=NORMAL) (index)                    164325    17.85µs     5.84µs     6.19µs    13.48µs    17.85µs
-InlaySQL is 1.03x slower than SQLite (journal, sync=FULL, fullfsync) (index)
+InlaySQL                                              75190   136.46µs    11.48µs    16.70µs    23.23µs   136.46µs
+SQLite (journal, sync=FULL, fullfsync) (index)       146579    15.55µs     6.62µs     6.88µs    12.25µs    15.55µs
+SQLite (WAL, sync=NORMAL) (index)                    195495    13.74µs     4.70µs     5.14µs     6.32µs    13.74µs
+InlaySQL is 1.93x slower than SQLite (journal, sync=FULL, fullfsync) (index)
 ```
 
 ## runner-concurrency-repeat.txt
 
 ```
-date:   2026-09-08T02:35:44Z
-commit: 6556115
+date:   2026-09-14T09:41:04Z
+commit: c576ac6
 dirty:  no
 rustc:  rustc 1.98.1 (48a229cea 2026-09-01)
 host:   Linux 6.17.0-1022-azure x86_64
 
 runs:   3
-        /home/runner/work/inlaysql/inlaysql/bench/results/20260908T023533Z.txt
-        /home/runner/work/inlaysql/inlaysql/bench/results/20260908T023537Z.txt
-        /home/runner/work/inlaysql/inlaysql/bench/results/20260908T023540Z.txt
+        /home/runner/work/inlaysql/inlaysql/bench/results/20260914T094050Z.txt
+        /home/runner/work/inlaysql/inlaysql/bench/results/20260914T094055Z.txt
+        /home/runner/work/inlaysql/inlaysql/bench/results/20260914T094100Z.txt
 
-metrics: 252; disagreeing by 10% or more across runs: 53
+metrics: 252; disagreeing by 10% or more across runs: 57
 
 Widest disagreement first. A figure listed here is not worth quoting to
 three digits: the machine moved it further than that between runs. A `max`
@@ -237,31 +250,31 @@ figure is the measurement itself, and swinging is what it is not supposed
 to do.
 
   spread      column        median           min           max  row
-  270.3%         max        5.22ms        2.39ms       16.50ms  SQLite (journal, sync=FULL, fullfsync)
-  181.3%         p99        1.12ms        1.09ms        3.12ms  SQLite (journal, sync=FULL, fullfsync)
-  155.5%         max       13.07ms        7.39ms       27.72ms  SQLite (journal, sync=FULL, fullfsync)
-  120.0%      lock.)         1.50%        -0.10%         1.70%  buckets: writers, busy ms over commits — gate_wait, gate_hold, follower_wait, gather_spin, fsync, post, pre-gate residual (<v> gate waits, racing holds)
-  108.5%         max        4.66ms        0.92ms        5.98ms  SQLite (journal, sync=FULL, fullfsync)
-   82.8%      lock.)         2.90%         0.80%         3.20%  barrier cycle: writers, barriers/s — fsync ms, interval ms, idle ms (<v> of the wall clock has no flush in flight); coordinator gather post gap ms/barrier
-   81.8%      lock.)          0.01             0          0.01  barrier cycle: writers, barriers/s — fsync ms, interval ms, idle ms (<v> of the wall clock has no flush in flight); coordinator gather post gap ms/barrier
-   75.9%         max       11.92ms        4.36ms       13.41ms  SQLite (journal, sync=FULL, fullfsync)
-   71.8%         p99       16.15ms       16.00ms       27.59ms  InlaySQL (parallel WAL regions)
-   67.6%         p99       12.73ms        7.59ms       16.19ms  InlaySQL (parallel WAL regions)
-   60.8%      lock.)          0.18          0.17          0.28  barrier cycle: writers, barriers/s — fsync ms, interval ms, idle ms (<v> of the wall clock has no flush in flight); coordinator gather post gap ms/barrier
-   44.8%         p99        5.83ms        3.56ms        6.17ms  InlaySQL (parallel WAL regions)
-   43.0%         max       26.98ms       26.72ms       38.31ms  InlaySQL (parallel WAL regions)
-   40.0%      lock.)          0.01          0.01          0.01  gate hold: writers, holds, ms mean — read (<v> calls), state (<v>), wal (<v>, KiB), data (<v>, KiB), of which extend (<v> extensions); device ms (<v>), residual ms (<v>), commit-point misses
-   39.6%         p99        3.03ms        1.96ms        3.16ms  InlaySQL (parallel WAL regions)
-   39.1%         p95      617.41µs      591.52µs      833.19µs  InlaySQL (parallel WAL regions)
-   38.9%         p99        1.13ms        1.12ms        1.56ms  SQLite (journal, sync=FULL, fullfsync)
-   38.3%         max       28.01ms       27.92ms       38.66ms  InlaySQL (parallel WAL regions)
-   35.5%      lock.)        -6.20%        -7.60%        -5.40%  buckets: writers, busy ms over commits — gate_wait, gate_hold, follower_wait, gather_spin, fsync, post, pre-gate residual (<v> gate waits, racing holds)
-   33.3%      lock.)             0             0             0  gate hold: writers, holds, ms mean — read (<v> calls), state (<v>), wal (<v>, KiB), data (<v>, KiB), of which extend (<v> extensions); device ms (<v>), residual ms (<v>), commit-point misses
-   33.3%      lock.)             0             0             0  gate hold: writers, holds, ms mean — read (<v> calls), state (<v>), wal (<v>, KiB), data (<v>, KiB), of which extend (<v> extensions); device ms (<v>), residual ms (<v>), commit-point misses
-   32.0%      lock.)         2.50%         2.40%         3.20%  buckets: writers, busy ms over commits — gate_wait, gate_hold, follower_wait, gather_spin, fsync, post, pre-gate residual (<v> gate waits, racing holds)
-   30.0%      lock.)         2.00%         2.00%         2.60%  buckets: writers, busy ms over commits — gate_wait, gate_hold, follower_wait, gather_spin, fsync, post, pre-gate residual (<v> gate waits, racing holds)
-   28.6%      lock.)          0.01          0.01          0.01  gate hold: writers, holds, ms mean — read (<v> calls), state (<v>), wal (<v>, KiB), data (<v>, KiB), of which extend (<v> extensions); device ms (<v>), residual ms (<v>), commit-point misses
-   25.0%      lock.)         0.40%         0.40%         0.50%  buckets: writers, busy ms over commits — gate_wait, gate_hold, follower_wait, gather_spin, fsync, post, pre-gate residual (<v> gate waits, racing holds)
+  920.0%      lock.)         -0.01         -0.01          0.03  barrier cycle: writers, barriers/s — fsync ms, interval ms, idle ms (<v> of the wall clock has no flush in flight); coordinator gather post gap ms/barrier
+  713.3%      lock.)        -1.50%        -4.20%         6.50%  barrier cycle: writers, barriers/s — fsync ms, interval ms, idle ms (<v> of the wall clock has no flush in flight); coordinator gather post gap ms/barrier
+  560.0%      lock.)          0.01             0          0.03  barrier cycle: writers, barriers/s — fsync ms, interval ms, idle ms (<v> of the wall clock has no flush in flight); coordinator gather post gap ms/barrier
+  325.0%      lock.)         0.80%         0.60%         3.20%  buckets: writers, busy ms over commits — gate_wait, gate_hold, follower_wait, gather_spin, fsync, post, pre-gate residual (<v> gate waits, racing holds)
+  264.9%      lock.)           148           123           515  gate hold: writers, holds, ms mean — read (<v> calls), state (<v>), wal (<v>, KiB), data (<v>, KiB), of which extend (<v> extensions); device ms (<v>), residual ms (<v>), commit-point misses
+  237.5%      lock.)         0.80%         0.60%         2.50%  buckets: writers, busy ms over commits — gate_wait, gate_hold, follower_wait, gather_spin, fsync, post, pre-gate residual (<v> gate waits, racing holds)
+  227.8%      lock.)         1.80%         0.80%         4.90%  buckets: writers, busy ms over commits — gate_wait, gate_hold, follower_wait, gather_spin, fsync, post, pre-gate residual (<v> gate waits, racing holds)
+  200.0%      lock.)             0             0             0  gate hold: writers, holds, ms mean — read (<v> calls), state (<v>), wal (<v>, KiB), data (<v>, KiB), of which extend (<v> extensions); device ms (<v>), residual ms (<v>), commit-point misses
+  115.9%      lock.)        -6.30%        -7.10%         0.20%  buckets: writers, busy ms over commits — gate_wait, gate_hold, follower_wait, gather_spin, fsync, post, pre-gate residual (<v> gate waits, racing holds)
+  100.0%      lock.)         7.80%         7.30%        15.10%  barrier cycle: writers, barriers/s — fsync ms, interval ms, idle ms (<v> of the wall clock has no flush in flight); coordinator gather post gap ms/barrier
+  100.0%      lock.)         0.10%         0.10%         0.20%  buckets: writers, busy ms over commits — gate_wait, gate_hold, follower_wait, gather_spin, fsync, post, pre-gate residual (<v> gate waits, racing holds)
+   98.0%         p99        2.49ms        2.04ms        4.48ms  InlaySQL (parallel WAL regions)
+   88.5%      lock.)          0.05          0.05           0.1  barrier cycle: writers, barriers/s — fsync ms, interval ms, idle ms (<v> of the wall clock has no flush in flight); coordinator gather post gap ms/barrier
+   84.8%      lock.)          0.03          0.03          0.06  barrier cycle: writers, barriers/s — fsync ms, interval ms, idle ms (<v> of the wall clock has no flush in flight); coordinator gather post gap ms/barrier
+   82.0%         max       10.71ms        6.02ms       14.80ms  InlaySQL (parallel WAL regions)
+   78.9%         max        5.11ms        5.07ms        9.10ms  SQLite (journal, sync=FULL, fullfsync)
+   76.8%         max        5.95ms        5.61ms       10.18ms  SQLite (journal, sync=FULL, fullfsync)
+   75.0%      lock.)         0.40%         0.30%         0.60%  buckets: writers, busy ms over commits — gate_wait, gate_hold, follower_wait, gather_spin, fsync, post, pre-gate residual (<v> gate waits, racing holds)
+   73.8%         max        7.45ms        2.05ms        7.55ms  InlaySQL (parallel WAL regions)
+   57.6%         max        5.54ms        5.44ms        8.63ms  SQLite (journal, sync=FULL, fullfsync)
+   56.0%         p99        2.68ms        2.54ms        4.04ms  SQLite (journal, sync=FULL, fullfsync)
+   53.6%         p95        5.04ms        3.78ms        6.48ms  InlaySQL (parallel WAL regions)
+   50.0%      lock.)             0             0             0  barrier cycle: writers, barriers/s — fsync ms, interval ms, idle ms (<v> of the wall clock has no flush in flight); coordinator gather post gap ms/barrier
+   50.0%      lock.)             0             0             0  gate hold: writers, holds, ms mean — read (<v> calls), state (<v>), wal (<v>, KiB), data (<v>, KiB), of which extend (<v> extensions); device ms (<v>), residual ms (<v>), commit-point misses
+   48.5%         p99        2.02ms        1.37ms        2.35ms  SQLite (journal, sync=FULL, fullfsync)
 
 --- median of all runs, in the layout run.sh printed ---
 
@@ -270,40 +283,40 @@ to do.
 (InlaySQL writers flush separate WAL regions in parallel. SQLite's writers
 still serialize at its file lock.)
   barriers: 1 writers, 200 normal flushes over 200 commits (    1 syncs/commit,    1 commits/sync)
-  barrier cycle: 1 writers, 3065.3 barriers/s — fsync  0.28 ms, interval  0.33 ms, idle  0.04 ms (13.30% of the wall clock has no flush in flight); coordinator gather     0 post     0 gap  0.12 ms/barrier
-  buckets: 1 writers, busy 65.1 ms over 200 commits — gate_wait 0.00%, gate_hold 18.50%, follower_wait 0.00%, gather_spin 0.00%, fsync 87.70%, post 0.20%, pre-gate residual -6.20% (202 gate waits, 0 racing holds)
-  gate hold: 1 writers, 202 holds,  0.06 ms mean —              read  0.01 (748 calls), state     0 (0), wal     0 (200, 4.5 KiB),              data  0.01 (200, 15.7 KiB), of which extend  0.01 (2 extensions);              device  0.02 ms (38.30%), residual  0.04 ms (61.70%), 0 commit-point misses
-  barriers: 2 writers, 300 normal flushes over 400 commits ( 0.75 syncs/commit, 1.33 commits/sync)
-  barrier cycle: 2 writers,   2779 barriers/s — fsync  0.35 ms, interval  0.36 ms, idle  0.01 ms (2.90% of the wall clock has no flush in flight); coordinator gather  0.04 post     0 gap  0.08 ms/barrier
-  buckets: 2 writers, busy 227.6 ms over 400 commits — gate_wait 2.00%, gate_hold 12.90%, follower_wait 29.00%, gather_spin 5.00%, fsync 49.10%, post 0.40%, pre-gate residual 1.50% (402 gate waits, 267 racing holds)
-  gate hold: 2 writers, 402 holds,  0.07 ms mean —              read  0.01 (538 calls), state     0 (0), wal     0 (400,   5 KiB),              data  0.01 (400, 17.9 KiB), of which extend  0.01 (3 extensions);              device  0.02 ms (31.00%), residual  0.05 ms (69.00%), 1 commit-point misses
-  barriers: 4 writers, 206 normal flushes over 800 commits ( 0.26 syncs/commit, 3.89 commits/sync)
-  barrier cycle: 4 writers, 988.2 barriers/s — fsync   0.6 ms, interval  1.01 ms, idle   0.4 ms (40.40% of the wall clock has no flush in flight); coordinator gather  0.28 post  0.01 gap  0.13 ms/barrier
-  buckets: 4 writers, busy 822.7 ms over 800 commits — gate_wait 13.00%, gate_hold 8.40%, follower_wait 51.50%, gather_spin 6.80%, fsync 15.40%, post 0.20%, pre-gate residual 4.70% (803 gate waits, 603 racing holds)
-  gate hold: 4 writers, 803 holds,  0.09 ms mean —              read  0.01 (2867 calls), state     0 (4), wal  0.01 (804, 10.5 KiB),              data  0.01 (800,   19 KiB), of which extend  0.01 (4 extensions);              device  0.03 ms (31.70%), residual  0.06 ms (68.30%), 3 commit-point misses
-  barriers: 8 writers, 216 normal flushes over 1600 commits ( 0.14 syncs/commit, 7.44 commits/sync)
-  barrier cycle: 8 writers, 546.7 barriers/s — fsync  1.05 ms, interval  1.83 ms, idle  0.78 ms (42.50% of the wall clock has no flush in flight); coordinator gather  0.67 post  0.02 gap  0.18 ms/barrier
-  buckets: 8 writers, busy 3128.1 ms over 1600 commits — gate_wait 17.80%, gate_hold 5.20%, follower_wait 62.30%, gather_spin 4.60%, fsync 7.40%, post 0.10%, pre-gate residual 2.50% (1604 gate waits, 1401 racing holds)
-  gate hold: 8 writers, 1604 holds,   0.1 ms mean —              read  0.01 (6339 calls), state     0 (8), wal  0.01 (1608, 11.4 KiB),              data  0.01 (1600, 19.7 KiB), of which extend  0.01 (6 extensions);              device  0.03 ms (28.40%), residual  0.07 ms (71.60%), 3 commit-point misses
+  barrier cycle: 1 writers, 2447.5 barriers/s — fsync  0.38 ms, interval  0.41 ms, idle  0.03 ms (7.80% of the wall clock has no flush in flight); coordinator gather     0 post     0 gap  0.11 ms/barrier
+  buckets: 1 writers, busy 81.6 ms over 200 commits — gate_wait 0.00%, gate_hold 13.30%, follower_wait 0.00%, gather_spin 0.00%, fsync 93.20%, post 0.10%, pre-gate residual -6.30% (202 gate waits, 0 racing holds)
+  gate hold: 1 writers, 202 holds,  0.05 ms mean —              read  0.01 (748 calls), state     0 (0), wal     0 (200, 4.5 KiB),              data  0.01 (200, 15.7 KiB), of which extend  0.01 (2 extensions);              device  0.02 ms (32.40%), residual  0.04 ms (67.60%), 0 commit-point misses
+  barriers: 2 writers, 378 normal flushes over 400 commits ( 0.94 syncs/commit, 1.06 commits/sync)
+  barrier cycle: 2 writers, 2808.6 barriers/s — fsync  0.36 ms, interval  0.36 ms, idle -0.01 ms (-1.50% of the wall clock has no flush in flight); coordinator gather  0.01 post     0 gap  0.05 ms/barrier
+  buckets: 2 writers, busy 268.2 ms over 400 commits — gate_wait 0.80%, gate_hold 8.00%, follower_wait 35.70%, gather_spin 0.80%, fsync 51.20%, post 0.40%, pre-gate residual 1.80% (402 gate waits, 373 racing holds)
+  gate hold: 2 writers, 402 holds,  0.06 ms mean —              read     0 (148 calls), state     0 (0), wal     0 (400,   5 KiB),              data  0.01 (400, 17.9 KiB), of which extend  0.01 (3 extensions);              device  0.01 ms (24.40%), residual  0.04 ms (75.60%), 1 commit-point misses
+  barriers: 4 writers, 216 normal flushes over 800 commits ( 0.27 syncs/commit, 3.72 commits/sync)
+  barrier cycle: 4 writers, 914.2 barriers/s — fsync  0.71 ms, interval  1.09 ms, idle  0.38 ms (33.50% of the wall clock has no flush in flight); coordinator gather  0.25 post  0.01 gap  0.13 ms/barrier
+  buckets: 4 writers, busy   936 ms over 800 commits — gate_wait 10.80%, gate_hold 7.50%, follower_wait 54.60%, gather_spin 5.40%, fsync 17.00%, post 0.20%, pre-gate residual 4.30% (803 gate waits, 611 racing holds)
+  gate hold: 4 writers, 803 holds,  0.09 ms mean —              read  0.01 (2851 calls), state     0 (4), wal  0.01 (804, 10.5 KiB),              data  0.01 (800,   19 KiB), of which extend  0.01 (4 extensions);              device  0.03 ms (29.00%), residual  0.06 ms (71.00%), 3 commit-point misses
+  barriers: 8 writers, 229 normal flushes over 1600 commits ( 0.14 syncs/commit, 7.02 commits/sync)
+  barrier cycle: 8 writers,   551 barriers/s — fsync  1.08 ms, interval  1.81 ms, idle  0.72 ms (40.00% of the wall clock has no flush in flight); coordinator gather  0.61 post  0.02 gap  0.19 ms/barrier
+  buckets: 8 writers, busy 3303.8 ms over 1600 commits — gate_wait 17.10%, gate_hold 5.10%, follower_wait 62.60%, gather_spin 4.20%, fsync 7.70%, post 0.10%, pre-gate residual 3.50% (1604 gate waits, 1422 racing holds)
+  gate hold: 8 writers, 1604 holds,   0.1 ms mean —              read  0.01 (6456 calls), state     0 (8), wal  0.01 (1608, 11.4 KiB),              data  0.01 (1600, 19.7 KiB), of which extend  0.01 (6 extensions);              device  0.03 ms (28.00%), residual  0.07 ms (72.00%), 3 commit-point misses
 
 engine                                    writers    commits/s    committed  conflicts        p50        p95        p99        max
-InlaySQL (parallel WAL regions)                 1         3065          200       0.00%   230.07µs   425.12µs     3.03ms     5.88ms
-InlaySQL (parallel WAL regions)                 2         3498          400       0.00%   440.04µs   617.41µs     5.83ms    13.02ms
-InlaySQL (parallel WAL regions)                 4         3875          800       0.00%   707.85µs     1.90ms    12.73ms    26.98ms
-InlaySQL (parallel WAL regions)                 8         4068         1600       0.00%     1.21ms     5.96ms    16.15ms    28.01ms
-SQLite (journal, sync=FULL, fullfsync)          1         1223          200       0.00%   791.87µs   857.04µs     0.97ms     4.66ms
-SQLite (journal, sync=FULL, fullfsync)          2         1222          400       0.00%   797.83µs   949.35µs     1.12ms     5.22ms
-SQLite (journal, sync=FULL, fullfsync)          4         1201          800       0.00%   795.53µs   892.84µs     1.39ms     11.92ms
-SQLite (journal, sync=FULL, fullfsync)          8         1199         1600       0.00%   796.47µs   891.49µs     1.13ms    13.07ms
+InlaySQL (parallel WAL regions)                 1         2447          200       0.00%   284.44µs   570.98µs   1160.00µs     7.45ms
+InlaySQL (parallel WAL regions)                 2         2972          400       0.00%   631.89µs   953.22µs     2.49ms    10.71ms
+InlaySQL (parallel WAL regions)                 4         3402          800       0.00%   880.42µs     1.70ms     7.72ms    31.78ms
+InlaySQL (parallel WAL regions)                 8         3850         1600       0.00%     1.42ms     5.04ms    26.19ms    28.18ms
+SQLite (journal, sync=FULL, fullfsync)          1          869          200       0.00%     1.12ms     1.26ms     2.02ms     5.08ms
+SQLite (journal, sync=FULL, fullfsync)          2          865          400       0.00%     1.11ms     1.24ms     2.68ms     5.11ms
+SQLite (journal, sync=FULL, fullfsync)          4          857          800       0.00%     1.11ms     1.23ms     2.56ms     5.54ms
+SQLite (journal, sync=FULL, fullfsync)          8          854         1600       0.00%     1.13ms     1.27ms     2.57ms     5.95ms
 
-InlaySQL at 8 writers does 1.36x the work of 1 writer, aborting 0.00% of transactions.
+InlaySQL at 8 writers does 1.60x the work of 1 writer, aborting 0.00% of transactions.
 ```
 
 ## runner-compare.txt
 
 ```
-date:   2026-09-08T02:19:48Z
-commit: 6556115
+date:   2026-09-14T09:23:44Z
+commit: c576ac6
 dirty:  no
 rustc:  rustc 1.98.1 (48a229cea 2026-09-01)
 host:   Linux 6.17.0-1022-azure x86_64
@@ -316,12 +329,12 @@ load:   override/unknown logical CPUs at start (max per CPU: off)
                                        --- vector search ---     |    --- hybrid (vector + text) ---   
 engine                              recall@k       p50       p95 |   agree       p50       p95    build
 -------------------------------------------------------------------------------------------------------
-InlaySQL (HNSW + BM25)                 1.000  172.00us  234.00us |   0.988  302.00us  371.00us     3.5s
-DuckDB (exhaustive + fts BM25)         1.000   14.83ms   16.30ms |   0.965   31.22ms   37.55ms    65.9s
-DuckDB (vss HNSW + fts BM25)           0.991   13.22ms   17.75ms |   0.961   30.17ms   37.06ms    68.5s
-Meilisearch (arroy ANN + built-in ranking, RRF fused by this driver)     0.998    3.30ms    3.68ms |   0.418   10.91ms   13.70ms     4.1s
-pgvector (HNSW + ts_rank)              0.988  391.00us  497.00us |   0.457   34.84ms   52.15ms     1.5s
-pgvector (exhaustive + ts_rank)        0.999    1.26ms    1.36ms |   0.465   36.22ms   54.07ms     0.5s
+InlaySQL (HNSW + BM25)                 1.000  181.00us  265.00us |   0.988  299.00us  375.00us     3.4s
+DuckDB (exhaustive + fts BM25)         1.000   14.67ms   15.25ms |   0.966   31.59ms   38.88ms    65.7s
+DuckDB (vss HNSW + fts BM25)           0.992   13.22ms   14.76ms |   0.962   30.12ms   35.43ms    67.0s
+Meilisearch (arroy ANN + built-in ranking, RRF fused by this driver)     0.997    3.17ms    3.51ms |   0.418   10.47ms   12.45ms     4.1s
+pgvector (HNSW + ts_rank)              0.989  387.00us  517.00us |   0.458   34.42ms   52.75ms     1.4s
+pgvector (exhaustive + ts_rank)        0.999    1.25ms    1.30ms |   0.465   35.84ms   54.58ms     0.5s
 
 recall@k is measured against exhaustive cosine similarity — an objective answer.
 `agree` is overlap with InlaySQL's reference fusion (exact vector + exact BM25).
@@ -347,12 +360,12 @@ one query.
                                                                  --- write (durable, one row/commit) --- |      --- read (point lookup) ---      
 engine                                                           write ops/s      p50      p95      p99 |  read ops/s      p50      p95      p99
 ------------------------------------------------------------------------------------------------------------------------------------------------
-InlaySQL                                                              3796.8  202.00us  403.00us  704.00us |    909706.5    1.00us    1.00us    1.00us
-InlaySQL (containerised, same volume class as MySQL/PostgreSQL)       3686.4  207.00us  407.00us    1.09ms |    877624.5    1.00us    1.00us    2.00us
-MySQL 8 (innodb_flush_log_at_trx_commit=1, binlog disabled)           3094.3  310.00us  400.00us  633.00us |      5261.4  168.00us  250.00us  294.00us
-                                                                   commits-per-fsync: 20003/21504 = 0.93
-PostgreSQL 17 (fsync=on, synchronous_commit=on)                       5383.2  174.00us  235.00us  274.00us |     11452.9   71.00us  125.00us  144.00us
-                                                                   commits-per-fsync: 20005/20001 = 1.00
+InlaySQL                                                              3856.8  200.00us  393.00us  688.00us |    926738.2    1.00us    1.00us    1.00us
+InlaySQL (containerised, same volume class as MySQL/PostgreSQL)       3769.3  203.00us  391.00us    1.07ms |    915664.0    1.00us    1.00us    1.00us
+MySQL 8 (innodb_flush_log_at_trx_commit=1, binlog disabled)           3132.7  298.00us  417.00us  791.00us |      5440.6  160.00us  243.00us  286.00us
+                                                                   commits-per-fsync: 20003/21398 = 0.93
+PostgreSQL 17 (fsync=on, synchronous_commit=on)                       5356.8  194.00us  228.00us  266.00us |     11824.3   69.00us  119.00us  140.00us
+                                                                   commits-per-fsync: 20005/20000 = 1.00
 
 Every row here is configured for real durability — fsync on every commit — matched
 as closely as each engine allows. See bench/README.md for the exact settings and the
@@ -392,21 +405,21 @@ is structural. See bench/README.md for the full accounting.
                                                                                     --- write (durable, one row/commit) ---         |      --- read (point lookup) ---      
 engine                                                                         conn write ops/s      p50      p95      p99 retries |  read ops/s      p50      p95      p99
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-InlaySQL (server, its own MySQL wire — inlaysql serve --mysql)                    1      1944.3  466.00us  584.00us  977.00us       0 |      3353.6  189.00us  221.00us  291.00us
+InlaySQL (server, its own MySQL wire — inlaysql serve --mysql)                    1      1992.5  426.00us  564.00us    1.26ms       0 |      3799.2  157.00us  222.00us  305.00us
                                                                                       commits-per-fsync: 2000/2000 = 1.00
-                                                                                      commits-per-fsync (checkpoint-inclusive): 2012/2012 = 1.00
-InlaySQL (server, its own MySQL wire — inlaysql serve --mysql)                    4      2559.1    1.03ms    1.95ms    4.97ms       0 |      4518.8  271.00us  415.00us  494.00us
-                                                                                      commits-per-fsync: 2011/593 = 3.39
-                                                                                      commits-per-fsync (checkpoint-inclusive): 2015/597 = 3.38
-InlaySQL (server, its own MySQL wire — inlaysql serve --mysql)                   16      1670.3    2.79ms    6.41ms   12.23ms       0 |      1414.2  399.00us    1.77ms    3.89ms
-                                                                                      commits-per-fsync: 2013/420 = 4.79
-                                                                                      commits-per-fsync (checkpoint-inclusive): 2022/429 = 4.71
-MySQL 8 (server-to-server, innodb_flush_log_at_trx_commit=1, binlog disabled)     1      2552.8  308.00us  387.00us  634.00us       0 |      3265.8  203.00us  247.00us  255.00us
-                                                                                      commits-per-fsync: 2003/2122 = 0.94
-MySQL 8 (server-to-server, innodb_flush_log_at_trx_commit=1, binlog disabled)     4      4487.7  481.00us  709.00us  934.00us       0 |      3843.6  317.00us  577.00us  876.00us
-                                                                                      commits-per-fsync: 2003/1443 = 1.39
-MySQL 8 (server-to-server, innodb_flush_log_at_trx_commit=1, binlog disabled)    16      1942.6  699.00us    2.37ms    4.53ms       0 |      1250.5  276.00us    2.15ms    3.34ms
-                                                                                      commits-per-fsync: 2003/1629 = 1.23
+                                                                                      commits-per-fsync (checkpoint-inclusive): 2013/2013 = 1.00
+InlaySQL (server, its own MySQL wire — inlaysql serve --mysql)                    4      2692.4  958.00us    1.34ms    5.21ms       0 |      5077.1  200.00us  226.00us  306.00us
+                                                                                      commits-per-fsync: 2007/618 = 3.25
+                                                                                      commits-per-fsync (checkpoint-inclusive): 2015/626 = 3.22
+InlaySQL (server, its own MySQL wire — inlaysql serve --mysql)                   16      1654.2    1.80ms    5.51ms   18.61ms       0 |      1514.2  391.00us    2.73ms    4.44ms
+                                                                                      commits-per-fsync: 2009/766 = 2.62
+                                                                                      commits-per-fsync (checkpoint-inclusive): 2025/781 = 2.59
+MySQL 8 (server-to-server, innodb_flush_log_at_trx_commit=1, binlog disabled)     1      2667.4  291.00us  359.00us  624.00us       0 |      3207.5  218.00us  243.00us  254.00us
+                                                                                      commits-per-fsync: 2003/2131 = 0.94
+MySQL 8 (server-to-server, innodb_flush_log_at_trx_commit=1, binlog disabled)     4      4836.7  460.00us  748.00us    1.09ms       0 |      4111.6  292.00us  466.00us  554.00us
+                                                                                      commits-per-fsync: 2003/1326 = 1.51
+MySQL 8 (server-to-server, innodb_flush_log_at_trx_commit=1, binlog disabled)    16      2118.3  714.00us    2.06ms    3.66ms       0 |      1223.4  290.00us    2.55ms    5.40ms
+                                                                                      commits-per-fsync: 2003/1476 = 1.36
 
 This is the row bench/README.md calls the missing apples-to-apples number: InlaySQL
 here is never a library call, it is `inlaysql serve --mysql`, reached over the compose
