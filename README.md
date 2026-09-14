@@ -248,26 +248,48 @@ In order. Each item lands only with an interleaved A/B that clears the
 harness's own noise floor, and no published number changes without a gated
 regeneration ([`AGENTS.md`](AGENTS.md)).
 
-1. **Measure before optimising.** A longer point-read window, profile suites
-   on the bench's API, a tuned release build (the tree has never set
-   `[profile.release]`), a concurrent-reader benchmark, write amplification
-   as a published column. Then regenerate every table.
-2. **Writes.** FIFO handoff at the commit gate (the p99 tail at 32 writers is
-   fairness, not fsync); bookkeeping rows out of the gate; a record that
-   names pages instead of copying them — write amplification from ~500x to
-   ~1x of dirty pages.
-3. **Reads.** The tail, not the median: a raw-slot leaf search, a prepared
+1. **Hygiene and the two silent statements.** `USE <other name>` and
+   `SET TRANSACTION ISOLATION LEVEL` refuse instead of returning OK — a
+   statement here is refused, never ignored. The client self-tests run in
+   CI, a changelog records what changed between versions, and a Linux
+   real-disk benchmark runner lets the MySQL and PostgreSQL write columns
+   publish.
+2. **ORM conformance as the SQL gate.** Committed Laravel 11, Django 5 and
+   Rails 8 corpora run over the wire in CI, and the walls close in the order
+   an application hits them: subqueries in writes, `SELECT … FOR UPDATE`
+   (optimistic — the selected row keys join the write set), `CREATE INDEX`
+   inside a transaction, `ALTER TABLE … MODIFY COLUMN` as an atomic table
+   rebuild, enforced foreign keys, views, `julianday` and the date functions
+   behind it.
+3. **Measure before optimising.** A tuned release build (the tree has never
+   set `[profile.release]`), a concurrent-reader benchmark, write
+   amplification as a published column. Then regenerate every table.
+4. **Format v7 and the first migration.** The commit record names pages
+   instead of copying them — write amplification from ~500x to ~1x of dirty
+   pages, the ~1 MiB transaction ceiling lifted, change data capture opt-in
+   and carrying row payloads. Then `inlaysql upgrade` migrates a v6 file
+   forward: that is the 0.1.0 line, and the point at which the crates
+   publish.
+5. **Writes.** FIFO handoff at the commit gate (the p99 tail at 32 writers is
+   fairness, not fsync); bookkeeping rows out of the gate.
+6. **Clients that are a product.** A prepared, streaming C ABI with catalog
+   introspection and vectors that round-trip; a Laravel driver in its own
+   repository over the PHP client, Django and Rails after it; Node and Go
+   over the same header.
+7. **Retrieval past a million rows.** No over-fetch where nothing consumes
+   it, a reusable visited set, a paged HNSW cache that does not clone a
+   record per hop. The index builds at `CREATE INDEX` time with progress
+   rather than inside the first `SELECT`, `m` and `ef_construction` become
+   tunable per index, and BM25 gains positions for phrase search and a
+   per-index tokeniser, CJK included.
+8. **Reads.** The tail, not the median: a raw-slot leaf search, a prepared
    statement that keeps its shape between executions, the schema check as
    a stamp. The three remaining losses to SQLite are all here.
-4. **MySQL wire.** Authorisation without re-parsing SQL, no plan clone per
+9. **MySQL wire.** Authorisation without re-parsing SQL, no plan clone per
    execute, a statement cache for text-protocol clients.
-5. **Retrieval.** No over-fetch where nothing consumes it, a reusable visited
-   set, a paged HNSW cache that does not clone a record per hop — the
-   prerequisite for 10M vectors in bounded RAM.
-6. **Clients.** The five self-tests in CI; a Laravel driver in its own
-   repository over the PHP client; Django and Rails after it.
-7. **Serverless.** Object-storage durability tier and scale-to-zero, as a
-   measured brief before code. The control plane is not this repository.
+10. **Serverless.** Object-storage durability tier and scale-to-zero, as a
+    measured brief before code, after the v7 record it depends on. The
+    control plane is not this repository.
 
 Losses are listed under [Performance](#performance); the gap matrix is
 [`SCOREBOARD.md` §5](SCOREBOARD.md#5-what-is-missing-to-fill-the-scoreboard-ranked-by-effort);

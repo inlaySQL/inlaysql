@@ -182,6 +182,9 @@ The working queue is the root `PLAN.md`, which is gitignored on purpose
 dated sections are the evidence behind every item. The rules below are what
 that queue has learnt the hard way — the measured dead ends are `PLAN.md`
 §9, and an idea on that list is not proposed again without new evidence.
+Since the 2026-09-14 edition that queue is ordered by what an application
+hits first — ORM conformance, the v7 record, the clients — rather than by
+microseconds; the performance items keep the A/B gate below.
 
 - **Regenerate before proposing anything on a published row.** Several
   losses in the tables have been fixed in code and not yet re-measured, and
