@@ -482,10 +482,20 @@ fn parse_json_value(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Res
                     chars.next();
                     break;
                 }
-                let Json::Real(real) = parse_json_value(chars)? else {
-                    return Err("an array parameter is a vector and must hold only numbers".into());
+                // A whole component encodes as `1`, not `1.0`, in every JSON
+                // writer the wrappers use — PHP's `json_encode`, Python's
+                // `json.dumps`, JavaScript's `JSON.stringify`. An integer here
+                // is a number, so it folds in rather than failing the vector.
+                let component = match parse_json_value(chars)? {
+                    Json::Real(real) => real,
+                    Json::Int(int) => int as f64,
+                    _ => {
+                        return Err(
+                            "an array parameter is a vector and must hold only numbers".into()
+                        )
+                    }
                 };
-                components.push(real);
+                components.push(component);
                 while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
                     chars.next();
                 }

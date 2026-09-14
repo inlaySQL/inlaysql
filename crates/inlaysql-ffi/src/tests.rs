@@ -188,6 +188,28 @@ fn null_real_and_vector_cells_render_as_the_wasm_surface_does() {
 }
 
 #[test]
+fn a_vector_component_may_arrive_as_an_integer() {
+    // PHP's `json_encode`, Python's `json.dumps` and `JSON.stringify` all
+    // write a whole float as `1`, so a caller who never typed an integer
+    // still sends one. Rejecting it reads as "must hold only numbers", which
+    // is both wrong and unactionable from the caller's side.
+    let dir = tmpdir("integer-components");
+    let client = Client::open(&dir.path().join("app.inlay"));
+    client.exec(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, embedding VECTOR(4))",
+        None,
+    );
+    client.exec(
+        "INSERT INTO t (embedding) VALUES (?)",
+        Some(r#"[[1, -2, 0.5, 0]]"#),
+    );
+    assert_eq!(
+        client.exec("SELECT embedding FROM t", None),
+        Some(r#"{"columns":["embedding"],"rows":[["<vector(4)>"]]}"#.into()),
+    );
+}
+
+#[test]
 fn failures_come_back_as_inlaysql_err_with_the_engines_message() {
     let dir = tmpdir("errors");
     let client = Client::open(&dir.path().join("app.inlay"));
